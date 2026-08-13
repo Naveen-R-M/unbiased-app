@@ -415,18 +415,35 @@ export function App() {
                   aria-label="Delete conversation"
                   style={{
                     flexShrink: 0,
+                    display: "flex",
+                    alignItems: "center",
                     background: "transparent",
                     color: colors.dim,
                     border: "none",
                     padding: "6px 8px",
-                    fontSize: 13,
                     cursor: "pointer",
                     lineHeight: 1,
                   }}
-                  onMouseEnter={(ev) => ((ev.target as HTMLButtonElement).style.color = colors.err)}
-                  onMouseLeave={(ev) => ((ev.target as HTMLButtonElement).style.color = colors.dim)}
+                  onMouseEnter={(ev) => ((ev.currentTarget as HTMLButtonElement).style.color = colors.err)}
+                  onMouseLeave={(ev) => ((ev.currentTarget as HTMLButtonElement).style.color = colors.dim)}
                 >
-                  ×
+                  <svg
+                    width="13"
+                    height="13"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    aria-hidden="true"
+                  >
+                    <path d="M3 6h18" />
+                    <path d="M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2" />
+                    <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
+                    <path d="M10 11v6" />
+                    <path d="M14 11v6" />
+                  </svg>
                 </button>
               )}
             </div>
