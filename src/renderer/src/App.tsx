@@ -128,11 +128,15 @@ export function App() {
   const [sideContext, setSideContext] = useState<string | null>(null);
   const [sideNonce, setSideNonce] = useState(0);
   const [navOpen, setNavOpen] = useState(() => localStorage.getItem("navOpen") !== "false");
-  const [sideWidth, setSideWidth] = useState(() => {
-    const stored = Number(localStorage.getItem("sideWidth"));
-    return stored >= 320 ? stored : Math.round(window.innerWidth * 0.42);
+  // The main/side split is a FRACTION of the content area (not pixels), so
+  // collapsing the nav or resizing the window scales both panes in ratio.
+  const [sideFrac, setSideFrac] = useState(() => {
+    const stored = Number(localStorage.getItem("sideFrac"));
+    return stored >= 0.25 && stored <= 0.7 ? stored : 0.45;
   });
   const draggingRef = useRef(false);
+  const navOpenRef = useRef(navOpen);
+  navOpenRef.current = navOpen;
 
   function toggleNav() {
     setNavOpen((o) => {
@@ -141,22 +145,25 @@ export function App() {
     });
   }
 
-  // Divider drag: width follows the cursor, clamped so neither pane
-  // collapses into uselessness. Persisted across launches.
+  // Divider drag: the fraction follows the cursor within the content area
+  // (everything right of the nav), clamped so neither pane collapses into
+  // uselessness. Persisted across launches.
   useEffect(() => {
     function onMove(e: MouseEvent) {
       if (!draggingRef.current) return;
-      const width = Math.min(Math.max(window.innerWidth - e.clientX, 320), Math.round(window.innerWidth * 0.7));
-      setSideWidth(width);
+      const contentLeft = navOpenRef.current ? 248 : 0;
+      const contentWidth = Math.max(window.innerWidth - contentLeft, 1);
+      const frac = (window.innerWidth - e.clientX) / contentWidth;
+      setSideFrac(Math.min(Math.max(frac, 0.25), 0.7));
     }
     function onUp() {
       if (!draggingRef.current) return;
       draggingRef.current = false;
       document.body.style.userSelect = "";
       document.body.style.cursor = "";
-      setSideWidth((w) => {
-        localStorage.setItem("sideWidth", String(w));
-        return w;
+      setSideFrac((f) => {
+        localStorage.setItem("sideFrac", String(f));
+        return f;
       });
     }
     window.addEventListener("mousemove", onMove);
@@ -350,7 +357,14 @@ export function App() {
       </nav>
       )}
 
-      <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column" }}>
+      <div
+        style={{
+          flex: sideOpen ? `${1 - sideFrac} 1 0%` : "1 1 0%",
+          minWidth: 320,
+          display: "flex",
+          flexDirection: "column",
+        }}
+      >
         <header
           style={{
             padding: "10px 16px",
@@ -427,8 +441,8 @@ export function App() {
       {sideOpen && (
         <div
           style={{
-            width: sideWidth,
-            flexShrink: 0,
+            flex: `${sideFrac} 1 0%`,
+            minWidth: 300,
             display: "flex",
             flexDirection: "column",
             background: "#131317",
