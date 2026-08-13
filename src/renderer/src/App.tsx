@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import Prism from "prismjs";
@@ -45,7 +45,22 @@ type Entry =
 
 type PaneId = "main" | "side";
 type ThreadSummary = { id: string; title: string; createdAt?: string };
-type OpenFileInfo = { name: string; relPath: string; fullPath: string; content?: string; error?: string };
+// A transcript excerpt staged for the next send, with an optional comment.
+// The live Range (when still valid) keeps the excerpt tinted in the DOM.
+type Annotation = { text: string; comment?: string; range?: Range };
+// kind: "image" sends as a localImage input item (model sees the pixels);
+// everything else rides as a mention (engine pulls in the file's text).
+// thumb is a small data-URL preview for the composer card.
+type Attachment = { name: string; path: string; kind?: "image" | "folder" | "file"; thumb?: string };
+type DirEntry = { name: string; dir: boolean };
+type OpenFileInfo = {
+  name: string;
+  relPath: string;
+  fullPath: string;
+  content?: string;
+  imageSrc?: string; // data URL — the viewer renders an image instead of code
+  error?: string;
+};
 
 /** Does an inline code chip look like a file reference worth opening? */
 function looksLikeFilePath(text: string): boolean {
@@ -67,9 +82,11 @@ declare global {
       sendMessage: (
         paneId: PaneId,
         text: string,
-        attachments?: { name: string; path: string }[],
+        attachments?: Attachment[],
       ) => Promise<{ turnId: string | null; threadId: string; created: boolean }>;
-      chooseAttachments: () => Promise<{ attachments: { name: string; path: string }[] }>;
+      chooseAttachments: () => Promise<{ attachments: Attachment[] }>;
+      clipboardHasImage: () => Promise<boolean>;
+      clipboardImage: () => Promise<{ attachment: Attachment | null }>;
       interrupt: (paneId: PaneId) => Promise<{ interrupted: boolean }>;
       onTurnStarted: (cb: (p: { paneId: PaneId; turnId: string | null }) => void) => () => void;
       onDelta: (cb: (p: { paneId: PaneId; delta: string }) => void) => () => void;
@@ -95,6 +112,8 @@ declare global {
       resetSideChat: () => Promise<{ ok: boolean }>;
       chooseProject: () => Promise<{ path: string | null; name: string | null }>;
       readFile: (path: string) => Promise<{ fullPath: string; relPath?: string; content?: string; error?: string }>;
+      readImage: (path: string) => Promise<{ dataUrl?: string; error?: string }>;
+      listDir: (dir?: string) => Promise<{ dir: string; entries: DirEntry[]; error?: string }>;
     };
   }
 }
@@ -123,7 +142,7 @@ export type ThemeConfig = {
 
 // The default follows the user's Codex dark theme (codex-theme-v1 import).
 const DEFAULT_THEME: ThemeConfig = {
-  accent: "#0169cc",
+  accent: "#FF563F",
   surface: "#111111",
   ink: "#fcfcfc",
   contrast: 50,
@@ -161,7 +180,7 @@ function mixHex(a: string, b: string, t: number): string {
 function themeVars(t: ThemeConfig): Record<string, string> {
   const k = Math.max(t.contrast, 5) / 50;
   const m = (x: number) => mixHex(t.surface, t.ink, Math.min(x * k, 1));
-  const accentRgb = hexToRgb(t.accent) ?? [1, 105, 204];
+  const accentRgb = hexToRgb(t.accent) ?? [255, 86, 63];
   const accentLuma = (0.299 * accentRgb[0] + 0.587 * accentRgb[1] + 0.114 * accentRgb[2]) / 255;
   return {
     "--bg": t.surface,
@@ -205,6 +224,8 @@ function parseThemeImport(raw: string): ThemeConfig | null {
     return null;
   }
 }
+
+const REMARK_PLUGINS = [remarkGfm];
 
 /** Drop a trailing empty assistant placeholder. */
 function withoutTrailingPlaceholder(es: Entry[]): Entry[] {
@@ -250,15 +271,28 @@ export function App() {
   const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
   const [activeProject, setActiveProject] = useState<{ name: string; path: string } | null>(null);
   const [hoveredThreadId, setHoveredThreadId] = useState<string | null>(null);
+  const [hoveredProject, setHoveredProject] = useState<string | null>(null);
   const [mainBusy, setMainBusy] = useState(false);
   const [mainReset, setMainReset] = useState<{ entries: Entry[]; nonce: number }>({ entries: [], nonce: 0 });
+  // sideOpen = the whole right panel is visible; sideChatEnabled = the chat
+  // tab exists in it. Kept separate so opening a file/image preview doesn't
+  // drag the side chat along with it.
   const [sideOpen, setSideOpen] = useState(() => localStorage.getItem("sideOpen") === "true");
+  const [sideChatEnabled, setSideChatEnabledState] = useState(() => {
+    const stored = localStorage.getItem("sideChatEnabled");
+    return stored !== null ? stored === "true" : localStorage.getItem("sideOpen") === "true";
+  });
   const [sideContext, setSideContext] = useState<string | null>(null);
   const [sideNonce, setSideNonce] = useState(0);
 
   function setSideOpenPersisted(open: boolean) {
     localStorage.setItem("sideOpen", String(open));
     setSideOpen(open);
+  }
+
+  function setSideChatEnabled(v: boolean) {
+    localStorage.setItem("sideChatEnabled", String(v));
+    setSideChatEnabledState(v);
   }
   const [navOpen, setNavOpen] = useState(() => localStorage.getItem("navOpen") !== "false");
   // The main/side split is a FRACTION of the content area (not pixels), so
@@ -329,7 +363,11 @@ export function App() {
     setSideContext(null);
     setSideNonce((n) => n + 1);
     setOpenFile(null);
+    setFilesOpen(false); // the tree browsed the previous conversation's cwd
+    setTreeFile(null);
     setPanelMode("chat");
+    // A panel that was only showing file views has nothing left.
+    if (!sideChatEnabled) setSideOpenPersisted(false);
   }
 
   async function newChat(project?: { name: string; path: string }) {
@@ -373,41 +411,131 @@ export function App() {
   }
 
   const [openFile, setOpenFile] = useState<OpenFileInfo | null>(null);
-  const [panelMode, setPanelMode] = useState<"chat" | "file">("chat");
+  const [panelMode, setPanelMode] = useState<"chat" | "file" | "files">("chat");
+  const [filesOpen, setFilesOpen] = useState(false);
+  // The side panel header's + menu (Review / Terminal / Files / Side chat).
+  const [sidePlusOpen, setSidePlusOpen] = useState(false);
+  const sidePlusRef = useRef<HTMLSpanElement>(null);
+
+  useEffect(() => {
+    if (!sidePlusOpen) return;
+    function onDown(e: MouseEvent) {
+      if (!sidePlusRef.current?.contains(e.target as Node)) setSidePlusOpen(false);
+    }
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") setSidePlusOpen(false);
+    }
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [sidePlusOpen]);
+
+  function openSideChatTab() {
+    setSidePlusOpen(false);
+    setSideChatEnabled(true);
+    setPanelMode("chat");
+  }
+
+  function openFilesTab() {
+    setSidePlusOpen(false);
+    setFilesOpen(true);
+    setPanelMode("files");
+  }
+
+  function closeFilesTab() {
+    setFilesOpen(false);
+    if (panelMode !== "files") return;
+    if (openFile) setPanelMode("file");
+    else if (sideChatEnabled) setPanelMode("chat");
+    else setSideOpenPersisted(false);
+  }
+
+  // File previews don't persist across launches — a panel restored open
+  // with no chat tab would be an empty shell.
+  useEffect(() => {
+    if (sideOpen && !sideChatEnabled) setSideOpenPersisted(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   function askInSideChat(text: string) {
     setSideContext(text);
+    setSideChatEnabled(true);
     setPanelMode("chat");
     setSideOpenPersisted(true);
   }
 
-  async function openFileInPanel(pathText: string) {
-    const result = await window.unbiased.readFile(pathText);
-    const name = pathText.split("/").filter(Boolean).pop() ?? pathText;
+  async function openImagePreview(a: { name: string; path: string }) {
+    const result = await window.unbiased.readImage(a.path);
     setOpenFile({
-      name,
-      relPath: result.relPath ?? pathText,
-      fullPath: result.fullPath,
-      content: result.content,
+      name: a.name,
+      relPath: a.name,
+      fullPath: a.path,
+      imageSrc: result.dataUrl,
       error: result.error,
     });
     setPanelMode("file");
     setSideOpenPersisted(true);
   }
 
-  // Closing HIDES the side chat — its conversation survives and reopening
-  // restores it. Only the ✎ (new side chat) actually resets the thread.
-  function closeSideChat() {
-    setSideOpenPersisted(false);
+  /** Text files read through file:read; images route to the picture viewer. */
+  async function loadFileInfo(pathText: string): Promise<OpenFileInfo> {
+    const name = pathText.split("/").filter(Boolean).pop() ?? pathText;
+    if (/\.(png|jpe?g|gif|webp|bmp)$/i.test(name)) {
+      const r = await window.unbiased.readImage(pathText);
+      return { name, relPath: name, fullPath: pathText, imageSrc: r.dataUrl, error: r.error };
+    }
+    const result = await window.unbiased.readFile(pathText);
+    return {
+      name,
+      relPath: result.relPath ?? pathText,
+      fullPath: result.fullPath,
+      content: result.content,
+      error: result.error,
+    };
   }
 
-  async function newSideChat() {
-    await window.unbiased.resetSideChat();
-    setSideContext(null);
-    setSideNonce((n) => n + 1);
+  async function openFileInPanel(pathText: string) {
+    setOpenFile(await loadFileInfo(pathText));
+    setPanelMode("file");
+    setSideOpenPersisted(true);
+  }
+
+  // The Files view's own selection — shown beside the tree, so browsing
+  // never hides the tree the way the standalone file tab does.
+  const [treeFile, setTreeFile] = useState<OpenFileInfo | null>(null);
+
+  async function openFileInTree(pathText: string) {
+    setTreeFile(await loadFileInfo(pathText));
+  }
+
+  // Closing HIDES the side chat — its conversation survives and reopening
+  // restores it; only a main-conversation switch resets the thread.
+  // An open file preview keeps the panel itself alive.
+  function closeSideChat() {
+    setSideChatEnabled(false);
+    if (openFile) setPanelMode("file");
+    else setSideOpenPersisted(false);
+  }
+
+  function toggleSideChat() {
+    if (sideChatEnabled) {
+      closeSideChat();
+    } else {
+      setSideChatEnabled(true);
+      setPanelMode("chat");
+      setSideOpenPersisted(true);
+    }
   }
 
   const connected = status.state === "connected";
+  // Files (workspace tree) only makes sense inside a project — a plain
+  // Recents chat lives in the home directory.
+  const inProject =
+    activeProject !== null ||
+    sidebar.projects.some((p) => p.threads.some((t) => t.id === activeThreadId));
   const mainTitle = (() => {
     if (activeThreadId) {
       const all = [...sidebar.projects.flatMap((p) => p.threads), ...sidebar.recents];
@@ -465,12 +593,8 @@ export function App() {
           <SidebarAction onClick={() => void openProjectDialog()} disabled={mainBusy} icon={<FolderPlusIcon />}>
             Open project…
           </SidebarAction>
-          <SidebarAction
-            onClick={() => setSideOpenPersisted(!sideOpen)}
-            disabled={false}
-            icon={<SideChatIcon />}
-          >
-            {sideOpen ? "Close side chat" : "Side chat"}
+          <SidebarAction onClick={toggleSideChat} disabled={false} icon={<SideChatIcon />}>
+            {sideChatEnabled ? "Close side chat" : "Side chat"}
           </SidebarAction>
         </div>
         <div style={{ flex: 1, overflowY: "auto", padding: "0 8px 12px" }}>
@@ -481,31 +605,56 @@ export function App() {
           {sidebar.projects.length > 0 && <SectionLabel>Projects</SectionLabel>}
           {sidebar.projects.map((p) => (
             <div key={p.path} style={{ marginBottom: 8 }}>
-              <button
-                onClick={() => void newChat({ name: p.name, path: p.path })}
-                disabled={mainBusy}
-                title={`New chat in ${p.path}`}
+              {/* A label, not a button — chats in a project start from the
+                  pencil that appears on hover. */}
+              <div
+                onMouseEnter={() => setHoveredProject(p.path)}
+                onMouseLeave={() => setHoveredProject(null)}
+                title={p.path}
                 style={{
                   display: "flex",
                   alignItems: "center",
                   gap: 10,
                   width: "100%",
                   background: activeProject?.path === p.path ? colors.panel : "transparent",
-                  border: "none",
                   borderRadius: 8,
                   padding: "7px 8px 5px",
                   fontSize: 14,
                   color: colors.fg,
-                  cursor: mainBusy ? "default" : "pointer",
-                  textAlign: "left",
-                  fontFamily: "inherit",
+                  boxSizing: "border-box",
                 }}
               >
                 <FolderIcon />
-                <span style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                <span
+                  style={{
+                    flex: 1,
+                    minWidth: 0,
+                    whiteSpace: "nowrap",
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                  }}
+                >
                   {p.name}
                 </span>
-              </button>
+                {hoveredProject === p.path && !mainBusy && (
+                  <button
+                    onClick={() => void newChat({ name: p.name, path: p.path })}
+                    title={`New chat in ${p.name}`}
+                    aria-label={`New chat in ${p.name}`}
+                    style={{
+                      background: "transparent",
+                      border: "none",
+                      color: colors.dim,
+                      cursor: "pointer",
+                      padding: 0,
+                      display: "flex",
+                      flexShrink: 0,
+                    }}
+                  >
+                    <PencilIcon />
+                  </button>
+                )}
+              </div>
               {p.threads.map((t) => (
                 <ThreadRow
                   key={t.id}
@@ -606,6 +755,7 @@ export function App() {
           onTurnLanded={refreshThreads}
           onAskSideChat={askInSideChat}
           onOpenFile={(p) => void openFileInPanel(p)}
+          onPreviewImage={(a) => void openImagePreview(a)}
         />
       </div>
 
@@ -647,36 +797,38 @@ export function App() {
               flexShrink: 0,
             }}
           >
-            <button
-              onClick={() => setPanelMode("chat")}
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: 8,
-                background: panelMode === "chat" ? colors.panel : "transparent",
-                color: panelMode === "chat" ? colors.fg : colors.dim,
-                border: "none",
-                borderRadius: 8,
-                padding: "6px 12px",
-                fontSize: 13,
-                cursor: "pointer",
-                fontFamily: "inherit",
-              }}
-            >
-              <ChatPlusIcon />
-              Side chat
-              <span
-                role="button"
-                aria-label="Close side chat"
-                onClick={(ev) => {
-                  ev.stopPropagation();
-                  void closeSideChat();
+            {sideChatEnabled && (
+              <button
+                onClick={() => setPanelMode("chat")}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 8,
+                  background: panelMode === "chat" ? colors.panel : "transparent",
+                  color: panelMode === "chat" ? colors.fg : colors.dim,
+                  border: "none",
+                  borderRadius: 8,
+                  padding: "6px 12px",
+                  fontSize: 13,
+                  cursor: "pointer",
+                  fontFamily: "inherit",
                 }}
-                style={{ display: "flex", color: colors.dim, marginLeft: 2 }}
               >
-                <CloseIcon />
-              </span>
-            </button>
+                <ChatPlusIcon />
+                Side chat
+                <span
+                  role="button"
+                  aria-label="Close side chat"
+                  onClick={(ev) => {
+                    ev.stopPropagation();
+                    closeSideChat();
+                  }}
+                  style={{ display: "flex", color: colors.dim, marginLeft: 2 }}
+                >
+                  <CloseIcon />
+                </span>
+              </button>
+            )}
             {openFile && (
               <button
                 onClick={() => setPanelMode("file")}
@@ -706,7 +858,9 @@ export function App() {
                   onClick={(ev) => {
                     ev.stopPropagation();
                     setOpenFile(null);
-                    setPanelMode("chat");
+                    // No chat tab behind it → nothing left in the panel.
+                    if (sideChatEnabled) setPanelMode("chat");
+                    else setSideOpenPersisted(false);
                   }}
                   style={{ display: "flex", color: colors.dim }}
                 >
@@ -714,14 +868,110 @@ export function App() {
                 </span>
               </button>
             )}
-            <span style={{ flex: 1 }} />
-            {panelMode === "chat" && (
-              <IconButton title="New side chat" onClick={() => void newSideChat()}>
-                <PencilIcon />
-              </IconButton>
+            {filesOpen && (
+              <button
+                onClick={() => setPanelMode("files")}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 8,
+                  background: panelMode === "files" ? colors.panel : "transparent",
+                  color: panelMode === "files" ? colors.fg : colors.dim,
+                  border: "none",
+                  borderRadius: 8,
+                  padding: "6px 12px",
+                  fontSize: 13,
+                  cursor: "pointer",
+                  fontFamily: "inherit",
+                }}
+              >
+                <FolderOutlineIcon size={13} />
+                Files
+                <span
+                  role="button"
+                  aria-label="Close files"
+                  onClick={(ev) => {
+                    ev.stopPropagation();
+                    closeFilesTab();
+                  }}
+                  style={{ display: "flex", color: colors.dim, marginLeft: 2 }}
+                >
+                  <CloseIcon />
+                </span>
+              </button>
             )}
+            <span ref={sidePlusRef} style={{ position: "relative", display: "flex" }}>
+              <IconButton title="Open side panel tab" onClick={() => setSidePlusOpen((o) => !o)}>
+                <PlusIcon />
+              </IconButton>
+              {sidePlusOpen && (
+                <div
+                  style={{
+                    position: "absolute",
+                    top: 32,
+                    left: 0,
+                    width: 224,
+                    background: colors.panel,
+                    border: `1px solid ${colors.border}`,
+                    borderRadius: 12,
+                    padding: 6,
+                    zIndex: 30,
+                    boxShadow: "0 8px 24px rgba(0,0,0,0.45)",
+                  }}
+                >
+                  <MenuItem icon={<ReviewIcon />} label="Review" desc="Soon" disabled onClick={() => {}} />
+                  <MenuItem icon={<TerminalIcon />} label="Terminal" desc="Soon" disabled onClick={() => {}} />
+                  {inProject && (
+                    <MenuItem icon={<FolderOutlineIcon size={15} />} label="Files" onClick={openFilesTab} />
+                  )}
+                  <MenuItem icon={<ChatPlusIcon />} label="Side chat" onClick={openSideChatTab} />
+                </div>
+              )}
+            </span>
+            <span style={{ flex: 1 }} />
           </header>
-          {openFile && panelMode === "file" && <FileViewer file={openFile} />}
+          {openFile && panelMode === "file" && (
+            <FileViewer file={openFile} onOpenFile={(p) => void openFileInPanel(p)} />
+          )}
+          {filesOpen && panelMode === "files" && (
+            <div style={{ flex: 1, minHeight: 0, display: "flex" }}>
+              <div
+                style={{
+                  flex: 1,
+                  minWidth: 0,
+                  display: "flex",
+                  flexDirection: "column",
+                  borderRight: `1px solid ${colors.border}`,
+                }}
+              >
+                {treeFile ? (
+                  <FileViewer file={treeFile} onOpenFile={(p) => void openFileInTree(p)} />
+                ) : (
+                  <div style={{ flex: 1, display: "grid", placeItems: "center" }}>
+                    <div style={{ textAlign: "center", color: colors.dim }}>
+                      <div style={{ display: "flex", justifyContent: "center", marginBottom: 10 }}>
+                        <FolderOutlineIcon size={30} />
+                      </div>
+                      <p style={{ fontSize: 15, fontWeight: 500, margin: 0, color: colors.fg }}>Open file</p>
+                      <p style={{ fontSize: 12.5, marginTop: 6 }}>Select a file from the workspace tree</p>
+                    </div>
+                  </div>
+                )}
+              </div>
+              <div
+                style={{
+                  width: "34%",
+                  minWidth: 160,
+                  maxWidth: 250,
+                  flexShrink: 0,
+                  display: "flex",
+                  flexDirection: "column",
+                }}
+              >
+                <FileTreePane onOpenFile={(p) => void openFileInTree(p)} />
+              </div>
+            </div>
+          )}
           <div
             style={{
               flex: 1,
@@ -738,14 +988,11 @@ export function App() {
             contextLabel="pareto · temporary"
             contextChip={sideContext}
             onContextClear={() => setSideContext(null)}
+            onPreviewImage={(a) => void openImagePreview(a)}
             emptyState={
               <div style={{ textAlign: "center", padding: "0 24px" }}>
                 <div style={{ color: colors.dim, display: "flex", justifyContent: "center", marginBottom: 10 }}>
-                  <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-                    <circle cx="12" cy="12" r="10" />
-                    <path d="M12 8v8" />
-                    <path d="M8 12h8" />
-                  </svg>
+                  <ChatPlusIcon size={34} strokeWidth={1.5} />
                 </div>
                 <p style={{ fontSize: 16, fontWeight: 500, margin: 0 }}>Side chat</p>
                 <p style={{ color: colors.dim, marginTop: 6, fontSize: 13 }}>
@@ -788,8 +1035,201 @@ function escapeHtml(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-/** Codex-style file view: breadcrumb, line numbers, Prism highlighting. */
-function FileViewer({ file }: { file: OpenFileInfo }) {
+/** Lazy directory tree. Reused by the Files pane and the breadcrumb
+ *  dropdown; `initialExpanded` pre-opens a path (the crumb's directory). */
+function DirTree({
+  root,
+  filter = "",
+  initialExpanded,
+  onOpenFile,
+}: {
+  root: string;
+  filter?: string;
+  initialExpanded?: string[];
+  onOpenFile: (path: string) => void;
+}) {
+  const [children, setChildren] = useState<Map<string, DirEntry[]>>(new Map());
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+
+  useEffect(() => {
+    let alive = true;
+    void (async () => {
+      const map = new Map<string, DirEntry[]>();
+      map.set(root, (await window.unbiased.listDir(root)).entries);
+      for (const p of initialExpanded ?? []) {
+        map.set(p, (await window.unbiased.listDir(p)).entries);
+      }
+      if (alive) {
+        setChildren(map);
+        setExpanded(new Set(initialExpanded ?? []));
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [root]);
+
+  async function toggleDir(path: string) {
+    const opening = !expanded.has(path);
+    setExpanded((s) => {
+      const next = new Set(s);
+      if (next.has(path)) next.delete(path);
+      else next.add(path);
+      return next;
+    });
+    if (opening && !children.has(path)) {
+      const res = await window.unbiased.listDir(path);
+      setChildren((m) => new Map(m).set(path, res.entries));
+    }
+  }
+
+  // Vertical padding lives on the label, not the row, so the indent guides
+  // (alignSelf: stretch) meet between rows and read as continuous lines.
+  const rowStyle: React.CSSProperties = {
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+    width: "100%",
+    background: "transparent",
+    border: "none",
+    borderRadius: 6,
+    padding: "0 10px",
+    fontSize: 13,
+    color: colors.fg,
+    cursor: "pointer",
+    textAlign: "left",
+    fontFamily: "inherit",
+  };
+  const nameStyle: React.CSSProperties = {
+    whiteSpace: "nowrap",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    padding: "5px 0",
+  };
+  // One 8px-wide unit per ancestor level (plus the 8px flex gap = 16px per
+  // depth step), each drawing the Codex-style guide line on its left edge.
+  const guides = (depth: number) =>
+    Array.from({ length: depth }, (_, i) => (
+      <span
+        key={`g${i}`}
+        style={{
+          width: 8,
+          alignSelf: "stretch",
+          flexShrink: 0,
+          borderLeft: `1px solid ${colors.border}`,
+        }}
+      />
+    ));
+
+  const f = filter.trim().toLowerCase();
+
+  function rows(dirPath: string, depth: number): React.ReactNode[] {
+    const out: React.ReactNode[] = [];
+    for (const e of children.get(dirPath) ?? []) {
+      const full = `${dirPath}/${e.name}`;
+      if (e.dir) {
+        const open = expanded.has(full);
+        out.push(
+          <button key={full} onClick={() => void toggleDir(full)} style={rowStyle}>
+            {guides(depth)}
+            <span
+              style={{
+                color: colors.dim,
+                fontSize: 12,
+                display: "inline-block",
+                width: 10,
+                flexShrink: 0,
+                transform: open ? "rotate(90deg)" : "none",
+                transition: "transform 120ms",
+              }}
+            >
+              ›
+            </span>
+            <span style={nameStyle}>{e.name}</span>
+          </button>,
+        );
+        if (open) out.push(...rows(full, depth + 1));
+      } else if (!f || e.name.toLowerCase().includes(f)) {
+        const ext = e.name.includes(".") ? (e.name.split(".").pop() ?? "") : "";
+        out.push(
+          <button key={full} onClick={() => onOpenFile(full)} style={rowStyle}>
+            {guides(depth)}
+            <span
+              style={{
+                fontSize: 8.5,
+                fontWeight: 600,
+                background: "var(--chip)",
+                color: colors.dim,
+                borderRadius: 4,
+                padding: "2px 3px",
+                minWidth: 16,
+                textAlign: "center",
+                flexShrink: 0,
+                fontFamily: "var(--font-code)",
+                textTransform: "uppercase",
+              }}
+            >
+              {ext.slice(0, 4) || "·"}
+            </span>
+            <span style={nameStyle}>{e.name}</span>
+          </button>,
+        );
+      }
+    }
+    return out;
+  }
+
+  return <>{rows(root, 0)}</>;
+}
+
+/** Codex-style workspace tree pane: name filter above a DirTree rooted at
+ *  the active conversation's cwd. */
+function FileTreePane({ onOpenFile }: { onOpenFile: (path: string) => void }) {
+  const [root, setRoot] = useState<string | null>(null);
+  const [filter, setFilter] = useState("");
+
+  useEffect(() => {
+    void window.unbiased.listDir().then((res) => setRoot(res.dir));
+  }, []);
+
+  return (
+    <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
+      <div style={{ padding: "10px 12px", borderBottom: `1px solid ${colors.border}`, flexShrink: 0 }}>
+        <input
+          value={filter}
+          onChange={(e) => setFilter(e.target.value)}
+          placeholder="Filter files…"
+          spellCheck={false}
+          style={{
+            width: "100%",
+            boxSizing: "border-box",
+            background: "var(--panel-2)",
+            border: `1px solid ${colors.border}`,
+            borderRadius: 8,
+            padding: "6px 10px",
+            color: colors.fg,
+            fontSize: 12.5,
+            outline: "none",
+            fontFamily: "inherit",
+          }}
+        />
+      </div>
+      <div style={{ flex: 1, overflowY: "auto", padding: "6px 6px 12px" }}>
+        {root === null ? (
+          <div style={{ color: colors.dim, fontSize: 12.5, padding: "8px 10px" }}>Loading…</div>
+        ) : (
+          <DirTree root={root} filter={filter} onOpenFile={onOpenFile} />
+        )}
+      </div>
+    </div>
+  );
+}
+
+/** Codex-style file view: breadcrumb, line numbers, Prism highlighting.
+ *  With onOpenFile, each crumb opens a dropdown of its parent directory
+ *  (siblings, the crumb pre-expanded) for quick navigation. */
+function FileViewer({ file, onOpenFile }: { file: OpenFileInfo; onOpenFile?: (path: string) => void }) {
   const content = file.content ?? "";
   const ext = file.name.split(".").pop()?.toLowerCase() ?? "";
   const lang = EXT_TO_PRISM[ext];
@@ -797,31 +1237,122 @@ function FileViewer({ file }: { file: OpenFileInfo }) {
   const html = grammar ? Prism.highlight(content, grammar, lang) : escapeHtml(content);
   const lineCount = content === "" ? 0 : content.split("\n").length;
   const crumbs = file.relPath.split("/").filter(Boolean);
+  const fullSegs = file.fullPath.split("/").filter(Boolean);
+  const segOffset = fullSegs.length - crumbs.length;
+
+  const [crumbMenu, setCrumbMenu] = useState<{ root: string; expand: string | null; left: number } | null>(null);
+  const headerRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => setCrumbMenu(null), [file.fullPath]);
+
+  useEffect(() => {
+    if (!crumbMenu) return;
+    function onDown(e: MouseEvent) {
+      if (!headerRef.current?.contains(e.target as Node)) setCrumbMenu(null);
+    }
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") setCrumbMenu(null);
+    }
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [crumbMenu]);
+
+  function onCrumbClick(i: number, e: React.MouseEvent<HTMLElement>) {
+    if (!onOpenFile) return;
+    const selfAbs = "/" + fullSegs.slice(0, segOffset + i + 1).join("/");
+    const parentSegs = fullSegs.slice(0, segOffset + i);
+    // Root crumb: no parent to list siblings from — list the crumb itself.
+    const root = parentSegs.length > 0 ? "/" + parentSegs.join("/") : selfAbs;
+    const expand = i < crumbs.length - 1 && root !== selfAbs ? selfAbs : null;
+    const left = (e.currentTarget as HTMLElement).offsetLeft;
+    setCrumbMenu((m) => (m && m.left === left ? null : { root, expand, left }));
+  }
 
   return (
     <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
-      <div
-        style={{
-          padding: "10px 16px",
-          fontSize: 12.5,
-          color: colors.dim,
-          borderBottom: `1px solid ${colors.border}`,
-          whiteSpace: "nowrap",
-          overflow: "hidden",
-          textOverflow: "ellipsis",
-          flexShrink: 0,
-        }}
-        title={file.fullPath}
-      >
-        {crumbs.map((c, i) => (
-          <span key={i}>
-            {i > 0 && <span style={{ margin: "0 6px", color: "var(--gutter)" }}>›</span>}
-            <span style={{ color: i === crumbs.length - 1 ? colors.fg : colors.dim }}>{c}</span>
-          </span>
-        ))}
+      <div ref={headerRef} style={{ position: "relative", borderBottom: `1px solid ${colors.border}`, flexShrink: 0 }}>
+        <div
+          style={{
+            padding: "10px 16px",
+            fontSize: 12.5,
+            color: colors.dim,
+            whiteSpace: "nowrap",
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+          }}
+          title={file.fullPath}
+        >
+          {crumbs.map((c, i) => (
+            <span key={i}>
+              {i > 0 && <span style={{ margin: "0 6px", color: "var(--gutter)" }}>›</span>}
+              <button
+                onClick={(e) => onCrumbClick(i, e)}
+                style={{
+                  background: "transparent",
+                  border: "none",
+                  padding: 0,
+                  fontFamily: "inherit",
+                  fontSize: "inherit",
+                  color: i === crumbs.length - 1 ? colors.fg : colors.dim,
+                  cursor: onOpenFile ? "pointer" : "default",
+                }}
+              >
+                {c}
+              </button>
+            </span>
+          ))}
+        </div>
+        {crumbMenu && onOpenFile && (
+          <div
+            style={{
+              position: "absolute",
+              top: "100%",
+              left: Math.min(crumbMenu.left, Math.max((headerRef.current?.clientWidth ?? 320) - 296, 8)),
+              width: 288,
+              maxHeight: 340,
+              overflowY: "auto",
+              background: colors.panel,
+              border: `1px solid ${colors.border}`,
+              borderRadius: 12,
+              padding: 6,
+              zIndex: 30,
+              boxShadow: "0 8px 24px rgba(0,0,0,0.45)",
+            }}
+          >
+            <DirTree
+              root={crumbMenu.root}
+              initialExpanded={crumbMenu.expand ? [crumbMenu.expand] : undefined}
+              onOpenFile={(p) => {
+                setCrumbMenu(null);
+                onOpenFile(p);
+              }}
+            />
+          </div>
+        )}
       </div>
       {file.error ? (
         <div style={{ padding: 24, color: colors.err, fontSize: 13 }}>{file.error}</div>
+      ) : file.imageSrc ? (
+        <div
+          style={{
+            flex: 1,
+            overflow: "auto",
+            display: "grid",
+            placeItems: "center",
+            background: "var(--code-bg)",
+            padding: 20,
+          }}
+        >
+          <img
+            src={file.imageSrc}
+            alt={file.name}
+            style={{ maxWidth: "100%", maxHeight: "100%", borderRadius: 8, display: "block" }}
+          />
+        </div>
       ) : (
         <div style={{ flex: 1, overflow: "auto", display: "flex", background: "var(--code-bg)" }}>
           <pre
@@ -870,6 +1401,7 @@ function ChatPane({
   onTurnLanded,
   onAskSideChat,
   onOpenFile,
+  onPreviewImage,
 }: {
   paneId: PaneId;
   connected: boolean;
@@ -882,24 +1414,92 @@ function ChatPane({
   onTurnLanded?: () => void;
   onAskSideChat?: (text: string) => void;
   onOpenFile?: (path: string) => void;
+  onPreviewImage?: (a: Attachment) => void;
 }) {
   const [entries, setEntries] = useState<Entry[]>(reset.entries);
   const [draft, setDraft] = useState("");
-  const [attachments, setAttachments] = useState<{ name: string; path: string }[]>([]);
+  const [attachments, setAttachments] = useState<Attachment[]>([]);
+  // Annotations staged for the next send: transcript excerpts, each with an
+  // optional comment, all attached together when the message goes out. The
+  // side pane's handed-down selection (contextChip) is consumed into the
+  // same list, so both panes present selections identically.
+  const [annotations, setAnnotations] = useState<Annotation[]>([]);
+  // null = the selection toolbar shows its buttons; a string (possibly
+  // empty) = the "Add to chat" comment input is open with that draft.
+  const [pendingComment, setPendingComment] = useState<string | null>(null);
+  useEffect(() => {
+    if (!contextChip) return;
+    setAnnotations((list) => [...list, { text: contextChip }]);
+    onContextClear?.();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [contextChip]);
+
+  // The + button's popup menu, plus whether the clipboard held an image
+  // when it was opened (drives the "Image from clipboard" item's state).
+  const [plusOpen, setPlusOpen] = useState(false);
+  const [clipHasImage, setClipHasImage] = useState(false);
+  // The menu panel hangs off the composer box (full width), not the +
+  // button, so outside-click must spare both.
+  const plusRef = useRef<HTMLSpanElement>(null);
+  const plusMenuRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!plusOpen) return;
+    function onDown(e: MouseEvent) {
+      const t = e.target as Node;
+      if (plusRef.current?.contains(t) || plusMenuRef.current?.contains(t)) return;
+      setPlusOpen(false);
+    }
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") setPlusOpen(false);
+    }
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [plusOpen]);
+
+  async function openPlusMenu() {
+    setClipHasImage(await window.unbiased.clipboardHasImage());
+    setPlusOpen(true);
+  }
+
+  function stageAttachment(a: Attachment) {
+    setAttachments((list) => (list.some((x) => x.path === a.path) ? list : [...list, a]));
+  }
 
   async function addAttachments() {
+    setPlusOpen(false);
     const { attachments: picked } = await window.unbiased.chooseAttachments();
-    if (picked.length === 0) return;
-    setAttachments((a) => {
-      const known = new Set(a.map((x) => x.path));
-      return [...a, ...picked.filter((x) => !known.has(x.path))];
-    });
+    picked.forEach(stageAttachment);
+  }
+
+  async function attachClipboardImage() {
+    setPlusOpen(false);
+    const { attachment } = await window.unbiased.clipboardImage();
+    if (attachment) stageAttachment(attachment);
   }
   const [busy, setBusyState] = useState(false);
   const [elapsed, setElapsed] = useState(0);
-  const [selection, setSelection] = useState<{ text: string; x: number; y: number } | null>(null);
+  // x = the selection's horizontal midpoint (anchors the button pill);
+  // right = its bounding-box right edge (anchors the comment box beside
+  // the numbered badge); y = its top.
+  const [selection, setSelection] = useState<{ text: string; x: number; y: number; right: number } | null>(null);
+  const savedRangeRef = useRef<Range | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const paneRef = useRef<HTMLDivElement>(null);
+
+  // These props get a fresh identity on every parent render. The markdown
+  // component map below must stay referentially stable — React reads a new
+  // component-function identity as a different type and remounts the whole
+  // subtree, which detaches the text nodes an active selection points at.
+  // Routing the callbacks through refs keeps the map's deps empty.
+  const onAskSideChatRef = useRef(onAskSideChat);
+  onAskSideChatRef.current = onAskSideChat;
+  const onOpenFileRef = useRef(onOpenFile);
+  onOpenFileRef.current = onOpenFile;
 
   function setBusy(b: boolean) {
     setBusyState(b);
@@ -909,6 +1509,9 @@ function ChatPane({
   useEffect(() => {
     setEntries(reset.entries);
     setBusy(false);
+    // Staged annotations belong to the conversation they came from.
+    setAnnotations([]);
+    setPendingComment(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [reset.nonce]);
 
@@ -1014,24 +1617,39 @@ function ChatPane({
 
   const lastEntry = entries[entries.length - 1];
   const showThinking = busy && !(lastEntry?.kind === "assistant" && lastEntry.text !== "");
+  const canSend = connected && (draft.trim() !== "" || annotations.length > 0);
 
   async function submit() {
     const text = draft.trim();
-    if (!text || busy || !connected) return;
-    const chip = contextChip?.trim();
-    const wire = chip ? `Regarding this excerpt from another conversation:\n> ${chip.replace(/\n/g, "\n> ")}\n\n${text}` : text;
+    // Annotations alone are a sendable message — the excerpts plus their
+    // comments carry the intent even without accompanying prose.
+    if ((!text && annotations.length === 0) || busy || !connected) return;
+    const anns = annotations;
+    const wire = (
+      anns.length > 0
+        ? `Regarding ${anns.length === 1 ? "this excerpt" : "these excerpts"} from the conversation:\n\n` +
+          anns
+            .map((a, i) => {
+              const head = anns.length > 1 ? `Excerpt ${i + 1}:\n` : "";
+              const quoted = `> ${a.text.replace(/\n/g, "\n> ")}`;
+              return head + quoted + (a.comment ? `\nComment: ${a.comment}` : "");
+            })
+            .join("\n\n") +
+          `\n\n${text}`
+        : text
+    ).trimEnd();
     const sentAttachments = attachments;
     setDraft("");
     setAttachments([]);
-    if (chip) onContextClear?.();
+    setAnnotations([]);
     setBusy(true);
     const suffix = [
-      chip ? "(with selection)" : "",
+      anns.length > 0 ? `(${anns.length} annotation${anns.length === 1 ? "" : "s"})` : "",
       sentAttachments.length > 0 ? `📎 ${sentAttachments.map((a) => a.name).join(", ")}` : "",
     ]
       .filter(Boolean)
       .join("\n");
-    setEntries((es) => [...es, { kind: "user", text: suffix ? `${text}\n\n${suffix}` : text }]);
+    setEntries((es) => [...es, { kind: "user", text: [text, suffix].filter(Boolean).join("\n\n") }]);
     try {
       await window.unbiased.sendMessage(paneId, wire, sentAttachments);
     } catch (err) {
@@ -1066,59 +1684,166 @@ function ChatPane({
 
   function handleMouseUp() {
     if (!onAskSideChat) return;
+    if (pendingComment !== null) return; // comment input open — Esc cancels, ✓ confirms
     const sel = window.getSelection();
     const text = sel?.toString().trim() ?? "";
     if (!text || !sel || sel.rangeCount === 0) {
       setSelection(null);
       return;
     }
-    const rect = sel.getRangeAt(0).getBoundingClientRect();
+    const range = sel.getRangeAt(0);
+    const rect = range.getBoundingClientRect();
     const paneRect = paneRef.current?.getBoundingClientRect();
     if (!paneRect) return;
-    setSelection({ text, x: rect.left - paneRect.left + rect.width / 2, y: rect.top - paneRect.top });
+    savedRangeRef.current = range.cloneRange();
+    setSelection({
+      text,
+      x: rect.left - paneRect.left + rect.width / 2,
+      y: rect.top - paneRect.top,
+      right: rect.right - paneRect.left,
+    });
   }
 
-  const mdComponents = {
-    code: (props: { className?: string; children?: React.ReactNode }) => {
-      if (props.className) {
-        // Block code: the surrounding <pre> (CodeBlock) owns the chrome.
-        return <code style={{ fontFamily: "inherit", fontSize: "inherit" }}>{props.children}</code>;
+  useLayoutEffect(() => {
+    if (selection && savedRangeRef.current) {
+      try {
+        const sel = window.getSelection();
+        if (sel) {
+          sel.removeAllRanges();
+          sel.addRange(savedRangeRef.current);
+        }
+      } catch {
+        // Range invalid if DOM nodes were replaced
       }
-      const text = extractText(props.children);
-      const isPath = Boolean(onOpenFile) && looksLikeFilePath(text);
-      const clickable = isPath || Boolean(onAskSideChat);
-      return (
-        <code
-          onClick={
-            isPath ? () => onOpenFile!(text) : onAskSideChat ? () => onAskSideChat(text) : undefined
-          }
-          title={isPath ? "Open file" : clickable ? "Open in side chat" : undefined}
-          style={{
-            fontFamily: "var(--font-code)",
-            fontSize: "0.84em",
-            background: "var(--chip)",
-            color: "var(--fg)",
-            padding: "2px 6px",
-            borderRadius: 6,
-            cursor: clickable ? "pointer" : "inherit",
-          }}
-        >
+    }
+  }, [selection]);
+
+  // The excerpt being annotated stays tinted via the CSS Custom Highlight
+  // API — the browser selection collapses the instant the comment input
+  // takes focus, so the native highlight can't carry this. Names are
+  // pane-scoped because CSS.highlights is a document-global registry.
+  useEffect(() => {
+    if (typeof Highlight === "undefined") return;
+    if (pendingComment !== null && savedRangeRef.current) {
+      CSS.highlights.set(`pending-${paneId}`, new Highlight(savedRangeRef.current));
+    } else {
+      CSS.highlights.delete(`pending-${paneId}`);
+    }
+    return () => void CSS.highlights.delete(`pending-${paneId}`);
+  }, [pendingComment, paneId]);
+
+  // Confirmed annotations keep their tint until the message sends. A range
+  // dies silently if its DOM re-renders; the captured text is unaffected.
+  useEffect(() => {
+    if (typeof Highlight === "undefined") return;
+    const ranges = annotations.map((a) => a.range).filter((r): r is Range => Boolean(r));
+    if (ranges.length > 0) CSS.highlights.set(`annotations-${paneId}`, new Highlight(...ranges));
+    else CSS.highlights.delete(`annotations-${paneId}`);
+    return () => void CSS.highlights.delete(`annotations-${paneId}`);
+  }, [annotations, paneId]);
+
+  // Numbered badges pinned at the top-right corner of each annotated
+  // excerpt, Codex-style. Positions come from the stored ranges after
+  // layout, in the transcript content's coordinate space, so they ride
+  // along as it scrolls. A dead range (rect collapses to zero) simply
+  // contributes no badge; the annotation chip still stands.
+  const contentRef = useRef<HTMLDivElement>(null);
+  const [badges, setBadges] = useState<{ n: number; left: number; top: number; label: string }[]>([]);
+  useLayoutEffect(() => {
+    function compute() {
+      const contentRect = contentRef.current?.getBoundingClientRect();
+      if (!contentRect) {
+        setBadges([]);
+        return;
+      }
+      const list: { n: number; left: number; top: number; label: string }[] = [];
+      const push = (range: Range | null | undefined, n: number, label: string) => {
+        const rect = range?.getBoundingClientRect();
+        if (!rect || (rect.width === 0 && rect.height === 0)) return;
+        list.push({
+          n,
+          label,
+          left: Math.max(0, Math.min(rect.right - contentRect.left + 4, contentRect.width - 28)),
+          top: rect.top - contentRect.top - 22,
+        });
+      };
+      annotations.forEach((a, i) => push(a.range, i + 1, a.comment ?? a.text));
+      if (pendingComment !== null) push(savedRangeRef.current, annotations.length + 1, "");
+      setBadges(list);
+    }
+    compute();
+    window.addEventListener("resize", compute);
+    return () => window.removeEventListener("resize", compute);
+  }, [annotations, pendingComment, entries]);
+
+  function confirmAnnotation() {
+    if (!selection) return;
+    const comment = (pendingComment ?? "").trim();
+    setAnnotations((list) => [
+      ...list,
+      { text: selection.text, comment: comment || undefined, range: savedRangeRef.current?.cloneRange() },
+    ]);
+    setPendingComment(null);
+    setSelection(null);
+    window.getSelection()?.removeAllRanges();
+  }
+
+  function cancelAnnotation() {
+    setPendingComment(null);
+    setSelection(null);
+    window.getSelection()?.removeAllRanges();
+  }
+
+  const mdComponents = useMemo(
+    () => ({
+      code: (props: { className?: string; children?: React.ReactNode }) => {
+        if (props.className) {
+          // Block code: the surrounding <pre> (CodeBlock) owns the chrome.
+          return <code style={{ fontFamily: "inherit", fontSize: "inherit" }}>{props.children}</code>;
+        }
+        const text = extractText(props.children);
+        const isPath = Boolean(onOpenFileRef.current) && looksLikeFilePath(text);
+        const clickable = isPath || Boolean(onAskSideChatRef.current);
+        return (
+          <code
+            onClick={
+              isPath
+                ? () => onOpenFileRef.current!(text)
+                : clickable
+                  ? () => onAskSideChatRef.current!(text)
+                  : undefined
+            }
+            title={isPath ? "Open file" : clickable ? "Open in side chat" : undefined}
+            style={{
+              fontFamily: "var(--font-code)",
+              fontSize: "0.84em",
+              background: "var(--chip)",
+              color: "var(--fg)",
+              padding: "2px 6px",
+              borderRadius: 6,
+              cursor: clickable ? "pointer" : "inherit",
+            }}
+          >
+            {props.children}
+          </code>
+        );
+      },
+      pre: (props: { children?: React.ReactNode }) => (
+        <CodeBlock onOpenCode={onAskSideChatRef.current ? (t) => onAskSideChatRef.current!(t) : undefined}>
           {props.children}
-        </code>
-      );
-    },
-    pre: (props: { children?: React.ReactNode }) => (
-      <CodeBlock onOpenCode={onAskSideChat}>{props.children}</CodeBlock>
-    ),
-    p: (props: { children?: React.ReactNode }) => <p style={{ margin: "10px 0" }}>{props.children}</p>,
-    ul: (props: { children?: React.ReactNode }) => (
-      <ul style={{ margin: "10px 0", paddingLeft: 24 }}>{props.children}</ul>
-    ),
-    ol: (props: { children?: React.ReactNode }) => (
-      <ol style={{ margin: "10px 0", paddingLeft: 24 }}>{props.children}</ol>
-    ),
-    li: (props: { children?: React.ReactNode }) => <li style={{ margin: "4px 0" }}>{props.children}</li>,
-  };
+        </CodeBlock>
+      ),
+      p: (props: { children?: React.ReactNode }) => <p style={{ margin: "10px 0" }}>{props.children}</p>,
+      ul: (props: { children?: React.ReactNode }) => (
+        <ul style={{ margin: "10px 0", paddingLeft: 24 }}>{props.children}</ul>
+      ),
+      ol: (props: { children?: React.ReactNode }) => (
+        <ol style={{ margin: "10px 0", paddingLeft: 24 }}>{props.children}</ol>
+      ),
+      li: (props: { children?: React.ReactNode }) => <li style={{ margin: "4px 0" }}>{props.children}</li>,
+    }),
+    [],
+  );
 
   return (
     <div ref={paneRef} style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", position: "relative" }}>
@@ -1126,9 +1851,15 @@ function ChatPane({
         <div
           style={{
             position: "absolute",
-            left: Math.max(80, Math.min(selection.x, (paneRef.current?.clientWidth ?? 400) - 80)),
-            top: Math.max(8, selection.y - 40),
-            transform: "translateX(-50%)",
+            // Button pill: centered over the selection. Comment box: hung
+            // up-and-right of the numbered badge (which marks the excerpt's
+            // end), Codex-style, with the badge in the gap between them.
+            left:
+              pendingComment !== null
+                ? Math.max(8, Math.min(selection.right + 16, (paneRef.current?.clientWidth ?? 400) - 310))
+                : Math.max(80, Math.min(selection.x, (paneRef.current?.clientWidth ?? 400) - 80)),
+            top: Math.max(8, selection.y - (pendingComment !== null ? 64 : 40)),
+            transform: pendingComment !== null ? "none" : "translateX(-50%)",
             zIndex: 10,
             display: "flex",
             background: "var(--chip)",
@@ -1138,26 +1869,54 @@ function ChatPane({
             boxShadow: "0 4px 16px rgba(0,0,0,0.4)",
           }}
         >
-          <button
-            onClick={() => {
-              setDraft((d) => (d ? d + "\n" : "") + `> ${selection.text.replace(/\n/g, "\n> ")}\n`);
-              setSelection(null);
-              window.getSelection()?.removeAllRanges();
-            }}
-            style={pillButtonStyle}
-          >
-            Add to chat
-          </button>
-          <button
-            onClick={() => {
-              onAskSideChat(selection.text);
-              setSelection(null);
-              window.getSelection()?.removeAllRanges();
-            }}
-            style={{ ...pillButtonStyle, borderLeft: `1px solid ${colors.border}` }}
-          >
-            Ask in side chat
-          </button>
+          {pendingComment === null ? (
+            <>
+              <button onClick={() => setPendingComment("")} style={pillButtonStyle}>
+                Add to chat
+              </button>
+              <button
+                onClick={() => {
+                  onAskSideChat(selection.text);
+                  setSelection(null);
+                  window.getSelection()?.removeAllRanges();
+                }}
+                style={{ ...pillButtonStyle, borderLeft: `1px solid ${colors.border}` }}
+              >
+                Ask in side chat
+              </button>
+            </>
+          ) : (
+            <>
+              <input
+                autoFocus
+                value={pendingComment}
+                onChange={(e) => setPendingComment(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") confirmAnnotation();
+                  if (e.key === "Escape") cancelAnnotation();
+                }}
+                placeholder="Add an optional comment…"
+                style={{
+                  width: 240,
+                  background: "transparent",
+                  border: "none",
+                  outline: "none",
+                  color: colors.fg,
+                  fontSize: 12.5,
+                  padding: "8px 4px 8px 12px",
+                  fontFamily: "inherit",
+                }}
+              />
+              <button
+                onClick={confirmAnnotation}
+                title="Add annotation"
+                aria-label="Add annotation"
+                style={{ ...pillButtonStyle, display: "flex", alignItems: "center", padding: "7px 10px" }}
+              >
+                <CheckIcon />
+              </button>
+            </>
+          )}
         </div>
       )}
 
@@ -1165,7 +1924,35 @@ function ChatPane({
         {entries.length === 0 && (
           <div style={{ height: "100%", display: "grid", placeItems: "center" }}>{emptyState}</div>
         )}
-        <div style={{ maxWidth: 720, margin: "0 auto", padding: "0 24px" }}>
+        <div ref={contentRef} style={{ maxWidth: 720, margin: "0 auto", padding: "0 24px", position: "relative" }}>
+          {badges.map((b) => (
+            <span
+              key={b.n}
+              title={b.label || undefined}
+              style={{
+                position: "absolute",
+                left: b.left,
+                top: b.top,
+                zIndex: 5,
+                minWidth: 20,
+                height: 20,
+                padding: "0 5px",
+                boxSizing: "border-box",
+                borderRadius: "999px 999px 999px 4px",
+                background: colors.accent,
+                color: "var(--accent-fg)",
+                fontSize: 11.5,
+                fontWeight: 600,
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                boxShadow: "0 1px 4px rgba(0,0,0,0.35)",
+                fontVariantNumeric: "tabular-nums",
+              }}
+            >
+              {b.n}
+            </span>
+          ))}
           {toDisplayBlocks(entries).map((block) => {
             if (block.kind === "steps") {
               return (
@@ -1195,7 +1982,7 @@ function ChatPane({
             if (e.kind === "assistant") {
               return (
                 <div key={block.key} style={{ margin: "16px 0", lineHeight: 1.75, fontSize: 15.5 }}>
-                  <Markdown remarkPlugins={[remarkGfm]} components={mdComponents}>
+                  <Markdown remarkPlugins={REMARK_PLUGINS} components={mdComponents}>
                     {e.text}
                   </Markdown>
                   {e.interrupted && <div style={{ color: colors.dim, fontSize: 12, marginTop: 4 }}>— stopped</div>}
@@ -1227,6 +2014,7 @@ function ChatPane({
       <div style={{ padding: "8px 16px 16px" }}>
         <div
           style={{
+            position: "relative",
             maxWidth: 720,
             margin: "0 auto",
             background: colors.panel,
@@ -1235,46 +2023,157 @@ function ChatPane({
             padding: "12px 14px 10px",
           }}
         >
-          {contextChip && (
+          {plusOpen && (
             <div
+              ref={plusMenuRef}
               style={{
-                display: "flex",
-                alignItems: "center",
-                gap: 8,
-                background: "var(--chip)",
+                position: "absolute",
+                bottom: "calc(100% + 8px)",
+                left: 0,
+                right: 0,
+                // Same surface as the composer box — Codex renders both at
+                // one elevation, not the popup a step lighter.
+                background: colors.panel,
                 border: `1px solid ${colors.border}`,
-                borderRadius: 8,
-                padding: "6px 10px",
-                marginBottom: 8,
-                fontSize: 12.5,
-                color: colors.dim,
+                borderRadius: 16,
+                padding: "8px 8px 8px",
+                zIndex: 20,
+                boxShadow: "0 8px 24px rgba(0,0,0,0.45)",
               }}
             >
-              <span
-                style={{
-                  flex: 1,
-                  whiteSpace: "nowrap",
-                  overflow: "hidden",
-                  textOverflow: "ellipsis",
-                }}
-                title={contextChip}
-              >
-                1 selection · {contextChip.slice(0, 80)}
-              </span>
-              <button
-                onClick={() => onContextClear?.()}
-                aria-label="Remove selection"
-                style={{
-                  background: "transparent",
-                  border: "none",
-                  color: colors.dim,
-                  cursor: "pointer",
-                  padding: 0,
-                  display: "flex",
-                }}
-              >
-                <CloseIcon />
-              </button>
+              <div style={{ color: colors.dim, fontSize: 13, padding: "4px 10px 6px" }}>Add</div>
+              <MenuItem icon={<PaperclipIcon />} label="Files and folders" onClick={() => void addAttachments()} />
+              <MenuItem
+                icon={<ImageIcon />}
+                label="Image from clipboard"
+                desc={clipHasImage ? undefined : "Nothing copied"}
+                disabled={!clipHasImage}
+                onClick={() => void attachClipboardImage()}
+              />
+            </div>
+          )}
+          {attachments.length > 0 && (
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 10, marginBottom: 10, paddingTop: 4 }}>
+              {attachments.map((a) => {
+                const remove = () => setAttachments((list) => list.filter((x) => x.path !== a.path));
+                return a.kind === "image" && a.thumb ? (
+                  <span key={a.path} title={a.path} style={{ position: "relative", display: "flex" }}>
+                    <img
+                      src={a.thumb}
+                      alt={a.name}
+                      onClick={onPreviewImage ? () => onPreviewImage(a) : undefined}
+                      title={onPreviewImage ? "Open preview" : a.path}
+                      style={{
+                        width: 56,
+                        height: 56,
+                        objectFit: "cover",
+                        borderRadius: 12,
+                        border: `1px solid ${colors.border}`,
+                        display: "block",
+                        cursor: onPreviewImage ? "pointer" : "default",
+                      }}
+                    />
+                    <RemoveBadge label={`Remove ${a.name}`} onClick={remove} />
+                  </span>
+                ) : (
+                  <span
+                    key={a.path}
+                    title={a.path}
+                    style={{
+                      position: "relative",
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 10,
+                      background: "var(--chip)",
+                      border: `1px solid ${colors.border}`,
+                      borderRadius: 14,
+                      padding: "8px 22px 8px 8px",
+                      maxWidth: 240,
+                    }}
+                  >
+                    <span
+                      style={{
+                        width: 40,
+                        height: 40,
+                        borderRadius: 10,
+                        background: "var(--code-bg)",
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                        color: colors.fg,
+                        flexShrink: 0,
+                      }}
+                    >
+                      {a.kind === "folder" ? <FolderOutlineIcon /> : <FileIcon />}
+                    </span>
+                    <span style={{ minWidth: 0 }}>
+                      <div
+                        style={{
+                          fontSize: 13.5,
+                          color: colors.fg,
+                          whiteSpace: "nowrap",
+                          overflow: "hidden",
+                          textOverflow: "ellipsis",
+                        }}
+                      >
+                        {a.name}
+                      </div>
+                      <div style={{ fontSize: 12, color: colors.dim }}>
+                        {a.kind === "folder" ? "Folder" : "File"}
+                      </div>
+                    </span>
+                    <RemoveBadge label={`Remove ${a.name}`} onClick={remove} />
+                  </span>
+                );
+              })}
+            </div>
+          )}
+          {annotations.length > 0 && (
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 8 }}>
+              {annotations.map((a, i) => (
+                <span
+                  key={i}
+                  title={a.comment ? `${a.text}\n— ${a.comment}` : a.text}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 6,
+                    background: "var(--chip)",
+                    border: `1px solid ${colors.border}`,
+                    borderRadius: 8,
+                    padding: "4px 8px",
+                    fontSize: 12,
+                    color: colors.dim,
+                    maxWidth: 260,
+                  }}
+                >
+                  <AnnotationIcon />
+                  <span
+                    style={{
+                      whiteSpace: "nowrap",
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                      color: colors.fg,
+                    }}
+                  >
+                    {a.comment || a.text}
+                  </span>
+                  <button
+                    onClick={() => setAnnotations((list) => list.filter((_, j) => j !== i))}
+                    aria-label="Remove annotation"
+                    style={{
+                      background: "transparent",
+                      border: "none",
+                      color: colors.dim,
+                      cursor: "pointer",
+                      padding: 0,
+                      display: "flex",
+                    }}
+                  >
+                    <CloseIcon />
+                  </button>
+                </span>
+              ))}
             </div>
           )}
           <textarea
@@ -1285,6 +2184,13 @@ function ChatPane({
                 e.preventDefault();
                 void submit();
               }
+            }}
+            onPaste={(e) => {
+              // A pasted image becomes an attachment; text pastes as usual.
+              const items = Array.from(e.clipboardData?.items ?? []);
+              if (!items.some((it) => it.type.startsWith("image/"))) return;
+              e.preventDefault();
+              void attachClipboardImage();
             }}
             placeholder={connected ? "Do anything" : "Engine starting…"}
             disabled={!connected}
@@ -1301,71 +2207,33 @@ function ChatPane({
               display: "block",
             }}
           />
-          {attachments.length > 0 && (
-            <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 8 }}>
-              {attachments.map((a) => (
-                <span
-                  key={a.path}
-                  title={a.path}
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    gap: 6,
-                    background: "var(--chip)",
-                    border: `1px solid ${colors.border}`,
-                    borderRadius: 8,
-                    padding: "4px 8px",
-                    fontSize: 12,
-                    color: colors.fg,
-                    maxWidth: 220,
-                  }}
-                >
-                  <PaperclipIcon />
-                  <span style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                    {a.name}
-                  </span>
-                  <button
-                    onClick={() => setAttachments((list) => list.filter((x) => x.path !== a.path))}
-                    aria-label={`Remove ${a.name}`}
-                    style={{
-                      background: "transparent",
-                      border: "none",
-                      color: colors.dim,
-                      cursor: "pointer",
-                      padding: 0,
-                      display: "flex",
-                    }}
-                  >
-                    <CloseIcon />
-                  </button>
-                </span>
-              ))}
-            </div>
-          )}
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginTop: 6 }}>
             <span style={{ display: "flex", alignItems: "center", gap: 10 }}>
-              <button
-                onClick={() => void addAttachments()}
-                disabled={!connected}
-                title="Attach files or folders"
-                aria-label="Attach files or folders"
-                style={{
-                  width: 28,
-                  height: 28,
-                  borderRadius: 14,
-                  background: "var(--chip)",
-                  color: connected ? colors.fg : colors.dim,
-                  border: `1px solid ${colors.border}`,
-                  cursor: connected ? "pointer" : "default",
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  fontSize: 15,
-                  lineHeight: 1,
-                }}
-              >
-                +
-              </button>
+              <span ref={plusRef} style={{ position: "relative", display: "flex" }}>
+                <button
+                  onClick={() => (plusOpen ? setPlusOpen(false) : void openPlusMenu())}
+                  disabled={!connected}
+                  title="Add"
+                  aria-label="Add"
+                  aria-expanded={plusOpen}
+                  style={{
+                    width: 28,
+                    height: 28,
+                    borderRadius: 14,
+                    background: plusOpen ? "var(--panel-2)" : "var(--chip)",
+                    color: connected ? colors.fg : colors.dim,
+                    border: `1px solid ${colors.border}`,
+                    cursor: connected ? "pointer" : "default",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    fontSize: 15,
+                    lineHeight: 1,
+                  }}
+                >
+                  +
+                </button>
+              </span>
               <span style={{ color: colors.dim, fontSize: 12.5 }}>{contextLabel}</span>
             </span>
             {busy ? (
@@ -1392,17 +2260,17 @@ function ChatPane({
             ) : (
               <button
                 onClick={() => void submit()}
-                disabled={!connected || !draft.trim()}
+                disabled={!canSend}
                 title="Send"
                 aria-label="Send"
                 style={{
                   width: 32,
                   height: 32,
                   borderRadius: 16,
-                  background: connected && draft.trim() ? colors.accent : "var(--panel-2)",
-                  color: connected && draft.trim() ? "var(--accent-fg)" : colors.dim,
+                  background: canSend ? colors.accent : "var(--panel-2)",
+                  color: canSend ? "var(--accent-fg)" : colors.dim,
                   border: "none",
-                  cursor: connected && draft.trim() ? "pointer" : "default",
+                  cursor: canSend ? "pointer" : "default",
                   display: "flex",
                   alignItems: "center",
                   justifyContent: "center",
@@ -1738,7 +2606,7 @@ function SettingsView({
               }}
               rows={3}
               spellCheck={false}
-              placeholder='codex-theme-v1:{"theme":{"accent":"#0169cc",…}}'
+              placeholder='codex-theme-v1:{"theme":{"accent":"#FF563F",…}}'
               style={{
                 width: "100%",
                 resize: "vertical",
@@ -1928,9 +2796,9 @@ function PanelIcon() {
   );
 }
 
-function ChatPlusIcon() {
+function ChatPlusIcon({ size = 14, strokeWidth = 2 }: { size?: number; strokeWidth?: number } = {}) {
   return (
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" style={{ flexShrink: 0 }}>
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={strokeWidth} strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" style={{ flexShrink: 0 }}>
       <path d="M21 11.5a8.38 8.38 0 0 1-8.5 8.5 8.5 8.5 0 0 1-3.5-.76L3 21l1.76-6A8.5 8.5 0 1 1 21 11.5Z" />
       <path d="M12 8v6" />
       <path d="M9 11h6" />
@@ -1943,6 +2811,167 @@ function SideChatIcon() {
     <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
       <rect x="2" y="4" width="20" height="16" rx="2" />
       <path d="M14 4v16" />
+    </svg>
+  );
+}
+
+/** Floating × on an attachment card's top-right corner. */
+function RemoveBadge({ label, onClick }: { label: string; onClick: () => void }) {
+  return (
+    <button
+      onClick={onClick}
+      aria-label={label}
+      title={label}
+      style={{
+        position: "absolute",
+        top: -6,
+        right: -6,
+        width: 18,
+        height: 18,
+        borderRadius: 9,
+        background: "var(--panel-2)",
+        border: `1px solid ${colors.border}`,
+        color: colors.fg,
+        cursor: "pointer",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        padding: 0,
+      }}
+    >
+      <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" aria-hidden="true">
+        <path d="M18 6 6 18" />
+        <path d="M6 6l12 12" />
+      </svg>
+    </button>
+  );
+}
+
+function FileIcon() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z" />
+      <polyline points="14 2 14 8 20 8" />
+    </svg>
+  );
+}
+
+function FolderOutlineIcon({ size = 18 }: { size?: number } = {}) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.7-.9L9.2 3.9A2 2 0 0 0 7.5 3H4a2 2 0 0 0-2 2v13c0 1.1.9 2 2 2Z" />
+    </svg>
+  );
+}
+
+function PlusIcon() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M12 5v14" />
+      <path d="M5 12h14" />
+    </svg>
+  );
+}
+
+function ReviewIcon() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <rect x="3" y="3" width="18" height="18" rx="4" />
+      <path d="M12 7v4" />
+      <path d="M10 9h4" />
+      <path d="M9 15h6" />
+    </svg>
+  );
+}
+
+function TerminalIcon() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <rect x="3" y="3" width="18" height="18" rx="4" />
+      <path d="m7.5 9 3 3-3 3" />
+      <path d="M13 15h3.5" />
+    </svg>
+  );
+}
+
+function ImageIcon({ size = 15 }: { size?: number } = {}) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" style={{ flexShrink: 0 }}>
+      <rect x="3" y="3" width="18" height="18" rx="2" />
+      <circle cx="9" cy="9" r="2" />
+      <path d="m21 15-3.1-3.1a2 2 0 0 0-2.8 0L6 21" />
+    </svg>
+  );
+}
+
+/** A row in the + button's popup: icon, label, optional dim description. */
+function MenuItem({
+  icon,
+  label,
+  desc,
+  disabled,
+  onClick,
+}: {
+  icon: React.ReactNode;
+  label: string;
+  desc?: string;
+  disabled?: boolean;
+  onClick: () => void;
+}) {
+  const [hover, setHover] = useState(false);
+  return (
+    <button
+      disabled={disabled}
+      onClick={onClick}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 10,
+        width: "100%",
+        background: hover && !disabled ? "var(--chip)" : "transparent",
+        border: "none",
+        borderRadius: 8,
+        padding: "8px 10px",
+        fontSize: 13.5,
+        color: disabled ? colors.dim : colors.fg,
+        cursor: disabled ? "default" : "pointer",
+        textAlign: "left",
+        fontFamily: "inherit",
+      }}
+    >
+      <span style={{ color: colors.dim, display: "flex", flexShrink: 0 }}>{icon}</span>
+      <span style={{ whiteSpace: "nowrap" }}>{label}</span>
+      {desc && (
+        <span
+          style={{
+            color: colors.dim,
+            fontSize: 12.5,
+            whiteSpace: "nowrap",
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+          }}
+        >
+          {desc}
+        </span>
+      )}
+    </button>
+  );
+}
+
+function CheckIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M20 6 9 17l-5-5" />
+    </svg>
+  );
+}
+
+function AnnotationIcon() {
+  return (
+    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" style={{ flexShrink: 0 }}>
+      <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
     </svg>
   );
 }

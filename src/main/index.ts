@@ -1,6 +1,7 @@
-import { app, BrowserWindow, dialog, ipcMain } from "electron";
+import { app, BrowserWindow, clipboard, dialog, ipcMain, nativeImage } from "electron";
+import type { NativeImage } from "electron";
 import { isAbsolute, join, relative } from "node:path";
-import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { EngineClient, engineVersionFromUserAgent, type EngineStatus } from "./engine";
 
 const engine = new EngineClient();
@@ -137,6 +138,17 @@ function resolveEngineDir(): string {
   return join(app.getAppPath(), "..", "unbiased-app-engine", "dist", "bundle");
 }
 
+/** Small data-URL preview for attachment cards; full-size stays on disk. */
+function thumbDataUrl(image: NativeImage): string {
+  const { width, height } = image.getSize();
+  const scale = 112 / Math.max(width, height, 1);
+  const small =
+    scale < 1
+      ? image.resize({ width: Math.round(width * scale), height: Math.round(height * scale) })
+      : image;
+  return small.toDataURL();
+}
+
 function pushStatus(status: EngineStatus): void {
   lastStatus = status;
   win?.webContents.send("engine:status", status);
@@ -146,11 +158,25 @@ function send(channel: string, payload: unknown): void {
   win?.webContents.send(channel, payload);
 }
 
+/** Launcher icon (rasterized from resources/icon.svg). In development it
+ *  lives in the repo; packaged builds must ship it via extraResources. */
+function resolveIconPath(): string {
+  return app.isPackaged
+    ? join(process.resourcesPath, "icon.png")
+    : join(app.getAppPath(), "resources", "icon.png");
+}
+
 function createWindow(): void {
+  const iconPath = resolveIconPath();
+  // macOS ignores BrowserWindow icons — the dock owns the launcher icon.
+  if (process.platform === "darwin" && existsSync(iconPath)) {
+    app.dock?.setIcon(iconPath);
+  }
   win = new BrowserWindow({
     width: 1100,
     height: 700,
     title: "Unbiased",
+    ...(process.platform !== "darwin" && existsSync(iconPath) ? { icon: iconPath } : {}),
     webPreferences: { preload: join(__dirname, "../preload/index.js") },
   });
   if (process.env.ELECTRON_RENDERER_URL) {
@@ -264,7 +290,7 @@ app.whenReady().then(async () => {
   ipcMain.handle("chat:send", async (_e, payload: {
     paneId: PaneId;
     text: string;
-    attachments?: { name: string; path: string }[];
+    attachments?: { name: string; path: string; kind?: "image" }[];
   }) => {
     const { paneId, text, attachments } = payload;
     const pane = panes[paneId];
@@ -292,7 +318,10 @@ app.whenReady().then(async () => {
       } else {
         started = (await engine.request("thread/start", {
           ...THREAD_POLICY,
-          ...(pendingCwd ? { cwd: pendingCwd } : {}),
+          // Explicit home when no project is chosen — left implicit, the
+          // engine falls back to its own process cwd (wherever the app
+          // launched from) and the chat wrongly files under that project.
+          cwd: pendingCwd ?? app.getPath("home"),
         })) as { thread: { id: string }; cwd?: string };
         mainCwd = (started as { cwd?: string }).cwd ?? pendingCwd ?? mainCwd;
       }
@@ -301,10 +330,16 @@ app.whenReady().then(async () => {
     }
     // Attachments ride as `mention` input items — the engine resolves the
     // path and pulls the content into context itself (same mechanism as
-    // codex's @-mentions), so files AND folders both work.
+    // codex's @-mentions), so files AND folders both work. Images go as
+    // `localImage` items instead, which the engine feeds to the model as
+    // actual image input rather than file text.
     const input: Record<string, unknown>[] = [{ type: "text", text }];
     for (const a of attachments ?? []) {
-      input.push({ type: "mention", name: a.name, path: a.path });
+      if (a.kind === "image") {
+        input.push({ type: "localImage", path: a.path });
+      } else {
+        input.push({ type: "mention", name: a.name, path: a.path });
+      }
     }
     const result = (await engine.request("turn/start", {
       threadId: pane.threadId,
@@ -440,11 +475,67 @@ app.whenReady().then(async () => {
     });
     if (result.canceled) return { attachments: [] };
     return {
-      attachments: result.filePaths.map((path) => ({
-        path,
-        name: path.split("/").filter(Boolean).pop() ?? path,
-      })),
+      attachments: result.filePaths.map((path) => {
+        const name = path.split("/").filter(Boolean).pop() ?? path;
+        try {
+          if (statSync(path).isDirectory()) return { path, name, kind: "folder" };
+        } catch {
+          // fall through to the generic file card
+        }
+        // Picked image files render a thumbnail card and send as localImage
+        // (a mention would dump binary into context). Unreadable/exotic
+        // formats quietly stay plain files.
+        if (/\.(png|jpe?g|gif|webp|bmp)$/i.test(path)) {
+          const img = nativeImage.createFromPath(path);
+          if (!img.isEmpty()) return { path, name, kind: "image", thumb: thumbDataUrl(img) };
+        }
+        return { path, name, kind: "file" };
+      }),
     };
+  });
+
+  // One directory level for the workspace tree — the renderer expands
+  // lazily, so huge folders (node_modules…) cost nothing until opened.
+  // No path argument = the active conversation's root.
+  ipcMain.handle("fs:list", (_e, rawDir?: string) => {
+    const base = mainCwd ?? pendingCwd ?? app.getPath("home");
+    const dir = rawDir ? (isAbsolute(rawDir) ? rawDir : join(base, rawDir)) : base;
+    try {
+      const entries = readdirSync(dir, { withFileTypes: true })
+        .map((d) => ({ name: d.name, dir: d.isDirectory() }))
+        .sort((a, b) => (a.dir === b.dir ? a.name.localeCompare(b.name) : a.dir ? -1 : 1));
+      return { dir, entries };
+    } catch {
+      return { dir, entries: [], error: `Could not read ${dir}` };
+    }
+  });
+
+  // Full-size image as a data URL for the side panel's preview tab (the
+  // renderer can't load file:// under its CSP; data: is allowed).
+  ipcMain.handle("file:read-image", (_e, path: string) => {
+    try {
+      if (statSync(path).size > 15_000_000) return { error: "Image is larger than 15 MB" };
+      const img = nativeImage.createFromPath(path);
+      if (img.isEmpty()) return { error: "Could not read image" };
+      return { dataUrl: img.toDataURL() };
+    } catch {
+      return { error: `Could not open ${path}` };
+    }
+  });
+
+  ipcMain.handle("clipboard:has-image", () => !clipboard.readImage().isEmpty());
+
+  // A copied/pasted image lives in the native clipboard; persist it to a
+  // temp PNG so it can ride the next turn as a localImage input item.
+  ipcMain.handle("attach:clipboard-image", () => {
+    const image = clipboard.readImage();
+    if (image.isEmpty()) return { attachment: null };
+    const dir = join(app.getPath("temp"), "unbiased-pastes");
+    mkdirSync(dir, { recursive: true });
+    const name = `pasted-${new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19)}.png`;
+    const path = join(dir, name);
+    writeFileSync(path, image.toPNG());
+    return { attachment: { name, path, kind: "image", thumb: thumbDataUrl(image) } };
   });
 
   ipcMain.handle("threads:delete", async (_e, id: string) => {

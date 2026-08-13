@@ -14,9 +14,11 @@ contextBridge.exposeInMainWorld("unbiased", {
   getEngineStatus: () => ipcRenderer.invoke("engine:status"),
   onEngineStatus: (cb: (status: unknown) => void) => subscribe("engine:status", cb),
 
-  sendMessage: (paneId: string, text: string, attachments?: { name: string; path: string }[]) =>
+  sendMessage: (paneId: string, text: string, attachments?: { name: string; path: string; kind?: string }[]) =>
     ipcRenderer.invoke("chat:send", { paneId, text, attachments }),
   chooseAttachments: () => ipcRenderer.invoke("attach:choose"),
+  clipboardHasImage: () => ipcRenderer.invoke("clipboard:has-image"),
+  clipboardImage: () => ipcRenderer.invoke("attach:clipboard-image"),
   interrupt: (paneId: string) => ipcRenderer.invoke("chat:interrupt", paneId),
   onTurnStarted: (cb: (p: unknown) => void) => subscribe("chat:turn-started", cb),
   onDelta: (cb: (p: unknown) => void) => subscribe("chat:delta", cb),
@@ -34,4 +36,6 @@ contextBridge.exposeInMainWorld("unbiased", {
   resetSideChat: () => ipcRenderer.invoke("side:reset"),
   chooseProject: () => ipcRenderer.invoke("project:choose"),
   readFile: (path: string) => ipcRenderer.invoke("file:read", path),
+  readImage: (path: string) => ipcRenderer.invoke("file:read-image", path),
+  listDir: (dir?: string) => ipcRenderer.invoke("fs:list", dir),
 });
