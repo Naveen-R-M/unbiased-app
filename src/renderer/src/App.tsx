@@ -97,17 +97,112 @@ declare global {
   }
 }
 
+// All chrome colors resolve through CSS variables set from the active
+// theme at the root — see themeVars(). Semantic status colors stay fixed.
 const colors = {
-  bg: "#16161a",
-  panel: "#1e1e23",
-  border: "#2a2a2e",
-  fg: "#e8e6e3",
-  dim: "#8a8886",
-  accent: "#FF7764",
+  bg: "var(--bg)",
+  panel: "var(--panel)",
+  border: "var(--border)",
+  fg: "var(--fg)",
+  dim: "var(--dim)",
+  accent: "var(--accent)",
   ok: "#5DCAA5",
   err: "#F09595",
   amber: "#FAC775",
 };
+
+export type ThemeConfig = {
+  accent: string;
+  surface: string;
+  ink: string;
+  contrast: number; // 0..100, 50 = baseline
+  fonts: { ui: string; code: string };
+};
+
+// The default follows the user's Codex dark theme (codex-theme-v1 import).
+const DEFAULT_THEME: ThemeConfig = {
+  accent: "#0169cc",
+  surface: "#111111",
+  ink: "#fcfcfc",
+  contrast: 50,
+  fonts: { ui: "Geist, Inter", code: '"Geist Mono", ui-monospace, "SFMono-Regular"' },
+};
+
+function loadTheme(): ThemeConfig {
+  try {
+    const parsed = JSON.parse(localStorage.getItem("themeV1") ?? "");
+    return { ...DEFAULT_THEME, ...parsed, fonts: { ...DEFAULT_THEME.fonts, ...(parsed.fonts ?? {}) } };
+  } catch {
+    return DEFAULT_THEME;
+  }
+}
+
+function saveTheme(t: ThemeConfig): void {
+  localStorage.setItem("themeV1", JSON.stringify(t));
+}
+
+function hexToRgb(hex: string): [number, number, number] | null {
+  const m = /^#?([0-9a-f]{6})$/i.exec(hex.trim());
+  if (!m) return null;
+  const n = parseInt(m[1], 16);
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+}
+
+function mixHex(a: string, b: string, t: number): string {
+  const ra = hexToRgb(a) ?? [17, 17, 17];
+  const rb = hexToRgb(b) ?? [252, 252, 252];
+  const mixed = ra.map((v, i) => Math.round(v + (rb[i] - v) * t));
+  return "#" + mixed.map((v) => v.toString(16).padStart(2, "0")).join("");
+}
+
+/** Derive every chrome shade from surface + ink + contrast, Codex-style. */
+function themeVars(t: ThemeConfig): Record<string, string> {
+  const k = Math.max(t.contrast, 5) / 50;
+  const m = (x: number) => mixHex(t.surface, t.ink, Math.min(x * k, 1));
+  const accentRgb = hexToRgb(t.accent) ?? [1, 105, 204];
+  const accentLuma = (0.299 * accentRgb[0] + 0.587 * accentRgb[1] + 0.114 * accentRgb[2]) / 255;
+  return {
+    "--bg": t.surface,
+    "--fg": t.ink,
+    "--accent": t.accent,
+    "--accent-fg": accentLuma > 0.6 ? "#111111" : "#ffffff",
+    "--nav-bg": mixHex(t.surface, "#000000", 0.14),
+    "--code-bg": mixHex(t.surface, "#000000", 0.3),
+    "--code-fg": mixHex(t.ink, t.surface, 0.14),
+    "--panel": m(0.05),
+    "--panel-2": m(0.09),
+    "--chip": m(0.09),
+    "--border": m(0.095),
+    "--user-bubble": m(0.13),
+    "--dim": mixHex(t.surface, t.ink, 0.52),
+    "--gutter": m(0.25),
+    "--font-ui": `${t.fonts.ui}, -apple-system, system-ui, sans-serif`,
+    "--font-code": `${t.fonts.code}, ui-monospace, Menlo, monospace`,
+  };
+}
+
+/** Parse a Codex theme export: `codex-theme-v1:{...}` or the raw JSON. */
+function parseThemeImport(raw: string): ThemeConfig | null {
+  try {
+    const json = raw.trim().replace(/^codex-theme-v1:/, "");
+    const parsed = JSON.parse(json);
+    const src = parsed.theme ?? parsed;
+    const next: ThemeConfig = {
+      accent: typeof src.accent === "string" ? src.accent : DEFAULT_THEME.accent,
+      surface: typeof src.surface === "string" ? src.surface : DEFAULT_THEME.surface,
+      ink: typeof src.ink === "string" ? src.ink : DEFAULT_THEME.ink,
+      contrast: typeof src.contrast === "number" ? src.contrast : DEFAULT_THEME.contrast,
+      fonts: {
+        ui: typeof src.fonts?.ui === "string" ? src.fonts.ui : DEFAULT_THEME.fonts.ui,
+        code: typeof src.fonts?.code === "string" ? src.fonts.code : DEFAULT_THEME.fonts.code,
+      },
+    };
+    if (!hexToRgb(next.accent) || !hexToRgb(next.surface) || !hexToRgb(next.ink)) return null;
+    return next;
+  } catch {
+    return null;
+  }
+}
 
 /** Drop a trailing empty assistant placeholder. */
 function withoutTrailingPlaceholder(es: Entry[]): Entry[] {
@@ -141,7 +236,14 @@ function toDisplayBlocks(entries: Entry[]): DisplayBlock[] {
 }
 
 export function App() {
+  const [theme, setTheme] = useState<ThemeConfig>(loadTheme);
+  const [showSettings, setShowSettings] = useState(false);
   const [status, setStatus] = useState<EngineStatus>({ state: "starting" });
+
+  function applyTheme(next: ThemeConfig) {
+    setTheme(next);
+    saveTheme(next);
+  }
   const [sidebar, setSidebar] = useState<SidebarData>({ projects: [], recents: [] });
   const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
   const [activeProject, setActiveProject] = useState<{ name: string; path: string } | null>(null);
@@ -312,14 +414,32 @@ export function App() {
     return activeProject ? `New chat · ${activeProject.name}` : "New chat";
   })();
 
+  if (showSettings) {
+    return (
+      <div
+        style={{
+          ...themeVars(theme),
+          height: "100vh",
+          display: "flex",
+          background: colors.bg,
+          color: colors.fg,
+          fontFamily: "var(--font-ui)",
+        }}
+      >
+        <SettingsView theme={theme} onChange={applyTheme} onBack={() => setShowSettings(false)} />
+      </div>
+    );
+  }
+
   return (
     <div
       style={{
+        ...themeVars(theme),
         height: "100vh",
         display: "flex",
         background: colors.bg,
         color: colors.fg,
-        fontFamily: "-apple-system, system-ui, sans-serif",
+        fontFamily: "var(--font-ui)",
       }}
     >
       {navOpen && (
@@ -330,7 +450,7 @@ export function App() {
           borderRight: `1px solid ${colors.border}`,
           display: "flex",
           flexDirection: "column",
-          background: "#131317",
+          background: "var(--nav-bg)",
         }}
       >
         <div style={{ padding: "14px 14px 6px" }}>
@@ -413,6 +533,11 @@ export function App() {
               onDelete={deleteThread}
             />
           ))}
+        </div>
+        <div style={{ padding: "4px 14px 2px", flexShrink: 0 }}>
+          <SidebarAction onClick={() => setShowSettings(true)} disabled={false} icon={<GearIcon />}>
+            Settings
+          </SidebarAction>
         </div>
         <ChatFooter status={status} busy={mainBusy} />
       </nav>
@@ -507,7 +632,7 @@ export function App() {
             minWidth: sideOpen ? 300 : 0,
             display: sideOpen ? "flex" : "none",
             flexDirection: "column",
-            background: "#131317",
+            background: "var(--nav-bg)",
           }}
         >
           <header
@@ -679,7 +804,7 @@ function FileViewer({ file }: { file: OpenFileInfo }) {
       >
         {crumbs.map((c, i) => (
           <span key={i}>
-            {i > 0 && <span style={{ margin: "0 6px", color: "#4a4a52" }}>›</span>}
+            {i > 0 && <span style={{ margin: "0 6px", color: "var(--gutter)" }}>›</span>}
             <span style={{ color: i === crumbs.length - 1 ? colors.fg : colors.dim }}>{c}</span>
           </span>
         ))}
@@ -687,16 +812,16 @@ function FileViewer({ file }: { file: OpenFileInfo }) {
       {file.error ? (
         <div style={{ padding: 24, color: colors.err, fontSize: 13 }}>{file.error}</div>
       ) : (
-        <div style={{ flex: 1, overflow: "auto", display: "flex", background: "#101014" }}>
+        <div style={{ flex: 1, overflow: "auto", display: "flex", background: "var(--code-bg)" }}>
           <pre
             aria-hidden="true"
             style={{
               margin: 0,
               padding: "14px 0 14px 16px",
               textAlign: "right",
-              color: "#4a4a52",
+              color: "var(--gutter)",
               userSelect: "none",
-              fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+              fontFamily: "var(--font-code)",
               fontSize: 12.5,
               lineHeight: 1.6,
               flexShrink: 0,
@@ -709,10 +834,10 @@ function FileViewer({ file }: { file: OpenFileInfo }) {
               margin: 0,
               padding: "14px 16px",
               flex: 1,
-              fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+              fontFamily: "var(--font-code)",
               fontSize: 12.5,
               lineHeight: 1.6,
-              color: "#d7d5d1",
+              color: "var(--code-fg)",
             }}
             dangerouslySetInnerHTML={{ __html: html }}
           />
@@ -940,10 +1065,10 @@ function ChatPane({
           }
           title={isPath ? "Open file" : clickable ? "Open in side chat" : undefined}
           style={{
-            fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+            fontFamily: "var(--font-code)",
             fontSize: "0.84em",
-            background: "#26262b",
-            color: "#e8e6e3",
+            background: "var(--chip)",
+            color: "var(--fg)",
             padding: "2px 6px",
             borderRadius: 6,
             cursor: clickable ? "pointer" : "inherit",
@@ -977,7 +1102,7 @@ function ChatPane({
             transform: "translateX(-50%)",
             zIndex: 10,
             display: "flex",
-            background: "#26262b",
+            background: "var(--chip)",
             border: `1px solid ${colors.border}`,
             borderRadius: 8,
             overflow: "hidden",
@@ -1027,7 +1152,7 @@ function ChatPane({
                       maxWidth: "85%",
                       padding: "10px 14px",
                       borderRadius: 12,
-                      background: "#33322f",
+                      background: "var(--user-bubble)",
                       whiteSpace: "pre-wrap",
                       lineHeight: 1.55,
                       fontSize: 14,
@@ -1087,7 +1212,7 @@ function ChatPane({
                 display: "flex",
                 alignItems: "center",
                 gap: 8,
-                background: "#26262b",
+                background: "var(--chip)",
                 border: `1px solid ${colors.border}`,
                 borderRadius: 8,
                 padding: "6px 10px",
@@ -1180,8 +1305,8 @@ function ChatPane({
                   width: 32,
                   height: 32,
                   borderRadius: 16,
-                  background: connected && draft.trim() ? colors.accent : "#2a2a2e",
-                  color: connected && draft.trim() ? "#3b1008" : colors.dim,
+                  background: connected && draft.trim() ? colors.accent : "var(--panel-2)",
+                  color: connected && draft.trim() ? "var(--accent-fg)" : colors.dim,
                   border: "none",
                   cursor: connected && draft.trim() ? "pointer" : "default",
                   display: "flex",
@@ -1260,8 +1385,8 @@ function CodeBlock({ children, onOpenCode }: { children?: React.ReactNode; onOpe
       }
       title={onOpenCode ? "Open in side chat" : undefined}
       style={{
-        background: "#101014",
-        border: `1px solid #26262b`,
+        background: "var(--code-bg)",
+        border: `1px solid ${colors.border}`,
         borderRadius: 10,
         margin: "12px 0",
         overflow: "hidden",
@@ -1309,10 +1434,10 @@ function CodeBlock({ children, onOpenCode }: { children?: React.ReactNode; onOpe
           margin: 0,
           padding: "2px 14px 12px",
           overflowX: "auto",
-          fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+          fontFamily: "var(--font-code)",
           fontSize: 12.75,
           lineHeight: 1.65,
-          color: "#d7d5d1",
+          color: "var(--code-fg)",
         }}
       >
         {children}
@@ -1324,13 +1449,259 @@ function CodeBlock({ children, onOpenCode }: { children?: React.ReactNode; onOpe
 const pillButtonStyle: React.CSSProperties = {
   background: "transparent",
   border: "none",
-  color: "#e8e6e3",
+  color: "var(--fg)",
   fontSize: 12.5,
   padding: "7px 12px",
   cursor: "pointer",
   fontFamily: "inherit",
   whiteSpace: "nowrap",
 };
+
+function SettingsView({
+  theme,
+  onChange,
+  onBack,
+}: {
+  theme: ThemeConfig;
+  onChange: (t: ThemeConfig) => void;
+  onBack: () => void;
+}) {
+  const [importText, setImportText] = useState("");
+  const [importError, setImportError] = useState<string | null>(null);
+
+  const rowStyle: React.CSSProperties = {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    padding: "14px 18px",
+    borderBottom: `1px solid ${colors.border}`,
+    fontSize: 14,
+  };
+  const textInputStyle: React.CSSProperties = {
+    background: "var(--panel-2)",
+    color: colors.fg,
+    border: `1px solid ${colors.border}`,
+    borderRadius: 8,
+    padding: "6px 10px",
+    fontSize: 13,
+    fontFamily: "var(--font-code)",
+    width: 260,
+    outline: "none",
+  };
+
+  function ColorRow({ label, value, set }: { label: string; value: string; set: (v: string) => void }) {
+    return (
+      <div style={rowStyle}>
+        <span>{label}</span>
+        <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <input
+            type="color"
+            value={/^#[0-9a-f]{6}$/i.test(value) ? value : "#000000"}
+            onChange={(e) => set(e.target.value)}
+            style={{ width: 26, height: 26, border: "none", background: "transparent", padding: 0, cursor: "pointer" }}
+          />
+          <input
+            value={value}
+            onChange={(e) => set(e.target.value)}
+            spellCheck={false}
+            style={{ ...textInputStyle, width: 110 }}
+          />
+        </span>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ flex: 1, display: "flex", minWidth: 0 }}>
+      <nav
+        style={{
+          width: 220,
+          flexShrink: 0,
+          borderRight: `1px solid ${colors.border}`,
+          background: "var(--nav-bg)",
+          padding: 14,
+        }}
+      >
+        <button
+          onClick={onBack}
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            background: "transparent",
+            border: "none",
+            color: colors.dim,
+            fontSize: 13.5,
+            cursor: "pointer",
+            padding: "4px 0 16px",
+            fontFamily: "inherit",
+          }}
+        >
+          ← Back to app
+        </button>
+        <SectionLabel>Personal</SectionLabel>
+        <div
+          style={{
+            background: colors.panel,
+            color: colors.fg,
+            borderRadius: 8,
+            padding: "8px 10px",
+            fontSize: 13.5,
+          }}
+        >
+          Appearance
+        </div>
+      </nav>
+
+      <div style={{ flex: 1, overflowY: "auto", padding: "40px 48px" }}>
+        <div style={{ maxWidth: 640, margin: "0 auto" }}>
+          <h1 style={{ fontSize: 22, fontWeight: 600, margin: "0 0 24px" }}>Appearance</h1>
+
+          <div
+            style={{
+              border: `1px solid ${colors.border}`,
+              borderRadius: 12,
+              background: colors.panel,
+              overflow: "hidden",
+            }}
+          >
+            <div style={{ ...rowStyle, fontWeight: 500 }}>
+              <span>Dark theme</span>
+              <button
+                onClick={() => onChange(DEFAULT_THEME)}
+                style={{
+                  background: "transparent",
+                  border: `1px solid ${colors.border}`,
+                  color: colors.dim,
+                  borderRadius: 8,
+                  padding: "5px 12px",
+                  fontSize: 12.5,
+                  cursor: "pointer",
+                  fontFamily: "inherit",
+                }}
+              >
+                Reset to default
+              </button>
+            </div>
+            <ColorRow label="Accent" value={theme.accent} set={(v) => onChange({ ...theme, accent: v })} />
+            <ColorRow label="Background" value={theme.surface} set={(v) => onChange({ ...theme, surface: v })} />
+            <ColorRow label="Foreground" value={theme.ink} set={(v) => onChange({ ...theme, ink: v })} />
+            <div style={rowStyle}>
+              <span>UI font</span>
+              <input
+                value={theme.fonts.ui}
+                onChange={(e) => onChange({ ...theme, fonts: { ...theme.fonts, ui: e.target.value } })}
+                spellCheck={false}
+                style={textInputStyle}
+              />
+            </div>
+            <div style={rowStyle}>
+              <span>Code font</span>
+              <input
+                value={theme.fonts.code}
+                onChange={(e) => onChange({ ...theme, fonts: { ...theme.fonts, code: e.target.value } })}
+                spellCheck={false}
+                style={textInputStyle}
+              />
+            </div>
+            <div style={{ ...rowStyle, borderBottom: "none" }}>
+              <span>Contrast</span>
+              <span style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                <input
+                  type="range"
+                  min={10}
+                  max={100}
+                  value={theme.contrast}
+                  onChange={(e) => onChange({ ...theme, contrast: Number(e.target.value) })}
+                  style={{ width: 160, accentColor: theme.accent }}
+                />
+                <span style={{ fontVariantNumeric: "tabular-nums", width: 28, textAlign: "right" }}>
+                  {theme.contrast}
+                </span>
+              </span>
+            </div>
+          </div>
+
+          <div
+            style={{
+              border: `1px solid ${colors.border}`,
+              borderRadius: 12,
+              background: colors.panel,
+              marginTop: 24,
+              padding: "14px 18px",
+            }}
+          >
+            <div style={{ fontSize: 14, fontWeight: 500, marginBottom: 8 }}>Import theme</div>
+            <div style={{ fontSize: 12.5, color: colors.dim, marginBottom: 10 }}>
+              Paste a Codex theme export (<code style={{ fontFamily: "var(--font-code)" }}>codex-theme-v1:…</code>)
+              or its raw JSON.
+            </div>
+            <textarea
+              value={importText}
+              onChange={(e) => {
+                setImportText(e.target.value);
+                setImportError(null);
+              }}
+              rows={3}
+              spellCheck={false}
+              placeholder='codex-theme-v1:{"theme":{"accent":"#0169cc",…}}'
+              style={{
+                width: "100%",
+                resize: "vertical",
+                background: "var(--panel-2)",
+                color: colors.fg,
+                border: `1px solid ${importError ? colors.err : colors.border}`,
+                borderRadius: 8,
+                padding: "8px 10px",
+                fontSize: 12.5,
+                fontFamily: "var(--font-code)",
+                outline: "none",
+                boxSizing: "border-box",
+              }}
+            />
+            <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 10 }}>
+              <button
+                onClick={() => {
+                  const parsed = parseThemeImport(importText);
+                  if (!parsed) {
+                    setImportError("Could not parse that theme.");
+                    return;
+                  }
+                  onChange(parsed);
+                  setImportText("");
+                  setImportError(null);
+                }}
+                disabled={!importText.trim()}
+                style={{
+                  background: importText.trim() ? colors.accent : "var(--panel-2)",
+                  color: importText.trim() ? "var(--accent-fg)" : colors.dim,
+                  border: "none",
+                  borderRadius: 8,
+                  padding: "7px 16px",
+                  fontSize: 13,
+                  cursor: importText.trim() ? "pointer" : "default",
+                  fontFamily: "inherit",
+                }}
+              >
+                Import
+              </button>
+              {importError && <span style={{ color: colors.err, fontSize: 12.5 }}>{importError}</span>}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function GearIcon() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <circle cx="12" cy="12" r="3" />
+      <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z" />
+    </svg>
+  );
+}
 
 function SidebarAction({
   onClick,
@@ -1674,7 +2045,7 @@ function StepsGroup({
           fontSize: 13.5,
           cursor: "pointer",
           padding: "2px 0",
-          fontFamily: "-apple-system, system-ui, sans-serif",
+          fontFamily: "var(--font-ui)",
         }}
       >
         {summary.text}
@@ -1703,9 +2074,9 @@ function StepsGroup({
                 padding: "10px 14px",
                 borderRadius: 12,
                 border: `1px solid ${e.status === "awaitingApproval" ? colors.amber : colors.border}`,
-                background: "#141417",
+                background: "var(--code-bg)",
                 fontSize: 12.5,
-                fontFamily: "ui-monospace, SFMono-Regular, monospace",
+                fontFamily: "var(--font-code)",
               }}
             >
               <div
@@ -1747,7 +2118,7 @@ function StepsGroup({
                       padding: "6px 16px",
                       fontSize: 13,
                       cursor: "pointer",
-                      fontFamily: "-apple-system, system-ui, sans-serif",
+                      fontFamily: "var(--font-ui)",
                     }}
                   >
                     Approve
@@ -1762,7 +2133,7 @@ function StepsGroup({
                       padding: "6px 16px",
                       fontSize: 13,
                       cursor: "pointer",
-                      fontFamily: "-apple-system, system-ui, sans-serif",
+                      fontFamily: "var(--font-ui)",
                     }}
                   >
                     Decline
