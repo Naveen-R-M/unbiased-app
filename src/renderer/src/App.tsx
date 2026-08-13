@@ -37,7 +37,21 @@ export function App() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState(false);
+  const [elapsed, setElapsed] = useState(0);
   const scrollRef = useRef<HTMLDivElement>(null);
+
+  // Pareto today completes the whole response before its first byte arrives
+  // (~3-5s of silence), so the wait needs to look attended, not frozen. The
+  // ticker runs for the whole turn; it only shows while the bubble is empty.
+  useEffect(() => {
+    if (!busy) {
+      setElapsed(0);
+      return;
+    }
+    const startedAt = Date.now();
+    const timer = setInterval(() => setElapsed((Date.now() - startedAt) / 1000), 100);
+    return () => clearInterval(timer);
+  }, [busy]);
 
   useEffect(() => {
     window.unbiased.getEngineStatus().then(setStatus);
@@ -137,7 +151,12 @@ export function App() {
                   fontSize: 14,
                 }}
               >
-                {m.text || (busy && i === messages.length - 1 ? "…" : "")}
+                {m.text ||
+                  (busy && i === messages.length - 1 ? (
+                    <span style={{ color: colors.dim }}>thinking… {elapsed.toFixed(1)}s</span>
+                  ) : (
+                    ""
+                  ))}
                 {m.interrupted && (
                   <div style={{ color: colors.dim, fontSize: 12, marginTop: 6 }}>— stopped</div>
                 )}
@@ -233,7 +252,7 @@ export function App() {
         {status.state === "connected" && (
           <span>
             connected · pareto · engine {status.engineVersion}
-            {busy ? " · thinking…" : ""}
+            {busy ? ` · thinking… ${elapsed.toFixed(0)}s` : ""}
           </span>
         )}
         {status.state === "starting" && <span>starting engine…</span>}
