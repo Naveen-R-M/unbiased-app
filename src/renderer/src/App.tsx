@@ -477,6 +477,27 @@ export function App() {
       </nav>
 
       <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column" }}>
+      <header
+        style={{
+          padding: "12px 24px",
+          borderBottom: `1px solid ${colors.border}`,
+          fontSize: 14,
+          fontWeight: 500,
+          color: colors.fg,
+          whiteSpace: "nowrap",
+          overflow: "hidden",
+          textOverflow: "ellipsis",
+          flexShrink: 0,
+        }}
+      >
+        {(() => {
+          if (activeThreadId) {
+            const all = [...sidebar.projects.flatMap((p) => p.threads), ...sidebar.recents];
+            return all.find((t) => t.id === activeThreadId)?.title ?? "Conversation";
+          }
+          return activeProject ? `New chat · ${activeProject.name}` : "New chat";
+        })()}
+      </header>
       <div ref={scrollRef} style={{ flex: 1, overflowY: "auto", padding: "24px 0" }}>
         {entries.length === 0 && (
           <div style={{ height: "100%", display: "grid", placeItems: "center" }}>
@@ -532,25 +553,14 @@ export function App() {
             }
             if (e.kind === "assistant") {
               return (
-                <div key={block.key} style={{ display: "flex", justifyContent: "flex-start", margin: "10px 0" }}>
-                  <div
-                    style={{
-                      maxWidth: "85%",
-                      padding: "4px 14px",
-                      borderRadius: 12,
-                      background: colors.panel,
-                      border: `1px solid ${colors.border}`,
-                      lineHeight: 1.55,
-                      fontSize: 14,
-                    }}
-                  >
-                    <Markdown remarkPlugins={[remarkGfm]} components={mdComponents}>
-                      {e.text}
-                    </Markdown>
-                    {e.interrupted && (
-                      <div style={{ color: colors.dim, fontSize: 12, margin: "0 0 6px" }}>— stopped</div>
-                    )}
-                  </div>
+                <div key={block.key} style={{ margin: "14px 0", lineHeight: 1.7, fontSize: 15 }}>
+                  <Markdown remarkPlugins={[remarkGfm]} components={mdComponents}>
+                    {e.text}
+                  </Markdown>
+                  {e.interrupted && (
+                    <div style={{ color: colors.dim, fontSize: 12, marginTop: 4 }}>— stopped</div>
+                  )}
+                  {e.text && <CopyButton text={e.text} />}
                 </div>
               );
             }
@@ -575,8 +585,17 @@ export function App() {
         </div>
       </div>
 
-      <div style={{ padding: "12px 24px 16px", borderTop: `1px solid ${colors.border}` }}>
-        <div style={{ maxWidth: 720, margin: "0 auto", display: "flex", gap: 8 }}>
+      <div style={{ padding: "8px 24px 18px" }}>
+        <div
+          style={{
+            maxWidth: 720,
+            margin: "0 auto",
+            background: colors.panel,
+            border: `1px solid ${colors.border}`,
+            borderRadius: 16,
+            padding: "12px 14px 10px",
+          }}
+        >
           <textarea
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
@@ -586,54 +605,72 @@ export function App() {
                 void submit();
               }
             }}
-            placeholder={connected ? "Message Pareto — Enter to send, Shift+Enter for newline" : "Engine starting…"}
+            placeholder={connected ? "Do anything" : "Engine starting…"}
             disabled={!connected}
             rows={2}
             style={{
-              flex: 1,
+              width: "100%",
               resize: "none",
-              background: colors.panel,
+              background: "transparent",
               color: colors.fg,
-              border: `1px solid ${colors.border}`,
-              borderRadius: 10,
-              padding: "10px 12px",
-              fontSize: 14,
+              border: "none",
+              fontSize: 14.5,
               fontFamily: "inherit",
               outline: "none",
+              display: "block",
             }}
           />
-          {busy ? (
-            <button
-              onClick={() => void window.unbiased.interrupt()}
-              style={{
-                background: "transparent",
-                color: colors.err,
-                border: `1px solid ${colors.err}`,
-                borderRadius: 10,
-                padding: "0 18px",
-                fontSize: 14,
-                cursor: "pointer",
-              }}
-            >
-              Stop
-            </button>
-          ) : (
-            <button
-              onClick={() => void submit()}
-              disabled={!connected || !draft.trim()}
-              style={{
-                background: connected && draft.trim() ? colors.accent : colors.panel,
-                color: connected && draft.trim() ? "#3b1008" : colors.dim,
-                border: "none",
-                borderRadius: 10,
-                padding: "0 18px",
-                fontSize: 14,
-                cursor: connected && draft.trim() ? "pointer" : "default",
-              }}
-            >
-              Send
-            </button>
-          )}
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginTop: 6 }}>
+            <span style={{ color: colors.dim, fontSize: 12.5 }}>
+              {activeProject ? `${activeProject.name} · ` : ""}pareto · read-only
+            </span>
+            {busy ? (
+              <button
+                onClick={() => void window.unbiased.interrupt()}
+                title="Stop"
+                aria-label="Stop"
+                style={{
+                  width: 32,
+                  height: 32,
+                  borderRadius: 16,
+                  background: "transparent",
+                  color: colors.err,
+                  border: `1.5px solid ${colors.err}`,
+                  cursor: "pointer",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  fontSize: 11,
+                }}
+              >
+                ■
+              </button>
+            ) : (
+              <button
+                onClick={() => void submit()}
+                disabled={!connected || !draft.trim()}
+                title="Send"
+                aria-label="Send"
+                style={{
+                  width: 32,
+                  height: 32,
+                  borderRadius: 16,
+                  background: connected && draft.trim() ? colors.accent : "#2a2a2e",
+                  color: connected && draft.trim() ? "#3b1008" : colors.dim,
+                  border: "none",
+                  cursor: connected && draft.trim() ? "pointer" : "default",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                }}
+              >
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                  <path d="M12 19V5" />
+                  <path d="M5 12l7-7 7 7" />
+                </svg>
+              </button>
+            )}
+          </div>
         </div>
       </div>
 
@@ -675,6 +712,39 @@ function ChatFooter({ status, busy, elapsed }: { status: EngineStatus; busy: boo
       {status.state === "starting" && <span>starting engine…</span>}
       {status.state === "exited" && <span style={{ color: colors.err }}>{status.detail}</span>}
     </footer>
+  );
+}
+
+function CopyButton({ text }: { text: string }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <button
+      onClick={() => {
+        void navigator.clipboard.writeText(text);
+        setCopied(true);
+        setTimeout(() => setCopied(false), 1200);
+      }}
+      title="Copy reply"
+      aria-label="Copy reply"
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 5,
+        background: "transparent",
+        border: "none",
+        color: copied ? colors.ok : colors.dim,
+        fontSize: 12,
+        cursor: "pointer",
+        padding: "4px 0 0",
+        fontFamily: "inherit",
+      }}
+    >
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+        <rect x="9" y="9" width="13" height="13" rx="2" />
+        <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+      </svg>
+      {copied ? "copied" : ""}
+    </button>
   );
 }
 
@@ -829,16 +899,16 @@ function StepsGroup({
   const expanded = open || needsApproval;
 
   const summary = needsApproval
-    ? { text: "needs your approval", color: colors.amber }
+    ? { text: "Needs your approval", color: colors.amber }
     : running
-      ? { text: "working…", color: colors.amber }
+      ? { text: "Working…", color: colors.amber }
       : {
-          text: `${items.length} step${items.length === 1 ? "" : "s"}${failed ? " · issues" : ""}`,
+          text: `Worked · ${items.length} step${items.length === 1 ? "" : "s"}${failed ? " · issues" : ""}`,
           color: failed ? colors.err : colors.dim,
         };
 
   return (
-    <div style={{ margin: "10px 0" }}>
+    <div style={{ margin: "14px 0" }}>
       <button
         onClick={() => setOpen((o) => !o)}
         style={{
@@ -848,23 +918,24 @@ function StepsGroup({
           background: "transparent",
           border: "none",
           color: summary.color,
-          fontSize: 12.5,
+          fontSize: 13.5,
           cursor: "pointer",
           padding: "2px 0",
           fontFamily: "-apple-system, system-ui, sans-serif",
         }}
       >
+        {summary.text}
         <span
           style={{
             display: "inline-block",
             transform: expanded ? "rotate(90deg)" : "none",
             transition: "transform 120ms",
-            fontSize: 10,
+            fontSize: 11,
+            marginTop: 1,
           }}
         >
-          ▶
+          ›
         </span>
-        {summary.text}
       </button>
       {expanded &&
         items.map((e) => {
