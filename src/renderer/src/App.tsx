@@ -124,9 +124,14 @@ export function App() {
   const [hoveredThreadId, setHoveredThreadId] = useState<string | null>(null);
   const [mainBusy, setMainBusy] = useState(false);
   const [mainReset, setMainReset] = useState<{ entries: Entry[]; nonce: number }>({ entries: [], nonce: 0 });
-  const [sideOpen, setSideOpen] = useState(false);
+  const [sideOpen, setSideOpen] = useState(() => localStorage.getItem("sideOpen") === "true");
   const [sideContext, setSideContext] = useState<string | null>(null);
   const [sideNonce, setSideNonce] = useState(0);
+
+  function setSideOpenPersisted(open: boolean) {
+    localStorage.setItem("sideOpen", String(open));
+    setSideOpen(open);
+  }
   const [navOpen, setNavOpen] = useState(() => localStorage.getItem("navOpen") !== "false");
   // The main/side split is a FRACTION of the content area (not pixels), so
   // collapsing the nav or resizing the window scales both panes in ratio.
@@ -227,14 +232,13 @@ export function App() {
 
   function askInSideChat(text: string) {
     setSideContext(text);
-    setSideOpen(true);
+    setSideOpenPersisted(true);
   }
 
-  async function closeSideChat() {
-    await window.unbiased.resetSideChat();
-    setSideOpen(false);
-    setSideContext(null);
-    setSideNonce((n) => n + 1);
+  // Closing HIDES the side chat — its conversation survives and reopening
+  // restores it. Only the ✎ (new side chat) actually resets the thread.
+  function closeSideChat() {
+    setSideOpenPersisted(false);
   }
 
   async function newSideChat() {
@@ -284,7 +288,7 @@ export function App() {
             Open project…
           </SidebarAction>
           <SidebarAction
-            onClick={() => (sideOpen ? void closeSideChat() : setSideOpen(true))}
+            onClick={() => setSideOpenPersisted(!sideOpen)}
             disabled={false}
             icon={<SideChatIcon />}
           >
@@ -438,12 +442,13 @@ export function App() {
           }}
         />
       )}
-      {sideOpen && (
+      {/* Always mounted so the side conversation survives hide/show; only
+          its visibility toggles. */}
         <div
           style={{
-            flex: `${sideFrac} 1 0%`,
-            minWidth: 300,
-            display: "flex",
+            flex: sideOpen ? `${sideFrac} 1 0%` : "0 0 0%",
+            minWidth: sideOpen ? 300 : 0,
+            display: sideOpen ? "flex" : "none",
             flexDirection: "column",
             background: "#131317",
           }}
@@ -491,7 +496,6 @@ export function App() {
             }
           />
         </div>
-      )}
     </div>
   );
 }
