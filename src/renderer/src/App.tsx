@@ -713,42 +713,42 @@ function ChatPane({
   }
 
   const mdComponents = {
-    code: (props: { className?: string; children?: React.ReactNode }) => (
-      <code
-        style={{
-          fontFamily: "ui-monospace, SFMono-Regular, monospace",
-          fontSize: 12.5,
-          background: "#141417",
-          padding: props.className ? undefined : "1px 5px",
-          borderRadius: 4,
-          display: props.className ? "block" : "inline",
-          overflowX: props.className ? "auto" : undefined,
-        }}
-      >
-        {props.children}
-      </code>
-    ),
+    code: (props: { className?: string; children?: React.ReactNode }) => {
+      if (props.className) {
+        // Block code: the surrounding <pre> (CodeBlock) owns the chrome.
+        return <code style={{ fontFamily: "inherit", fontSize: "inherit" }}>{props.children}</code>;
+      }
+      const text = extractText(props.children);
+      const clickable = Boolean(onAskSideChat);
+      return (
+        <code
+          onClick={clickable ? () => onAskSideChat!(text) : undefined}
+          title={clickable ? "Open in side chat" : undefined}
+          style={{
+            fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+            fontSize: "0.84em",
+            background: "#26262b",
+            color: "#e8e6e3",
+            padding: "2px 6px",
+            borderRadius: 6,
+            cursor: clickable ? "pointer" : "inherit",
+          }}
+        >
+          {props.children}
+        </code>
+      );
+    },
     pre: (props: { children?: React.ReactNode }) => (
-      <pre
-        style={{
-          background: "#141417",
-          border: `1px solid ${colors.border}`,
-          borderRadius: 8,
-          padding: "10px 12px",
-          overflowX: "auto",
-          margin: "8px 0",
-        }}
-      >
-        {props.children}
-      </pre>
+      <CodeBlock onOpenCode={onAskSideChat}>{props.children}</CodeBlock>
     ),
-    p: (props: { children?: React.ReactNode }) => <p style={{ margin: "6px 0" }}>{props.children}</p>,
+    p: (props: { children?: React.ReactNode }) => <p style={{ margin: "10px 0" }}>{props.children}</p>,
     ul: (props: { children?: React.ReactNode }) => (
-      <ul style={{ margin: "6px 0", paddingLeft: 22 }}>{props.children}</ul>
+      <ul style={{ margin: "10px 0", paddingLeft: 24 }}>{props.children}</ul>
     ),
     ol: (props: { children?: React.ReactNode }) => (
-      <ol style={{ margin: "6px 0", paddingLeft: 22 }}>{props.children}</ol>
+      <ol style={{ margin: "10px 0", paddingLeft: 24 }}>{props.children}</ol>
     ),
+    li: (props: { children?: React.ReactNode }) => <li style={{ margin: "4px 0" }}>{props.children}</li>,
   };
 
   return (
@@ -825,7 +825,7 @@ function ChatPane({
             }
             if (e.kind === "assistant") {
               return (
-                <div key={block.key} style={{ margin: "14px 0", lineHeight: 1.7, fontSize: 15 }}>
+                <div key={block.key} style={{ margin: "16px 0", lineHeight: 1.75, fontSize: 15.5 }}>
                   <Markdown remarkPlugins={[remarkGfm]} components={mdComponents}>
                     {e.text}
                   </Markdown>
@@ -983,6 +983,125 @@ function ChatPane({
           </div>
         </div>
       </div>
+    </div>
+  );
+}
+
+/** Pull the raw text out of react-markdown's rendered children. */
+function extractText(node: React.ReactNode): string {
+  if (node == null || typeof node === "boolean") return "";
+  if (typeof node === "string" || typeof node === "number") return String(node);
+  if (Array.isArray(node)) return node.map(extractText).join("");
+  if (typeof node === "object" && "props" in node) {
+    return extractText((node as { props: { children?: React.ReactNode } }).props.children);
+  }
+  return "";
+}
+
+const LANGUAGE_NAMES: Record<string, string> = {
+  ts: "TypeScript",
+  typescript: "TypeScript",
+  tsx: "TypeScript",
+  js: "JavaScript",
+  javascript: "JavaScript",
+  jsx: "JavaScript",
+  py: "Python",
+  python: "Python",
+  go: "Go",
+  rust: "Rust",
+  sh: "Shell",
+  bash: "Shell",
+  zsh: "Shell",
+  json: "JSON",
+  toml: "TOML",
+  yaml: "YAML",
+  html: "HTML",
+  css: "CSS",
+  sql: "SQL",
+};
+
+/** Codex-style fenced code block: header bar with a language label and copy,
+ *  dark canvas, and (in the main pane) click-to-open in the side chat. */
+function CodeBlock({ children, onOpenCode }: { children?: React.ReactNode; onOpenCode?: (text: string) => void }) {
+  const [copied, setCopied] = useState(false);
+  const child = Array.isArray(children) ? children[0] : children;
+  const className: string =
+    (typeof child === "object" && child && "props" in child
+      ? ((child as { props: { className?: string } }).props.className ?? "")
+      : "") || "";
+  const lang = /language-([\w-]+)/.exec(className)?.[1]?.toLowerCase() ?? "";
+  const label = LANGUAGE_NAMES[lang] ?? (lang ? lang.toUpperCase() : "Plain text");
+  const text = extractText(children).replace(/\n$/, "");
+
+  return (
+    <div
+      onClick={
+        onOpenCode
+          ? () => {
+              // A drag-select inside the block is reading, not clicking.
+              if (window.getSelection()?.isCollapsed) onOpenCode(text);
+            }
+          : undefined
+      }
+      title={onOpenCode ? "Open in side chat" : undefined}
+      style={{
+        background: "#101014",
+        border: `1px solid #26262b`,
+        borderRadius: 10,
+        margin: "12px 0",
+        overflow: "hidden",
+        cursor: onOpenCode ? "pointer" : "default",
+      }}
+    >
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          padding: "7px 12px",
+          fontSize: 12,
+          color: colors.dim,
+        }}
+      >
+        <span>{label}</span>
+        <button
+          onClick={(ev) => {
+            ev.stopPropagation();
+            void navigator.clipboard.writeText(text);
+            setCopied(true);
+            setTimeout(() => setCopied(false), 1200);
+          }}
+          title="Copy code"
+          aria-label="Copy code"
+          style={{
+            background: "transparent",
+            border: "none",
+            color: copied ? colors.ok : colors.dim,
+            cursor: "pointer",
+            padding: 2,
+            display: "flex",
+            alignItems: "center",
+          }}
+        >
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <rect x="9" y="9" width="13" height="13" rx="2" />
+            <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+          </svg>
+        </button>
+      </div>
+      <pre
+        style={{
+          margin: 0,
+          padding: "2px 14px 12px",
+          overflowX: "auto",
+          fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+          fontSize: 12.75,
+          lineHeight: 1.65,
+          color: "#d7d5d1",
+        }}
+      >
+        {children}
+      </pre>
     </div>
   );
 }
