@@ -194,12 +194,20 @@ export function App() {
     });
   }, []);
 
+  // The side chat is attached to the main conversation (it forks from it),
+  // so every main-context switch discards the side pane's transcript too.
+  function resetSideView() {
+    setSideContext(null);
+    setSideNonce((n) => n + 1);
+  }
+
   async function newChat(project?: { name: string; path: string }) {
     if (mainBusy) return;
     await window.unbiased.detachThread(project?.path);
     setActiveProject(project ?? null);
     setActiveThreadId(null);
     setMainReset((r) => ({ entries: [], nonce: r.nonce + 1 }));
+    resetSideView();
   }
 
   async function openProjectDialog() {
@@ -209,6 +217,7 @@ export function App() {
     setActiveProject({ name, path });
     setActiveThreadId(null);
     setMainReset((r) => ({ entries: [], nonce: r.nonce + 1 }));
+    resetSideView();
     void refreshThreads(); // the project shows in the sidebar immediately
   }
 
@@ -218,6 +227,7 @@ export function App() {
     setActiveProject(null);
     setActiveThreadId(id);
     setMainReset((r) => ({ entries: history, nonce: r.nonce + 1 }));
+    resetSideView();
   }
 
   async function deleteThread(id: string) {
@@ -226,6 +236,7 @@ export function App() {
     if (id === activeThreadId) {
       setActiveThreadId(null);
       setMainReset((r) => ({ entries: [], nonce: r.nonce + 1 }));
+      resetSideView();
     }
     void refreshThreads();
   }
@@ -490,7 +501,8 @@ export function App() {
                 </div>
                 <p style={{ fontSize: 16, fontWeight: 500, margin: 0 }}>Side chat</p>
                 <p style={{ color: colors.dim, marginTop: 6, fontSize: 13 }}>
-                  Side chats are temporary and disappear when you close the app.
+                  Shares this conversation’s context. Temporary — it resets when
+                  you switch conversations and disappears when you close the app.
                 </p>
               </div>
             }

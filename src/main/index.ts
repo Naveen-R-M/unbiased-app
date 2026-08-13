@@ -262,13 +262,30 @@ app.whenReady().then(async () => {
     const pane = panes[paneId];
     let created = false;
     if (!pane.threadId) {
-      const startParams =
-        paneId === "side"
-          ? { ...THREAD_POLICY, ephemeral: true }
-          : { ...THREAD_POLICY, ...(pendingCwd ? { cwd: pendingCwd } : {}) };
-      const started = (await engine.request("thread/start", startParams)) as {
-        thread: { id: string };
-      };
+      let started: { thread: { id: string } };
+      if (paneId === "side" && panes.main.threadId) {
+        // The Codex semantics, confirmed from its own client: a side chat is
+        // an ephemeral FORK of the parent conversation — full context copied
+        // into a temporary thread the engine forgets at exit. excludeTurns
+        // only trims the response payload, not the model-visible history.
+        started = (await engine.request("thread/fork", {
+          threadId: panes.main.threadId,
+          ephemeral: true,
+          excludeTurns: true,
+          ...THREAD_POLICY,
+        })) as { thread: { id: string } };
+      } else if (paneId === "side") {
+        // No parent conversation yet: a plain scratch thread.
+        started = (await engine.request("thread/start", {
+          ...THREAD_POLICY,
+          ephemeral: true,
+        })) as { thread: { id: string } };
+      } else {
+        started = (await engine.request("thread/start", {
+          ...THREAD_POLICY,
+          ...(pendingCwd ? { cwd: pendingCwd } : {}),
+        })) as { thread: { id: string } };
+      }
       pane.threadId = started.thread.id;
       created = true;
     }
@@ -338,6 +355,8 @@ app.whenReady().then(async () => {
     pendingCwd = path;
     panes.main.threadId = null;
     panes.main.turnId = null;
+    panes.side.threadId = null;
+    panes.side.turnId = null;
     return { path, name: path.split("/").filter(Boolean).pop() ?? path };
   });
 
@@ -347,6 +366,10 @@ app.whenReady().then(async () => {
     };
     panes.main.threadId = id;
     panes.main.turnId = null;
+    // The side chat (if any) was forked from the previous conversation;
+    // it resets alongside every main-context switch.
+    panes.side.threadId = null;
+    panes.side.turnId = null;
     return { id, entries: threadToEntries(result.thread) };
   });
 
@@ -354,6 +377,8 @@ app.whenReady().then(async () => {
     // Fresh main-chat view: the next send creates a new thread, in `cwd` if given.
     panes.main.threadId = null;
     panes.main.turnId = null;
+    panes.side.threadId = null;
+    panes.side.turnId = null;
     pendingCwd = cwd ?? null;
     return { ok: true };
   });
@@ -371,6 +396,8 @@ app.whenReady().then(async () => {
     if (panes.main.threadId === id) {
       panes.main.threadId = null;
       panes.main.turnId = null;
+      panes.side.threadId = null;
+      panes.side.turnId = null;
     }
     return { ok: true };
   });
