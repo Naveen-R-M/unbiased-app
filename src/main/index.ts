@@ -89,6 +89,9 @@ function wireNotifications(): void {
         pendingApprovals.set(requestId, msg.id);
         send("chat:approval-request", {
           requestId,
+          // itemId ties the request to its commandExecution item so the
+          // renderer can put the buttons ON the command card.
+          itemId: (params.itemId as string) ?? null,
           command: (params.command as string) ?? "(unknown command)",
           cwd: (params.cwd as string) ?? null,
           reason: (params.reason as string) ?? null,

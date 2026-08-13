@@ -1,4 +1,6 @@
 import { useEffect, useRef, useState } from "react";
+import Markdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 type EngineStatus =
   | { state: "starting" }
@@ -18,13 +20,14 @@ type Entry =
   | { kind: "user"; text: string }
   | { kind: "assistant"; text: string; interrupted?: boolean }
   | {
-      kind: "approval";
-      requestId: string;
+      kind: "command";
+      itemId: string;
       command: string;
-      reason: string | null;
-      decision?: "accept" | "decline";
-    }
-  | { kind: "command"; itemId: string; command: string; status: string; exitCode?: number; output?: string };
+      status: string; // inProgress | completed | failed | declined | awaitingApproval
+      exitCode?: number;
+      output?: string;
+      approval?: { requestId: string; reason: string | null; decision?: "accept" | "decline" };
+    };
 
 declare global {
   interface Window {
@@ -38,7 +41,13 @@ declare global {
       onTurnCompleted: (cb: (p: { status: string }) => void) => () => void;
       decideApproval: (requestId: string, decision: "accept" | "decline") => Promise<{ ok: boolean }>;
       onApprovalRequest: (
-        cb: (p: { requestId: string; command: string; cwd: string | null; reason: string | null }) => void,
+        cb: (p: {
+          requestId: string;
+          itemId: string | null;
+          command: string;
+          cwd: string | null;
+          reason: string | null;
+        }) => void,
       ) => () => void;
       onCommand: (cb: (p: { phase: "started" | "completed"; item: CommandItem }) => void) => () => void;
     };
@@ -56,6 +65,15 @@ const colors = {
   err: "#F09595",
   amber: "#FAC775",
 };
+
+/** Drop a trailing empty assistant placeholder (it exists only so deltas have
+ *  somewhere to land; once a command card or turn end arrives, an empty one
+ *  is just noise). */
+function withoutTrailingPlaceholder(es: Entry[]): Entry[] {
+  const last = es[es.length - 1];
+  if (last?.kind === "assistant" && last.text === "" && !last.interrupted) return es.slice(0, -1);
+  return es;
+}
 
 export function App() {
   const [status, setStatus] = useState<EngineStatus>({ state: "starting" });
@@ -90,34 +108,66 @@ export function App() {
       }),
       window.unbiased.onTurnCompleted(({ status: turnStatus }) => {
         setBusy(false);
-        if (turnStatus === "interrupted") {
-          setEntries((es) => {
-            const last = es[es.length - 1];
-            if (last?.kind === "assistant") return [...es.slice(0, -1), { ...last, interrupted: true }];
-            return es;
-          });
-        }
+        setEntries((es) => {
+          let next = es;
+          if (turnStatus === "interrupted") {
+            const last = next[next.length - 1];
+            if (last?.kind === "assistant" && last.text !== "") {
+              next = [...next.slice(0, -1), { ...last, interrupted: true }];
+            }
+          }
+          return withoutTrailingPlaceholder(next);
+        });
       }),
       window.unbiased.onApprovalRequest((p) => {
-        setEntries((es) => [
-          ...es,
-          { kind: "approval", requestId: p.requestId, command: p.command, reason: p.reason },
-        ]);
+        setEntries((es) => {
+          const cleaned = withoutTrailingPlaceholder(es);
+          const approval = { requestId: p.requestId, reason: p.reason };
+          const idx = cleaned.findIndex((e) => e.kind === "command" && e.itemId === p.itemId);
+          if (idx !== -1) {
+            const cmd = cleaned[idx] as Extract<Entry, { kind: "command" }>;
+            const updated: Entry = { ...cmd, status: "awaitingApproval", approval };
+            return [...cleaned.slice(0, idx), updated, ...cleaned.slice(idx + 1)];
+          }
+          return [
+            ...cleaned,
+            {
+              kind: "command",
+              itemId: p.itemId ?? p.requestId,
+              command: p.command,
+              status: "awaitingApproval",
+              approval,
+            },
+          ];
+        });
       }),
       window.unbiased.onCommand(({ phase, item }) => {
         setEntries((es) => {
+          const cleaned = withoutTrailingPlaceholder(es);
           const itemId = item.id ?? "unknown";
-          const next: Entry = {
-            kind: "command",
-            itemId,
-            command: item.command ?? "(command)",
-            status: item.status ?? (phase === "started" ? "inProgress" : "completed"),
-            exitCode: item.exitCode,
-            output: item.aggregatedOutput ?? item.output,
+          const idx = cleaned.findIndex((e) => e.kind === "command" && e.itemId === itemId);
+          if (idx === -1) {
+            return [
+              ...cleaned,
+              {
+                kind: "command",
+                itemId,
+                command: item.command ?? "(command)",
+                status: item.status ?? (phase === "started" ? "inProgress" : "completed"),
+                exitCode: item.exitCode,
+                output: item.aggregatedOutput ?? item.output,
+              },
+            ];
+          }
+          const existing = cleaned[idx] as Extract<Entry, { kind: "command" }>;
+          const updated: Entry = {
+            ...existing,
+            command: item.command ?? existing.command,
+            status: item.status ?? existing.status,
+            exitCode: item.exitCode ?? existing.exitCode,
+            output: item.aggregatedOutput ?? item.output ?? existing.output,
           };
-          const idx = es.findIndex((e) => e.kind === "command" && e.itemId === itemId);
-          if (idx === -1) return [...es, next];
-          return [...es.slice(0, idx), next, ...es.slice(idx + 1)];
+          return [...cleaned.slice(0, idx), updated, ...cleaned.slice(idx + 1)];
         });
       }),
     ];
@@ -129,33 +179,80 @@ export function App() {
   }, [entries]);
 
   const connected = status.state === "connected";
+  const lastEntry = entries[entries.length - 1];
+  const showThinking = busy && !(lastEntry?.kind === "assistant" && lastEntry.text !== "");
 
   async function submit() {
     const text = draft.trim();
     if (!text || busy || !connected) return;
     setDraft("");
     setBusy(true);
-    setEntries((es) => [...es, { kind: "user", text }, { kind: "assistant", text: "" }]);
+    setEntries((es) => [...es, { kind: "user", text }]);
     try {
       await window.unbiased.sendMessage(text);
     } catch (err) {
       setBusy(false);
-      setEntries((es) => [
-        ...es.slice(0, -1),
-        { kind: "assistant", text: `Something went wrong: ${String(err)}` },
-      ]);
+      setEntries((es) => [...es, { kind: "assistant", text: `Something went wrong: ${String(err)}` }]);
     }
   }
 
-  async function decide(requestId: string, decision: "accept" | "decline") {
+  async function decide(itemId: string, requestId: string, decision: "accept" | "decline") {
     setEntries((es) =>
-      es.map((e) => (e.kind === "approval" && e.requestId === requestId ? { ...e, decision } : e)),
+      es.map((e) =>
+        e.kind === "command" && e.itemId === itemId && e.approval
+          ? { ...e, approval: { ...e.approval, decision }, status: decision === "decline" ? "declined" : "inProgress" }
+          : e,
+      ),
     );
     await window.unbiased.decideApproval(requestId, decision);
   }
 
-  const commandStatusColor = (s: string, exitCode?: number) =>
-    s === "declined" ? colors.dim : s === "failed" || (exitCode ?? 0) !== 0 ? colors.err : s === "inProgress" ? colors.amber : colors.ok;
+  const statusLabel = (e: Extract<Entry, { kind: "command" }>) => {
+    if (e.status === "awaitingApproval") return { text: "▸ needs approval", color: colors.amber };
+    if (e.status === "inProgress") return { text: "▸ running", color: colors.amber };
+    if (e.status === "declined") return { text: "▸ declined", color: colors.dim };
+    if (e.status === "failed" || (e.exitCode ?? 0) !== 0) return { text: `▸ exit ${e.exitCode ?? "?"}`, color: colors.err };
+    return { text: "▸ done", color: colors.ok };
+  };
+
+  const mdComponents = {
+    code: (props: { className?: string; children?: React.ReactNode }) => (
+      <code
+        style={{
+          fontFamily: "ui-monospace, SFMono-Regular, monospace",
+          fontSize: 12.5,
+          background: "#141417",
+          padding: props.className ? undefined : "1px 5px",
+          borderRadius: 4,
+          display: props.className ? "block" : "inline",
+          overflowX: props.className ? "auto" : undefined,
+        }}
+      >
+        {props.children}
+      </code>
+    ),
+    pre: (props: { children?: React.ReactNode }) => (
+      <pre
+        style={{
+          background: "#141417",
+          border: `1px solid ${colors.border}`,
+          borderRadius: 8,
+          padding: "10px 12px",
+          overflowX: "auto",
+          margin: "8px 0",
+        }}
+      >
+        {props.children}
+      </pre>
+    ),
+    p: (props: { children?: React.ReactNode }) => <p style={{ margin: "6px 0" }}>{props.children}</p>,
+    ul: (props: { children?: React.ReactNode }) => (
+      <ul style={{ margin: "6px 0", paddingLeft: 22 }}>{props.children}</ul>
+    ),
+    ol: (props: { children?: React.ReactNode }) => (
+      <ol style={{ margin: "6px 0", paddingLeft: 22 }}>{props.children}</ol>
+    ),
+  };
 
   return (
     <div
@@ -183,106 +280,50 @@ export function App() {
         )}
         <div style={{ maxWidth: 720, margin: "0 auto", padding: "0 24px" }}>
           {entries.map((e, i) => {
-            if (e.kind === "user" || e.kind === "assistant") {
+            if (e.kind === "user") {
               return (
-                <div
-                  key={i}
-                  style={{
-                    display: "flex",
-                    justifyContent: e.kind === "user" ? "flex-end" : "flex-start",
-                    margin: "10px 0",
-                  }}
-                >
+                <div key={i} style={{ display: "flex", justifyContent: "flex-end", margin: "10px 0" }}>
                   <div
                     style={{
                       maxWidth: "85%",
                       padding: "10px 14px",
                       borderRadius: 12,
-                      background: e.kind === "user" ? "#33322f" : colors.panel,
-                      border: e.kind === "assistant" ? `1px solid ${colors.border}` : "none",
+                      background: "#33322f",
                       whiteSpace: "pre-wrap",
                       lineHeight: 1.55,
                       fontSize: 14,
                     }}
                   >
-                    {e.text ||
-                      (busy && i === entries.length - 1 && e.kind === "assistant" ? (
-                        <span style={{ color: colors.dim }}>thinking… {elapsed.toFixed(1)}s</span>
-                      ) : (
-                        ""
-                      ))}
-                    {e.kind === "assistant" && e.interrupted && (
-                      <div style={{ color: colors.dim, fontSize: 12, marginTop: 6 }}>— stopped</div>
+                    {e.text}
+                  </div>
+                </div>
+              );
+            }
+            if (e.kind === "assistant") {
+              return (
+                <div key={i} style={{ display: "flex", justifyContent: "flex-start", margin: "10px 0" }}>
+                  <div
+                    style={{
+                      maxWidth: "85%",
+                      padding: "4px 14px",
+                      borderRadius: 12,
+                      background: colors.panel,
+                      border: `1px solid ${colors.border}`,
+                      lineHeight: 1.55,
+                      fontSize: 14,
+                    }}
+                  >
+                    <Markdown remarkPlugins={[remarkGfm]} components={mdComponents}>
+                      {e.text}
+                    </Markdown>
+                    {e.interrupted && (
+                      <div style={{ color: colors.dim, fontSize: 12, margin: "0 0 6px" }}>— stopped</div>
                     )}
                   </div>
                 </div>
               );
             }
-            if (e.kind === "approval") {
-              return (
-                <div
-                  key={i}
-                  style={{
-                    margin: "10px 0",
-                    padding: "12px 14px",
-                    borderRadius: 12,
-                    border: `1px solid ${e.decision ? colors.border : colors.amber}`,
-                    background: colors.panel,
-                    fontSize: 13,
-                  }}
-                >
-                  <div style={{ color: e.decision ? colors.dim : colors.amber, marginBottom: 8 }}>
-                    {e.decision ? `Command ${e.decision === "accept" ? "approved" : "declined"}` : "Pareto wants to run a command"}
-                  </div>
-                  <code
-                    style={{
-                      display: "block",
-                      fontFamily: "ui-monospace, SFMono-Regular, monospace",
-                      fontSize: 12.5,
-                      color: colors.fg,
-                      whiteSpace: "pre-wrap",
-                      marginBottom: e.reason || !e.decision ? 10 : 0,
-                    }}
-                  >
-                    {e.command}
-                  </code>
-                  {e.reason && <div style={{ color: colors.dim, marginBottom: 10 }}>{e.reason}</div>}
-                  {!e.decision && (
-                    <div style={{ display: "flex", gap: 8 }}>
-                      <button
-                        onClick={() => void decide(e.requestId, "accept")}
-                        style={{
-                          background: colors.ok,
-                          color: "#04342C",
-                          border: "none",
-                          borderRadius: 8,
-                          padding: "6px 16px",
-                          fontSize: 13,
-                          cursor: "pointer",
-                        }}
-                      >
-                        Approve
-                      </button>
-                      <button
-                        onClick={() => void decide(e.requestId, "decline")}
-                        style={{
-                          background: "transparent",
-                          color: colors.err,
-                          border: `1px solid ${colors.err}`,
-                          borderRadius: 8,
-                          padding: "6px 16px",
-                          fontSize: 13,
-                          cursor: "pointer",
-                        }}
-                      >
-                        Decline
-                      </button>
-                    </div>
-                  )}
-                </div>
-              );
-            }
-            // command
+            const label = statusLabel(e);
             return (
               <div
                 key={i}
@@ -290,18 +331,53 @@ export function App() {
                   margin: "10px 0",
                   padding: "10px 14px",
                   borderRadius: 12,
-                  border: `1px solid ${colors.border}`,
+                  border: `1px solid ${e.status === "awaitingApproval" ? colors.amber : colors.border}`,
                   background: "#141417",
                   fontSize: 12.5,
                   fontFamily: "ui-monospace, SFMono-Regular, monospace",
                 }}
               >
                 <div style={{ display: "flex", gap: 8, alignItems: "baseline" }}>
-                  <span style={{ color: commandStatusColor(e.status, e.exitCode) }}>
-                    {e.status === "inProgress" ? "▸ running" : e.status === "declined" ? "▸ declined" : (e.exitCode ?? 0) === 0 && e.status !== "failed" ? "▸ done" : `▸ exit ${e.exitCode}`}
-                  </span>
+                  <span style={{ color: label.color, flexShrink: 0 }}>{label.text}</span>
                   <span style={{ whiteSpace: "pre-wrap", color: colors.fg }}>{e.command}</span>
                 </div>
+                {e.approval?.reason && (
+                  <div style={{ color: colors.dim, marginTop: 6, fontFamily: "inherit" }}>{e.approval.reason}</div>
+                )}
+                {e.status === "awaitingApproval" && e.approval && !e.approval.decision && (
+                  <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+                    <button
+                      onClick={() => void decide(e.itemId, e.approval!.requestId, "accept")}
+                      style={{
+                        background: colors.ok,
+                        color: "#04342C",
+                        border: "none",
+                        borderRadius: 8,
+                        padding: "6px 16px",
+                        fontSize: 13,
+                        cursor: "pointer",
+                        fontFamily: "-apple-system, system-ui, sans-serif",
+                      }}
+                    >
+                      Approve
+                    </button>
+                    <button
+                      onClick={() => void decide(e.itemId, e.approval!.requestId, "decline")}
+                      style={{
+                        background: "transparent",
+                        color: colors.err,
+                        border: `1px solid ${colors.err}`,
+                        borderRadius: 8,
+                        padding: "6px 16px",
+                        fontSize: 13,
+                        cursor: "pointer",
+                        fontFamily: "-apple-system, system-ui, sans-serif",
+                      }}
+                    >
+                      Decline
+                    </button>
+                  </div>
+                )}
                 {e.output && (
                   <pre
                     style={{
@@ -318,6 +394,22 @@ export function App() {
               </div>
             );
           })}
+          {showThinking && (
+            <div style={{ display: "flex", justifyContent: "flex-start", margin: "10px 0" }}>
+              <div
+                style={{
+                  padding: "10px 14px",
+                  borderRadius: 12,
+                  background: colors.panel,
+                  border: `1px solid ${colors.border}`,
+                  fontSize: 14,
+                  color: colors.dim,
+                }}
+              >
+                thinking… {elapsed.toFixed(1)}s
+              </div>
+            </div>
+          )}
         </div>
       </div>
 
