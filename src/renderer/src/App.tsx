@@ -29,12 +29,14 @@ type Entry =
       approval?: { requestId: string; reason: string | null; decision?: "accept" | "decline" };
     };
 
+type ThreadSummary = { id: string; title: string; createdAt?: string };
+
 declare global {
   interface Window {
     unbiased: {
       getEngineStatus: () => Promise<EngineStatus>;
       onEngineStatus: (cb: (status: EngineStatus) => void) => () => void;
-      sendMessage: (text: string) => Promise<{ turnId: string | null }>;
+      sendMessage: (text: string) => Promise<{ turnId: string | null; threadId: string; created: boolean }>;
       interrupt: () => Promise<{ interrupted: boolean }>;
       onTurnStarted: (cb: (p: { turnId: string | null }) => void) => () => void;
       onDelta: (cb: (p: { delta: string }) => void) => () => void;
@@ -50,6 +52,9 @@ declare global {
         }) => void,
       ) => () => void;
       onCommand: (cb: (p: { phase: "started" | "completed"; item: CommandItem }) => void) => () => void;
+      listThreads: () => Promise<{ threads: ThreadSummary[] }>;
+      openThread: (id: string) => Promise<{ id: string; entries: Entry[] }>;
+      detachThread: () => Promise<{ ok: boolean }>;
     };
   }
 }
@@ -104,7 +109,28 @@ export function App() {
   const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState(false);
   const [elapsed, setElapsed] = useState(0);
+  const [threads, setThreads] = useState<ThreadSummary[]>([]);
+  const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+
+  async function refreshThreads() {
+    const { threads: list } = await window.unbiased.listThreads();
+    setThreads(list);
+  }
+
+  async function newChat() {
+    if (busy) return;
+    await window.unbiased.detachThread();
+    setActiveThreadId(null);
+    setEntries([]);
+  }
+
+  async function openThread(id: string) {
+    if (busy || id === activeThreadId) return;
+    const { entries: history } = await window.unbiased.openThread(id);
+    setActiveThreadId(id);
+    setEntries(history);
+  }
 
   // Pareto today completes the whole response before its first byte arrives
   // (~3-5s of silence), so the wait needs to look attended, not frozen.
@@ -119,9 +145,15 @@ export function App() {
   }, [busy]);
 
   useEffect(() => {
-    window.unbiased.getEngineStatus().then(setStatus);
+    window.unbiased.getEngineStatus().then((s) => {
+      setStatus(s);
+      if (s.state === "connected") void refreshThreads();
+    });
     const offs = [
-      window.unbiased.onEngineStatus(setStatus),
+      window.unbiased.onEngineStatus((s: EngineStatus) => {
+        setStatus(s);
+        if (s.state === "connected") void refreshThreads();
+      }),
       window.unbiased.onDelta(({ delta }) => {
         setEntries((es) => {
           const last = es[es.length - 1];
@@ -131,6 +163,7 @@ export function App() {
       }),
       window.unbiased.onTurnCompleted(({ status: turnStatus }) => {
         setBusy(false);
+        void refreshThreads(); // previews/titles update after a turn lands
         setEntries((es) => {
           let next = es;
           if (turnStatus === "interrupted") {
@@ -212,7 +245,11 @@ export function App() {
     setBusy(true);
     setEntries((es) => [...es, { kind: "user", text }]);
     try {
-      await window.unbiased.sendMessage(text);
+      const result = await window.unbiased.sendMessage(text);
+      if (result.created) {
+        setActiveThreadId(result.threadId);
+        void refreshThreads();
+      }
     } catch (err) {
       setBusy(false);
       setEntries((es) => [...es, { kind: "assistant", text: `Something went wrong: ${String(err)}` }]);
@@ -282,12 +319,79 @@ export function App() {
       style={{
         height: "100vh",
         display: "flex",
-        flexDirection: "column",
         background: colors.bg,
         color: colors.fg,
         fontFamily: "-apple-system, system-ui, sans-serif",
       }}
     >
+      <nav
+        style={{
+          width: 232,
+          flexShrink: 0,
+          borderRight: `1px solid ${colors.border}`,
+          display: "flex",
+          flexDirection: "column",
+          background: "#131317",
+        }}
+      >
+        <div style={{ padding: "14px 14px 10px" }}>
+          <div style={{ fontSize: 17, fontWeight: 600, letterSpacing: -0.3, marginBottom: 12 }}>
+            <span style={{ color: colors.accent }}>un</span>biased
+          </div>
+          <button
+            onClick={() => void newChat()}
+            disabled={busy}
+            style={{
+              width: "100%",
+              background: "transparent",
+              color: busy ? colors.dim : colors.fg,
+              border: `1px solid ${colors.border}`,
+              borderRadius: 8,
+              padding: "8px 10px",
+              fontSize: 13,
+              cursor: busy ? "default" : "pointer",
+              textAlign: "left",
+              fontFamily: "inherit",
+            }}
+          >
+            + New chat
+          </button>
+        </div>
+        <div style={{ flex: 1, overflowY: "auto", padding: "0 8px 12px" }}>
+          {threads.length === 0 && (
+            <div style={{ color: colors.dim, fontSize: 12, padding: "8px 6px" }}>No conversations yet</div>
+          )}
+          {threads.map((t) => (
+            <button
+              key={t.id}
+              onClick={() => void openThread(t.id)}
+              disabled={busy}
+              title={t.title}
+              style={{
+                display: "block",
+                width: "100%",
+                background: t.id === activeThreadId ? colors.panel : "transparent",
+                color: t.id === activeThreadId ? colors.fg : colors.dim,
+                border: "none",
+                borderRadius: 8,
+                padding: "8px 10px",
+                fontSize: 13,
+                textAlign: "left",
+                cursor: busy ? "default" : "pointer",
+                whiteSpace: "nowrap",
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                fontFamily: "inherit",
+                marginBottom: 2,
+              }}
+            >
+              {t.title}
+            </button>
+          ))}
+        </div>
+      </nav>
+
+      <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column" }}>
       <div ref={scrollRef} style={{ flex: 1, overflowY: "auto", padding: "24px 0" }}>
         {entries.length === 0 && (
           <div style={{ height: "100%", display: "grid", placeItems: "center" }}>
@@ -441,6 +545,7 @@ export function App() {
       </div>
 
       <ChatFooter status={status} busy={busy} elapsed={elapsed} />
+      </div>
     </div>
   );
 }

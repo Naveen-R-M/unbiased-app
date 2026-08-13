@@ -7,10 +7,81 @@ const engine = new EngineClient();
 let win: BrowserWindow | null = null;
 let lastStatus: EngineStatus = { state: "starting" };
 
-// One conversation per app run for now (ephemeral: nothing persisted).
-// The threads-sidebar milestone replaces this with thread/list + resume.
+// The active conversation. Threads persist in the engine home; null means
+// a fresh chat whose thread is created lazily on first send, so switching
+// around the sidebar never litters the history with empty threads.
 let threadId: string | null = null;
 let activeTurnId: string | null = null;
+
+// Every thread we start or resume gets the same policy: built-in trusted
+// commands run freely, everything else asks the human. Sandbox stays
+// read-only until the file-change approval UI exists.
+const THREAD_POLICY = { approvalPolicy: "untrusted", sandbox: "read-only" } as const;
+
+type ThreadSummary = { id: string; title: string; createdAt?: string };
+type WireItem = {
+  id?: string;
+  type?: string;
+  text?: string;
+  content?: unknown;
+  command?: string;
+  status?: string;
+  exitCode?: number;
+  aggregatedOutput?: string;
+};
+type WireThread = {
+  id: string;
+  name?: string | null;
+  preview?: string;
+  createdAt?: string;
+  turns?: { items?: WireItem[] }[];
+};
+
+function threadTitle(t: WireThread): string {
+  const name = t.name?.trim();
+  if (name) return name;
+  const preview = t.preview?.trim();
+  if (preview) return preview.length > 48 ? preview.slice(0, 48) + "…" : preview;
+  return "New chat";
+}
+
+function contentToText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((c) => (typeof c === "string" ? c : ((c as { text?: string })?.text ?? "")))
+      .join("");
+  }
+  return "";
+}
+
+/** Flatten a resumed thread's turns into the renderer's entry list. */
+function threadToEntries(thread: WireThread): unknown[] {
+  const entries: unknown[] = [];
+  for (const turn of thread.turns ?? []) {
+    for (const item of turn.items ?? []) {
+      switch (item.type) {
+        case "userMessage":
+          entries.push({ kind: "user", text: item.text ?? contentToText(item.content) });
+          break;
+        case "agentMessage":
+          entries.push({ kind: "assistant", text: item.text ?? "" });
+          break;
+        case "commandExecution":
+          entries.push({
+            kind: "command",
+            itemId: item.id ?? "unknown",
+            command: item.command ?? "(command)",
+            status: item.status ?? "completed",
+            exitCode: item.exitCode,
+            output: item.aggregatedOutput,
+          });
+          break;
+      }
+    }
+  }
+  return entries;
+}
 
 /** The engine binary ships beside the app (extraResources) in production;
  *  in development it comes from the sibling unbiased-app-engine checkout's
@@ -123,16 +194,6 @@ async function startEngine(): Promise<void> {
   engine.start(bin);
 
   const result = await engine.handshake(app.getVersion());
-  // "untrusted": the engine runs its built-in trusted commands (ls, cat…)
-  // freely and asks the human for everything else. Sandbox stays read-only
-  // until the file-change approval UI exists.
-  const thread = (await engine.request("thread/start", {
-    ephemeral: true,
-    approvalPolicy: "untrusted",
-    sandbox: "read-only",
-  })) as { thread: { id: string } };
-  threadId = thread.thread.id;
-
   pushStatus({
     state: "connected",
     userAgent: result.userAgent,
@@ -145,13 +206,46 @@ app.whenReady().then(async () => {
   ipcMain.handle("engine:status", () => lastStatus);
 
   ipcMain.handle("chat:send", async (_e, text: string) => {
-    if (!threadId) throw new Error("no thread — engine not connected");
+    let created = false;
+    if (!threadId) {
+      const started = (await engine.request("thread/start", { ...THREAD_POLICY })) as {
+        thread: { id: string };
+      };
+      threadId = started.thread.id;
+      created = true;
+    }
     const result = (await engine.request("turn/start", {
       threadId,
       input: [{ type: "text", text }],
     })) as { turn?: { id?: string } };
     if (result.turn?.id) activeTurnId = result.turn.id;
-    return { turnId: activeTurnId };
+    return { turnId: activeTurnId, threadId, created };
+  });
+
+  ipcMain.handle("threads:list", async () => {
+    const result = (await engine.request("thread/list", { limit: 50 })) as { data?: WireThread[] };
+    const threads: ThreadSummary[] = (result.data ?? []).map((t) => ({
+      id: t.id,
+      title: threadTitle(t),
+      createdAt: t.createdAt,
+    }));
+    return { threads };
+  });
+
+  ipcMain.handle("threads:open", async (_e, id: string) => {
+    const result = (await engine.request("thread/resume", { threadId: id, ...THREAD_POLICY })) as {
+      thread: WireThread;
+    };
+    threadId = id;
+    activeTurnId = null;
+    return { id, entries: threadToEntries(result.thread) };
+  });
+
+  ipcMain.handle("threads:detach", () => {
+    // Fresh-chat view: the next send creates a new thread.
+    threadId = null;
+    activeTurnId = null;
+    return { ok: true };
   });
 
   ipcMain.handle("chat:interrupt", async () => {

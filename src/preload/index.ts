@@ -24,4 +24,8 @@ contextBridge.exposeInMainWorld("unbiased", {
     ipcRenderer.invoke("chat:approve", { requestId, decision }),
   onApprovalRequest: (cb: (p: unknown) => void) => subscribe("chat:approval-request", cb),
   onCommand: (cb: (p: unknown) => void) => subscribe("chat:command", cb),
+
+  listThreads: () => ipcRenderer.invoke("threads:list"),
+  openThread: (id: string) => ipcRenderer.invoke("threads:open", id),
+  detachThread: () => ipcRenderer.invoke("threads:detach"),
 });
