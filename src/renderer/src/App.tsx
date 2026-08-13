@@ -490,7 +490,16 @@ function StepsGroup({
   decide: (itemId: string, requestId: string, decision: "accept" | "decline") => Promise<void>;
 }) {
   const [open, setOpen] = useState(false);
+  const [openItems, setOpenItems] = useState<Set<string>>(new Set());
   const needsApproval = items.some((e) => e.status === "awaitingApproval" && e.approval && !e.approval.decision);
+
+  const toggleItem = (itemId: string) =>
+    setOpenItems((s) => {
+      const next = new Set(s);
+      if (next.has(itemId)) next.delete(itemId);
+      else next.add(itemId);
+      return next;
+    });
   const running = items.some((e) => e.status === "inProgress");
   const failed = items.some((e) => e.status === "failed" || (e.exitCode ?? 0) !== 0);
   // A hidden approval would hang the turn on a question nobody can see.
@@ -537,6 +546,8 @@ function StepsGroup({
       {expanded &&
         items.map((e) => {
           const label = statusLabel(e);
+          const hasOutput = Boolean(e.output);
+          const itemOpen = openItems.has(e.itemId);
           return (
             <div
               key={e.itemId}
@@ -550,7 +561,27 @@ function StepsGroup({
                 fontFamily: "ui-monospace, SFMono-Regular, monospace",
               }}
             >
-              <div style={{ display: "flex", gap: 8, alignItems: "baseline" }}>
+              <div
+                onClick={hasOutput ? () => toggleItem(e.itemId) : undefined}
+                style={{
+                  display: "flex",
+                  gap: 8,
+                  alignItems: "baseline",
+                  cursor: hasOutput ? "pointer" : "default",
+                }}
+              >
+                <span
+                  style={{
+                    color: hasOutput ? colors.dim : "transparent",
+                    flexShrink: 0,
+                    fontSize: 9,
+                    display: "inline-block",
+                    transform: itemOpen ? "rotate(90deg)" : "none",
+                    transition: "transform 120ms",
+                  }}
+                >
+                  ▶
+                </span>
                 <span style={{ color: label.color, flexShrink: 0 }}>{label.text}</span>
                 <span style={{ whiteSpace: "pre-wrap", color: colors.fg }}>{e.command}</span>
               </div>
@@ -591,7 +622,7 @@ function StepsGroup({
                   </button>
                 </div>
               )}
-              {e.output && (
+              {e.output && itemOpen && (
                 <pre
                   style={{
                     margin: "8px 0 0",
