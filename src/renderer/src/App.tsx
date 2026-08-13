@@ -75,6 +75,29 @@ function withoutTrailingPlaceholder(es: Entry[]): Entry[] {
   return es;
 }
 
+type CommandEntry = Extract<Entry, { kind: "command" }>;
+type DisplayBlock = { kind: "entry"; entry: Entry; key: number } | { kind: "steps"; items: CommandEntry[]; key: number };
+
+/** Consecutive command entries collapse into one steps group — the agent's
+ *  work reads as a single disclosure, the way the answer reads as one bubble. */
+function toDisplayBlocks(entries: Entry[]): DisplayBlock[] {
+  const blocks: DisplayBlock[] = [];
+  for (let i = 0; i < entries.length; i++) {
+    const e = entries[i];
+    if (e.kind === "command") {
+      const last = blocks[blocks.length - 1];
+      if (last?.kind === "steps") {
+        last.items.push(e);
+      } else {
+        blocks.push({ kind: "steps", items: [e], key: i });
+      }
+    } else {
+      blocks.push({ kind: "entry", entry: e, key: i });
+    }
+  }
+  return blocks;
+}
+
 export function App() {
   const [status, setStatus] = useState<EngineStatus>({ state: "starting" });
   const [entries, setEntries] = useState<Entry[]>([]);
@@ -279,10 +302,21 @@ export function App() {
           </div>
         )}
         <div style={{ maxWidth: 720, margin: "0 auto", padding: "0 24px" }}>
-          {entries.map((e, i) => {
+          {toDisplayBlocks(entries).map((block) => {
+            if (block.kind === "steps") {
+              return (
+                <StepsGroup
+                  key={`s${block.key}`}
+                  items={block.items}
+                  statusLabel={statusLabel}
+                  decide={decide}
+                />
+              );
+            }
+            const e = block.entry;
             if (e.kind === "user") {
               return (
-                <div key={i} style={{ display: "flex", justifyContent: "flex-end", margin: "10px 0" }}>
+                <div key={block.key} style={{ display: "flex", justifyContent: "flex-end", margin: "10px 0" }}>
                   <div
                     style={{
                       maxWidth: "85%",
@@ -301,7 +335,7 @@ export function App() {
             }
             if (e.kind === "assistant") {
               return (
-                <div key={i} style={{ display: "flex", justifyContent: "flex-start", margin: "10px 0" }}>
+                <div key={block.key} style={{ display: "flex", justifyContent: "flex-start", margin: "10px 0" }}>
                   <div
                     style={{
                       maxWidth: "85%",
@@ -323,76 +357,7 @@ export function App() {
                 </div>
               );
             }
-            const label = statusLabel(e);
-            return (
-              <div
-                key={i}
-                style={{
-                  margin: "10px 0",
-                  padding: "10px 14px",
-                  borderRadius: 12,
-                  border: `1px solid ${e.status === "awaitingApproval" ? colors.amber : colors.border}`,
-                  background: "#141417",
-                  fontSize: 12.5,
-                  fontFamily: "ui-monospace, SFMono-Regular, monospace",
-                }}
-              >
-                <div style={{ display: "flex", gap: 8, alignItems: "baseline" }}>
-                  <span style={{ color: label.color, flexShrink: 0 }}>{label.text}</span>
-                  <span style={{ whiteSpace: "pre-wrap", color: colors.fg }}>{e.command}</span>
-                </div>
-                {e.approval?.reason && (
-                  <div style={{ color: colors.dim, marginTop: 6, fontFamily: "inherit" }}>{e.approval.reason}</div>
-                )}
-                {e.status === "awaitingApproval" && e.approval && !e.approval.decision && (
-                  <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
-                    <button
-                      onClick={() => void decide(e.itemId, e.approval!.requestId, "accept")}
-                      style={{
-                        background: colors.ok,
-                        color: "#04342C",
-                        border: "none",
-                        borderRadius: 8,
-                        padding: "6px 16px",
-                        fontSize: 13,
-                        cursor: "pointer",
-                        fontFamily: "-apple-system, system-ui, sans-serif",
-                      }}
-                    >
-                      Approve
-                    </button>
-                    <button
-                      onClick={() => void decide(e.itemId, e.approval!.requestId, "decline")}
-                      style={{
-                        background: "transparent",
-                        color: colors.err,
-                        border: `1px solid ${colors.err}`,
-                        borderRadius: 8,
-                        padding: "6px 16px",
-                        fontSize: 13,
-                        cursor: "pointer",
-                        fontFamily: "-apple-system, system-ui, sans-serif",
-                      }}
-                    >
-                      Decline
-                    </button>
-                  </div>
-                )}
-                {e.output && (
-                  <pre
-                    style={{
-                      margin: "8px 0 0",
-                      color: colors.dim,
-                      whiteSpace: "pre-wrap",
-                      maxHeight: 200,
-                      overflowY: "auto",
-                    }}
-                  >
-                    {e.output.length > 4000 ? e.output.slice(0, 4000) + "\n… (truncated)" : e.output}
-                  </pre>
-                )}
-              </div>
-            );
+            return null;
           })}
           {showThinking && (
             <div style={{ display: "flex", justifyContent: "flex-start", margin: "10px 0" }}>
@@ -475,36 +440,173 @@ export function App() {
         </div>
       </div>
 
-      <footer
+      <ChatFooter status={status} busy={busy} elapsed={elapsed} />
+    </div>
+  );
+}
+
+function ChatFooter({ status, busy, elapsed }: { status: EngineStatus; busy: boolean; elapsed: number }) {
+  return (
+    <footer
+      style={{
+        padding: "8px 16px",
+        borderTop: `1px solid ${colors.border}`,
+        fontSize: 12,
+        color: colors.dim,
+        display: "flex",
+        gap: 8,
+        alignItems: "center",
+        fontVariantNumeric: "tabular-nums",
+      }}
+    >
+      <span
         style={{
-          padding: "8px 16px",
-          borderTop: `1px solid ${colors.border}`,
-          fontSize: 12,
-          color: colors.dim,
+          width: 8,
+          height: 8,
+          borderRadius: 4,
+          background:
+            status.state === "connected" ? colors.ok : status.state === "starting" ? colors.accent : colors.err,
+        }}
+      />
+      {status.state === "connected" && (
+        <span>
+          connected · pareto · engine {status.engineVersion}
+          {busy ? ` · thinking… ${elapsed.toFixed(0)}s` : ""}
+        </span>
+      )}
+      {status.state === "starting" && <span>starting engine…</span>}
+      {status.state === "exited" && <span style={{ color: colors.err }}>{status.detail}</span>}
+    </footer>
+  );
+}
+
+function StepsGroup({
+  items,
+  statusLabel,
+  decide,
+}: {
+  items: CommandEntry[];
+  statusLabel: (e: CommandEntry) => { text: string; color: string };
+  decide: (itemId: string, requestId: string, decision: "accept" | "decline") => Promise<void>;
+}) {
+  const [open, setOpen] = useState(false);
+  const needsApproval = items.some((e) => e.status === "awaitingApproval" && e.approval && !e.approval.decision);
+  const running = items.some((e) => e.status === "inProgress");
+  const failed = items.some((e) => e.status === "failed" || (e.exitCode ?? 0) !== 0);
+  // A hidden approval would hang the turn on a question nobody can see.
+  const expanded = open || needsApproval;
+
+  const summary = needsApproval
+    ? { text: "needs your approval", color: colors.amber }
+    : running
+      ? { text: "working…", color: colors.amber }
+      : {
+          text: `${items.length} step${items.length === 1 ? "" : "s"}${failed ? " · issues" : ""}`,
+          color: failed ? colors.err : colors.dim,
+        };
+
+  return (
+    <div style={{ margin: "10px 0" }}>
+      <button
+        onClick={() => setOpen((o) => !o)}
+        style={{
           display: "flex",
-          gap: 8,
           alignItems: "center",
-          fontVariantNumeric: "tabular-nums",
+          gap: 6,
+          background: "transparent",
+          border: "none",
+          color: summary.color,
+          fontSize: 12.5,
+          cursor: "pointer",
+          padding: "2px 0",
+          fontFamily: "-apple-system, system-ui, sans-serif",
         }}
       >
         <span
           style={{
-            width: 8,
-            height: 8,
-            borderRadius: 4,
-            background:
-              status.state === "connected" ? colors.ok : status.state === "starting" ? colors.accent : colors.err,
+            display: "inline-block",
+            transform: expanded ? "rotate(90deg)" : "none",
+            transition: "transform 120ms",
+            fontSize: 10,
           }}
-        />
-        {status.state === "connected" && (
-          <span>
-            connected · pareto · engine {status.engineVersion}
-            {busy ? ` · thinking… ${elapsed.toFixed(0)}s` : ""}
-          </span>
-        )}
-        {status.state === "starting" && <span>starting engine…</span>}
-        {status.state === "exited" && <span style={{ color: colors.err }}>{status.detail}</span>}
-      </footer>
+        >
+          ▶
+        </span>
+        {summary.text}
+      </button>
+      {expanded &&
+        items.map((e) => {
+          const label = statusLabel(e);
+          return (
+            <div
+              key={e.itemId}
+              style={{
+                margin: "8px 0",
+                padding: "10px 14px",
+                borderRadius: 12,
+                border: `1px solid ${e.status === "awaitingApproval" ? colors.amber : colors.border}`,
+                background: "#141417",
+                fontSize: 12.5,
+                fontFamily: "ui-monospace, SFMono-Regular, monospace",
+              }}
+            >
+              <div style={{ display: "flex", gap: 8, alignItems: "baseline" }}>
+                <span style={{ color: label.color, flexShrink: 0 }}>{label.text}</span>
+                <span style={{ whiteSpace: "pre-wrap", color: colors.fg }}>{e.command}</span>
+              </div>
+              {e.approval?.reason && (
+                <div style={{ color: colors.dim, marginTop: 6, fontFamily: "inherit" }}>{e.approval.reason}</div>
+              )}
+              {e.status === "awaitingApproval" && e.approval && !e.approval.decision && (
+                <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+                  <button
+                    onClick={() => void decide(e.itemId, e.approval!.requestId, "accept")}
+                    style={{
+                      background: colors.ok,
+                      color: "#04342C",
+                      border: "none",
+                      borderRadius: 8,
+                      padding: "6px 16px",
+                      fontSize: 13,
+                      cursor: "pointer",
+                      fontFamily: "-apple-system, system-ui, sans-serif",
+                    }}
+                  >
+                    Approve
+                  </button>
+                  <button
+                    onClick={() => void decide(e.itemId, e.approval!.requestId, "decline")}
+                    style={{
+                      background: "transparent",
+                      color: colors.err,
+                      border: `1px solid ${colors.err}`,
+                      borderRadius: 8,
+                      padding: "6px 16px",
+                      fontSize: 13,
+                      cursor: "pointer",
+                      fontFamily: "-apple-system, system-ui, sans-serif",
+                    }}
+                  >
+                    Decline
+                  </button>
+                </div>
+              )}
+              {e.output && (
+                <pre
+                  style={{
+                    margin: "8px 0 0",
+                    color: colors.dim,
+                    whiteSpace: "pre-wrap",
+                    maxHeight: 200,
+                    overflowY: "auto",
+                  }}
+                >
+                  {e.output.length > 4000 ? e.output.slice(0, 4000) + "\n… (truncated)" : e.output}
+                </pre>
+              )}
+            </div>
+          );
+        })}
     </div>
   );
 }
