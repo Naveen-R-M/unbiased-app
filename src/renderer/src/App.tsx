@@ -55,6 +55,7 @@ declare global {
       listThreads: () => Promise<{ threads: ThreadSummary[] }>;
       openThread: (id: string) => Promise<{ id: string; entries: Entry[] }>;
       detachThread: () => Promise<{ ok: boolean }>;
+      deleteThread: (id: string) => Promise<{ ok: boolean }>;
     };
   }
 }
@@ -111,6 +112,7 @@ export function App() {
   const [elapsed, setElapsed] = useState(0);
   const [threads, setThreads] = useState<ThreadSummary[]>([]);
   const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
+  const [hoveredThreadId, setHoveredThreadId] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   async function refreshThreads() {
@@ -130,6 +132,16 @@ export function App() {
     const { entries: history } = await window.unbiased.openThread(id);
     setActiveThreadId(id);
     setEntries(history);
+  }
+
+  async function deleteThread(id: string) {
+    if (busy) return;
+    await window.unbiased.deleteThread(id);
+    if (id === activeThreadId) {
+      setActiveThreadId(null);
+      setEntries([]);
+    }
+    void refreshThreads();
   }
 
   // Pareto today completes the whole response before its first byte arrives
@@ -362,31 +374,62 @@ export function App() {
             <div style={{ color: colors.dim, fontSize: 12, padding: "8px 6px" }}>No conversations yet</div>
           )}
           {threads.map((t) => (
-            <button
+            <div
               key={t.id}
-              onClick={() => void openThread(t.id)}
-              disabled={busy}
-              title={t.title}
+              onMouseEnter={() => setHoveredThreadId(t.id)}
+              onMouseLeave={() => setHoveredThreadId((h) => (h === t.id ? null : h))}
               style={{
-                display: "block",
-                width: "100%",
+                display: "flex",
+                alignItems: "center",
                 background: t.id === activeThreadId ? colors.panel : "transparent",
-                color: t.id === activeThreadId ? colors.fg : colors.dim,
-                border: "none",
                 borderRadius: 8,
-                padding: "8px 10px",
-                fontSize: 13,
-                textAlign: "left",
-                cursor: busy ? "default" : "pointer",
-                whiteSpace: "nowrap",
-                overflow: "hidden",
-                textOverflow: "ellipsis",
-                fontFamily: "inherit",
                 marginBottom: 2,
               }}
             >
-              {t.title}
-            </button>
+              <button
+                onClick={() => void openThread(t.id)}
+                disabled={busy}
+                title={t.title}
+                style={{
+                  flex: 1,
+                  minWidth: 0,
+                  background: "transparent",
+                  color: t.id === activeThreadId ? colors.fg : colors.dim,
+                  border: "none",
+                  padding: "8px 4px 8px 10px",
+                  fontSize: 13,
+                  textAlign: "left",
+                  cursor: busy ? "default" : "pointer",
+                  whiteSpace: "nowrap",
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                  fontFamily: "inherit",
+                }}
+              >
+                {t.title}
+              </button>
+              {hoveredThreadId === t.id && !busy && (
+                <button
+                  onClick={() => void deleteThread(t.id)}
+                  title="Delete conversation"
+                  aria-label="Delete conversation"
+                  style={{
+                    flexShrink: 0,
+                    background: "transparent",
+                    color: colors.dim,
+                    border: "none",
+                    padding: "6px 8px",
+                    fontSize: 13,
+                    cursor: "pointer",
+                    lineHeight: 1,
+                  }}
+                  onMouseEnter={(ev) => ((ev.target as HTMLButtonElement).style.color = colors.err)}
+                  onMouseLeave={(ev) => ((ev.target as HTMLButtonElement).style.color = colors.dim)}
+                >
+                  ×
+                </button>
+              )}
+            </div>
           ))}
         </div>
       </nav>

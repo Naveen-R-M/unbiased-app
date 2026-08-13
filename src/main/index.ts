@@ -248,6 +248,15 @@ app.whenReady().then(async () => {
     return { ok: true };
   });
 
+  ipcMain.handle("threads:delete", async (_e, id: string) => {
+    await engine.request("thread/delete", { threadId: id });
+    if (threadId === id) {
+      threadId = null;
+      activeTurnId = null;
+    }
+    return { ok: true, wasActive: threadId === null };
+  });
+
   ipcMain.handle("chat:interrupt", async () => {
     if (!threadId || !activeTurnId) return { interrupted: false };
     await engine.request("turn/interrupt", { threadId, turnId: activeTurnId });
