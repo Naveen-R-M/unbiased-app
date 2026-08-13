@@ -38,4 +38,5 @@ contextBridge.exposeInMainWorld("unbiased", {
   readFile: (path: string) => ipcRenderer.invoke("file:read", path),
   readImage: (path: string) => ipcRenderer.invoke("file:read-image", path),
   listDir: (dir?: string) => ipcRenderer.invoke("fs:list", dir),
+  searchRefs: (word: string) => ipcRenderer.invoke("fs:search-refs", word),
 });

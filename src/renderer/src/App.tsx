@@ -53,12 +53,14 @@ type Annotation = { text: string; comment?: string; range?: Range };
 // thumb is a small data-URL preview for the composer card.
 type Attachment = { name: string; path: string; kind?: "image" | "folder" | "file"; thumb?: string };
 type DirEntry = { name: string; dir: boolean };
+type RefHit = { path: string; rel: string; line: number; text: string };
 type OpenFileInfo = {
   name: string;
   relPath: string;
   fullPath: string;
   content?: string;
   imageSrc?: string; // data URL — the viewer renders an image instead of code
+  line?: number; // scroll target + highlight stripe (references navigation)
   error?: string;
 };
 
@@ -114,6 +116,7 @@ declare global {
       readFile: (path: string) => Promise<{ fullPath: string; relPath?: string; content?: string; error?: string }>;
       readImage: (path: string) => Promise<{ dataUrl?: string; error?: string }>;
       listDir: (dir?: string) => Promise<{ dir: string; entries: DirEntry[]; error?: string }>;
+      searchRefs: (word: string) => Promise<{ results: RefHit[]; truncated?: boolean; error?: string }>;
     };
   }
 }
@@ -295,6 +298,13 @@ export function App() {
     setSideChatEnabledState(v);
   }
   const [navOpen, setNavOpen] = useState(() => localStorage.getItem("navOpen") !== "false");
+  // Nav width is user-draggable within [180, 400]px, persisted.
+  const NAV_MIN = 180;
+  const NAV_MAX = 400;
+  const [navWidth, setNavWidth] = useState(() => {
+    const stored = Number(localStorage.getItem("navWidth"));
+    return stored >= NAV_MIN && stored <= NAV_MAX ? stored : 248;
+  });
   // The main/side split is a FRACTION of the content area (not pixels), so
   // collapsing the nav or resizing the window scales both panes in ratio.
   const [sideFrac, setSideFrac] = useState(() => {
@@ -302,8 +312,11 @@ export function App() {
     return stored >= 0.25 && stored <= 0.7 ? stored : 0.45;
   });
   const draggingRef = useRef(false);
+  const navDraggingRef = useRef(false);
   const navOpenRef = useRef(navOpen);
   navOpenRef.current = navOpen;
+  const navWidthRef = useRef(navWidth);
+  navWidthRef.current = navWidth;
 
   function toggleNav() {
     setNavOpen((o) => {
@@ -317,13 +330,27 @@ export function App() {
   // uselessness. Persisted across launches.
   useEffect(() => {
     function onMove(e: MouseEvent) {
+      if (navDraggingRef.current) {
+        setNavWidth(Math.min(Math.max(e.clientX, NAV_MIN), NAV_MAX));
+        return;
+      }
       if (!draggingRef.current) return;
-      const contentLeft = navOpenRef.current ? 248 : 0;
+      const contentLeft = navOpenRef.current ? navWidthRef.current : 0;
       const contentWidth = Math.max(window.innerWidth - contentLeft, 1);
       const frac = (window.innerWidth - e.clientX) / contentWidth;
       setSideFrac(Math.min(Math.max(frac, 0.25), 0.7));
     }
     function onUp() {
+      if (navDraggingRef.current) {
+        navDraggingRef.current = false;
+        document.body.style.userSelect = "";
+        document.body.style.cursor = "";
+        setNavWidth((w) => {
+          localStorage.setItem("navWidth", String(w));
+          return w;
+        });
+        return;
+      }
       if (!draggingRef.current) return;
       draggingRef.current = false;
       document.body.style.userSelect = "";
@@ -411,7 +438,9 @@ export function App() {
   }
 
   const [openFile, setOpenFile] = useState<OpenFileInfo | null>(null);
-  const [panelMode, setPanelMode] = useState<"chat" | "file" | "files">("chat");
+  // "launcher" = the panel is open with nothing selected yet — it shows
+  // big rows asking which surface to open (Codex's empty side panel).
+  const [panelMode, setPanelMode] = useState<"chat" | "file" | "files" | "launcher">("chat");
   const [filesOpen, setFilesOpen] = useState(false);
   // The side panel header's + menu (Review / Terminal / Files / Side chat).
   const [sidePlusOpen, setSidePlusOpen] = useState(false);
@@ -443,6 +472,20 @@ export function App() {
     setSidePlusOpen(false);
     setFilesOpen(true);
     setPanelMode("files");
+  }
+
+  // The header's panel toggle: open to whatever the panel last showed, or
+  // the launcher when there's nothing yet.
+  function toggleSidePanel() {
+    if (sideOpen) {
+      setSideOpenPersisted(false);
+      return;
+    }
+    setSideOpenPersisted(true);
+    if (sideChatEnabled) setPanelMode("chat");
+    else if (openFile) setPanelMode("file");
+    else if (filesOpen) setPanelMode("files");
+    else setPanelMode("launcher");
   }
 
   function closeFilesTab() {
@@ -481,7 +524,7 @@ export function App() {
   }
 
   /** Text files read through file:read; images route to the picture viewer. */
-  async function loadFileInfo(pathText: string): Promise<OpenFileInfo> {
+  async function loadFileInfo(pathText: string, line?: number): Promise<OpenFileInfo> {
     const name = pathText.split("/").filter(Boolean).pop() ?? pathText;
     if (/\.(png|jpe?g|gif|webp|bmp)$/i.test(name)) {
       const r = await window.unbiased.readImage(pathText);
@@ -493,12 +536,13 @@ export function App() {
       relPath: result.relPath ?? pathText,
       fullPath: result.fullPath,
       content: result.content,
+      line,
       error: result.error,
     };
   }
 
-  async function openFileInPanel(pathText: string) {
-    setOpenFile(await loadFileInfo(pathText));
+  async function openFileInPanel(pathText: string, line?: number) {
+    setOpenFile(await loadFileInfo(pathText, line));
     setPanelMode("file");
     setSideOpenPersisted(true);
   }
@@ -507,8 +551,8 @@ export function App() {
   // never hides the tree the way the standalone file tab does.
   const [treeFile, setTreeFile] = useState<OpenFileInfo | null>(null);
 
-  async function openFileInTree(pathText: string) {
-    setTreeFile(await loadFileInfo(pathText));
+  async function openFileInTree(pathText: string, line?: number) {
+    setTreeFile(await loadFileInfo(pathText, line));
   }
 
   // Closing HIDES the side chat — its conversation survives and reopening
@@ -575,7 +619,7 @@ export function App() {
       {navOpen && (
       <nav
         style={{
-          width: 248,
+          width: navWidth,
           flexShrink: 0,
           borderRight: `1px solid ${colors.border}`,
           display: "flex",
@@ -693,6 +737,26 @@ export function App() {
         <ChatFooter status={status} busy={mainBusy} />
       </nav>
       )}
+      {navOpen && (
+        <div
+          onMouseDown={() => {
+            navDraggingRef.current = true;
+            document.body.style.userSelect = "none";
+            document.body.style.cursor = "col-resize";
+          }}
+          title="Drag to resize"
+          // Invisible grab strip straddling the nav's border; the nav's own
+          // borderRight draws the line, so this adds no visual weight.
+          style={{
+            width: 5,
+            flexShrink: 0,
+            cursor: "col-resize",
+            background: "transparent",
+            marginLeft: -5,
+            zIndex: 5,
+          }}
+        />
+      )}
 
       <div
         style={{
@@ -727,6 +791,10 @@ export function App() {
           >
             {mainTitle}
           </span>
+          <span style={{ flex: 1 }} />
+          <IconButton title={sideOpen ? "Close side panel" : "Open side panel"} onClick={toggleSidePanel}>
+            <SideChatIcon />
+          </IconButton>
         </header>
         <ChatPane
           paneId="main"
@@ -930,8 +998,27 @@ export function App() {
             </span>
             <span style={{ flex: 1 }} />
           </header>
+          {panelMode === "launcher" && (
+            <div
+              style={{
+                flex: 1,
+                display: "flex",
+                flexDirection: "column",
+                justifyContent: "center",
+                padding: "0 28px",
+                gap: 10,
+              }}
+            >
+              <LauncherRow icon={<ChatPlusIcon />} label="Side chat" onClick={openSideChatTab} />
+              {inProject && (
+                <LauncherRow icon={<FolderOutlineIcon size={15} />} label="Files" onClick={openFilesTab} />
+              )}
+              <LauncherRow icon={<TerminalIcon />} label="Terminal" hint="Soon" disabled />
+              <LauncherRow icon={<ReviewIcon />} label="Review" hint="Soon" disabled />
+            </div>
+          )}
           {openFile && panelMode === "file" && (
-            <FileViewer file={openFile} onOpenFile={(p) => void openFileInPanel(p)} />
+            <FileViewer file={openFile} onOpenFile={(p, l) => void openFileInPanel(p, l)} />
           )}
           {filesOpen && panelMode === "files" && (
             <div style={{ flex: 1, minHeight: 0, display: "flex" }}>
@@ -945,7 +1032,7 @@ export function App() {
                 }}
               >
                 {treeFile ? (
-                  <FileViewer file={treeFile} onOpenFile={(p) => void openFileInTree(p)} />
+                  <FileViewer file={treeFile} onOpenFile={(p, l) => void openFileInTree(p, l)} />
                 ) : (
                   <div style={{ flex: 1, display: "grid", placeItems: "center" }}>
                     <div style={{ textAlign: "center", color: colors.dim }}>
@@ -1229,7 +1316,13 @@ function FileTreePane({ onOpenFile }: { onOpenFile: (path: string) => void }) {
 /** Codex-style file view: breadcrumb, line numbers, Prism highlighting.
  *  With onOpenFile, each crumb opens a dropdown of its parent directory
  *  (siblings, the crumb pre-expanded) for quick navigation. */
-function FileViewer({ file, onOpenFile }: { file: OpenFileInfo; onOpenFile?: (path: string) => void }) {
+function FileViewer({
+  file,
+  onOpenFile,
+}: {
+  file: OpenFileInfo;
+  onOpenFile?: (path: string, line?: number) => void;
+}) {
   const content = file.content ?? "";
   const ext = file.name.split(".").pop()?.toLowerCase() ?? "";
   const lang = EXT_TO_PRISM[ext];
@@ -1243,7 +1336,89 @@ function FileViewer({ file, onOpenFile }: { file: OpenFileInfo; onOpenFile?: (pa
   const [crumbMenu, setCrumbMenu] = useState<{ root: string; expand: string | null; left: number } | null>(null);
   const headerRef = useRef<HTMLDivElement>(null);
 
-  useEffect(() => setCrumbMenu(null), [file.fullPath]);
+  // ⌘-click references: VS Code-style symbol navigation, powered by a
+  // whole-word project search rather than a language server. The anchor is
+  // the clicked spot in code-content coordinates, so the popover rides the
+  // scroll with the line it points at.
+  const [refs, setRefs] = useState<{
+    word: string;
+    items: RefHit[];
+    truncated: boolean;
+    loading: boolean;
+    error?: string;
+    x: number;
+    lineTop: number;
+  } | null>(null);
+  const scrollBodyRef = useRef<HTMLDivElement>(null);
+  const refsPanelRef = useRef<HTMLDivElement>(null);
+  // 12.5px font × 1.6 line-height, shared by the gutter and code panes.
+  const LINE_H = 20;
+  const PAD_TOP = 14;
+
+  useEffect(() => {
+    setCrumbMenu(null);
+    setRefs(null);
+  }, [file.fullPath]);
+
+  // Land the target line in the upper third of the viewport.
+  useEffect(() => {
+    const el = scrollBodyRef.current;
+    if (file.line && el) {
+      el.scrollTop = Math.max(0, PAD_TOP + (file.line - 1) * LINE_H - el.clientHeight / 3);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [file.fullPath, file.line]);
+
+  useEffect(() => {
+    if (!refs) return;
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") setRefs(null);
+    }
+    function onDown(e: MouseEvent) {
+      if (!refsPanelRef.current?.contains(e.target as Node)) setRefs(null);
+    }
+    document.addEventListener("keydown", onKey);
+    document.addEventListener("mousedown", onDown);
+    return () => {
+      document.removeEventListener("keydown", onKey);
+      document.removeEventListener("mousedown", onDown);
+    };
+  }, [refs]);
+
+  function handleCodeClick(e: React.MouseEvent<HTMLDivElement>) {
+    if (!onOpenFile || !(e.metaKey || e.ctrlKey)) return;
+    const range = document.caretRangeFromPoint(e.clientX, e.clientY);
+    const node = range?.startContainer;
+    if (!node || node.nodeType !== Node.TEXT_NODE) return;
+    const text = node.textContent ?? "";
+    const isWord = (ch: string) => /[\w$]/.test(ch);
+    let s = range.startOffset;
+    let en = range.startOffset;
+    while (s > 0 && isWord(text[s - 1])) s--;
+    while (en < text.length && isWord(text[en])) en++;
+    const word = text.slice(s, en);
+    if (!word || word.length > 128 || /^\d+$/.test(word)) return;
+    e.preventDefault();
+    setCrumbMenu(null);
+    // Anchor at the clicked line, in content coordinates (scroll included).
+    const el = scrollBodyRef.current;
+    const rect = el?.getBoundingClientRect();
+    const contentX = rect && el ? e.clientX - rect.left + el.scrollLeft : 0;
+    const contentY = rect && el ? e.clientY - rect.top + el.scrollTop : 0;
+    const lineTop = PAD_TOP + Math.floor(Math.max(contentY - PAD_TOP, 0) / LINE_H) * LINE_H;
+    const anchor = { x: contentX, lineTop };
+    setRefs({ word, items: [], truncated: false, loading: true, ...anchor });
+    void window.unbiased.searchRefs(word).then((res) => {
+      setRefs({
+        word,
+        items: res.results ?? [],
+        truncated: res.truncated ?? false,
+        loading: false,
+        error: res.error,
+        ...anchor,
+      });
+    });
+  }
 
   useEffect(() => {
     if (!crumbMenu) return;
@@ -1354,7 +1529,127 @@ function FileViewer({ file, onOpenFile }: { file: OpenFileInfo; onOpenFile?: (pa
           />
         </div>
       ) : (
-        <div style={{ flex: 1, overflow: "auto", display: "flex", background: "var(--code-bg)" }}>
+        <div
+          ref={scrollBodyRef}
+          onClick={handleCodeClick}
+          style={{ flex: 1, overflow: "auto", display: "flex", background: "var(--code-bg)", position: "relative" }}
+        >
+          {file.line !== undefined && (
+            <div
+              aria-hidden="true"
+              style={{
+                position: "absolute",
+                left: 0,
+                right: 0,
+                top: PAD_TOP + (file.line - 1) * LINE_H,
+                height: LINE_H,
+                background: "color-mix(in srgb, var(--accent) 14%, transparent)",
+                pointerEvents: "none",
+              }}
+            />
+          )}
+          {refs &&
+            onOpenFile &&
+            (() => {
+              const containerW = scrollBodyRef.current?.clientWidth ?? 480;
+              const panelW = Math.min(520, containerW - 16);
+              const panelLeft = Math.max(8, Math.min(refs.x - panelW / 2, containerW - panelW - 8));
+              // Above the clicked line with a small gap; flip below when
+              // the click is too close to the top of the file.
+              const placeAbove = refs.lineTop > 352;
+              return (
+          <div
+            ref={refsPanelRef}
+            style={{
+              position: "absolute",
+              left: panelLeft,
+              width: panelW,
+              ...(placeAbove
+                ? { top: refs.lineTop - 10, transform: "translateY(-100%)" }
+                : { top: refs.lineTop + LINE_H + 10 }),
+              maxHeight: 320,
+              overflowY: "auto",
+              boxSizing: "border-box",
+              background: colors.panel,
+              border: `1px solid ${colors.border}`,
+              borderRadius: 12,
+              padding: 6,
+              zIndex: 30,
+              boxShadow: "0 8px 24px rgba(0,0,0,0.45)",
+            }}
+          >
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+                padding: "4px 10px 6px",
+                fontSize: 12.5,
+                color: colors.dim,
+              }}
+            >
+              <span style={{ flex: 1, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                References to <code style={{ fontFamily: "var(--font-code)", color: colors.fg }}>{refs.word}</code>
+                {refs.loading
+                  ? " · searching…"
+                  : ` · ${refs.items.length}${refs.truncated ? "+" : ""} result${refs.items.length === 1 ? "" : "s"}`}
+              </span>
+              <button
+                onClick={() => setRefs(null)}
+                aria-label="Close references"
+                style={{ background: "transparent", border: "none", color: colors.dim, cursor: "pointer", padding: 0, display: "flex" }}
+              >
+                <CloseIcon />
+              </button>
+            </div>
+            {refs.error && !refs.loading && (
+              <div style={{ padding: "4px 10px 8px", fontSize: 12.5, color: colors.dim }}>{refs.error}</div>
+            )}
+            {!refs.loading && !refs.error && refs.items.length === 0 && (
+              <div style={{ padding: "4px 10px 8px", fontSize: 12.5, color: colors.dim }}>No references found.</div>
+            )}
+            {refs.items.map((hit, i) => (
+              <button
+                key={`${hit.path}:${hit.line}:${i}`}
+                onClick={() => {
+                  setRefs(null);
+                  onOpenFile(hit.path, hit.line);
+                }}
+                title={`${hit.rel}:${hit.line}`}
+                style={{
+                  display: "flex",
+                  alignItems: "baseline",
+                  gap: 10,
+                  width: "100%",
+                  background: "transparent",
+                  border: "none",
+                  borderRadius: 6,
+                  padding: "5px 10px",
+                  fontSize: 12.5,
+                  cursor: "pointer",
+                  textAlign: "left",
+                  fontFamily: "inherit",
+                }}
+              >
+                <span style={{ color: colors.dim, flexShrink: 0, fontFamily: "var(--font-code)" }}>
+                  {hit.rel}:{hit.line}
+                </span>
+                <span
+                  style={{
+                    color: colors.fg,
+                    whiteSpace: "nowrap",
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    fontFamily: "var(--font-code)",
+                  }}
+                >
+                  {hit.text}
+                </span>
+              </button>
+            ))}
+          </div>
+              );
+            })()}
           <pre
             aria-hidden="true"
             style={{
@@ -2901,6 +3196,50 @@ function ImageIcon({ size = 15 }: { size?: number } = {}) {
       <circle cx="9" cy="9" r="2" />
       <path d="m21 15-3.1-3.1a2 2 0 0 0-2.8 0L6 21" />
     </svg>
+  );
+}
+
+/** A big launcher row in the empty side panel: icon, label, right hint. */
+function LauncherRow({
+  icon,
+  label,
+  hint,
+  disabled,
+  onClick,
+}: {
+  icon: React.ReactNode;
+  label: string;
+  hint?: string;
+  disabled?: boolean;
+  onClick?: () => void;
+}) {
+  const [hover, setHover] = useState(false);
+  return (
+    <button
+      disabled={disabled}
+      onClick={onClick}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 12,
+        width: "100%",
+        background: hover && !disabled ? "var(--panel-2)" : colors.panel,
+        border: `1px solid ${colors.border}`,
+        borderRadius: 12,
+        padding: "14px 16px",
+        fontSize: 14.5,
+        color: disabled ? colors.dim : colors.fg,
+        cursor: disabled ? "default" : "pointer",
+        textAlign: "left",
+        fontFamily: "inherit",
+      }}
+    >
+      <span style={{ color: colors.dim, display: "flex", flexShrink: 0 }}>{icon}</span>
+      <span style={{ flex: 1 }}>{label}</span>
+      {hint && <span style={{ color: colors.dim, fontSize: 12 }}>{hint}</span>}
+    </button>
   );
 }
 

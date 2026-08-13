@@ -2,6 +2,7 @@ import { app, BrowserWindow, clipboard, dialog, ipcMain, nativeImage } from "ele
 import type { NativeImage } from "electron";
 import { isAbsolute, join, relative } from "node:path";
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { execFile } from "node:child_process";
 import { EngineClient, engineVersionFromUserAgent, type EngineStatus } from "./engine";
 
 const engine = new EngineClient();
@@ -508,6 +509,53 @@ app.whenReady().then(async () => {
     } catch {
       return { dir, entries: [], error: `Could not read ${dir}` };
     }
+  });
+
+  // Whole-word references search across the active project — the engine
+  // behind ⌘-click in the file viewer. Text-based (grep), not semantic:
+  // works for every language, no language servers. execFile with an args
+  // array means the symbol is never shell-interpreted.
+  ipcMain.handle("fs:search-refs", (_e, word: string) => {
+    const base = mainCwd ?? pendingCwd;
+    if (!base || base === app.getPath("home")) {
+      return { results: [], error: "References need a project conversation" };
+    }
+    if (!/^[\w$]{1,128}$/.test(word)) return { results: [], error: "Not a searchable symbol" };
+    return new Promise((resolve) => {
+      execFile(
+        "grep",
+        [
+          "-rnIwF", // recursive, line numbers, skip binaries, whole word, literal
+          "--exclude-dir=node_modules",
+          "--exclude-dir=.git",
+          "--exclude-dir=.claude", // worktrees duplicate the whole repo
+          "--exclude-dir=dist",
+          "--exclude-dir=out",
+          "--exclude-dir=build",
+          "--exclude-dir=.next",
+          "--exclude-dir=target",
+          word,
+          base,
+        ],
+        { maxBuffer: 8 * 1024 * 1024, timeout: 10_000 },
+        (_err, stdout) => {
+          // grep exits 1 on "no matches" — a result, not a failure.
+          const lines = stdout ? stdout.split("\n").filter(Boolean) : [];
+          const results = [];
+          for (const ln of lines.slice(0, 200)) {
+            const m = /^(.*?):(\d+):(.*)$/.exec(ln);
+            if (!m) continue;
+            results.push({
+              path: m[1],
+              rel: relative(base, m[1]),
+              line: Number(m[2]),
+              text: m[3].trim().slice(0, 200),
+            });
+          }
+          resolve({ results, truncated: lines.length > 200 });
+        },
+      );
+    });
   });
 
   // Full-size image as a data URL for the side panel's preview tab (the
