@@ -14,7 +14,9 @@ contextBridge.exposeInMainWorld("unbiased", {
   getEngineStatus: () => ipcRenderer.invoke("engine:status"),
   onEngineStatus: (cb: (status: unknown) => void) => subscribe("engine:status", cb),
 
-  sendMessage: (paneId: string, text: string) => ipcRenderer.invoke("chat:send", { paneId, text }),
+  sendMessage: (paneId: string, text: string, attachments?: { name: string; path: string }[]) =>
+    ipcRenderer.invoke("chat:send", { paneId, text, attachments }),
+  chooseAttachments: () => ipcRenderer.invoke("attach:choose"),
   interrupt: (paneId: string) => ipcRenderer.invoke("chat:interrupt", paneId),
   onTurnStarted: (cb: (p: unknown) => void) => subscribe("chat:turn-started", cb),
   onDelta: (cb: (p: unknown) => void) => subscribe("chat:delta", cb),

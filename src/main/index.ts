@@ -261,8 +261,12 @@ async function startEngine(): Promise<void> {
 app.whenReady().then(async () => {
   ipcMain.handle("engine:status", () => lastStatus);
 
-  ipcMain.handle("chat:send", async (_e, payload: { paneId: PaneId; text: string }) => {
-    const { paneId, text } = payload;
+  ipcMain.handle("chat:send", async (_e, payload: {
+    paneId: PaneId;
+    text: string;
+    attachments?: { name: string; path: string }[];
+  }) => {
+    const { paneId, text, attachments } = payload;
     const pane = panes[paneId];
     let created = false;
     if (!pane.threadId) {
@@ -295,9 +299,16 @@ app.whenReady().then(async () => {
       pane.threadId = started.thread.id;
       created = true;
     }
+    // Attachments ride as `mention` input items — the engine resolves the
+    // path and pulls the content into context itself (same mechanism as
+    // codex's @-mentions), so files AND folders both work.
+    const input: Record<string, unknown>[] = [{ type: "text", text }];
+    for (const a of attachments ?? []) {
+      input.push({ type: "mention", name: a.name, path: a.path });
+    }
     const result = (await engine.request("turn/start", {
       threadId: pane.threadId,
-      input: [{ type: "text", text }],
+      input,
     })) as { turn?: { id?: string } };
     if (result.turn?.id) pane.turnId = result.turn.id;
     return { turnId: pane.turnId, threadId: pane.threadId, created };
@@ -417,6 +428,23 @@ app.whenReady().then(async () => {
     } catch {
       return { error: `Could not open ${rawPath}`, fullPath };
     }
+  });
+
+  ipcMain.handle("attach:choose", async () => {
+    if (!win) return { attachments: [] };
+    const result = await dialog.showOpenDialog(win, {
+      properties: ["openFile", "openDirectory", "multiSelections"],
+      title: "Attach files or folders",
+      buttonLabel: "Attach",
+      defaultPath: mainCwd ?? undefined,
+    });
+    if (result.canceled) return { attachments: [] };
+    return {
+      attachments: result.filePaths.map((path) => ({
+        path,
+        name: path.split("/").filter(Boolean).pop() ?? path,
+      })),
+    };
   });
 
   ipcMain.handle("threads:delete", async (_e, id: string) => {

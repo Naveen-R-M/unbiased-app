@@ -67,7 +67,9 @@ declare global {
       sendMessage: (
         paneId: PaneId,
         text: string,
+        attachments?: { name: string; path: string }[],
       ) => Promise<{ turnId: string | null; threadId: string; created: boolean }>;
+      chooseAttachments: () => Promise<{ attachments: { name: string; path: string }[] }>;
       interrupt: (paneId: PaneId) => Promise<{ interrupted: boolean }>;
       onTurnStarted: (cb: (p: { paneId: PaneId; turnId: string | null }) => void) => () => void;
       onDelta: (cb: (p: { paneId: PaneId; delta: string }) => void) => () => void;
@@ -874,6 +876,16 @@ function ChatPane({
 }) {
   const [entries, setEntries] = useState<Entry[]>(reset.entries);
   const [draft, setDraft] = useState("");
+  const [attachments, setAttachments] = useState<{ name: string; path: string }[]>([]);
+
+  async function addAttachments() {
+    const { attachments: picked } = await window.unbiased.chooseAttachments();
+    if (picked.length === 0) return;
+    setAttachments((a) => {
+      const known = new Set(a.map((x) => x.path));
+      return [...a, ...picked.filter((x) => !known.has(x.path))];
+    });
+  }
   const [busy, setBusyState] = useState(false);
   const [elapsed, setElapsed] = useState(0);
   const [selection, setSelection] = useState<{ text: string; x: number; y: number } | null>(null);
@@ -999,12 +1011,20 @@ function ChatPane({
     if (!text || busy || !connected) return;
     const chip = contextChip?.trim();
     const wire = chip ? `Regarding this excerpt from another conversation:\n> ${chip.replace(/\n/g, "\n> ")}\n\n${text}` : text;
+    const sentAttachments = attachments;
     setDraft("");
+    setAttachments([]);
     if (chip) onContextClear?.();
     setBusy(true);
-    setEntries((es) => [...es, { kind: "user", text: chip ? `${text}\n\n(with selection)` : text }]);
+    const suffix = [
+      chip ? "(with selection)" : "",
+      sentAttachments.length > 0 ? `📎 ${sentAttachments.map((a) => a.name).join(", ")}` : "",
+    ]
+      .filter(Boolean)
+      .join("\n");
+    setEntries((es) => [...es, { kind: "user", text: suffix ? `${text}\n\n${suffix}` : text }]);
     try {
-      await window.unbiased.sendMessage(paneId, wire);
+      await window.unbiased.sendMessage(paneId, wire, sentAttachments);
     } catch (err) {
       setBusy(false);
       setEntries((es) => [...es, { kind: "assistant", text: `Something went wrong: ${String(err)}` }]);
@@ -1272,8 +1292,73 @@ function ChatPane({
               display: "block",
             }}
           />
+          {attachments.length > 0 && (
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 8 }}>
+              {attachments.map((a) => (
+                <span
+                  key={a.path}
+                  title={a.path}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 6,
+                    background: "var(--chip)",
+                    border: `1px solid ${colors.border}`,
+                    borderRadius: 8,
+                    padding: "4px 8px",
+                    fontSize: 12,
+                    color: colors.fg,
+                    maxWidth: 220,
+                  }}
+                >
+                  <PaperclipIcon />
+                  <span style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                    {a.name}
+                  </span>
+                  <button
+                    onClick={() => setAttachments((list) => list.filter((x) => x.path !== a.path))}
+                    aria-label={`Remove ${a.name}`}
+                    style={{
+                      background: "transparent",
+                      border: "none",
+                      color: colors.dim,
+                      cursor: "pointer",
+                      padding: 0,
+                      display: "flex",
+                    }}
+                  >
+                    <CloseIcon />
+                  </button>
+                </span>
+              ))}
+            </div>
+          )}
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginTop: 6 }}>
-            <span style={{ color: colors.dim, fontSize: 12.5 }}>{contextLabel}</span>
+            <span style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <button
+                onClick={() => void addAttachments()}
+                disabled={!connected}
+                title="Attach files or folders"
+                aria-label="Attach files or folders"
+                style={{
+                  width: 28,
+                  height: 28,
+                  borderRadius: 14,
+                  background: "var(--chip)",
+                  color: connected ? colors.fg : colors.dim,
+                  border: `1px solid ${colors.border}`,
+                  cursor: connected ? "pointer" : "default",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  fontSize: 15,
+                  lineHeight: 1,
+                }}
+              >
+                +
+              </button>
+              <span style={{ color: colors.dim, fontSize: 12.5 }}>{contextLabel}</span>
+            </span>
             {busy ? (
               <button
                 onClick={() => void window.unbiased.interrupt(paneId)}
@@ -1691,6 +1776,14 @@ function SettingsView({
         </div>
       </div>
     </div>
+  );
+}
+
+function PaperclipIcon() {
+  return (
+    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" style={{ flexShrink: 0 }}>
+      <path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48" />
+    </svg>
   );
 }
 
