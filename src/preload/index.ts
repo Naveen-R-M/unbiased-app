@@ -1,13 +1,22 @@
 import { contextBridge, ipcRenderer } from "electron";
 
 // The renderer's entire view of the engine. Typed, minimal, and additive:
-// each milestone (turns, approvals, threads) extends this surface rather
-// than exposing ipcRenderer directly.
+// each milestone (approvals, threads) extends this surface rather than
+// exposing ipcRenderer directly.
+
+function subscribe(channel: string, cb: (payload: unknown) => void): () => void {
+  const listener = (_e: unknown, payload: unknown) => cb(payload);
+  ipcRenderer.on(channel, listener);
+  return () => ipcRenderer.removeListener(channel, listener);
+}
+
 contextBridge.exposeInMainWorld("unbiased", {
   getEngineStatus: () => ipcRenderer.invoke("engine:status"),
-  onEngineStatus: (cb: (status: unknown) => void) => {
-    const listener = (_e: unknown, status: unknown) => cb(status);
-    ipcRenderer.on("engine:status", listener);
-    return () => ipcRenderer.removeListener("engine:status", listener);
-  },
+  onEngineStatus: (cb: (status: unknown) => void) => subscribe("engine:status", cb),
+
+  sendMessage: (text: string) => ipcRenderer.invoke("chat:send", text),
+  interrupt: () => ipcRenderer.invoke("chat:interrupt"),
+  onTurnStarted: (cb: (p: unknown) => void) => subscribe("chat:turn-started", cb),
+  onDelta: (cb: (p: unknown) => void) => subscribe("chat:delta", cb),
+  onTurnCompleted: (cb: (p: unknown) => void) => subscribe("chat:turn-completed", cb),
 });
