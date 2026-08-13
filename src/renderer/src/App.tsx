@@ -127,6 +127,45 @@ export function App() {
   const [sideOpen, setSideOpen] = useState(false);
   const [sideContext, setSideContext] = useState<string | null>(null);
   const [sideNonce, setSideNonce] = useState(0);
+  const [navOpen, setNavOpen] = useState(() => localStorage.getItem("navOpen") !== "false");
+  const [sideWidth, setSideWidth] = useState(() => {
+    const stored = Number(localStorage.getItem("sideWidth"));
+    return stored >= 320 ? stored : Math.round(window.innerWidth * 0.42);
+  });
+  const draggingRef = useRef(false);
+
+  function toggleNav() {
+    setNavOpen((o) => {
+      localStorage.setItem("navOpen", String(!o));
+      return !o;
+    });
+  }
+
+  // Divider drag: width follows the cursor, clamped so neither pane
+  // collapses into uselessness. Persisted across launches.
+  useEffect(() => {
+    function onMove(e: MouseEvent) {
+      if (!draggingRef.current) return;
+      const width = Math.min(Math.max(window.innerWidth - e.clientX, 320), Math.round(window.innerWidth * 0.7));
+      setSideWidth(width);
+    }
+    function onUp() {
+      if (!draggingRef.current) return;
+      draggingRef.current = false;
+      document.body.style.userSelect = "";
+      document.body.style.cursor = "";
+      setSideWidth((w) => {
+        localStorage.setItem("sideWidth", String(w));
+        return w;
+      });
+    }
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+  }, []);
 
   async function refreshThreads() {
     setSidebar(await window.unbiased.listThreads());
@@ -216,6 +255,7 @@ export function App() {
         fontFamily: "-apple-system, system-ui, sans-serif",
       }}
     >
+      {navOpen && (
       <nav
         style={{
           width: 248,
@@ -308,22 +348,34 @@ export function App() {
           ))}
         </div>
       </nav>
+      )}
 
       <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column" }}>
         <header
           style={{
-            padding: "12px 24px",
+            padding: "10px 16px",
             borderBottom: `1px solid ${colors.border}`,
-            fontSize: 14,
-            fontWeight: 500,
-            color: colors.fg,
-            whiteSpace: "nowrap",
-            overflow: "hidden",
-            textOverflow: "ellipsis",
+            display: "flex",
+            alignItems: "center",
+            gap: 10,
             flexShrink: 0,
           }}
         >
-          {mainTitle}
+          <IconButton title={navOpen ? "Hide sidebar" : "Show sidebar"} onClick={toggleNav}>
+            <PanelIcon />
+          </IconButton>
+          <span
+            style={{
+              fontSize: 14,
+              fontWeight: 500,
+              color: colors.fg,
+              whiteSpace: "nowrap",
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+            }}
+          >
+            {mainTitle}
+          </span>
         </header>
         <ChatPane
           paneId="main"
@@ -357,10 +409,26 @@ export function App() {
 
       {sideOpen && (
         <div
+          onMouseDown={() => {
+            draggingRef.current = true;
+            document.body.style.userSelect = "none";
+            document.body.style.cursor = "col-resize";
+          }}
+          title="Drag to resize"
           style={{
-            width: 400,
+            width: 5,
             flexShrink: 0,
+            cursor: "col-resize",
+            background: "transparent",
             borderLeft: `1px solid ${colors.border}`,
+          }}
+        />
+      )}
+      {sideOpen && (
+        <div
+          style={{
+            width: sideWidth,
+            flexShrink: 0,
             display: "flex",
             flexDirection: "column",
             background: "#131317",
@@ -394,7 +462,14 @@ export function App() {
             onContextClear={() => setSideContext(null)}
             emptyState={
               <div style={{ textAlign: "center", padding: "0 24px" }}>
-                <p style={{ fontSize: 15, fontWeight: 500, margin: 0 }}>Side chat</p>
+                <div style={{ color: colors.dim, display: "flex", justifyContent: "center", marginBottom: 10 }}>
+                  <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                    <circle cx="12" cy="12" r="10" />
+                    <path d="M12 8v8" />
+                    <path d="M8 12h8" />
+                  </svg>
+                </div>
+                <p style={{ fontSize: 16, fontWeight: 500, margin: 0 }}>Side chat</p>
                 <p style={{ color: colors.dim, marginTop: 6, fontSize: 13 }}>
                   Side chats are temporary and disappear when you close the app.
                 </p>
@@ -1003,6 +1078,15 @@ function PencilIcon() {
     <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
       <path d="M12 20h9" />
       <path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z" />
+    </svg>
+  );
+}
+
+function PanelIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <rect x="3" y="4" width="18" height="16" rx="2" />
+      <path d="M9 4v16" />
     </svg>
   );
 }
