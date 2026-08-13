@@ -652,7 +652,7 @@ export function App() {
               style={{
                 display: "flex",
                 alignItems: "center",
-                gap: 6,
+                gap: 8,
                 background: panelMode === "chat" ? colors.panel : "transparent",
                 color: panelMode === "chat" ? colors.fg : colors.dim,
                 border: "none",
@@ -663,7 +663,19 @@ export function App() {
                 fontFamily: "inherit",
               }}
             >
+              <ChatPlusIcon />
               Side chat
+              <span
+                role="button"
+                aria-label="Close side chat"
+                onClick={(ev) => {
+                  ev.stopPropagation();
+                  void closeSideChat();
+                }}
+                style={{ display: "flex", color: colors.dim, marginLeft: 2 }}
+              >
+                <CloseIcon />
+              </span>
             </button>
             {openFile && (
               <button
@@ -708,9 +720,6 @@ export function App() {
                 <PencilIcon />
               </IconButton>
             )}
-            <IconButton title="Close panel" onClick={() => void closeSideChat()}>
-              <CloseIcon />
-            </IconButton>
           </header>
           {openFile && panelMode === "file" && <FileViewer file={openFile} />}
           <div
@@ -1915,6 +1924,16 @@ function PanelIcon() {
     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
       <rect x="3" y="4" width="18" height="16" rx="2" />
       <path d="M9 4v16" />
+    </svg>
+  );
+}
+
+function ChatPlusIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" style={{ flexShrink: 0 }}>
+      <path d="M21 11.5a8.38 8.38 0 0 1-8.5 8.5 8.5 8.5 0 0 1-3.5-.76L3 21l1.76-6A8.5 8.5 0 1 1 21 11.5Z" />
+      <path d="M12 8v6" />
+      <path d="M9 11h6" />
     </svg>
   );
 }
