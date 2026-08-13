@@ -30,6 +30,7 @@ type Entry =
     };
 
 type ThreadSummary = { id: string; title: string; createdAt?: string };
+type SidebarData = { projects: { name: string; threads: ThreadSummary[] }[]; recents: ThreadSummary[] };
 
 declare global {
   interface Window {
@@ -52,7 +53,7 @@ declare global {
         }) => void,
       ) => () => void;
       onCommand: (cb: (p: { phase: "started" | "completed"; item: CommandItem }) => void) => () => void;
-      listThreads: () => Promise<{ threads: ThreadSummary[] }>;
+      listThreads: () => Promise<SidebarData>;
       openThread: (id: string) => Promise<{ id: string; entries: Entry[] }>;
       detachThread: () => Promise<{ ok: boolean }>;
       deleteThread: (id: string) => Promise<{ ok: boolean }>;
@@ -110,14 +111,13 @@ export function App() {
   const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState(false);
   const [elapsed, setElapsed] = useState(0);
-  const [threads, setThreads] = useState<ThreadSummary[]>([]);
+  const [sidebar, setSidebar] = useState<SidebarData>({ projects: [], recents: [] });
   const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
   const [hoveredThreadId, setHoveredThreadId] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   async function refreshThreads() {
-    const { threads: list } = await window.unbiased.listThreads();
-    setThreads(list);
+    setSidebar(await window.unbiased.listThreads());
   }
 
   async function newChat() {
@@ -338,7 +338,7 @@ export function App() {
     >
       <nav
         style={{
-          width: 232,
+          width: 248,
           flexShrink: 0,
           borderRight: `1px solid ${colors.border}`,
           display: "flex",
@@ -346,107 +346,82 @@ export function App() {
           background: "#131317",
         }}
       >
-        <div style={{ padding: "14px 14px 10px" }}>
-          <div style={{ fontSize: 17, fontWeight: 600, letterSpacing: -0.3, marginBottom: 12 }}>
+        <div style={{ padding: "14px 14px 6px" }}>
+          <div style={{ fontSize: 17, fontWeight: 600, letterSpacing: -0.3, marginBottom: 14 }}>
             <span style={{ color: colors.accent }}>un</span>biased
           </div>
           <button
             onClick={() => void newChat()}
             disabled={busy}
             style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 10,
               width: "100%",
               background: "transparent",
               color: busy ? colors.dim : colors.fg,
-              border: `1px solid ${colors.border}`,
+              border: "none",
               borderRadius: 8,
-              padding: "8px 10px",
-              fontSize: 13,
+              padding: "8px 8px",
+              fontSize: 14,
               cursor: busy ? "default" : "pointer",
               textAlign: "left",
               fontFamily: "inherit",
             }}
           >
-            + New chat
+            <PencilIcon />
+            New chat
           </button>
         </div>
         <div style={{ flex: 1, overflowY: "auto", padding: "0 8px 12px" }}>
-          {threads.length === 0 && (
-            <div style={{ color: colors.dim, fontSize: 12, padding: "8px 6px" }}>No conversations yet</div>
+          {sidebar.projects.length === 0 && sidebar.recents.length === 0 && (
+            <div style={{ color: colors.dim, fontSize: 12, padding: "8px 8px" }}>No conversations yet</div>
           )}
-          {threads.map((t) => (
-            <div
-              key={t.id}
-              onMouseEnter={() => setHoveredThreadId(t.id)}
-              onMouseLeave={() => setHoveredThreadId((h) => (h === t.id ? null : h))}
-              style={{
-                display: "flex",
-                alignItems: "center",
-                background: t.id === activeThreadId ? colors.panel : "transparent",
-                borderRadius: 8,
-                marginBottom: 2,
-              }}
-            >
-              <button
-                onClick={() => void openThread(t.id)}
-                disabled={busy}
-                title={t.title}
+
+          {sidebar.projects.length > 0 && <SectionLabel>Projects</SectionLabel>}
+          {sidebar.projects.map((p) => (
+            <div key={p.name} style={{ marginBottom: 8 }}>
+              <div
                 style={{
-                  flex: 1,
-                  minWidth: 0,
-                  background: "transparent",
-                  color: t.id === activeThreadId ? colors.fg : colors.dim,
-                  border: "none",
-                  padding: "8px 4px 8px 10px",
-                  fontSize: 13,
-                  textAlign: "left",
-                  cursor: busy ? "default" : "pointer",
-                  whiteSpace: "nowrap",
-                  overflow: "hidden",
-                  textOverflow: "ellipsis",
-                  fontFamily: "inherit",
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 10,
+                  padding: "7px 8px 5px",
+                  fontSize: 14,
+                  color: colors.fg,
                 }}
               >
-                {t.title}
-              </button>
-              {hoveredThreadId === t.id && !busy && (
-                <button
-                  onClick={() => void deleteThread(t.id)}
-                  title="Delete conversation"
-                  aria-label="Delete conversation"
-                  style={{
-                    flexShrink: 0,
-                    display: "flex",
-                    alignItems: "center",
-                    background: "transparent",
-                    color: colors.dim,
-                    border: "none",
-                    padding: "6px 8px",
-                    cursor: "pointer",
-                    lineHeight: 1,
-                  }}
-                  onMouseEnter={(ev) => ((ev.currentTarget as HTMLButtonElement).style.color = colors.err)}
-                  onMouseLeave={(ev) => ((ev.currentTarget as HTMLButtonElement).style.color = colors.dim)}
-                >
-                  <svg
-                    width="13"
-                    height="13"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="2"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    aria-hidden="true"
-                  >
-                    <path d="M3 6h18" />
-                    <path d="M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2" />
-                    <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
-                    <path d="M10 11v6" />
-                    <path d="M14 11v6" />
-                  </svg>
-                </button>
-              )}
+                <FolderIcon />
+                <span style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{p.name}</span>
+              </div>
+              {p.threads.map((t) => (
+                <ThreadRow
+                  key={t.id}
+                  thread={t}
+                  active={t.id === activeThreadId}
+                  hovered={hoveredThreadId === t.id}
+                  busy={busy}
+                  indent
+                  onHover={setHoveredThreadId}
+                  onOpen={openThread}
+                  onDelete={deleteThread}
+                />
+              ))}
             </div>
+          ))}
+
+          {sidebar.recents.length > 0 && <SectionLabel>Recents</SectionLabel>}
+          {sidebar.recents.map((t) => (
+            <ThreadRow
+              key={t.id}
+              thread={t}
+              active={t.id === activeThreadId}
+              hovered={hoveredThreadId === t.id}
+              busy={busy}
+              onHover={setHoveredThreadId}
+              onOpen={openThread}
+              onDelete={deleteThread}
+            />
           ))}
         </div>
       </nav>
@@ -642,6 +617,121 @@ function ChatFooter({ status, busy, elapsed }: { status: EngineStatus; busy: boo
       {status.state === "starting" && <span>starting engine…</span>}
       {status.state === "exited" && <span style={{ color: colors.err }}>{status.detail}</span>}
     </footer>
+  );
+}
+
+function SectionLabel({ children }: { children: React.ReactNode }) {
+  return (
+    <div style={{ color: colors.dim, fontSize: 12, fontWeight: 500, padding: "10px 8px 4px" }}>{children}</div>
+  );
+}
+
+function PencilIcon() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M12 20h9" />
+      <path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z" />
+    </svg>
+  );
+}
+
+function FolderIcon() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" style={{ color: colors.amber, flexShrink: 0 }}>
+      <path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.7-.9L9.2 3.9A2 2 0 0 0 7.5 3H4a2 2 0 0 0-2 2v13c0 1.1.9 2 2 2Z" />
+    </svg>
+  );
+}
+
+function TrashIcon() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M3 6h18" />
+      <path d="M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2" />
+      <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
+      <path d="M10 11v6" />
+      <path d="M14 11v6" />
+    </svg>
+  );
+}
+
+function ThreadRow({
+  thread,
+  active,
+  hovered,
+  busy,
+  indent,
+  onHover,
+  onOpen,
+  onDelete,
+}: {
+  thread: ThreadSummary;
+  active: boolean;
+  hovered: boolean;
+  busy: boolean;
+  indent?: boolean;
+  onHover: (id: string | null) => void;
+  onOpen: (id: string) => Promise<void>;
+  onDelete: (id: string) => Promise<void>;
+}) {
+  return (
+    <div
+      onMouseEnter={() => onHover(thread.id)}
+      onMouseLeave={() => onHover(null)}
+      style={{
+        display: "flex",
+        alignItems: "center",
+        background: active ? colors.panel : "transparent",
+        borderRadius: 8,
+        marginBottom: 1,
+        paddingLeft: indent ? 25 : 0,
+      }}
+    >
+      <button
+        onClick={() => void onOpen(thread.id)}
+        disabled={busy}
+        title={thread.title}
+        style={{
+          flex: 1,
+          minWidth: 0,
+          background: "transparent",
+          color: active ? colors.fg : colors.dim,
+          border: "none",
+          padding: "7px 4px 7px 8px",
+          fontSize: 13,
+          textAlign: "left",
+          cursor: busy ? "default" : "pointer",
+          whiteSpace: "nowrap",
+          overflow: "hidden",
+          textOverflow: "ellipsis",
+          fontFamily: "inherit",
+        }}
+      >
+        {thread.title}
+      </button>
+      {hovered && !busy && (
+        <button
+          onClick={() => void onDelete(thread.id)}
+          title="Delete conversation"
+          aria-label="Delete conversation"
+          style={{
+            flexShrink: 0,
+            display: "flex",
+            alignItems: "center",
+            background: "transparent",
+            color: colors.dim,
+            border: "none",
+            padding: "6px 8px",
+            cursor: "pointer",
+            lineHeight: 1,
+          }}
+          onMouseEnter={(ev) => ((ev.currentTarget as HTMLButtonElement).style.color = colors.err)}
+          onMouseLeave={(ev) => ((ev.currentTarget as HTMLButtonElement).style.color = colors.dim)}
+        >
+          <TrashIcon />
+        </button>
+      )}
+    </div>
   );
 }
 

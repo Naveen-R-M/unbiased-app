@@ -34,6 +34,7 @@ type WireThread = {
   name?: string | null;
   preview?: string;
   createdAt?: string;
+  cwd?: string;
   turns?: { items?: WireItem[] }[];
 };
 
@@ -223,13 +224,27 @@ app.whenReady().then(async () => {
   });
 
   ipcMain.handle("threads:list", async () => {
-    const result = (await engine.request("thread/list", { limit: 50 })) as { data?: WireThread[] };
-    const threads: ThreadSummary[] = (result.data ?? []).map((t) => ({
-      id: t.id,
-      title: threadTitle(t),
-      createdAt: t.createdAt,
-    }));
-    return { threads };
+    const result = (await engine.request("thread/list", { limit: 100 })) as { data?: WireThread[] };
+    const home = app.getPath("home");
+    // Codex-style sections: threads that ran inside a project folder group
+    // under that folder's name; home-dir (or cwd-less) threads are Recents.
+    const projectMap = new Map<string, ThreadSummary[]>();
+    const recents: ThreadSummary[] = [];
+    for (const t of result.data ?? []) {
+      const summary: ThreadSummary = { id: t.id, title: threadTitle(t), createdAt: t.createdAt };
+      if (t.cwd && t.cwd !== home) {
+        const name = t.cwd.split("/").filter(Boolean).pop() ?? t.cwd;
+        const list = projectMap.get(name) ?? [];
+        list.push(summary);
+        projectMap.set(name, list);
+      } else {
+        recents.push(summary);
+      }
+    }
+    return {
+      projects: [...projectMap].map(([name, threads]) => ({ name, threads })),
+      recents,
+    };
   });
 
   ipcMain.handle("threads:open", async (_e, id: string) => {
