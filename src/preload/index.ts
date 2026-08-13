@@ -1,8 +1,8 @@
 import { contextBridge, ipcRenderer } from "electron";
 
-// The renderer's entire view of the engine. Typed, minimal, and additive:
-// each milestone (approvals, threads) extends this surface rather than
-// exposing ipcRenderer directly.
+// The renderer's entire view of the engine. Typed, minimal, and additive.
+// Chat traffic is pane-scoped: every event payload carries paneId and every
+// action names the pane it drives.
 
 function subscribe(channel: string, cb: (payload: unknown) => void): () => void {
   const listener = (_e: unknown, payload: unknown) => cb(payload);
@@ -14,8 +14,8 @@ contextBridge.exposeInMainWorld("unbiased", {
   getEngineStatus: () => ipcRenderer.invoke("engine:status"),
   onEngineStatus: (cb: (status: unknown) => void) => subscribe("engine:status", cb),
 
-  sendMessage: (text: string) => ipcRenderer.invoke("chat:send", text),
-  interrupt: () => ipcRenderer.invoke("chat:interrupt"),
+  sendMessage: (paneId: string, text: string) => ipcRenderer.invoke("chat:send", { paneId, text }),
+  interrupt: (paneId: string) => ipcRenderer.invoke("chat:interrupt", paneId),
   onTurnStarted: (cb: (p: unknown) => void) => subscribe("chat:turn-started", cb),
   onDelta: (cb: (p: unknown) => void) => subscribe("chat:delta", cb),
   onTurnCompleted: (cb: (p: unknown) => void) => subscribe("chat:turn-completed", cb),
@@ -29,5 +29,6 @@ contextBridge.exposeInMainWorld("unbiased", {
   openThread: (id: string) => ipcRenderer.invoke("threads:open", id),
   detachThread: (cwd?: string) => ipcRenderer.invoke("threads:detach", cwd),
   deleteThread: (id: string) => ipcRenderer.invoke("threads:delete", id),
+  resetSideChat: () => ipcRenderer.invoke("side:reset"),
   chooseProject: () => ipcRenderer.invoke("project:choose"),
 });

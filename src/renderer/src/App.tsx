@@ -29,6 +29,7 @@ type Entry =
       approval?: { requestId: string; reason: string | null; decision?: "accept" | "decline" };
     };
 
+type PaneId = "main" | "side";
 type ThreadSummary = { id: string; title: string; createdAt?: string };
 type SidebarData = {
   projects: { name: string; path: string; threads: ThreadSummary[] }[];
@@ -40,14 +41,18 @@ declare global {
     unbiased: {
       getEngineStatus: () => Promise<EngineStatus>;
       onEngineStatus: (cb: (status: EngineStatus) => void) => () => void;
-      sendMessage: (text: string) => Promise<{ turnId: string | null; threadId: string; created: boolean }>;
-      interrupt: () => Promise<{ interrupted: boolean }>;
-      onTurnStarted: (cb: (p: { turnId: string | null }) => void) => () => void;
-      onDelta: (cb: (p: { delta: string }) => void) => () => void;
-      onTurnCompleted: (cb: (p: { status: string }) => void) => () => void;
+      sendMessage: (
+        paneId: PaneId,
+        text: string,
+      ) => Promise<{ turnId: string | null; threadId: string; created: boolean }>;
+      interrupt: (paneId: PaneId) => Promise<{ interrupted: boolean }>;
+      onTurnStarted: (cb: (p: { paneId: PaneId; turnId: string | null }) => void) => () => void;
+      onDelta: (cb: (p: { paneId: PaneId; delta: string }) => void) => () => void;
+      onTurnCompleted: (cb: (p: { paneId: PaneId; status: string }) => void) => () => void;
       decideApproval: (requestId: string, decision: "accept" | "decline") => Promise<{ ok: boolean }>;
       onApprovalRequest: (
         cb: (p: {
+          paneId: PaneId;
           requestId: string;
           itemId: string | null;
           command: string;
@@ -55,11 +60,14 @@ declare global {
           reason: string | null;
         }) => void,
       ) => () => void;
-      onCommand: (cb: (p: { phase: "started" | "completed"; item: CommandItem }) => void) => () => void;
+      onCommand: (
+        cb: (p: { paneId: PaneId; phase: "started" | "completed"; item: CommandItem }) => void,
+      ) => () => void;
       listThreads: () => Promise<SidebarData>;
       openThread: (id: string) => Promise<{ id: string; entries: Entry[] }>;
       detachThread: (cwd?: string) => Promise<{ ok: boolean }>;
       deleteThread: (id: string) => Promise<{ ok: boolean }>;
+      resetSideChat: () => Promise<{ ok: boolean }>;
       chooseProject: () => Promise<{ path: string | null; name: string | null }>;
     };
   }
@@ -77,9 +85,7 @@ const colors = {
   amber: "#FAC775",
 };
 
-/** Drop a trailing empty assistant placeholder (it exists only so deltas have
- *  somewhere to land; once a command card or turn end arrives, an empty one
- *  is just noise). */
+/** Drop a trailing empty assistant placeholder. */
 function withoutTrailingPlaceholder(es: Entry[]): Entry[] {
   const last = es[es.length - 1];
   if (last?.kind === "assistant" && last.text === "" && !last.interrupted) return es.slice(0, -1);
@@ -87,10 +93,11 @@ function withoutTrailingPlaceholder(es: Entry[]): Entry[] {
 }
 
 type CommandEntry = Extract<Entry, { kind: "command" }>;
-type DisplayBlock = { kind: "entry"; entry: Entry; key: number } | { kind: "steps"; items: CommandEntry[]; key: number };
+type DisplayBlock =
+  | { kind: "entry"; entry: Entry; key: number }
+  | { kind: "steps"; items: CommandEntry[]; key: number };
 
-/** Consecutive command entries collapse into one steps group — the agent's
- *  work reads as a single disclosure, the way the answer reads as one bubble. */
+/** Consecutive command entries collapse into one steps group. */
 function toDisplayBlocks(entries: Entry[]): DisplayBlock[] {
   const blocks: DisplayBlock[] = [];
   for (let i = 0; i < entries.length; i++) {
@@ -111,58 +118,338 @@ function toDisplayBlocks(entries: Entry[]): DisplayBlock[] {
 
 export function App() {
   const [status, setStatus] = useState<EngineStatus>({ state: "starting" });
-  const [entries, setEntries] = useState<Entry[]>([]);
-  const [draft, setDraft] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [elapsed, setElapsed] = useState(0);
   const [sidebar, setSidebar] = useState<SidebarData>({ projects: [], recents: [] });
   const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
+  const [activeProject, setActiveProject] = useState<{ name: string; path: string } | null>(null);
   const [hoveredThreadId, setHoveredThreadId] = useState<string | null>(null);
-  const scrollRef = useRef<HTMLDivElement>(null);
+  const [mainBusy, setMainBusy] = useState(false);
+  const [mainReset, setMainReset] = useState<{ entries: Entry[]; nonce: number }>({ entries: [], nonce: 0 });
+  const [sideOpen, setSideOpen] = useState(false);
+  const [sideContext, setSideContext] = useState<string | null>(null);
+  const [sideNonce, setSideNonce] = useState(0);
 
   async function refreshThreads() {
     setSidebar(await window.unbiased.listThreads());
   }
 
-  const [activeProject, setActiveProject] = useState<{ name: string; path: string } | null>(null);
+  useEffect(() => {
+    window.unbiased.getEngineStatus().then((s) => {
+      setStatus(s);
+      if (s.state === "connected") void refreshThreads();
+    });
+    return window.unbiased.onEngineStatus((s: EngineStatus) => {
+      setStatus(s);
+      if (s.state === "connected") void refreshThreads();
+    });
+  }, []);
 
   async function newChat(project?: { name: string; path: string }) {
-    if (busy) return;
+    if (mainBusy) return;
     await window.unbiased.detachThread(project?.path);
     setActiveProject(project ?? null);
     setActiveThreadId(null);
-    setEntries([]);
+    setMainReset((r) => ({ entries: [], nonce: r.nonce + 1 }));
   }
 
   async function openProjectDialog() {
-    if (busy) return;
+    if (mainBusy) return;
     const { path, name } = await window.unbiased.chooseProject();
     if (!path || !name) return; // cancelled
     setActiveProject({ name, path });
     setActiveThreadId(null);
-    setEntries([]);
+    setMainReset((r) => ({ entries: [], nonce: r.nonce + 1 }));
     void refreshThreads(); // the project shows in the sidebar immediately
   }
 
   async function openThread(id: string) {
-    if (busy || id === activeThreadId) return;
+    if (mainBusy || id === activeThreadId) return;
     const { entries: history } = await window.unbiased.openThread(id);
     setActiveProject(null);
     setActiveThreadId(id);
-    setEntries(history);
+    setMainReset((r) => ({ entries: history, nonce: r.nonce + 1 }));
   }
 
   async function deleteThread(id: string) {
-    if (busy) return;
+    if (mainBusy) return;
     await window.unbiased.deleteThread(id);
     if (id === activeThreadId) {
       setActiveThreadId(null);
-      setEntries([]);
+      setMainReset((r) => ({ entries: [], nonce: r.nonce + 1 }));
     }
     void refreshThreads();
   }
 
-  // Pareto today completes the whole response before its first byte arrives
+  function askInSideChat(text: string) {
+    setSideContext(text);
+    setSideOpen(true);
+  }
+
+  async function closeSideChat() {
+    await window.unbiased.resetSideChat();
+    setSideOpen(false);
+    setSideContext(null);
+    setSideNonce((n) => n + 1);
+  }
+
+  async function newSideChat() {
+    await window.unbiased.resetSideChat();
+    setSideContext(null);
+    setSideNonce((n) => n + 1);
+  }
+
+  const connected = status.state === "connected";
+  const mainTitle = (() => {
+    if (activeThreadId) {
+      const all = [...sidebar.projects.flatMap((p) => p.threads), ...sidebar.recents];
+      return all.find((t) => t.id === activeThreadId)?.title ?? "Conversation";
+    }
+    return activeProject ? `New chat · ${activeProject.name}` : "New chat";
+  })();
+
+  return (
+    <div
+      style={{
+        height: "100vh",
+        display: "flex",
+        background: colors.bg,
+        color: colors.fg,
+        fontFamily: "-apple-system, system-ui, sans-serif",
+      }}
+    >
+      <nav
+        style={{
+          width: 248,
+          flexShrink: 0,
+          borderRight: `1px solid ${colors.border}`,
+          display: "flex",
+          flexDirection: "column",
+          background: "#131317",
+        }}
+      >
+        <div style={{ padding: "14px 14px 6px" }}>
+          <div style={{ fontSize: 17, fontWeight: 600, letterSpacing: -0.3, marginBottom: 14 }}>
+            <span style={{ color: colors.accent }}>un</span>biased
+          </div>
+          <SidebarAction onClick={() => void newChat()} disabled={mainBusy} icon={<PencilIcon />}>
+            New chat
+          </SidebarAction>
+          <SidebarAction onClick={() => void openProjectDialog()} disabled={mainBusy} icon={<FolderPlusIcon />}>
+            Open project…
+          </SidebarAction>
+          <SidebarAction
+            onClick={() => (sideOpen ? void closeSideChat() : setSideOpen(true))}
+            disabled={false}
+            icon={<SideChatIcon />}
+          >
+            {sideOpen ? "Close side chat" : "Side chat"}
+          </SidebarAction>
+        </div>
+        <div style={{ flex: 1, overflowY: "auto", padding: "0 8px 12px" }}>
+          {sidebar.projects.length === 0 && sidebar.recents.length === 0 && (
+            <div style={{ color: colors.dim, fontSize: 12, padding: "8px 8px" }}>No conversations yet</div>
+          )}
+
+          {sidebar.projects.length > 0 && <SectionLabel>Projects</SectionLabel>}
+          {sidebar.projects.map((p) => (
+            <div key={p.path} style={{ marginBottom: 8 }}>
+              <button
+                onClick={() => void newChat({ name: p.name, path: p.path })}
+                disabled={mainBusy}
+                title={`New chat in ${p.path}`}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 10,
+                  width: "100%",
+                  background: activeProject?.path === p.path ? colors.panel : "transparent",
+                  border: "none",
+                  borderRadius: 8,
+                  padding: "7px 8px 5px",
+                  fontSize: 14,
+                  color: colors.fg,
+                  cursor: mainBusy ? "default" : "pointer",
+                  textAlign: "left",
+                  fontFamily: "inherit",
+                }}
+              >
+                <FolderIcon />
+                <span style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                  {p.name}
+                </span>
+              </button>
+              {p.threads.map((t) => (
+                <ThreadRow
+                  key={t.id}
+                  thread={t}
+                  active={t.id === activeThreadId}
+                  hovered={hoveredThreadId === t.id}
+                  busy={mainBusy}
+                  indent
+                  onHover={setHoveredThreadId}
+                  onOpen={openThread}
+                  onDelete={deleteThread}
+                />
+              ))}
+            </div>
+          ))}
+
+          {sidebar.recents.length > 0 && <SectionLabel>Recents</SectionLabel>}
+          {sidebar.recents.map((t) => (
+            <ThreadRow
+              key={t.id}
+              thread={t}
+              active={t.id === activeThreadId}
+              hovered={hoveredThreadId === t.id}
+              busy={mainBusy}
+              onHover={setHoveredThreadId}
+              onOpen={openThread}
+              onDelete={deleteThread}
+            />
+          ))}
+        </div>
+      </nav>
+
+      <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column" }}>
+        <header
+          style={{
+            padding: "12px 24px",
+            borderBottom: `1px solid ${colors.border}`,
+            fontSize: 14,
+            fontWeight: 500,
+            color: colors.fg,
+            whiteSpace: "nowrap",
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            flexShrink: 0,
+          }}
+        >
+          {mainTitle}
+        </header>
+        <ChatPane
+          paneId="main"
+          connected={connected}
+          reset={mainReset}
+          contextLabel={`${activeProject ? `${activeProject.name} · ` : ""}pareto · read-only`}
+          emptyState={
+            <div style={{ textAlign: "center" }}>
+              <h1 style={{ fontSize: 42, fontWeight: 600, letterSpacing: -1, margin: 0 }}>
+                <span style={{ color: colors.accent }}>un</span>biased
+              </h1>
+              <p style={{ color: colors.dim, marginTop: 8 }}>
+                {!connected ? (
+                  "Waiting for the engine…"
+                ) : activeProject ? (
+                  <>
+                    New chat in <span style={{ color: colors.fg }}>{activeProject.name}</span>
+                  </>
+                ) : (
+                  "Ask Pareto anything."
+                )}
+              </p>
+            </div>
+          }
+          onBusyChange={setMainBusy}
+          onTurnLanded={refreshThreads}
+          onAskSideChat={askInSideChat}
+        />
+        <ChatFooter status={status} busy={mainBusy} />
+      </div>
+
+      {sideOpen && (
+        <div
+          style={{
+            width: 400,
+            flexShrink: 0,
+            borderLeft: `1px solid ${colors.border}`,
+            display: "flex",
+            flexDirection: "column",
+            background: "#131317",
+          }}
+        >
+          <header
+            style={{
+              padding: "12px 16px",
+              borderBottom: `1px solid ${colors.border}`,
+              display: "flex",
+              alignItems: "center",
+              gap: 8,
+              flexShrink: 0,
+            }}
+          >
+            <span style={{ fontSize: 14, fontWeight: 500, flex: 1 }}>Side chat</span>
+            <IconButton title="New side chat" onClick={() => void newSideChat()}>
+              <PencilIcon />
+            </IconButton>
+            <IconButton title="Close side chat" onClick={() => void closeSideChat()}>
+              <CloseIcon />
+            </IconButton>
+          </header>
+          <ChatPane
+            key={sideNonce}
+            paneId="side"
+            connected={connected}
+            reset={{ entries: [], nonce: 0 }}
+            contextLabel="pareto · temporary"
+            contextChip={sideContext}
+            onContextClear={() => setSideContext(null)}
+            emptyState={
+              <div style={{ textAlign: "center", padding: "0 24px" }}>
+                <p style={{ fontSize: 15, fontWeight: 500, margin: 0 }}>Side chat</p>
+                <p style={{ color: colors.dim, marginTop: 6, fontSize: 13 }}>
+                  Side chats are temporary and disappear when you close the app.
+                </p>
+              </div>
+            }
+          />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ChatPane({
+  paneId,
+  connected,
+  reset,
+  contextLabel,
+  contextChip,
+  onContextClear,
+  emptyState,
+  onBusyChange,
+  onTurnLanded,
+  onAskSideChat,
+}: {
+  paneId: PaneId;
+  connected: boolean;
+  reset: { entries: Entry[]; nonce: number };
+  contextLabel: string;
+  contextChip?: string | null;
+  onContextClear?: () => void;
+  emptyState: React.ReactNode;
+  onBusyChange?: (busy: boolean) => void;
+  onTurnLanded?: () => void;
+  onAskSideChat?: (text: string) => void;
+}) {
+  const [entries, setEntries] = useState<Entry[]>(reset.entries);
+  const [draft, setDraft] = useState("");
+  const [busy, setBusyState] = useState(false);
+  const [elapsed, setElapsed] = useState(0);
+  const [selection, setSelection] = useState<{ text: string; x: number; y: number } | null>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const paneRef = useRef<HTMLDivElement>(null);
+
+  function setBusy(b: boolean) {
+    setBusyState(b);
+    onBusyChange?.(b);
+  }
+
+  useEffect(() => {
+    setEntries(reset.entries);
+    setBusy(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [reset.nonce]);
+
+  // Pareto completes the whole response before its first byte arrives
   // (~3-5s of silence), so the wait needs to look attended, not frozen.
   useEffect(() => {
     if (!busy) {
@@ -175,28 +462,22 @@ export function App() {
   }, [busy]);
 
   useEffect(() => {
-    window.unbiased.getEngineStatus().then((s) => {
-      setStatus(s);
-      if (s.state === "connected") void refreshThreads();
-    });
     const offs = [
-      window.unbiased.onEngineStatus((s: EngineStatus) => {
-        setStatus(s);
-        if (s.state === "connected") void refreshThreads();
-      }),
-      window.unbiased.onDelta(({ delta }) => {
+      window.unbiased.onDelta((p) => {
+        if (p.paneId !== paneId) return;
         setEntries((es) => {
           const last = es[es.length - 1];
-          if (!last || last.kind !== "assistant") return [...es, { kind: "assistant", text: delta }];
-          return [...es.slice(0, -1), { ...last, text: last.text + delta }];
+          if (!last || last.kind !== "assistant") return [...es, { kind: "assistant", text: p.delta }];
+          return [...es.slice(0, -1), { ...last, text: last.text + p.delta }];
         });
       }),
-      window.unbiased.onTurnCompleted(({ status: turnStatus }) => {
+      window.unbiased.onTurnCompleted((p) => {
+        if (p.paneId !== paneId) return;
         setBusy(false);
-        void refreshThreads(); // previews/titles update after a turn lands
+        onTurnLanded?.();
         setEntries((es) => {
           let next = es;
-          if (turnStatus === "interrupted") {
+          if (p.status === "interrupted") {
             const last = next[next.length - 1];
             if (last?.kind === "assistant" && last.text !== "") {
               next = [...next.slice(0, -1), { ...last, interrupted: true }];
@@ -206,12 +487,13 @@ export function App() {
         });
       }),
       window.unbiased.onApprovalRequest((p) => {
+        if (p.paneId !== paneId) return;
         setEntries((es) => {
           const cleaned = withoutTrailingPlaceholder(es);
           const approval = { requestId: p.requestId, reason: p.reason };
           const idx = cleaned.findIndex((e) => e.kind === "command" && e.itemId === p.itemId);
           if (idx !== -1) {
-            const cmd = cleaned[idx] as Extract<Entry, { kind: "command" }>;
+            const cmd = cleaned[idx] as CommandEntry;
             const updated: Entry = { ...cmd, status: "awaitingApproval", approval };
             return [...cleaned.slice(0, idx), updated, ...cleaned.slice(idx + 1)];
           }
@@ -227,7 +509,9 @@ export function App() {
           ];
         });
       }),
-      window.unbiased.onCommand(({ phase, item }) => {
+      window.unbiased.onCommand((p) => {
+        if (p.paneId !== paneId) return;
+        const item = p.item;
         setEntries((es) => {
           const cleaned = withoutTrailingPlaceholder(es);
           const itemId = item.id ?? "unknown";
@@ -239,13 +523,13 @@ export function App() {
                 kind: "command",
                 itemId,
                 command: item.command ?? "(command)",
-                status: item.status ?? (phase === "started" ? "inProgress" : "completed"),
+                status: item.status ?? (p.phase === "started" ? "inProgress" : "completed"),
                 exitCode: item.exitCode,
                 output: item.aggregatedOutput ?? item.output,
               },
             ];
           }
-          const existing = cleaned[idx] as Extract<Entry, { kind: "command" }>;
+          const existing = cleaned[idx] as CommandEntry;
           const updated: Entry = {
             ...existing,
             command: item.command ?? existing.command,
@@ -258,28 +542,27 @@ export function App() {
       }),
     ];
     return () => offs.forEach((off) => off());
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [paneId]);
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
   }, [entries]);
 
-  const connected = status.state === "connected";
   const lastEntry = entries[entries.length - 1];
   const showThinking = busy && !(lastEntry?.kind === "assistant" && lastEntry.text !== "");
 
   async function submit() {
     const text = draft.trim();
     if (!text || busy || !connected) return;
+    const chip = contextChip?.trim();
+    const wire = chip ? `Regarding this excerpt from another conversation:\n> ${chip.replace(/\n/g, "\n> ")}\n\n${text}` : text;
     setDraft("");
+    if (chip) onContextClear?.();
     setBusy(true);
-    setEntries((es) => [...es, { kind: "user", text }]);
+    setEntries((es) => [...es, { kind: "user", text: chip ? `${text}\n\n(with selection)` : text }]);
     try {
-      const result = await window.unbiased.sendMessage(text);
-      if (result.created) {
-        setActiveThreadId(result.threadId);
-        void refreshThreads();
-      }
+      await window.unbiased.sendMessage(paneId, wire);
     } catch (err) {
       setBusy(false);
       setEntries((es) => [...es, { kind: "assistant", text: `Something went wrong: ${String(err)}` }]);
@@ -290,20 +573,39 @@ export function App() {
     setEntries((es) =>
       es.map((e) =>
         e.kind === "command" && e.itemId === itemId && e.approval
-          ? { ...e, approval: { ...e.approval, decision }, status: decision === "decline" ? "declined" : "inProgress" }
+          ? {
+              ...e,
+              approval: { ...e.approval, decision },
+              status: decision === "decline" ? "declined" : "inProgress",
+            }
           : e,
       ),
     );
     await window.unbiased.decideApproval(requestId, decision);
   }
 
-  const statusLabel = (e: Extract<Entry, { kind: "command" }>) => {
+  const statusLabel = (e: CommandEntry) => {
     if (e.status === "awaitingApproval") return { text: "▸ needs approval", color: colors.amber };
     if (e.status === "inProgress") return { text: "▸ running", color: colors.amber };
     if (e.status === "declined") return { text: "▸ declined", color: colors.dim };
-    if (e.status === "failed" || (e.exitCode ?? 0) !== 0) return { text: `▸ exit ${e.exitCode ?? "?"}`, color: colors.err };
+    if (e.status === "failed" || (e.exitCode ?? 0) !== 0)
+      return { text: `▸ exit ${e.exitCode ?? "?"}`, color: colors.err };
     return { text: "▸ done", color: colors.ok };
   };
+
+  function handleMouseUp() {
+    if (!onAskSideChat) return;
+    const sel = window.getSelection();
+    const text = sel?.toString().trim() ?? "";
+    if (!text || !sel || sel.rangeCount === 0) {
+      setSelection(null);
+      return;
+    }
+    const rect = sel.getRangeAt(0).getBoundingClientRect();
+    const paneRect = paneRef.current?.getBoundingClientRect();
+    if (!paneRect) return;
+    setSelection({ text, x: rect.left - paneRect.left + rect.width / 2, y: rect.top - paneRect.top });
+  }
 
   const mdComponents = {
     code: (props: { className?: string; children?: React.ReactNode }) => (
@@ -345,190 +647,55 @@ export function App() {
   };
 
   return (
-    <div
-      style={{
-        height: "100vh",
-        display: "flex",
-        background: colors.bg,
-        color: colors.fg,
-        fontFamily: "-apple-system, system-ui, sans-serif",
-      }}
-    >
-      <nav
-        style={{
-          width: 248,
-          flexShrink: 0,
-          borderRight: `1px solid ${colors.border}`,
-          display: "flex",
-          flexDirection: "column",
-          background: "#131317",
-        }}
-      >
-        <div style={{ padding: "14px 14px 6px" }}>
-          <div style={{ fontSize: 17, fontWeight: 600, letterSpacing: -0.3, marginBottom: 14 }}>
-            <span style={{ color: colors.accent }}>un</span>biased
-          </div>
+    <div ref={paneRef} style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", position: "relative" }}>
+      {selection && onAskSideChat && (
+        <div
+          style={{
+            position: "absolute",
+            left: Math.max(80, Math.min(selection.x, (paneRef.current?.clientWidth ?? 400) - 80)),
+            top: Math.max(8, selection.y - 40),
+            transform: "translateX(-50%)",
+            zIndex: 10,
+            display: "flex",
+            background: "#26262b",
+            border: `1px solid ${colors.border}`,
+            borderRadius: 8,
+            overflow: "hidden",
+            boxShadow: "0 4px 16px rgba(0,0,0,0.4)",
+          }}
+        >
           <button
-            onClick={() => void newChat()}
-            disabled={busy}
-            style={{
-              display: "flex",
-              alignItems: "center",
-              gap: 10,
-              width: "100%",
-              background: "transparent",
-              color: busy ? colors.dim : colors.fg,
-              border: "none",
-              borderRadius: 8,
-              padding: "8px 8px",
-              fontSize: 14,
-              cursor: busy ? "default" : "pointer",
-              textAlign: "left",
-              fontFamily: "inherit",
+            onClick={() => {
+              setDraft((d) => (d ? d + "\n" : "") + `> ${selection.text.replace(/\n/g, "\n> ")}\n`);
+              setSelection(null);
+              window.getSelection()?.removeAllRanges();
             }}
+            style={pillButtonStyle}
           >
-            <PencilIcon />
-            New chat
+            Add to chat
           </button>
           <button
-            onClick={() => void openProjectDialog()}
-            disabled={busy}
-            style={{
-              display: "flex",
-              alignItems: "center",
-              gap: 10,
-              width: "100%",
-              background: "transparent",
-              color: busy ? colors.dim : colors.fg,
-              border: "none",
-              borderRadius: 8,
-              padding: "8px 8px",
-              fontSize: 14,
-              cursor: busy ? "default" : "pointer",
-              textAlign: "left",
-              fontFamily: "inherit",
+            onClick={() => {
+              onAskSideChat(selection.text);
+              setSelection(null);
+              window.getSelection()?.removeAllRanges();
             }}
+            style={{ ...pillButtonStyle, borderLeft: `1px solid ${colors.border}` }}
           >
-            <FolderPlusIcon />
-            Open project…
+            Ask in side chat
           </button>
         </div>
-        <div style={{ flex: 1, overflowY: "auto", padding: "0 8px 12px" }}>
-          {sidebar.projects.length === 0 && sidebar.recents.length === 0 && (
-            <div style={{ color: colors.dim, fontSize: 12, padding: "8px 8px" }}>No conversations yet</div>
-          )}
+      )}
 
-          {sidebar.projects.length > 0 && <SectionLabel>Projects</SectionLabel>}
-          {sidebar.projects.map((p) => (
-            <div key={p.path} style={{ marginBottom: 8 }}>
-              <button
-                onClick={() => void newChat({ name: p.name, path: p.path })}
-                disabled={busy}
-                title={`New chat in ${p.path}`}
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 10,
-                  width: "100%",
-                  background: activeProject?.path === p.path ? colors.panel : "transparent",
-                  border: "none",
-                  borderRadius: 8,
-                  padding: "7px 8px 5px",
-                  fontSize: 14,
-                  color: colors.fg,
-                  cursor: busy ? "default" : "pointer",
-                  textAlign: "left",
-                  fontFamily: "inherit",
-                }}
-              >
-                <FolderIcon />
-                <span style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{p.name}</span>
-              </button>
-              {p.threads.map((t) => (
-                <ThreadRow
-                  key={t.id}
-                  thread={t}
-                  active={t.id === activeThreadId}
-                  hovered={hoveredThreadId === t.id}
-                  busy={busy}
-                  indent
-                  onHover={setHoveredThreadId}
-                  onOpen={openThread}
-                  onDelete={deleteThread}
-                />
-              ))}
-            </div>
-          ))}
-
-          {sidebar.recents.length > 0 && <SectionLabel>Recents</SectionLabel>}
-          {sidebar.recents.map((t) => (
-            <ThreadRow
-              key={t.id}
-              thread={t}
-              active={t.id === activeThreadId}
-              hovered={hoveredThreadId === t.id}
-              busy={busy}
-              onHover={setHoveredThreadId}
-              onOpen={openThread}
-              onDelete={deleteThread}
-            />
-          ))}
-        </div>
-      </nav>
-
-      <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column" }}>
-      <header
-        style={{
-          padding: "12px 24px",
-          borderBottom: `1px solid ${colors.border}`,
-          fontSize: 14,
-          fontWeight: 500,
-          color: colors.fg,
-          whiteSpace: "nowrap",
-          overflow: "hidden",
-          textOverflow: "ellipsis",
-          flexShrink: 0,
-        }}
-      >
-        {(() => {
-          if (activeThreadId) {
-            const all = [...sidebar.projects.flatMap((p) => p.threads), ...sidebar.recents];
-            return all.find((t) => t.id === activeThreadId)?.title ?? "Conversation";
-          }
-          return activeProject ? `New chat · ${activeProject.name}` : "New chat";
-        })()}
-      </header>
-      <div ref={scrollRef} style={{ flex: 1, overflowY: "auto", padding: "24px 0" }}>
+      <div ref={scrollRef} onMouseUp={handleMouseUp} style={{ flex: 1, overflowY: "auto", padding: "24px 0" }}>
         {entries.length === 0 && (
-          <div style={{ height: "100%", display: "grid", placeItems: "center" }}>
-            <div style={{ textAlign: "center" }}>
-              <h1 style={{ fontSize: 42, fontWeight: 600, letterSpacing: -1, margin: 0 }}>
-                <span style={{ color: colors.accent }}>un</span>biased
-              </h1>
-              <p style={{ color: colors.dim, marginTop: 8 }}>
-                {!connected
-                  ? "Waiting for the engine…"
-                  : activeProject
-                    ? (
-                        <>
-                          New chat in <span style={{ color: colors.fg }}>{activeProject.name}</span>
-                        </>
-                      )
-                    : "Ask Pareto anything."}
-              </p>
-            </div>
-          </div>
+          <div style={{ height: "100%", display: "grid", placeItems: "center" }}>{emptyState}</div>
         )}
         <div style={{ maxWidth: 720, margin: "0 auto", padding: "0 24px" }}>
           {toDisplayBlocks(entries).map((block) => {
             if (block.kind === "steps") {
               return (
-                <StepsGroup
-                  key={`s${block.key}`}
-                  items={block.items}
-                  statusLabel={statusLabel}
-                  decide={decide}
-                />
+                <StepsGroup key={`s${block.key}`} items={block.items} statusLabel={statusLabel} decide={decide} />
               );
             }
             const e = block.entry;
@@ -557,9 +724,7 @@ export function App() {
                   <Markdown remarkPlugins={[remarkGfm]} components={mdComponents}>
                     {e.text}
                   </Markdown>
-                  {e.interrupted && (
-                    <div style={{ color: colors.dim, fontSize: 12, marginTop: 4 }}>— stopped</div>
-                  )}
+                  {e.interrupted && <div style={{ color: colors.dim, fontSize: 12, marginTop: 4 }}>— stopped</div>}
                   {e.text && <CopyButton text={e.text} />}
                 </div>
               );
@@ -585,7 +750,7 @@ export function App() {
         </div>
       </div>
 
-      <div style={{ padding: "8px 24px 18px" }}>
+      <div style={{ padding: "8px 16px 16px" }}>
         <div
           style={{
             maxWidth: 720,
@@ -596,6 +761,48 @@ export function App() {
             padding: "12px 14px 10px",
           }}
         >
+          {contextChip && (
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+                background: "#26262b",
+                border: `1px solid ${colors.border}`,
+                borderRadius: 8,
+                padding: "6px 10px",
+                marginBottom: 8,
+                fontSize: 12.5,
+                color: colors.dim,
+              }}
+            >
+              <span
+                style={{
+                  flex: 1,
+                  whiteSpace: "nowrap",
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                }}
+                title={contextChip}
+              >
+                1 selection · {contextChip.slice(0, 80)}
+              </span>
+              <button
+                onClick={() => onContextClear?.()}
+                aria-label="Remove selection"
+                style={{
+                  background: "transparent",
+                  border: "none",
+                  color: colors.dim,
+                  cursor: "pointer",
+                  padding: 0,
+                  display: "flex",
+                }}
+              >
+                <CloseIcon />
+              </button>
+            </div>
+          )}
           <textarea
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
@@ -621,12 +828,10 @@ export function App() {
             }}
           />
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginTop: 6 }}>
-            <span style={{ color: colors.dim, fontSize: 12.5 }}>
-              {activeProject ? `${activeProject.name} · ` : ""}pareto · read-only
-            </span>
+            <span style={{ color: colors.dim, fontSize: 12.5 }}>{contextLabel}</span>
             {busy ? (
               <button
-                onClick={() => void window.unbiased.interrupt()}
+                onClick={() => void window.unbiased.interrupt(paneId)}
                 title="Stop"
                 aria-label="Stop"
                 style={{
@@ -673,45 +878,84 @@ export function App() {
           </div>
         </div>
       </div>
-
-      <ChatFooter status={status} busy={busy} elapsed={elapsed} />
-      </div>
     </div>
   );
 }
 
-function ChatFooter({ status, busy, elapsed }: { status: EngineStatus; busy: boolean; elapsed: number }) {
+const pillButtonStyle: React.CSSProperties = {
+  background: "transparent",
+  border: "none",
+  color: "#e8e6e3",
+  fontSize: 12.5,
+  padding: "7px 12px",
+  cursor: "pointer",
+  fontFamily: "inherit",
+  whiteSpace: "nowrap",
+};
+
+function SidebarAction({
+  onClick,
+  disabled,
+  icon,
+  children,
+}: {
+  onClick: () => void;
+  disabled: boolean;
+  icon: React.ReactNode;
+  children: React.ReactNode;
+}) {
   return (
-    <footer
+    <button
+      onClick={onClick}
+      disabled={disabled}
       style={{
-        padding: "8px 16px",
-        borderTop: `1px solid ${colors.border}`,
-        fontSize: 12,
-        color: colors.dim,
         display: "flex",
-        gap: 8,
         alignItems: "center",
-        fontVariantNumeric: "tabular-nums",
+        gap: 10,
+        width: "100%",
+        background: "transparent",
+        color: disabled ? colors.dim : colors.fg,
+        border: "none",
+        borderRadius: 8,
+        padding: "8px 8px",
+        fontSize: 14,
+        cursor: disabled ? "default" : "pointer",
+        textAlign: "left",
+        fontFamily: "inherit",
       }}
     >
-      <span
-        style={{
-          width: 8,
-          height: 8,
-          borderRadius: 4,
-          background:
-            status.state === "connected" ? colors.ok : status.state === "starting" ? colors.accent : colors.err,
-        }}
-      />
-      {status.state === "connected" && (
-        <span>
-          connected · pareto · engine {status.engineVersion}
-          {busy ? ` · thinking… ${elapsed.toFixed(0)}s` : ""}
-        </span>
-      )}
-      {status.state === "starting" && <span>starting engine…</span>}
-      {status.state === "exited" && <span style={{ color: colors.err }}>{status.detail}</span>}
-    </footer>
+      {icon}
+      {children}
+    </button>
+  );
+}
+
+function IconButton({
+  title,
+  onClick,
+  children,
+}: {
+  title: string;
+  onClick: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      title={title}
+      aria-label={title}
+      onClick={onClick}
+      style={{
+        background: "transparent",
+        border: "none",
+        color: colors.dim,
+        cursor: "pointer",
+        padding: 4,
+        display: "flex",
+        alignItems: "center",
+      }}
+    >
+      {children}
+    </button>
   );
 }
 
@@ -759,6 +1003,24 @@ function PencilIcon() {
     <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
       <path d="M12 20h9" />
       <path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z" />
+    </svg>
+  );
+}
+
+function SideChatIcon() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <rect x="2" y="4" width="20" height="16" rx="2" />
+      <path d="M14 4v16" />
+    </svg>
+  );
+}
+
+function CloseIcon() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M18 6 6 18" />
+      <path d="M6 6l12 12" />
     </svg>
   );
 }
@@ -870,6 +1132,41 @@ function ThreadRow({
         </button>
       )}
     </div>
+  );
+}
+
+function ChatFooter({ status, busy }: { status: EngineStatus; busy: boolean }) {
+  return (
+    <footer
+      style={{
+        padding: "8px 16px",
+        borderTop: `1px solid ${colors.border}`,
+        fontSize: 12,
+        color: colors.dim,
+        display: "flex",
+        gap: 8,
+        alignItems: "center",
+        fontVariantNumeric: "tabular-nums",
+      }}
+    >
+      <span
+        style={{
+          width: 8,
+          height: 8,
+          borderRadius: 4,
+          background:
+            status.state === "connected" ? colors.ok : status.state === "starting" ? colors.accent : colors.err,
+        }}
+      />
+      {status.state === "connected" && (
+        <span>
+          connected · pareto · engine {status.engineVersion}
+          {busy ? " · thinking…" : ""}
+        </span>
+      )}
+      {status.state === "starting" && <span>starting engine…</span>}
+      {status.state === "exited" && <span style={{ color: colors.err }}>{status.detail}</span>}
+    </footer>
   );
 }
 

@@ -7,13 +7,23 @@ const engine = new EngineClient();
 let win: BrowserWindow | null = null;
 let lastStatus: EngineStatus = { state: "starting" };
 
-// The active conversation. Threads persist in the engine home; null means
-// a fresh chat whose thread is created lazily on first send, so switching
-// around the sidebar never litters the history with empty threads.
-let threadId: string | null = null;
-let activeTurnId: string | null = null;
+// Two conversation panes share one engine. "main" is the persistent,
+// sidebar-listed conversation; "side" is a scratch pane on an ephemeral
+// thread (in-memory only — codex discards it when the engine exits).
+// Notifications carry threadId, so each pane's traffic routes cleanly.
+type PaneId = "main" | "side";
+const panes: Record<PaneId, { threadId: string | null; turnId: string | null }> = {
+  main: { threadId: null, turnId: null },
+  side: { threadId: null, turnId: null },
+};
 
-// Where the NEXT fresh chat's thread will live. null = home directory
+function paneForThread(threadId: unknown): PaneId | null {
+  if (panes.main.threadId === threadId) return "main";
+  if (panes.side.threadId === threadId) return "side";
+  return null;
+}
+
+// Where the NEXT fresh main chat's thread will live. null = home directory
 // (a plain chat, listed under Recents). Set by the project picker or by
 // clicking a project header; consumed when the lazy thread is created.
 let pendingCwd: string | null = null;
@@ -134,8 +144,8 @@ function send(channel: string, payload: unknown): void {
 
 function createWindow(): void {
   win = new BrowserWindow({
-    width: 900,
-    height: 640,
+    width: 1100,
+    height: 700,
     title: "Unbiased",
     webPreferences: { preload: join(__dirname, "../preload/index.js") },
   });
@@ -153,29 +163,39 @@ const pendingApprovals = new Map<string, number | string>();
 function wireNotifications(): void {
   engine.on("notification", (msg: { method: string; params?: Record<string, unknown> }) => {
     const params = msg.params ?? {};
+    const paneId = paneForThread(params.threadId);
+    if (!paneId) return; // a thread no pane owns (e.g. just deleted)
     switch (msg.method) {
       case "turn/started": {
         const turn = params.turn as { id?: string } | undefined;
-        if (turn?.id) activeTurnId = turn.id;
-        send("chat:turn-started", { turnId: activeTurnId });
+        if (turn?.id) panes[paneId].turnId = turn.id;
+        send("chat:turn-started", { paneId, turnId: panes[paneId].turnId });
         break;
       }
       case "item/agentMessage/delta": {
-        send("chat:delta", { delta: (params.delta as string) ?? "" });
+        send("chat:delta", { paneId, delta: (params.delta as string) ?? "" });
         break;
       }
       case "item/started":
       case "item/completed": {
         const item = params.item as { type?: string } | undefined;
         if (item?.type === "commandExecution") {
-          send("chat:command", { phase: msg.method === "item/started" ? "started" : "completed", item });
+          send("chat:command", {
+            paneId,
+            phase: msg.method === "item/started" ? "started" : "completed",
+            item,
+          });
         }
         break;
       }
       case "turn/completed": {
         const turn = params.turn as { status?: string; usage?: unknown } | undefined;
-        activeTurnId = null;
-        send("chat:turn-completed", { status: turn?.status ?? "completed", usage: turn?.usage ?? null });
+        panes[paneId].turnId = null;
+        send("chat:turn-completed", {
+          paneId,
+          status: turn?.status ?? "completed",
+          usage: turn?.usage ?? null,
+        });
         break;
       }
     }
@@ -186,9 +206,11 @@ function wireNotifications(): void {
     (msg: { id: number | string; method: string; params?: Record<string, unknown> }) => {
       const params = msg.params ?? {};
       if (msg.method === "item/commandExecution/requestApproval") {
+        const paneId = paneForThread(params.threadId) ?? "main";
         const requestId = `apr_${msg.id}`;
         pendingApprovals.set(requestId, msg.id);
         send("chat:approval-request", {
+          paneId,
           requestId,
           // itemId ties the request to its commandExecution item so the
           // renderer can put the buttons ON the command card.
@@ -235,22 +257,42 @@ async function startEngine(): Promise<void> {
 app.whenReady().then(async () => {
   ipcMain.handle("engine:status", () => lastStatus);
 
-  ipcMain.handle("chat:send", async (_e, text: string) => {
+  ipcMain.handle("chat:send", async (_e, payload: { paneId: PaneId; text: string }) => {
+    const { paneId, text } = payload;
+    const pane = panes[paneId];
     let created = false;
-    if (!threadId) {
-      const started = (await engine.request("thread/start", {
-        ...THREAD_POLICY,
-        ...(pendingCwd ? { cwd: pendingCwd } : {}),
-      })) as { thread: { id: string } };
-      threadId = started.thread.id;
+    if (!pane.threadId) {
+      const startParams =
+        paneId === "side"
+          ? { ...THREAD_POLICY, ephemeral: true }
+          : { ...THREAD_POLICY, ...(pendingCwd ? { cwd: pendingCwd } : {}) };
+      const started = (await engine.request("thread/start", startParams)) as {
+        thread: { id: string };
+      };
+      pane.threadId = started.thread.id;
       created = true;
     }
     const result = (await engine.request("turn/start", {
-      threadId,
+      threadId: pane.threadId,
       input: [{ type: "text", text }],
     })) as { turn?: { id?: string } };
-    if (result.turn?.id) activeTurnId = result.turn.id;
-    return { turnId: activeTurnId, threadId, created };
+    if (result.turn?.id) pane.turnId = result.turn.id;
+    return { turnId: pane.turnId, threadId: pane.threadId, created };
+  });
+
+  ipcMain.handle("chat:interrupt", async (_e, paneId: PaneId) => {
+    const pane = panes[paneId];
+    if (!pane.threadId || !pane.turnId) return { interrupted: false };
+    await engine.request("turn/interrupt", { threadId: pane.threadId, turnId: pane.turnId });
+    return { interrupted: true };
+  });
+
+  ipcMain.handle("chat:approve", (_e, payload: { requestId: string; decision: "accept" | "decline" }) => {
+    const engineRequestId = pendingApprovals.get(payload.requestId);
+    if (engineRequestId === undefined) return { ok: false };
+    pendingApprovals.delete(payload.requestId);
+    engine.respond(engineRequestId, { decision: payload.decision });
+    return { ok: true };
   });
 
   ipcMain.handle("threads:list", async () => {
@@ -294,8 +336,8 @@ app.whenReady().then(async () => {
     const path = result.filePaths[0];
     rememberProject(path);
     pendingCwd = path;
-    threadId = null;
-    activeTurnId = null;
+    panes.main.threadId = null;
+    panes.main.turnId = null;
     return { path, name: path.split("/").filter(Boolean).pop() ?? path };
   });
 
@@ -303,39 +345,33 @@ app.whenReady().then(async () => {
     const result = (await engine.request("thread/resume", { threadId: id, ...THREAD_POLICY })) as {
       thread: WireThread;
     };
-    threadId = id;
-    activeTurnId = null;
+    panes.main.threadId = id;
+    panes.main.turnId = null;
     return { id, entries: threadToEntries(result.thread) };
   });
 
   ipcMain.handle("threads:detach", (_e, cwd?: string) => {
-    // Fresh-chat view: the next send creates a new thread, in `cwd` if given.
-    threadId = null;
-    activeTurnId = null;
+    // Fresh main-chat view: the next send creates a new thread, in `cwd` if given.
+    panes.main.threadId = null;
+    panes.main.turnId = null;
     pendingCwd = cwd ?? null;
+    return { ok: true };
+  });
+
+  ipcMain.handle("side:reset", () => {
+    // Side chats are disposable: dropping the reference is the whole
+    // cleanup — the ephemeral thread evaporates with the engine.
+    panes.side.threadId = null;
+    panes.side.turnId = null;
     return { ok: true };
   });
 
   ipcMain.handle("threads:delete", async (_e, id: string) => {
     await engine.request("thread/delete", { threadId: id });
-    if (threadId === id) {
-      threadId = null;
-      activeTurnId = null;
+    if (panes.main.threadId === id) {
+      panes.main.threadId = null;
+      panes.main.turnId = null;
     }
-    return { ok: true, wasActive: threadId === null };
-  });
-
-  ipcMain.handle("chat:interrupt", async () => {
-    if (!threadId || !activeTurnId) return { interrupted: false };
-    await engine.request("turn/interrupt", { threadId, turnId: activeTurnId });
-    return { interrupted: true };
-  });
-
-  ipcMain.handle("chat:approve", (_e, payload: { requestId: string; decision: "accept" | "decline" }) => {
-    const engineRequestId = pendingApprovals.get(payload.requestId);
-    if (engineRequestId === undefined) return { ok: false };
-    pendingApprovals.delete(payload.requestId);
-    engine.respond(engineRequestId, { decision: payload.decision });
     return { ok: true };
   });
 
