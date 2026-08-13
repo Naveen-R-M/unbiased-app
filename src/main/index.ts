@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain } from "electron";
+import { app, BrowserWindow, dialog, ipcMain } from "electron";
 import { join } from "node:path";
 import { existsSync } from "node:fs";
 import { EngineClient, engineVersionFromUserAgent, type EngineStatus } from "./engine";
@@ -12,6 +12,11 @@ let lastStatus: EngineStatus = { state: "starting" };
 // around the sidebar never litters the history with empty threads.
 let threadId: string | null = null;
 let activeTurnId: string | null = null;
+
+// Where the NEXT fresh chat's thread will live. null = home directory
+// (a plain chat, listed under Recents). Set by the project picker or by
+// clicking a project header; consumed when the lazy thread is created.
+let pendingCwd: string | null = null;
 
 // Every thread we start or resume gets the same policy: built-in trusted
 // commands run freely, everything else asks the human. Sandbox stays
@@ -209,9 +214,10 @@ app.whenReady().then(async () => {
   ipcMain.handle("chat:send", async (_e, text: string) => {
     let created = false;
     if (!threadId) {
-      const started = (await engine.request("thread/start", { ...THREAD_POLICY })) as {
-        thread: { id: string };
-      };
+      const started = (await engine.request("thread/start", {
+        ...THREAD_POLICY,
+        ...(pendingCwd ? { cwd: pendingCwd } : {}),
+      })) as { thread: { id: string } };
       threadId = started.thread.id;
       created = true;
     }
@@ -228,23 +234,42 @@ app.whenReady().then(async () => {
     const home = app.getPath("home");
     // Codex-style sections: threads that ran inside a project folder group
     // under that folder's name; home-dir (or cwd-less) threads are Recents.
+    // Keyed by full path so two folders sharing a basename stay distinct.
     const projectMap = new Map<string, ThreadSummary[]>();
     const recents: ThreadSummary[] = [];
     for (const t of result.data ?? []) {
       const summary: ThreadSummary = { id: t.id, title: threadTitle(t), createdAt: t.createdAt };
       if (t.cwd && t.cwd !== home) {
-        const name = t.cwd.split("/").filter(Boolean).pop() ?? t.cwd;
-        const list = projectMap.get(name) ?? [];
+        const list = projectMap.get(t.cwd) ?? [];
         list.push(summary);
-        projectMap.set(name, list);
+        projectMap.set(t.cwd, list);
       } else {
         recents.push(summary);
       }
     }
     return {
-      projects: [...projectMap].map(([name, threads]) => ({ name, threads })),
+      projects: [...projectMap].map(([path, threads]) => ({
+        path,
+        name: path.split("/").filter(Boolean).pop() ?? path,
+        threads,
+      })),
       recents,
     };
+  });
+
+  ipcMain.handle("project:choose", async () => {
+    if (!win) return { path: null, name: null };
+    const result = await dialog.showOpenDialog(win, {
+      properties: ["openDirectory"],
+      title: "Choose a project folder",
+      buttonLabel: "Open project",
+    });
+    if (result.canceled || result.filePaths.length === 0) return { path: null, name: null };
+    const path = result.filePaths[0];
+    pendingCwd = path;
+    threadId = null;
+    activeTurnId = null;
+    return { path, name: path.split("/").filter(Boolean).pop() ?? path };
   });
 
   ipcMain.handle("threads:open", async (_e, id: string) => {
@@ -256,10 +281,11 @@ app.whenReady().then(async () => {
     return { id, entries: threadToEntries(result.thread) };
   });
 
-  ipcMain.handle("threads:detach", () => {
-    // Fresh-chat view: the next send creates a new thread.
+  ipcMain.handle("threads:detach", (_e, cwd?: string) => {
+    // Fresh-chat view: the next send creates a new thread, in `cwd` if given.
     threadId = null;
     activeTurnId = null;
+    pendingCwd = cwd ?? null;
     return { ok: true };
   });
 

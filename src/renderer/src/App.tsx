@@ -30,7 +30,10 @@ type Entry =
     };
 
 type ThreadSummary = { id: string; title: string; createdAt?: string };
-type SidebarData = { projects: { name: string; threads: ThreadSummary[] }[]; recents: ThreadSummary[] };
+type SidebarData = {
+  projects: { name: string; path: string; threads: ThreadSummary[] }[];
+  recents: ThreadSummary[];
+};
 
 declare global {
   interface Window {
@@ -55,8 +58,9 @@ declare global {
       onCommand: (cb: (p: { phase: "started" | "completed"; item: CommandItem }) => void) => () => void;
       listThreads: () => Promise<SidebarData>;
       openThread: (id: string) => Promise<{ id: string; entries: Entry[] }>;
-      detachThread: () => Promise<{ ok: boolean }>;
+      detachThread: (cwd?: string) => Promise<{ ok: boolean }>;
       deleteThread: (id: string) => Promise<{ ok: boolean }>;
+      chooseProject: () => Promise<{ path: string | null; name: string | null }>;
     };
   }
 }
@@ -120,9 +124,21 @@ export function App() {
     setSidebar(await window.unbiased.listThreads());
   }
 
-  async function newChat() {
+  const [activeProject, setActiveProject] = useState<{ name: string; path: string } | null>(null);
+
+  async function newChat(project?: { name: string; path: string }) {
     if (busy) return;
-    await window.unbiased.detachThread();
+    await window.unbiased.detachThread(project?.path);
+    setActiveProject(project ?? null);
+    setActiveThreadId(null);
+    setEntries([]);
+  }
+
+  async function openProjectDialog() {
+    if (busy) return;
+    const { path, name } = await window.unbiased.chooseProject();
+    if (!path || !name) return; // cancelled
+    setActiveProject({ name, path });
     setActiveThreadId(null);
     setEntries([]);
   }
@@ -130,6 +146,7 @@ export function App() {
   async function openThread(id: string) {
     if (busy || id === activeThreadId) return;
     const { entries: history } = await window.unbiased.openThread(id);
+    setActiveProject(null);
     setActiveThreadId(id);
     setEntries(history);
   }
@@ -372,6 +389,28 @@ export function App() {
             <PencilIcon />
             New chat
           </button>
+          <button
+            onClick={() => void openProjectDialog()}
+            disabled={busy}
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 10,
+              width: "100%",
+              background: "transparent",
+              color: busy ? colors.dim : colors.fg,
+              border: "none",
+              borderRadius: 8,
+              padding: "8px 8px",
+              fontSize: 14,
+              cursor: busy ? "default" : "pointer",
+              textAlign: "left",
+              fontFamily: "inherit",
+            }}
+          >
+            <FolderPlusIcon />
+            Open project…
+          </button>
         </div>
         <div style={{ flex: 1, overflowY: "auto", padding: "0 8px 12px" }}>
           {sidebar.projects.length === 0 && sidebar.recents.length === 0 && (
@@ -380,20 +419,29 @@ export function App() {
 
           {sidebar.projects.length > 0 && <SectionLabel>Projects</SectionLabel>}
           {sidebar.projects.map((p) => (
-            <div key={p.name} style={{ marginBottom: 8 }}>
-              <div
+            <div key={p.path} style={{ marginBottom: 8 }}>
+              <button
+                onClick={() => void newChat({ name: p.name, path: p.path })}
+                disabled={busy}
+                title={`New chat in ${p.path}`}
                 style={{
                   display: "flex",
                   alignItems: "center",
                   gap: 10,
+                  width: "100%",
+                  background: "transparent",
+                  border: "none",
                   padding: "7px 8px 5px",
                   fontSize: 14,
                   color: colors.fg,
+                  cursor: busy ? "default" : "pointer",
+                  textAlign: "left",
+                  fontFamily: "inherit",
                 }}
               >
                 <FolderIcon />
                 <span style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{p.name}</span>
-              </div>
+              </button>
               {p.threads.map((t) => (
                 <ThreadRow
                   key={t.id}
@@ -435,7 +483,15 @@ export function App() {
                 <span style={{ color: colors.accent }}>un</span>biased
               </h1>
               <p style={{ color: colors.dim, marginTop: 8 }}>
-                {connected ? "Ask Pareto anything." : "Waiting for the engine…"}
+                {!connected
+                  ? "Waiting for the engine…"
+                  : activeProject
+                    ? (
+                        <>
+                          New chat in <span style={{ color: colors.fg }}>{activeProject.name}</span>
+                        </>
+                      )
+                    : "Ask Pareto anything."}
               </p>
             </div>
           </div>
@@ -631,6 +687,16 @@ function PencilIcon() {
     <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
       <path d="M12 20h9" />
       <path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z" />
+    </svg>
+  );
+}
+
+function FolderPlusIcon() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.7-.9L9.2 3.9A2 2 0 0 0 7.5 3H4a2 2 0 0 0-2 2v13c0 1.1.9 2 2 2Z" />
+      <path d="M12 10v6" />
+      <path d="M9 13h6" />
     </svg>
   );
 }

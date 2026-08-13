@@ -27,6 +27,7 @@ contextBridge.exposeInMainWorld("unbiased", {
 
   listThreads: () => ipcRenderer.invoke("threads:list"),
   openThread: (id: string) => ipcRenderer.invoke("threads:open", id),
-  detachThread: () => ipcRenderer.invoke("threads:detach"),
+  detachThread: (cwd?: string) => ipcRenderer.invoke("threads:detach", cwd),
   deleteThread: (id: string) => ipcRenderer.invoke("threads:delete", id),
+  chooseProject: () => ipcRenderer.invoke("project:choose"),
 });
