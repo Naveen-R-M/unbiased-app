@@ -19,4 +19,9 @@ contextBridge.exposeInMainWorld("unbiased", {
   onTurnStarted: (cb: (p: unknown) => void) => subscribe("chat:turn-started", cb),
   onDelta: (cb: (p: unknown) => void) => subscribe("chat:delta", cb),
   onTurnCompleted: (cb: (p: unknown) => void) => subscribe("chat:turn-completed", cb),
+
+  decideApproval: (requestId: string, decision: "accept" | "decline") =>
+    ipcRenderer.invoke("chat:approve", { requestId, decision }),
+  onApprovalRequest: (cb: (p: unknown) => void) => subscribe("chat:approval-request", cb),
+  onCommand: (cb: (p: unknown) => void) => subscribe("chat:command", cb),
 });

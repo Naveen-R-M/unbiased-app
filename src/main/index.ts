@@ -45,6 +45,10 @@ function createWindow(): void {
   }
 }
 
+// Server-initiated approval requests awaiting a human decision, keyed by a
+// string handle the renderer can safely round-trip.
+const pendingApprovals = new Map<string, number | string>();
+
 function wireNotifications(): void {
   engine.on("notification", (msg: { method: string; params?: Record<string, unknown> }) => {
     const params = msg.params ?? {};
@@ -59,6 +63,14 @@ function wireNotifications(): void {
         send("chat:delta", { delta: (params.delta as string) ?? "" });
         break;
       }
+      case "item/started":
+      case "item/completed": {
+        const item = params.item as { type?: string } | undefined;
+        if (item?.type === "commandExecution") {
+          send("chat:command", { phase: msg.method === "item/started" ? "started" : "completed", item });
+        }
+        break;
+      }
       case "turn/completed": {
         const turn = params.turn as { status?: string; usage?: unknown } | undefined;
         activeTurnId = null;
@@ -68,14 +80,27 @@ function wireNotifications(): void {
     }
   });
 
-  // Chat milestone runs approvalPolicy "never" + read-only sandbox, so the
-  // engine should not ask us anything. If it does, declining beats hanging
-  // the turn forever on a request nobody can see. The approvals milestone
-  // replaces this with a real dialog.
-  engine.on("server-request", (msg: { id: number | string; method: string }) => {
-    console.warn("[app] declining unexpected server request:", msg.method);
-    engine.respond(msg.id, { decision: "decline" });
-  });
+  engine.on(
+    "server-request",
+    (msg: { id: number | string; method: string; params?: Record<string, unknown> }) => {
+      const params = msg.params ?? {};
+      if (msg.method === "item/commandExecution/requestApproval") {
+        const requestId = `apr_${msg.id}`;
+        pendingApprovals.set(requestId, msg.id);
+        send("chat:approval-request", {
+          requestId,
+          command: (params.command as string) ?? "(unknown command)",
+          cwd: (params.cwd as string) ?? null,
+          reason: (params.reason as string) ?? null,
+        });
+        return;
+      }
+      // Anything we don't render yet (file changes, user-input tools):
+      // declining beats hanging the turn on a question nobody can see.
+      console.warn("[app] declining unhandled server request:", msg.method);
+      engine.respond(msg.id, { decision: "decline" });
+    },
+  );
 }
 
 async function startEngine(): Promise<void> {
@@ -95,9 +120,12 @@ async function startEngine(): Promise<void> {
   engine.start(bin);
 
   const result = await engine.handshake(app.getVersion());
+  // "untrusted": the engine runs its built-in trusted commands (ls, cat…)
+  // freely and asks the human for everything else. Sandbox stays read-only
+  // until the file-change approval UI exists.
   const thread = (await engine.request("thread/start", {
     ephemeral: true,
-    approvalPolicy: "never",
+    approvalPolicy: "untrusted",
     sandbox: "read-only",
   })) as { thread: { id: string } };
   threadId = thread.thread.id;
@@ -127,6 +155,14 @@ app.whenReady().then(async () => {
     if (!threadId || !activeTurnId) return { interrupted: false };
     await engine.request("turn/interrupt", { threadId, turnId: activeTurnId });
     return { interrupted: true };
+  });
+
+  ipcMain.handle("chat:approve", (_e, payload: { requestId: string; decision: "accept" | "decline" }) => {
+    const engineRequestId = pendingApprovals.get(payload.requestId);
+    if (engineRequestId === undefined) return { ok: false };
+    pendingApprovals.delete(payload.requestId);
+    engine.respond(engineRequestId, { decision: payload.decision });
+    return { ok: true };
   });
 
   createWindow();
