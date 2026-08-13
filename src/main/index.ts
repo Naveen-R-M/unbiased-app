@@ -1,6 +1,6 @@
 import { app, BrowserWindow, dialog, ipcMain } from "electron";
-import { join } from "node:path";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { isAbsolute, join, relative } from "node:path";
+import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { EngineClient, engineVersionFromUserAgent, type EngineStatus } from "./engine";
 
 const engine = new EngineClient();
@@ -22,6 +22,10 @@ function paneForThread(threadId: unknown): PaneId | null {
   if (panes.side.threadId === threadId) return "side";
   return null;
 }
+
+// The active main conversation's working directory — file references in
+// chat resolve against it. Kept in sync with thread starts/resumes.
+let mainCwd: string | null = null;
 
 // Where the NEXT fresh main chat's thread will live. null = home directory
 // (a plain chat, listed under Recents). Set by the project picker or by
@@ -285,7 +289,8 @@ app.whenReady().then(async () => {
         started = (await engine.request("thread/start", {
           ...THREAD_POLICY,
           ...(pendingCwd ? { cwd: pendingCwd } : {}),
-        })) as { thread: { id: string } };
+        })) as { thread: { id: string }; cwd?: string };
+        mainCwd = (started as { cwd?: string }).cwd ?? pendingCwd ?? mainCwd;
       }
       pane.threadId = started.thread.id;
       created = true;
@@ -354,6 +359,7 @@ app.whenReady().then(async () => {
     const path = result.filePaths[0];
     rememberProject(path);
     pendingCwd = path;
+    mainCwd = path;
     panes.main.threadId = null;
     panes.main.turnId = null;
     panes.side.threadId = null;
@@ -364,7 +370,9 @@ app.whenReady().then(async () => {
   ipcMain.handle("threads:open", async (_e, id: string) => {
     const result = (await engine.request("thread/resume", { threadId: id, ...THREAD_POLICY })) as {
       thread: WireThread;
+      cwd?: string;
     };
+    mainCwd = result.cwd ?? result.thread.cwd ?? null;
     panes.main.threadId = id;
     panes.main.turnId = null;
     // The side chat (if any) was forked from the previous conversation;
@@ -381,6 +389,7 @@ app.whenReady().then(async () => {
     panes.side.threadId = null;
     panes.side.turnId = null;
     pendingCwd = cwd ?? null;
+    mainCwd = cwd ?? null;
     return { ok: true };
   });
 
@@ -390,6 +399,24 @@ app.whenReady().then(async () => {
     panes.side.threadId = null;
     panes.side.turnId = null;
     return { ok: true };
+  });
+
+  // Read-only file access for the viewer panel. Paths resolve against the
+  // active conversation's cwd; output is capped and binary files refused.
+  ipcMain.handle("file:read", (_e, rawPath: string) => {
+    const base = mainCwd ?? pendingCwd ?? app.getPath("home");
+    const fullPath = isAbsolute(rawPath) ? rawPath : join(base, rawPath);
+    try {
+      const info = statSync(fullPath);
+      if (!info.isFile()) return { error: "Not a file", fullPath };
+      if (info.size > 1_000_000) return { error: "File is larger than 1 MB", fullPath };
+      const content = readFileSync(fullPath, "utf8");
+      if (content.includes("\u0000")) return { error: "Binary file", fullPath };
+      const rel = relative(base, fullPath);
+      return { fullPath, relPath: rel.startsWith("..") ? fullPath : rel, content };
+    } catch {
+      return { error: `Could not open ${rawPath}`, fullPath };
+    }
   });
 
   ipcMain.handle("threads:delete", async (_e, id: string) => {

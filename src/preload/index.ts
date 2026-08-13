@@ -31,4 +31,5 @@ contextBridge.exposeInMainWorld("unbiased", {
   deleteThread: (id: string) => ipcRenderer.invoke("threads:delete", id),
   resetSideChat: () => ipcRenderer.invoke("side:reset"),
   chooseProject: () => ipcRenderer.invoke("project:choose"),
+  readFile: (path: string) => ipcRenderer.invoke("file:read", path),
 });

@@ -1,6 +1,20 @@
 import { useEffect, useRef, useState } from "react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import Prism from "prismjs";
+import "prismjs/components/prism-typescript";
+import "prismjs/components/prism-jsx";
+import "prismjs/components/prism-tsx";
+import "prismjs/components/prism-json";
+import "prismjs/components/prism-bash";
+import "prismjs/components/prism-python";
+import "prismjs/components/prism-go";
+import "prismjs/components/prism-rust";
+import "prismjs/components/prism-toml";
+import "prismjs/components/prism-yaml";
+import "prismjs/components/prism-sql";
+import "prismjs/components/prism-markdown";
+import "prismjs/themes/prism-tomorrow.css";
 
 type EngineStatus =
   | { state: "starting" }
@@ -31,6 +45,15 @@ type Entry =
 
 type PaneId = "main" | "side";
 type ThreadSummary = { id: string; title: string; createdAt?: string };
+type OpenFileInfo = { name: string; relPath: string; fullPath: string; content?: string; error?: string };
+
+/** Does an inline code chip look like a file reference worth opening? */
+function looksLikeFilePath(text: string): boolean {
+  const t = text.trim();
+  if (!t || t.length > 260 || /\s/.test(t)) return false;
+  if (t.includes("/") && /^[./~]?[\w.@/-]+\.[A-Za-z0-9]{1,8}$/.test(t)) return true;
+  return /^[\w.-]+\.(ts|tsx|js|jsx|mjs|cjs|json|go|rs|py|sh|bash|zsh|toml|yaml|yml|css|scss|html|md|sql|txt|lock)$/.test(t);
+}
 type SidebarData = {
   projects: { name: string; path: string; threads: ThreadSummary[] }[];
   recents: ThreadSummary[];
@@ -69,6 +92,7 @@ declare global {
       deleteThread: (id: string) => Promise<{ ok: boolean }>;
       resetSideChat: () => Promise<{ ok: boolean }>;
       chooseProject: () => Promise<{ path: string | null; name: string | null }>;
+      readFile: (path: string) => Promise<{ fullPath: string; relPath?: string; content?: string; error?: string }>;
     };
   }
 }
@@ -195,10 +219,13 @@ export function App() {
   }, []);
 
   // The side chat is attached to the main conversation (it forks from it),
-  // so every main-context switch discards the side pane's transcript too.
+  // so every main-context switch discards the side pane's transcript too —
+  // and any open file, which resolved against the previous conversation.
   function resetSideView() {
     setSideContext(null);
     setSideNonce((n) => n + 1);
+    setOpenFile(null);
+    setPanelMode("chat");
   }
 
   async function newChat(project?: { name: string; path: string }) {
@@ -241,8 +268,26 @@ export function App() {
     void refreshThreads();
   }
 
+  const [openFile, setOpenFile] = useState<OpenFileInfo | null>(null);
+  const [panelMode, setPanelMode] = useState<"chat" | "file">("chat");
+
   function askInSideChat(text: string) {
     setSideContext(text);
+    setPanelMode("chat");
+    setSideOpenPersisted(true);
+  }
+
+  async function openFileInPanel(pathText: string) {
+    const result = await window.unbiased.readFile(pathText);
+    const name = pathText.split("/").filter(Boolean).pop() ?? pathText;
+    setOpenFile({
+      name,
+      relPath: result.relPath ?? pathText,
+      fullPath: result.fullPath,
+      content: result.content,
+      error: result.error,
+    });
+    setPanelMode("file");
     setSideOpenPersisted(true);
   }
 
@@ -433,6 +478,7 @@ export function App() {
           onBusyChange={setMainBusy}
           onTurnLanded={refreshThreads}
           onAskSideChat={askInSideChat}
+          onOpenFile={(p) => void openFileInPanel(p)}
         />
       </div>
 
@@ -466,22 +512,88 @@ export function App() {
         >
           <header
             style={{
-              padding: "12px 16px",
+              padding: "8px 12px",
               borderBottom: `1px solid ${colors.border}`,
               display: "flex",
               alignItems: "center",
-              gap: 8,
+              gap: 6,
               flexShrink: 0,
             }}
           >
-            <span style={{ fontSize: 14, fontWeight: 500, flex: 1 }}>Side chat</span>
-            <IconButton title="New side chat" onClick={() => void newSideChat()}>
-              <PencilIcon />
-            </IconButton>
-            <IconButton title="Close side chat" onClick={() => void closeSideChat()}>
+            <button
+              onClick={() => setPanelMode("chat")}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 6,
+                background: panelMode === "chat" ? colors.panel : "transparent",
+                color: panelMode === "chat" ? colors.fg : colors.dim,
+                border: "none",
+                borderRadius: 8,
+                padding: "6px 12px",
+                fontSize: 13,
+                cursor: "pointer",
+                fontFamily: "inherit",
+              }}
+            >
+              Side chat
+            </button>
+            {openFile && (
+              <button
+                onClick={() => setPanelMode("file")}
+                title={openFile.fullPath}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 8,
+                  background: panelMode === "file" ? colors.panel : "transparent",
+                  color: panelMode === "file" ? colors.fg : colors.dim,
+                  border: "none",
+                  borderRadius: 8,
+                  padding: "6px 12px",
+                  fontSize: 13,
+                  cursor: "pointer",
+                  fontFamily: "inherit",
+                  minWidth: 0,
+                  maxWidth: 220,
+                }}
+              >
+                <span style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                  {openFile.name}
+                </span>
+                <span
+                  role="button"
+                  aria-label="Close file"
+                  onClick={(ev) => {
+                    ev.stopPropagation();
+                    setOpenFile(null);
+                    setPanelMode("chat");
+                  }}
+                  style={{ display: "flex", color: colors.dim }}
+                >
+                  <CloseIcon />
+                </span>
+              </button>
+            )}
+            <span style={{ flex: 1 }} />
+            {panelMode === "chat" && (
+              <IconButton title="New side chat" onClick={() => void newSideChat()}>
+                <PencilIcon />
+              </IconButton>
+            )}
+            <IconButton title="Close panel" onClick={() => void closeSideChat()}>
               <CloseIcon />
             </IconButton>
           </header>
+          {openFile && panelMode === "file" && <FileViewer file={openFile} />}
+          <div
+            style={{
+              flex: 1,
+              minHeight: 0,
+              display: panelMode === "chat" ? "flex" : "none",
+              flexDirection: "column",
+            }}
+          >
           <ChatPane
             key={sideNonce}
             paneId="side"
@@ -507,7 +619,105 @@ export function App() {
               </div>
             }
           />
+          </div>
         </div>
+    </div>
+  );
+}
+
+const EXT_TO_PRISM: Record<string, string> = {
+  ts: "typescript",
+  tsx: "tsx",
+  js: "javascript",
+  jsx: "jsx",
+  mjs: "javascript",
+  cjs: "javascript",
+  json: "json",
+  sh: "bash",
+  bash: "bash",
+  zsh: "bash",
+  py: "python",
+  go: "go",
+  rs: "rust",
+  toml: "toml",
+  yml: "yaml",
+  yaml: "yaml",
+  css: "css",
+  html: "markup",
+  md: "markdown",
+  sql: "sql",
+};
+
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+/** Codex-style file view: breadcrumb, line numbers, Prism highlighting. */
+function FileViewer({ file }: { file: OpenFileInfo }) {
+  const content = file.content ?? "";
+  const ext = file.name.split(".").pop()?.toLowerCase() ?? "";
+  const lang = EXT_TO_PRISM[ext];
+  const grammar = lang ? Prism.languages[lang] : undefined;
+  const html = grammar ? Prism.highlight(content, grammar, lang) : escapeHtml(content);
+  const lineCount = content === "" ? 0 : content.split("\n").length;
+  const crumbs = file.relPath.split("/").filter(Boolean);
+
+  return (
+    <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
+      <div
+        style={{
+          padding: "10px 16px",
+          fontSize: 12.5,
+          color: colors.dim,
+          borderBottom: `1px solid ${colors.border}`,
+          whiteSpace: "nowrap",
+          overflow: "hidden",
+          textOverflow: "ellipsis",
+          flexShrink: 0,
+        }}
+        title={file.fullPath}
+      >
+        {crumbs.map((c, i) => (
+          <span key={i}>
+            {i > 0 && <span style={{ margin: "0 6px", color: "#4a4a52" }}>›</span>}
+            <span style={{ color: i === crumbs.length - 1 ? colors.fg : colors.dim }}>{c}</span>
+          </span>
+        ))}
+      </div>
+      {file.error ? (
+        <div style={{ padding: 24, color: colors.err, fontSize: 13 }}>{file.error}</div>
+      ) : (
+        <div style={{ flex: 1, overflow: "auto", display: "flex", background: "#101014" }}>
+          <pre
+            aria-hidden="true"
+            style={{
+              margin: 0,
+              padding: "14px 0 14px 16px",
+              textAlign: "right",
+              color: "#4a4a52",
+              userSelect: "none",
+              fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+              fontSize: 12.5,
+              lineHeight: 1.6,
+              flexShrink: 0,
+            }}
+          >
+            {Array.from({ length: lineCount }, (_, i) => i + 1).join("\n")}
+          </pre>
+          <pre
+            style={{
+              margin: 0,
+              padding: "14px 16px",
+              flex: 1,
+              fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+              fontSize: 12.5,
+              lineHeight: 1.6,
+              color: "#d7d5d1",
+            }}
+            dangerouslySetInnerHTML={{ __html: html }}
+          />
+        </div>
+      )}
     </div>
   );
 }
@@ -523,6 +733,7 @@ function ChatPane({
   onBusyChange,
   onTurnLanded,
   onAskSideChat,
+  onOpenFile,
 }: {
   paneId: PaneId;
   connected: boolean;
@@ -534,6 +745,7 @@ function ChatPane({
   onBusyChange?: (busy: boolean) => void;
   onTurnLanded?: () => void;
   onAskSideChat?: (text: string) => void;
+  onOpenFile?: (path: string) => void;
 }) {
   const [entries, setEntries] = useState<Entry[]>(reset.entries);
   const [draft, setDraft] = useState("");
@@ -719,11 +931,14 @@ function ChatPane({
         return <code style={{ fontFamily: "inherit", fontSize: "inherit" }}>{props.children}</code>;
       }
       const text = extractText(props.children);
-      const clickable = Boolean(onAskSideChat);
+      const isPath = Boolean(onOpenFile) && looksLikeFilePath(text);
+      const clickable = isPath || Boolean(onAskSideChat);
       return (
         <code
-          onClick={clickable ? () => onAskSideChat!(text) : undefined}
-          title={clickable ? "Open in side chat" : undefined}
+          onClick={
+            isPath ? () => onOpenFile!(text) : onAskSideChat ? () => onAskSideChat(text) : undefined
+          }
+          title={isPath ? "Open file" : clickable ? "Open in side chat" : undefined}
           style={{
             fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
             fontSize: "0.84em",
