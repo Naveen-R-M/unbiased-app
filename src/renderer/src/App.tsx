@@ -354,6 +354,7 @@ export function App() {
             />
           ))}
         </div>
+        <ChatFooter status={status} busy={mainBusy} />
       </nav>
       )}
 
@@ -418,7 +419,6 @@ export function App() {
           onTurnLanded={refreshThreads}
           onAskSideChat={askInSideChat}
         />
-        <ChatFooter status={status} busy={mainBusy} />
       </div>
 
       {sideOpen && (
@@ -1237,33 +1237,41 @@ function ChatFooter({ status, busy }: { status: EngineStatus; busy: boolean }) {
   return (
     <footer
       style={{
-        padding: "8px 16px",
+        padding: "10px 14px",
         borderTop: `1px solid ${colors.border}`,
-        fontSize: 12,
+        fontSize: 11.5,
         color: colors.dim,
         display: "flex",
-        gap: 8,
+        gap: 7,
         alignItems: "center",
         fontVariantNumeric: "tabular-nums",
+        flexShrink: 0,
+        whiteSpace: "nowrap",
+        overflow: "hidden",
       }}
     >
       <span
         style={{
-          width: 8,
-          height: 8,
+          width: 7,
+          height: 7,
           borderRadius: 4,
+          flexShrink: 0,
           background:
             status.state === "connected" ? colors.ok : status.state === "starting" ? colors.accent : colors.err,
         }}
       />
       {status.state === "connected" && (
-        <span>
+        <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>
           connected · pareto · engine {status.engineVersion}
           {busy ? " · thinking…" : ""}
         </span>
       )}
       {status.state === "starting" && <span>starting engine…</span>}
-      {status.state === "exited" && <span style={{ color: colors.err }}>{status.detail}</span>}
+      {status.state === "exited" && (
+        <span style={{ color: colors.err, overflow: "hidden", textOverflow: "ellipsis" }} title={status.detail}>
+          {status.detail}
+        </span>
+      )}
     </footer>
   );
 }
