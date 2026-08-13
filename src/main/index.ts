@@ -1,6 +1,6 @@
 import { app, BrowserWindow, dialog, ipcMain } from "electron";
 import { join } from "node:path";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { EngineClient, engineVersionFromUserAgent, type EngineStatus } from "./engine";
 
 const engine = new EngineClient();
@@ -42,6 +42,30 @@ type WireThread = {
   cwd?: string;
   turns?: { items?: WireItem[] }[];
 };
+
+// Projects the user has explicitly opened. Persisted so a project appears
+// in the sidebar the moment it's chosen — before (and regardless of) any
+// conversation existing in it. Thread cwds merge in at list time.
+function projectsFile(): string {
+  return join(app.getPath("userData"), "projects.json");
+}
+
+function loadProjects(): string[] {
+  try {
+    const parsed = JSON.parse(readFileSync(projectsFile(), "utf8"));
+    return Array.isArray(parsed) ? parsed.filter((p) => typeof p === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+function rememberProject(path: string): void {
+  const projects = loadProjects();
+  if (!projects.includes(path)) {
+    projects.unshift(path);
+    writeFileSync(projectsFile(), JSON.stringify(projects, null, 2) + "\n");
+  }
+}
 
 function threadTitle(t: WireThread): string {
   const name = t.name?.trim();
@@ -235,7 +259,9 @@ app.whenReady().then(async () => {
     // Codex-style sections: threads that ran inside a project folder group
     // under that folder's name; home-dir (or cwd-less) threads are Recents.
     // Keyed by full path so two folders sharing a basename stay distinct.
+    // Explicitly opened projects render even with zero conversations.
     const projectMap = new Map<string, ThreadSummary[]>();
+    for (const path of loadProjects()) projectMap.set(path, []);
     const recents: ThreadSummary[] = [];
     for (const t of result.data ?? []) {
       const summary: ThreadSummary = { id: t.id, title: threadTitle(t), createdAt: t.createdAt };
@@ -266,6 +292,7 @@ app.whenReady().then(async () => {
     });
     if (result.canceled || result.filePaths.length === 0) return { path: null, name: null };
     const path = result.filePaths[0];
+    rememberProject(path);
     pendingCwd = path;
     threadId = null;
     activeTurnId = null;

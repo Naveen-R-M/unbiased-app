@@ -141,6 +141,7 @@ export function App() {
     setActiveProject({ name, path });
     setActiveThreadId(null);
     setEntries([]);
+    void refreshThreads(); // the project shows in the sidebar immediately
   }
 
   async function openThread(id: string) {
@@ -429,8 +430,9 @@ export function App() {
                   alignItems: "center",
                   gap: 10,
                   width: "100%",
-                  background: "transparent",
+                  background: activeProject?.path === p.path ? colors.panel : "transparent",
                   border: "none",
+                  borderRadius: 8,
                   padding: "7px 8px 5px",
                   fontSize: 14,
                   color: colors.fg,
