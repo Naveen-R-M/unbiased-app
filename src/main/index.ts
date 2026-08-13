@@ -1,4 +1,4 @@
-import { app, BrowserWindow, clipboard, dialog, ipcMain, nativeImage } from "electron";
+import { app, BrowserWindow, clipboard, dialog, ipcMain, nativeImage, shell } from "electron";
 import type { NativeImage } from "electron";
 import { isAbsolute, join, relative } from "node:path";
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
@@ -179,6 +179,18 @@ function createWindow(): void {
     title: "Unbiased",
     ...(process.platform !== "darwin" && existsSync(iconPath) ? { icon: iconPath } : {}),
     webPreferences: { preload: join(__dirname, "../preload/index.js") },
+  });
+  // Links in rendered markdown are real anchors now — route them to the
+  // system browser instead of navigating (or spawning) app windows.
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    if (/^https?:/.test(url)) void shell.openExternal(url);
+    return { action: "deny" };
+  });
+  win.webContents.on("will-navigate", (e, url) => {
+    if (/^https?:/.test(url) && !url.startsWith("http://localhost")) {
+      e.preventDefault();
+      void shell.openExternal(url);
+    }
   });
   if (process.env.ELECTRON_RENDERER_URL) {
     win.loadURL(process.env.ELECTRON_RENDERER_URL);

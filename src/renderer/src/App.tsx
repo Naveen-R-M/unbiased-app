@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import rehypeRaw from "rehype-raw";
 import Prism from "prismjs";
 import "prismjs/components/prism-typescript";
 import "prismjs/components/prism-jsx";
@@ -199,6 +200,8 @@ function themeVars(t: ThemeConfig): Record<string, string> {
     "--border": m(0.095),
     "--user-bubble": m(0.13),
     "--dim": mixHex(t.surface, t.ink, 0.52),
+    // Between fg and dim: sidebar thread titles, Codex-style.
+    "--fg-soft": mixHex(t.surface, t.ink, 0.78),
     "--gutter": m(0.25),
     "--font-ui": `${t.fonts.ui}, -apple-system, system-ui, sans-serif`,
     "--font-code": `${t.fonts.code}, ui-monospace, Menlo, monospace`,
@@ -229,6 +232,9 @@ function parseThemeImport(raw: string): ThemeConfig | null {
 }
 
 const REMARK_PLUGINS = [remarkGfm];
+// File previews render embedded HTML (chat markdown stays text-only).
+// Scripts can't run regardless — the CSP has no unsafe-inline.
+const REHYPE_PLUGINS = [rehypeRaw];
 
 /** Drop a trailing empty assistant placeholder. */
 function withoutTrailingPlaceholder(es: Entry[]): Entry[] {
@@ -275,6 +281,27 @@ export function App() {
   const [activeProject, setActiveProject] = useState<{ name: string; path: string } | null>(null);
   const [hoveredThreadId, setHoveredThreadId] = useState<string | null>(null);
   const [hoveredProject, setHoveredProject] = useState<string | null>(null);
+  // Sidebar sections fold independently; both states persist.
+  const [projectsCollapsed, setProjectsCollapsed] = useState(
+    () => localStorage.getItem("navProjectsCollapsed") === "true",
+  );
+  const [recentsCollapsed, setRecentsCollapsed] = useState(
+    () => localStorage.getItem("navRecentsCollapsed") === "true",
+  );
+
+  function toggleProjectsSection() {
+    setProjectsCollapsed((c) => {
+      localStorage.setItem("navProjectsCollapsed", String(!c));
+      return !c;
+    });
+  }
+
+  function toggleRecentsSection() {
+    setRecentsCollapsed((c) => {
+      localStorage.setItem("navRecentsCollapsed", String(!c));
+      return !c;
+    });
+  }
   const [mainBusy, setMainBusy] = useState(false);
   const [mainReset, setMainReset] = useState<{ entries: Entry[]; nonce: number }>({ entries: [], nonce: 0 });
   // sideOpen = the whole right panel is visible; sideChatEnabled = the chat
@@ -442,6 +469,20 @@ export function App() {
   // big rows asking which surface to open (Codex's empty side panel).
   const [panelMode, setPanelMode] = useState<"chat" | "file" | "files" | "launcher">("chat");
   const [filesOpen, setFilesOpen] = useState(false);
+  // The Files view's tree column can collapse, leaving the viewer full
+  // width — Codex's folders toggle. Persisted.
+  const [treeVisible, setTreeVisible] = useState(() => localStorage.getItem("filesTreeVisible") !== "false");
+
+  function toggleTreeVisible() {
+    setTreeVisible((v) => {
+      localStorage.setItem("filesTreeVisible", String(!v));
+      return !v;
+    });
+  }
+
+  // Rendered preview for files that have one (markdown, SVG). Raw code is
+  // the default; the header button flips per file and resets on switch.
+  const [previewOn, setPreviewOn] = useState(false);
   // The side panel header's + menu (Review / Terminal / Files / Side chat).
   const [sidePlusOpen, setSidePlusOpen] = useState(false);
   const sidePlusRef = useRef<HTMLSpanElement>(null);
@@ -580,6 +621,18 @@ export function App() {
   const inProject =
     activeProject !== null ||
     sidebar.projects.some((p) => p.threads.some((t) => t.id === activeThreadId));
+
+  // Whatever file the panel is currently showing, and whether it has a
+  // rendered form worth offering.
+  const visibleFile = panelMode === "file" ? openFile : panelMode === "files" ? treeFile : null;
+  const previewable =
+    !!visibleFile &&
+    !visibleFile.error &&
+    visibleFile.content !== undefined &&
+    /\.(md|markdown|svg)$/i.test(visibleFile.name);
+
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => setPreviewOn(false), [visibleFile?.fullPath]);
   const mainTitle = (() => {
     if (activeThreadId) {
       const all = [...sidebar.projects.flatMap((p) => p.threads), ...sidebar.recents];
@@ -628,8 +681,8 @@ export function App() {
         }}
       >
         <div style={{ padding: "14px 14px 6px" }}>
-          <div style={{ fontSize: 17, fontWeight: 600, letterSpacing: -0.3, marginBottom: 14 }}>
-            <span style={{ color: colors.accent }}>un</span>biased
+          <div style={{ display: "flex", marginBottom: 14, padding: "2px 0" }}>
+            <Wordmark height={15} />
           </div>
           <SidebarAction onClick={() => void newChat()} disabled={mainBusy} icon={<PencilIcon />}>
             New chat
@@ -646,9 +699,14 @@ export function App() {
             <div style={{ color: colors.dim, fontSize: 12, padding: "8px 8px" }}>No conversations yet</div>
           )}
 
-          {sidebar.projects.length > 0 && <SectionLabel>Projects</SectionLabel>}
-          {sidebar.projects.map((p) => (
-            <div key={p.path} style={{ marginBottom: 8 }}>
+          {sidebar.projects.length > 0 && (
+            <SectionLabel collapsed={projectsCollapsed} onToggle={toggleProjectsSection}>
+              Projects
+            </SectionLabel>
+          )}
+          {!projectsCollapsed &&
+          sidebar.projects.map((p) => (
+            <div key={p.path} style={{ marginBottom: 12 }}>
               {/* A label, not a button — chats in a project start from the
                   pencil that appears on hover. */}
               <div
@@ -662,8 +720,8 @@ export function App() {
                   width: "100%",
                   background: activeProject?.path === p.path ? colors.panel : "transparent",
                   borderRadius: 8,
-                  padding: "7px 8px 5px",
-                  fontSize: 14,
+                  padding: "8px 8px 6px",
+                  fontSize: 14.5,
                   color: colors.fg,
                   boxSizing: "border-box",
                 }}
@@ -715,8 +773,13 @@ export function App() {
             </div>
           ))}
 
-          {sidebar.recents.length > 0 && <SectionLabel>Recents</SectionLabel>}
-          {sidebar.recents.map((t) => (
+          {sidebar.recents.length > 0 && (
+            <SectionLabel collapsed={recentsCollapsed} onToggle={toggleRecentsSection}>
+              Recents
+            </SectionLabel>
+          )}
+          {!recentsCollapsed &&
+          sidebar.recents.map((t) => (
             <ThreadRow
               key={t.id}
               thread={t}
@@ -803,8 +866,8 @@ export function App() {
           contextLabel={`${activeProject ? `${activeProject.name} · ` : ""}pareto · read-only`}
           emptyState={
             <div style={{ textAlign: "center" }}>
-              <h1 style={{ fontSize: 42, fontWeight: 600, letterSpacing: -1, margin: 0 }}>
-                <span style={{ color: colors.accent }}>un</span>biased
+              <h1 style={{ margin: 0, display: "flex", justifyContent: "center" }}>
+                <Wordmark height={36} />
               </h1>
               <p style={{ color: colors.dim, marginTop: 8 }}>
                 {!connected ? (
@@ -997,6 +1060,30 @@ export function App() {
               )}
             </span>
             <span style={{ flex: 1 }} />
+            {previewable && (
+              <button
+                onClick={() => setPreviewOn((o) => !o)}
+                style={{
+                  background: "transparent",
+                  border: `1px solid ${colors.border}`,
+                  color: colors.dim,
+                  borderRadius: 8,
+                  padding: "4px 10px",
+                  fontSize: 12,
+                  cursor: "pointer",
+                  fontFamily: "inherit",
+                  whiteSpace: "nowrap",
+                  flexShrink: 0,
+                }}
+              >
+                {previewOn ? "View raw" : "View preview"}
+              </button>
+            )}
+            {filesOpen && panelMode === "files" && (
+              <IconButton title={treeVisible ? "Hide file tree" : "Show file tree"} onClick={toggleTreeVisible}>
+                <FoldersIcon />
+              </IconButton>
+            )}
           </header>
           {panelMode === "launcher" && (
             <div
@@ -1018,7 +1105,7 @@ export function App() {
             </div>
           )}
           {openFile && panelMode === "file" && (
-            <FileViewer file={openFile} onOpenFile={(p, l) => void openFileInPanel(p, l)} />
+            <FileViewer file={openFile} onOpenFile={(p, l) => void openFileInPanel(p, l)} preview={previewOn} />
           )}
           {filesOpen && panelMode === "files" && (
             <div style={{ flex: 1, minHeight: 0, display: "flex" }}>
@@ -1028,11 +1115,11 @@ export function App() {
                   minWidth: 0,
                   display: "flex",
                   flexDirection: "column",
-                  borderRight: `1px solid ${colors.border}`,
+                  borderRight: treeVisible ? `1px solid ${colors.border}` : "none",
                 }}
               >
                 {treeFile ? (
-                  <FileViewer file={treeFile} onOpenFile={(p, l) => void openFileInTree(p, l)} />
+                  <FileViewer file={treeFile} onOpenFile={(p, l) => void openFileInTree(p, l)} preview={previewOn} />
                 ) : (
                   <div style={{ flex: 1, display: "grid", placeItems: "center" }}>
                     <div style={{ textAlign: "center", color: colors.dim }}>
@@ -1045,18 +1132,20 @@ export function App() {
                   </div>
                 )}
               </div>
-              <div
-                style={{
-                  width: "34%",
-                  minWidth: 160,
-                  maxWidth: 250,
-                  flexShrink: 0,
-                  display: "flex",
-                  flexDirection: "column",
-                }}
-              >
-                <FileTreePane onOpenFile={(p) => void openFileInTree(p)} />
-              </div>
+              {treeVisible && (
+                <div
+                  style={{
+                    width: "34%",
+                    minWidth: 160,
+                    maxWidth: 250,
+                    flexShrink: 0,
+                    display: "flex",
+                    flexDirection: "column",
+                  }}
+                >
+                  <FileTreePane onOpenFile={(p) => void openFileInTree(p)} />
+                </div>
+              )}
             </div>
           )}
           <div
@@ -1313,15 +1402,51 @@ function FileTreePane({ onOpenFile }: { onOpenFile: (path: string) => void }) {
   );
 }
 
+/** An image inside a markdown preview. Relative srcs resolve against the
+ *  markdown file's own directory and load through the main process (the
+ *  CSP forbids file:// URLs); http(s) srcs are left alone and simply
+ *  won't load under the CSP — the alt text shows instead. */
+function MdImage({ src, alt, baseDir }: { src?: string; alt?: string; baseDir: string }) {
+  const [url, setUrl] = useState<string | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    setUrl(null);
+    if (!src) return;
+    if (/^(https?:|data:)/.test(src)) {
+      setUrl(src);
+      return;
+    }
+    const resolved = src.startsWith("/") ? src : `${baseDir}/${src}`;
+    void (async () => {
+      if (/\.svg$/i.test(resolved)) {
+        const r = await window.unbiased.readFile(resolved);
+        if (alive) setUrl(r.content ? `data:image/svg+xml;utf8,${encodeURIComponent(r.content)}` : null);
+      } else {
+        const r = await window.unbiased.readImage(resolved);
+        if (alive) setUrl(r.dataUrl ?? null);
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [src, baseDir]);
+
+  if (!url) return <span style={{ color: colors.dim, fontSize: 12.5 }}>[image: {alt || src}]</span>;
+  return <img src={url} alt={alt} style={{ maxWidth: "100%", borderRadius: 8 }} />;
+}
+
 /** Codex-style file view: breadcrumb, line numbers, Prism highlighting.
  *  With onOpenFile, each crumb opens a dropdown of its parent directory
  *  (siblings, the crumb pre-expanded) for quick navigation. */
 function FileViewer({
   file,
   onOpenFile,
+  preview,
 }: {
   file: OpenFileInfo;
   onOpenFile?: (path: string, line?: number) => void;
+  preview?: boolean;
 }) {
   const content = file.content ?? "";
   const ext = file.name.split(".").pop()?.toLowerCase() ?? "";
@@ -1354,6 +1479,58 @@ function FileViewer({
   // 12.5px font × 1.6 line-height, shared by the gutter and code panes.
   const LINE_H = 20;
   const PAD_TOP = 14;
+
+  // Markdown-preview element overrides: theme-colored links (opened via
+  // the system browser), images resolved against this file's directory,
+  // and code surfaces matching the app. Memoized per file — a fresh map
+  // would remount the preview subtree every render.
+  const previewComponents = useMemo(() => {
+    const baseDir = file.fullPath.split("/").slice(0, -1).join("/") || "/";
+    return {
+      a: (props: { href?: string; children?: React.ReactNode }) => (
+        <a href={props.href} target="_blank" rel="noreferrer" style={{ color: "var(--accent)" }}>
+          {props.children}
+        </a>
+      ),
+      img: (props: { src?: string; alt?: string }) => (
+        <MdImage src={props.src} alt={props.alt} baseDir={baseDir} />
+      ),
+      pre: (props: { children?: React.ReactNode }) => (
+        <pre
+          style={{
+            background: "var(--code-bg)",
+            border: `1px solid ${colors.border}`,
+            borderRadius: 10,
+            padding: "12px 14px",
+            overflowX: "auto",
+            fontFamily: "var(--font-code)",
+            fontSize: 12.75,
+            lineHeight: 1.65,
+            color: "var(--code-fg)",
+          }}
+        >
+          {props.children}
+        </pre>
+      ),
+      code: (props: { className?: string; children?: React.ReactNode }) =>
+        props.className ? (
+          <code style={{ fontFamily: "inherit", fontSize: "inherit" }}>{props.children}</code>
+        ) : (
+          <code
+            style={{
+              fontFamily: "var(--font-code)",
+              fontSize: "0.84em",
+              background: "var(--chip)",
+              padding: "2px 6px",
+              borderRadius: 6,
+            }}
+          >
+            {props.children}
+          </code>
+        ),
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [file.fullPath]);
 
   useEffect(() => {
     setCrumbMenu(null);
@@ -1511,6 +1688,29 @@ function FileViewer({
       </div>
       {file.error ? (
         <div style={{ padding: 24, color: colors.err, fontSize: 13 }}>{file.error}</div>
+      ) : preview && /\.svg$/i.test(file.name) ? (
+        <div
+          style={{
+            flex: 1,
+            overflow: "auto",
+            display: "grid",
+            placeItems: "center",
+            background: "var(--code-bg)",
+            padding: 20,
+          }}
+        >
+          <img
+            src={`data:image/svg+xml;utf8,${encodeURIComponent(content)}`}
+            alt={file.name}
+            style={{ maxWidth: "100%", maxHeight: "100%", display: "block" }}
+          />
+        </div>
+      ) : preview && /\.(md|markdown)$/i.test(file.name) ? (
+        <div style={{ flex: 1, overflowY: "auto", padding: "20px 28px", fontSize: 14.5, lineHeight: 1.7 }}>
+          <Markdown remarkPlugins={REMARK_PLUGINS} rehypePlugins={REHYPE_PLUGINS} components={previewComponents}>
+            {content}
+          </Markdown>
+        </div>
       ) : file.imageSrc ? (
         <div
           style={{
@@ -2127,6 +2327,11 @@ function ChatPane({
         <CodeBlock onOpenCode={onAskSideChatRef.current ? (t) => onAskSideChatRef.current!(t) : undefined}>
           {props.children}
         </CodeBlock>
+      ),
+      a: (props: { href?: string; children?: React.ReactNode }) => (
+        <a href={props.href} target="_blank" rel="noreferrer" style={{ color: "var(--accent)" }}>
+          {props.children}
+        </a>
       ),
       p: (props: { children?: React.ReactNode }) => <p style={{ margin: "10px 0" }}>{props.children}</p>,
       ul: (props: { children?: React.ReactNode }) => (
@@ -2951,6 +3156,20 @@ function SettingsView({
   );
 }
 
+/** Brand wordmark (unbiased-platform public/logos/unbiased-wordmark.svg),
+ *  inlined so "biased" tracks the theme foreground; "un" keeps the brand
+ *  corals from the source asset. */
+function Wordmark({ height = 16 }: { height?: number }) {
+  const width = Math.round(height * (314.673 / 50.0576));
+  return (
+    <svg width={width} height={height} viewBox="0 0 314.673 50.0576" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="unbiased">
+      <path d="M12.2295 34.8111C12.2295 36.2942 12.58 37.4937 13.2812 38.4098C14.0264 39.3258 15.0562 39.7847 16.3711 39.7848C17.9052 39.7848 19.3296 39.2822 20.6445 38.2789C21.6136 37.5073 22.6651 36.3679 23.8008 34.8619V12.6285H36.0303V49.2721H24.1299L23.9033 45.4146C22.7391 46.6374 21.5007 47.5971 20.1846 48.2906C17.9491 49.4684 15.604 50.0572 13.1494 50.0572C10.3004 50.0572 7.88943 49.4902 5.91699 48.356C3.98848 47.1782 2.51983 45.5427 1.51172 43.4488C0.503563 41.3549 0 38.8898 0 36.0543V12.6285H12.2295V34.8111Z" fill="#FF7764" />
+      <path d="M66.8253 11.8432C69.6743 11.8432 72.0636 12.432 73.9922 13.6098C75.9647 14.744 77.4548 16.3587 78.463 18.4526C79.471 20.5464 79.9756 23.0108 79.9756 25.8462V49.2719H67.7462V27.0893C67.7461 25.6063 67.3731 24.4067 66.628 23.4907C65.9267 22.5747 64.9185 22.1167 63.6036 22.1167C62.0696 22.1167 60.645 22.6401 59.3301 23.687C58.3612 24.4263 57.3095 25.5451 56.1739 27.0424V49.2719H43.9444V12.6284H55.8458L56.0704 16.4848C57.2345 15.2621 58.474 14.3033 59.7901 13.6098C62.0255 12.4321 64.3708 11.8433 66.8253 11.8432Z" fill="#FF563F" />
+      <path d="M96.4538 18.0605C97.7249 16.3156 99.3907 14.9626 101.451 14.0029C103.511 12.9998 105.768 12.4981 108.222 12.498C111.466 12.498 114.293 13.3051 116.704 14.9189C119.158 16.4894 121.087 18.6928 122.49 21.5283C123.893 24.3638 124.594 27.614 124.594 31.2783C124.594 34.899 123.893 38.1274 122.49 40.9629C121.087 43.7982 119.158 46.0227 116.704 47.6367C114.293 49.2507 111.466 50.0576 108.222 50.0576C105.724 50.0576 103.423 49.5342 101.319 48.4873C99.2589 47.3967 97.5931 45.9793 96.322 44.2344L96.1247 49.2725H89.8132V1.17773H96.4538V18.0605ZM177.705 12.498C180.948 12.498 183.754 13.0433 186.121 14.1338C188.488 15.1808 190.307 16.7082 191.578 18.7148C192.893 20.7215 193.55 23.1639 193.55 26.043V49.2725H187.239L187.057 43.6396C185.989 45.3653 184.605 46.7642 182.899 47.833C180.532 49.3161 177.618 50.0576 174.155 50.0576C171.788 50.0576 169.706 49.6432 167.909 48.8145C166.112 47.942 164.709 46.7208 163.701 45.1504C162.693 43.5363 162.188 41.66 162.188 39.5225C162.188 35.8149 163.613 32.936 166.462 30.8857C169.355 28.8354 173.388 27.8096 178.56 27.8096H186.976V25.7158C186.976 23.1423 186.121 21.1358 184.412 19.6963C182.746 18.2131 180.444 17.4707 177.508 17.4707C174.659 17.4708 172.336 18.1259 170.539 19.4346C168.742 20.6996 167.755 22.466 167.58 24.7344H161.071C161.29 22.1608 162.123 19.9799 163.569 18.1914C165.016 16.3592 166.944 14.9626 169.355 14.0029C171.766 12.9997 174.549 12.4981 177.705 12.498ZM215.931 12.498C220.446 12.4981 224.062 13.5448 226.78 15.6387C229.541 17.689 231.031 20.5248 231.251 24.1455H225.005C224.873 22.0517 223.996 20.4379 222.375 19.3037C220.797 18.1259 218.649 17.5362 215.931 17.5361C213.389 17.5361 211.439 18.0386 210.08 19.042C208.765 20.0453 208.107 21.3101 208.107 22.8369C208.107 24.0146 208.545 24.9525 209.422 25.6504C210.298 26.3047 211.438 26.8281 212.841 27.2207C214.243 27.5697 215.778 27.8968 217.443 28.2021C219.153 28.4639 220.841 28.8138 222.507 29.25C224.216 29.6862 225.772 30.2969 227.174 31.082C228.577 31.8236 229.694 32.8487 230.527 34.1572C231.404 35.4658 231.842 37.167 231.842 39.2607C231.842 42.6197 230.484 45.2593 227.766 47.1787C225.049 49.0981 221.432 50.0576 216.918 50.0576C213.718 50.0576 210.891 49.5124 208.436 48.4219C206.026 47.2877 204.162 45.7175 202.847 43.7109C201.532 41.6606 200.853 39.2174 200.809 36.3818H207.055C207.055 39.0429 207.954 41.1372 209.751 42.6641C211.548 44.1908 213.915 44.954 216.851 44.9541C219.35 44.9541 221.344 44.4961 222.835 43.5801C224.369 42.6204 225.136 41.3328 225.136 39.7188C225.136 38.4539 224.698 37.4505 223.821 36.709C222.988 35.9238 221.87 35.3132 220.467 34.877C219.065 34.4408 217.509 34.07 215.799 33.7646C214.134 33.4157 212.446 33.0231 210.737 32.5869C209.071 32.1071 207.537 31.5183 206.134 30.8203C204.732 30.0787 203.592 29.0965 202.716 27.875C201.839 26.6536 201.401 25.0615 201.401 23.0986C201.401 21.0483 201.992 19.2374 203.175 17.667C204.359 16.053 206.025 14.7881 208.173 13.8721C210.364 12.956 212.951 12.498 215.931 12.498ZM256.721 12.498C262.551 12.498 266.891 14.1118 269.74 17.3398C272.589 20.5244 273.839 24.9093 273.488 30.4932H245.038C245.026 30.8144 245.018 31.1417 245.018 31.4746C245.018 34.0481 245.456 36.3382 246.333 38.3447C247.253 40.3078 248.569 41.8352 250.278 42.9258C251.987 44.0163 254.048 44.5615 256.459 44.5615C259.308 44.5615 261.675 43.8854 263.559 42.5332C265.488 41.1809 266.672 39.3482 267.11 37.0361H273.751C273.181 41.093 271.362 44.2778 268.294 46.5898C265.225 48.9019 261.28 50.0576 256.459 50.0576C252.733 50.0576 249.511 49.3161 246.794 47.833C244.076 46.3063 241.994 44.1471 240.548 41.3555C239.101 38.52 238.378 35.1389 238.378 31.2129C238.378 27.2868 239.101 23.9277 240.548 21.1357C242.038 18.3438 244.141 16.2059 246.859 14.7227C249.621 13.2395 252.908 12.4981 256.721 12.498ZM314.673 49.2725H308.426L308.229 44.2344C306.958 45.9793 305.27 47.3967 303.166 48.4873C301.106 49.5342 298.805 50.0576 296.262 50.0576C293.063 50.0576 290.236 49.2508 287.781 47.6367C285.326 46.0227 283.397 43.7983 281.995 40.9629C280.636 38.1274 279.957 34.899 279.957 31.2783C279.957 27.614 280.636 24.3638 281.995 21.5283C283.397 18.6928 285.326 16.4894 287.781 14.9189C290.236 13.305 293.063 12.4981 296.262 12.498C298.761 12.498 301.04 12.9996 303.1 14.0029C305.16 14.9626 306.826 16.3156 308.097 18.0605V1.17773H314.673V49.2725ZM146.58 43.9072H159.007V49.2725H126.592V43.9072H139.939V18.6494H131.392V13.2832H146.58V43.9072ZM178.297 32.7178C175.316 32.7178 172.971 33.2848 171.261 34.4189C169.596 35.5531 168.763 37.1453 168.763 39.1953C168.763 40.8966 169.355 42.2278 170.539 43.1875C171.766 44.147 173.41 44.6269 175.469 44.627C178.099 44.627 180.423 43.9291 182.439 42.5332C184.26 41.2608 185.772 39.5786 186.976 37.4883V32.7178H178.297ZM106.776 18.0605C104.453 18.0606 102.371 18.7147 100.53 20.0234C98.6891 21.2885 97.3304 23.0768 96.4538 25.3887V37.1016C97.3305 39.37 98.689 41.1809 100.53 42.5332C102.371 43.8418 104.453 44.4961 106.776 44.4961C109.011 44.4961 110.962 43.929 112.628 42.7949C114.293 41.6607 115.586 40.1115 116.507 38.1484C117.427 36.1418 117.887 33.852 117.887 31.2783C117.887 28.6609 117.427 26.3703 116.507 24.4072C115.586 22.4007 114.293 20.8523 112.628 19.7617C110.962 18.6275 109.012 18.0605 106.776 18.0605ZM297.709 18.0605C295.517 18.0606 293.588 18.6275 291.923 19.7617C290.257 20.8523 288.942 22.4008 287.978 24.4072C287.058 26.3703 286.597 28.6609 286.597 31.2783C286.597 33.8519 287.058 36.1419 287.978 38.1484C288.942 40.1114 290.257 41.6607 291.923 42.7949C293.588 43.9291 295.517 44.4961 297.709 44.4961C300.076 44.4961 302.18 43.8419 304.021 42.5332C305.862 41.1809 307.221 39.37 308.097 37.1016V25.3887C307.221 23.0768 305.862 21.2885 304.021 20.0234C302.18 18.7147 300.076 18.0605 297.709 18.0605ZM256.721 17.9297C252.952 17.9297 250.059 19.1072 248.043 21.4629C247.077 22.5915 246.345 23.9462 245.841 25.5254L266.716 25.585C266.54 23.2731 265.532 21.4193 263.691 20.0234C261.85 18.6275 259.527 17.9297 256.721 17.9297ZM146.909 7.13281H139.479V0H146.909V7.13281Z" fill="var(--fg)" />
+    </svg>
+  );
+}
+
 function PaperclipIcon() {
   return (
     <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" style={{ flexShrink: 0 }}>
@@ -3067,9 +3286,51 @@ function CopyButton({ text }: { text: string }) {
   );
 }
 
-function SectionLabel({ children }: { children: React.ReactNode }) {
+function SectionLabel({
+  children,
+  collapsed,
+  onToggle,
+}: {
+  children: React.ReactNode;
+  collapsed?: boolean;
+  onToggle?: () => void;
+}) {
+  const base: React.CSSProperties = {
+    color: colors.dim,
+    fontSize: 13.5,
+    fontWeight: 500,
+    padding: "14px 8px 6px",
+  };
+  if (!onToggle) return <div style={base}>{children}</div>;
   return (
-    <div style={{ color: colors.dim, fontSize: 12, fontWeight: 500, padding: "10px 8px 4px" }}>{children}</div>
+    <button
+      onClick={onToggle}
+      aria-expanded={!collapsed}
+      style={{
+        ...base,
+        display: "flex",
+        alignItems: "center",
+        gap: 6,
+        width: "100%",
+        background: "transparent",
+        border: "none",
+        textAlign: "left",
+        cursor: "pointer",
+        fontFamily: "inherit",
+      }}
+    >
+      {children}
+      <span
+        style={{
+          display: "inline-block",
+          fontSize: 11,
+          transform: collapsed ? "none" : "rotate(90deg)",
+          transition: "transform 120ms",
+        }}
+      >
+        ›
+      </span>
+    </button>
   );
 }
 
@@ -3155,6 +3416,15 @@ function FolderOutlineIcon({ size = 18 }: { size?: number } = {}) {
   return (
     <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
       <path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.7-.9L9.2 3.9A2 2 0 0 0 7.5 3H4a2 2 0 0 0-2 2v13c0 1.1.9 2 2 2Z" />
+    </svg>
+  );
+}
+
+function FoldersIcon() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M20 17a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3.9a2 2 0 0 1-1.69-.9l-.81-1.2a2 2 0 0 0-1.67-.9H8a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2Z" />
+      <path d="M2 8v11a2 2 0 0 0 2 2h14" />
     </svg>
   );
 }
@@ -3394,10 +3664,10 @@ function ThreadRow({
           flex: 1,
           minWidth: 0,
           background: "transparent",
-          color: active ? colors.fg : colors.dim,
+          color: active ? colors.fg : "var(--fg-soft)",
           border: "none",
-          padding: "7px 4px 7px 8px",
-          fontSize: 13,
+          padding: "8px 4px 8px 8px",
+          fontSize: 14,
           textAlign: "left",
           cursor: busy ? "default" : "pointer",
           whiteSpace: "nowrap",
