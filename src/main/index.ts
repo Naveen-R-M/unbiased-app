@@ -1,9 +1,21 @@
-import { app, BrowserWindow, clipboard, dialog, ipcMain, nativeImage, shell } from "electron";
+import {
+  app,
+  BrowserWindow,
+  clipboard,
+  dialog,
+  ipcMain,
+  Menu,
+  nativeImage,
+  shell,
+  WebContentsView,
+} from "electron";
+import type { MenuItemConstructorOptions } from "electron";
 import type { NativeImage } from "electron";
 import { isAbsolute, join, relative } from "node:path";
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { EngineClient, engineVersionFromUserAgent, type EngineStatus } from "./engine";
+import { spawn as ptySpawn, type IPty } from "@lydell/node-pty";
 
 const engine = new EngineClient();
 let win: BrowserWindow | null = null;
@@ -34,10 +46,26 @@ let mainCwd: string | null = null;
 // clicking a project header; consumed when the lazy thread is created.
 let pendingCwd: string | null = null;
 
-// Every thread we start or resume gets the same policy: built-in trusted
-// commands run freely, everything else asks the human. Sandbox stays
-// read-only until the file-change approval UI exists.
-const THREAD_POLICY = { approvalPolicy: "untrusted", sandbox: "read-only" } as const;
+// User-selectable access mode (Codex-style). Applied to every new thread
+// AND sent as turn-level overrides, which per the protocol change "this
+// turn and subsequent turns" — so switching applies mid-conversation.
+type AccessMode = "ask" | "auto" | "full";
+let accessMode: AccessMode = "ask";
+
+const MODE_THREAD_POLICY: Record<AccessMode, { approvalPolicy: string; sandbox: string }> = {
+  ask: { approvalPolicy: "untrusted", sandbox: "read-only" },
+  auto: { approvalPolicy: "on-request", sandbox: "workspace-write" },
+  full: { approvalPolicy: "never", sandbox: "danger-full-access" },
+};
+const MODE_TURN_SANDBOX: Record<AccessMode, Record<string, unknown>> = {
+  ask: { type: "readOnly" },
+  auto: { type: "workspaceWrite" },
+  full: { type: "dangerFullAccess" },
+};
+
+function threadPolicy(): { approvalPolicy: string; sandbox: string } {
+  return MODE_THREAD_POLICY[accessMode];
+}
 
 type ThreadSummary = { id: string; title: string; createdAt?: string };
 type WireItem = {
@@ -140,9 +168,9 @@ function resolveEngineDir(): string {
 }
 
 /** Small data-URL preview for attachment cards; full-size stays on disk. */
-function thumbDataUrl(image: NativeImage): string {
+function thumbDataUrl(image: NativeImage, max = 112): string {
   const { width, height } = image.getSize();
-  const scale = 112 / Math.max(width, height, 1);
+  const scale = max / Math.max(width, height, 1);
   const small =
     scale < 1
       ? image.resize({ width: Math.round(width * scale), height: Math.round(height * scale) })
@@ -202,6 +230,183 @@ function createWindow(): void {
 // Server-initiated approval requests awaiting a human decision, keyed by a
 // string handle the renderer can safely round-trip.
 const pendingApprovals = new Map<string, number | string>();
+
+// Live PTYs for the integrated terminal, keyed by handle.
+const ptys = new Map<string, IPty>();
+let nextPtyId = 1;
+
+// The in-page annotation picker, injected with executeJavaScript. Runs
+// entirely inside the page: hover-highlight → click to pick an element →
+// inline comment bubble → the returned promise resolves with the pick
+// (or null on Escape), which is exactly when executeJavaScript resolves.
+const ANNOTATE_PICKER = `
+(() => {
+  if (window.__unbiasedPick) return window.__unbiasedPick;
+  window.__unbiasedPick = new Promise((resolve) => {
+    const Z = 2147483646;
+    const hl = document.createElement('div');
+    hl.style.cssText = 'position:fixed;z-index:' + Z + ';pointer-events:none;border:2px solid #FF563F;border-radius:4px;background:rgba(255,86,63,0.08);left:-9999px;top:0';
+    const badge = document.createElement('div');
+    badge.style.cssText = 'position:fixed;z-index:' + (Z + 1) + ';pointer-events:none;width:22px;height:22px;border-radius:50% 50% 50% 4px;background:#FF563F;left:-9999px;top:0';
+    document.documentElement.append(hl, badge);
+    let current = null;
+    const cleanup = () => {
+      window.removeEventListener('mousemove', onMove, true);
+      window.removeEventListener('click', onClick, true);
+      window.removeEventListener('keydown', onKey, true);
+      hl.remove(); badge.remove();
+    };
+    const done = (val) => { cleanup(); delete window.__unbiasedPick; resolve(val); };
+    const onMove = (e) => {
+      badge.style.left = (e.clientX + 10) + 'px';
+      badge.style.top = (e.clientY - 28) + 'px';
+      const el = document.elementFromPoint(e.clientX, e.clientY);
+      if (!el || el === hl || el === badge) return;
+      current = el;
+      const r = el.getBoundingClientRect();
+      hl.style.left = r.left + 'px'; hl.style.top = r.top + 'px';
+      hl.style.width = r.width + 'px'; hl.style.height = r.height + 'px';
+    };
+    const onKey = (e) => { if (e.key === 'Escape') { e.preventDefault(); done(null); } };
+    const onClick = (e) => {
+      if (!current) return;
+      e.preventDefault(); e.stopPropagation();
+      const el = current;
+      window.removeEventListener('mousemove', onMove, true);
+      window.removeEventListener('click', onClick, true);
+      badge.remove();
+      const r = el.getBoundingClientRect();
+      const box = document.createElement('div');
+      box.style.cssText = 'position:fixed;z-index:' + (Z + 1) + ';display:flex;align-items:center;gap:6px;background:#26262b;border-radius:999px;box-shadow:0 4px 16px rgba(0,0,0,0.5);padding:5px 6px 5px 14px;left:' +
+        Math.max(8, Math.min(r.left + r.width / 2 - 140, innerWidth - 300)) + 'px;top:' + Math.max(8, r.top - 48) + 'px';
+      const input = document.createElement('input');
+      input.placeholder = 'Add an optional comment…';
+      input.style.cssText = 'background:transparent;border:none;outline:none;color:#eee;font:13px -apple-system,sans-serif;width:200px';
+      const ok = document.createElement('button');
+      ok.textContent = '\\u2713';
+      ok.style.cssText = 'background:#FF563F;color:#fff;border:none;border-radius:50%;width:26px;height:26px;cursor:pointer;font-size:13px;line-height:1';
+      box.append(input, ok);
+      document.documentElement.append(box);
+      input.focus();
+      const finish = () => {
+        const text = (el.innerText || el.textContent || '').trim().slice(0, 1500);
+        box.remove();
+        done({ text, comment: input.value.trim(), url: location.href, title: document.title, tag: el.tagName.toLowerCase() });
+      };
+      ok.addEventListener('click', finish);
+      input.addEventListener('keydown', (ke) => {
+        ke.stopPropagation();
+        if (ke.key === 'Enter') finish();
+        if (ke.key === 'Escape') { box.remove(); done(null); }
+      });
+    };
+    window.addEventListener('mousemove', onMove, true);
+    window.addEventListener('click', onClick, true);
+    window.addEventListener('keydown', onKey, true);
+  });
+  return window.__unbiasedPick;
+})()
+`;
+
+/** Run the picker in the browser page; forward a completed pick to the
+ *  renderer as a main-composer annotation carrying page provenance. */
+async function startAnnotatePicker(): Promise<void> {
+  const wc = browserView?.webContents;
+  if (!wc || wc.isDestroyed()) return;
+  try {
+    const result = (await wc.executeJavaScript(ANNOTATE_PICKER, true)) as {
+      text: string;
+      comment: string;
+      url: string;
+      title: string;
+      tag: string;
+    } | null;
+    if (result?.text) {
+      // The page thumbnail rides along, Codex-style, for the sent-message
+      // annotation card. Best-effort — a failed capture drops the image.
+      let thumb: string | undefined;
+      try {
+        thumb = thumbDataUrl(await wc.capturePage(), 360);
+      } catch {
+        thumb = undefined;
+      }
+      send("browser:annotate", {
+        text: `${result.text}\n\n(from ${result.title || "page"} — ${result.url})`,
+        comment: result.comment || undefined,
+        tag: result.tag,
+        thumb,
+      });
+    }
+  } catch {
+    // Navigation mid-pick destroys the page context; the pick just ends.
+  }
+}
+
+// The embedded browser: a sandboxed WebContentsView layered over the side
+// panel. The renderer owns the toolbar and reports the placeholder's
+// bounds; this side owns navigation and pushes state back.
+let browserView: WebContentsView | null = null;
+
+function ensureBrowserView(): WebContentsView {
+  if (browserView) return browserView;
+  const view = new WebContentsView({ webPreferences: { sandbox: true } });
+  browserView = view;
+  win?.contentView.addChildView(view);
+  const wc = view.webContents;
+  const pushState = () => {
+    if (wc.isDestroyed()) return;
+    send("browser:state", {
+      url: wc.getURL(),
+      title: wc.getTitle(),
+      canGoBack: wc.navigationHistory.canGoBack(),
+      canGoForward: wc.navigationHistory.canGoForward(),
+      loading: wc.isLoading(),
+    });
+  };
+  wc.on("did-navigate", pushState);
+  wc.on("did-navigate-in-page", pushState);
+  wc.on("page-title-updated", pushState);
+  wc.on("did-start-loading", pushState);
+  wc.on("did-stop-loading", pushState);
+  // Popups/new-tab links load in the same pane — there is one pane.
+  wc.setWindowOpenHandler(({ url }) => {
+    if (/^https?:/.test(url)) void wc.loadURL(url);
+    return { action: "deny" };
+  });
+
+  // Right-click menu, Codex-style. "Add … to chat" stages the selection
+  // or link as an annotation in the main composer.
+  wc.on("context-menu", (_e, params) => {
+    const selection = params.selectionText.trim();
+    const link = params.linkURL;
+    const items: (MenuItemConstructorOptions | null)[] = [
+      selection
+        ? { label: "Quick annotate", click: () => send("browser:annotate", { text: selection, tag: "selection" }) }
+        : link
+          ? { label: "Quick annotate", click: () => send("browser:annotate", { text: link, tag: "link" }) }
+          : null,
+      { label: "Annotate", click: () => void startAnnotatePicker() },
+      { type: "separator" },
+      link ? { label: "Open link", click: () => void wc.loadURL(link) } : null,
+      link ? { label: "Open in external browser", click: () => void shell.openExternal(link) } : null,
+      { type: "separator" },
+      link ? { label: "Copy link address", click: () => clipboard.writeText(link) } : null,
+      selection ? { label: "Copy", click: () => wc.copy() } : null,
+      link ? { label: "Save Link As…", click: () => wc.downloadURL(link) } : null,
+      { type: "separator" },
+      { label: "Inspect", click: () => wc.inspectElement(params.x, params.y) },
+    ];
+    // Drop the nulls, then collapse the separator runs they leave behind.
+    const template = items
+      .filter((i): i is MenuItemConstructorOptions => i !== null)
+      .filter(
+        (item, idx, arr) =>
+          item.type !== "separator" || (idx > 0 && idx < arr.length - 1 && arr[idx - 1].type !== "separator"),
+      );
+    Menu.buildFromTemplate(template).popup({ window: win ?? undefined });
+  });
+  return view;
+}
 
 function wireNotifications(): void {
   engine.on("notification", (msg: { method: string; params?: Record<string, unknown> }) => {
@@ -320,17 +525,17 @@ app.whenReady().then(async () => {
         started = (await engine.request("thread/fork", {
           threadId: panes.main.threadId,
           ephemeral: true,
-          ...THREAD_POLICY,
+          ...threadPolicy(),
         })) as { thread: { id: string } };
       } else if (paneId === "side") {
         // No parent conversation yet: a plain scratch thread.
         started = (await engine.request("thread/start", {
-          ...THREAD_POLICY,
+          ...threadPolicy(),
           ephemeral: true,
         })) as { thread: { id: string } };
       } else {
         started = (await engine.request("thread/start", {
-          ...THREAD_POLICY,
+          ...threadPolicy(),
           // Explicit home when no project is chosen — left implicit, the
           // engine falls back to its own process cwd (wherever the app
           // launched from) and the chat wrongly files under that project.
@@ -357,9 +562,18 @@ app.whenReady().then(async () => {
     const result = (await engine.request("turn/start", {
       threadId: pane.threadId,
       input,
+      // Turn-level overrides apply "this turn and subsequent turns", so a
+      // mode switched mid-conversation takes effect immediately.
+      approvalPolicy: threadPolicy().approvalPolicy,
+      sandboxPolicy: MODE_TURN_SANDBOX[accessMode],
     })) as { turn?: { id?: string } };
     if (result.turn?.id) pane.turnId = result.turn.id;
     return { turnId: pane.turnId, threadId: pane.threadId, created };
+  });
+
+  ipcMain.handle("policy:set-mode", (_e, mode: string) => {
+    if (mode === "ask" || mode === "auto" || mode === "full") accessMode = mode;
+    return { mode: accessMode };
   });
 
   ipcMain.handle("chat:interrupt", async (_e, paneId: PaneId) => {
@@ -427,7 +641,7 @@ app.whenReady().then(async () => {
   });
 
   ipcMain.handle("threads:open", async (_e, id: string) => {
-    const result = (await engine.request("thread/resume", { threadId: id, ...THREAD_POLICY })) as {
+    const result = (await engine.request("thread/resume", { threadId: id, ...threadPolicy() })) as {
       thread: WireThread;
       cwd?: string;
     };
@@ -505,6 +719,93 @@ app.whenReady().then(async () => {
         return { path, name, kind: "file" };
       }),
     };
+  });
+
+  ipcMain.handle("browser:open", (_e, url?: string) => {
+    const view = ensureBrowserView();
+    if (url) void view.webContents.loadURL(url);
+    return { ok: true };
+  });
+
+  ipcMain.handle("browser:bounds", (_e, b: { x: number; y: number; width: number; height: number }) => {
+    // The renderer measures in its own CSS pixels; setBounds wants window
+    // DIPs. They differ by the page zoom factor (Cmd+= / Cmd+-), so an
+    // unzoomed conversion strands the view at the wrong spot and size.
+    const z = win?.webContents.getZoomFactor() ?? 1;
+    ensureBrowserView().setBounds({
+      x: Math.round(b.x * z),
+      y: Math.round(b.y * z),
+      width: Math.max(0, Math.round(b.width * z)),
+      height: Math.max(0, Math.round(b.height * z)),
+    });
+  });
+
+  ipcMain.handle("browser:visible", (_e, visible: boolean) => {
+    browserView?.setVisible(visible);
+  });
+
+  ipcMain.handle("browser:navigate", (_e, p: { url?: string; action?: "back" | "forward" | "reload" }) => {
+    const wc = browserView?.webContents;
+    if (!wc) return;
+    if (p.url) {
+      const url = /^[a-z][a-z0-9+.-]*:/i.test(p.url) ? p.url : `https://${p.url}`;
+      void wc.loadURL(url);
+    } else if (p.action === "back") {
+      wc.navigationHistory.goBack();
+    } else if (p.action === "forward") {
+      wc.navigationHistory.goForward();
+    } else if (p.action === "reload") {
+      wc.reload();
+    }
+  });
+
+  ipcMain.handle("browser:annotate-mode", () => {
+    void startAnnotatePicker();
+    return { ok: true };
+  });
+
+  ipcMain.handle("browser:close", () => {
+    if (browserView) {
+      win?.contentView.removeChildView(browserView);
+      browserView.webContents.close();
+      browserView = null;
+    }
+  });
+
+  // Integrated terminal: a real PTY running the user's shell, rooted at
+  // the active conversation's cwd (the Codex/Claude-desktop contract —
+  // the terminal sees the same files the agent works on).
+  ipcMain.handle("term:create", (_e, opts: { cols?: number; rows?: number }) => {
+    const cwd = mainCwd ?? pendingCwd ?? app.getPath("home");
+    const shell = process.env.SHELL || "/bin/zsh";
+    const id = `pty_${nextPtyId++}`;
+    const pty = ptySpawn(shell, [], {
+      name: "xterm-256color",
+      cwd,
+      cols: opts.cols || 80,
+      rows: opts.rows || 24,
+      env: process.env as Record<string, string>,
+    });
+    pty.onData((data) => send("term:data", { id, data }));
+    pty.onExit(({ exitCode }) => {
+      ptys.delete(id);
+      send("term:exit", { id, exitCode });
+    });
+    ptys.set(id, pty);
+    return { id, cwd, shell };
+  });
+
+  ipcMain.handle("term:write", (_e, p: { id: string; data: string }) => {
+    ptys.get(p.id)?.write(p.data);
+  });
+
+  ipcMain.handle("term:resize", (_e, p: { id: string; cols: number; rows: number }) => {
+    ptys.get(p.id)?.resize(Math.max(2, Math.floor(p.cols)), Math.max(1, Math.floor(p.rows)));
+  });
+
+  ipcMain.handle("term:kill", (_e, id: string) => {
+    ptys.get(id)?.kill();
+    ptys.delete(id);
   });
 
   // One directory level for the workspace tree — the renderer expands
@@ -618,6 +919,8 @@ app.whenReady().then(async () => {
 });
 
 app.on("window-all-closed", () => {
+  for (const pty of ptys.values()) pty.kill();
+  ptys.clear();
   engine.stop();
   app.quit();
 });

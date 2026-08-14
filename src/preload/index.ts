@@ -24,6 +24,7 @@ contextBridge.exposeInMainWorld("unbiased", {
   onDelta: (cb: (p: unknown) => void) => subscribe("chat:delta", cb),
   onTurnCompleted: (cb: (p: unknown) => void) => subscribe("chat:turn-completed", cb),
 
+  setAccessMode: (mode: string) => ipcRenderer.invoke("policy:set-mode", mode),
   decideApproval: (requestId: string, decision: "accept" | "decline") =>
     ipcRenderer.invoke("chat:approve", { requestId, decision }),
   onApprovalRequest: (cb: (p: unknown) => void) => subscribe("chat:approval-request", cb),
@@ -39,4 +40,22 @@ contextBridge.exposeInMainWorld("unbiased", {
   readImage: (path: string) => ipcRenderer.invoke("file:read-image", path),
   listDir: (dir?: string) => ipcRenderer.invoke("fs:list", dir),
   searchRefs: (word: string) => ipcRenderer.invoke("fs:search-refs", word),
+
+  openBrowser: (url?: string) => ipcRenderer.invoke("browser:open", url),
+  setBrowserBounds: (b: { x: number; y: number; width: number; height: number }) =>
+    ipcRenderer.invoke("browser:bounds", b),
+  setBrowserVisible: (visible: boolean) => ipcRenderer.invoke("browser:visible", visible),
+  navigateBrowser: (p: { url?: string; action?: string }) => ipcRenderer.invoke("browser:navigate", p),
+  closeBrowser: () => ipcRenderer.invoke("browser:close"),
+  startBrowserAnnotate: () => ipcRenderer.invoke("browser:annotate-mode"),
+  onBrowserState: (cb: (p: unknown) => void) => subscribe("browser:state", cb),
+  onBrowserAnnotate: (cb: (p: unknown) => void) => subscribe("browser:annotate", cb),
+
+  createTerminal: (cols: number, rows: number) => ipcRenderer.invoke("term:create", { cols, rows }),
+  writeTerminal: (id: string, data: string) => ipcRenderer.invoke("term:write", { id, data }),
+  resizeTerminal: (id: string, cols: number, rows: number) =>
+    ipcRenderer.invoke("term:resize", { id, cols, rows }),
+  killTerminal: (id: string) => ipcRenderer.invoke("term:kill", id),
+  onTermData: (cb: (p: unknown) => void) => subscribe("term:data", cb),
+  onTermExit: (cb: (p: unknown) => void) => subscribe("term:exit", cb),
 });

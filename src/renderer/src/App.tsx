@@ -2,6 +2,9 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeRaw from "rehype-raw";
+import { Terminal } from "@xterm/xterm";
+import { FitAddon } from "@xterm/addon-fit";
+import "@xterm/xterm/css/xterm.css";
 import Prism from "prismjs";
 import "prismjs/components/prism-typescript";
 import "prismjs/components/prism-jsx";
@@ -32,7 +35,7 @@ type CommandItem = {
 };
 
 type Entry =
-  | { kind: "user"; text: string }
+  | { kind: "user"; text: string; annotations?: SentAnnotation[] }
   | { kind: "assistant"; text: string; interrupted?: boolean }
   | {
       kind: "command";
@@ -48,12 +51,25 @@ type PaneId = "main" | "side";
 type ThreadSummary = { id: string; title: string; createdAt?: string };
 // A transcript excerpt staged for the next send, with an optional comment.
 // The live Range (when still valid) keeps the excerpt tinted in the DOM.
-type Annotation = { text: string; comment?: string; range?: Range };
+// tag = what kind of thing was annotated (element tag, "selection",
+// "link"); thumb = page screenshot for browser annotations.
+type Annotation = { text: string; comment?: string; range?: Range; tag?: string; thumb?: string };
+// What a sent user message keeps for its annotation card.
+type SentAnnotation = { text: string; comment?: string; tag?: string; thumb?: string };
 // kind: "image" sends as a localImage input item (model sees the pixels);
 // everything else rides as a mention (engine pulls in the file's text).
 // thumb is a small data-URL preview for the composer card.
 type Attachment = { name: string; path: string; kind?: "image" | "folder" | "file"; thumb?: string };
 type DirEntry = { name: string; dir: boolean };
+type BrowserState = { url: string; title: string; canGoBack: boolean; canGoForward: boolean; loading: boolean };
+// How agent actions get approved — maps to engine approvalPolicy+sandbox
+// pairs in the main process.
+type AccessMode = "ask" | "auto" | "full";
+const ACCESS_MODES: { id: AccessMode; name: string; desc: string; danger?: boolean }[] = [
+  { id: "ask", name: "Ask for approval", desc: "Read-only — every command needs your approval" },
+  { id: "auto", name: "Approve for me", desc: "Can edit project files; asks for risky commands" },
+  { id: "full", name: "Full access", desc: "Unrestricted commands and file access", danger: true },
+];
 type RefHit = { path: string; rel: string; line: number; text: string };
 type OpenFileInfo = {
   name: string;
@@ -94,6 +110,7 @@ declare global {
       onTurnStarted: (cb: (p: { paneId: PaneId; turnId: string | null }) => void) => () => void;
       onDelta: (cb: (p: { paneId: PaneId; delta: string }) => void) => () => void;
       onTurnCompleted: (cb: (p: { paneId: PaneId; status: string }) => void) => () => void;
+      setAccessMode: (mode: AccessMode) => Promise<{ mode: string }>;
       decideApproval: (requestId: string, decision: "accept" | "decline") => Promise<{ ok: boolean }>;
       onApprovalRequest: (
         cb: (p: {
@@ -118,6 +135,22 @@ declare global {
       readImage: (path: string) => Promise<{ dataUrl?: string; error?: string }>;
       listDir: (dir?: string) => Promise<{ dir: string; entries: DirEntry[]; error?: string }>;
       searchRefs: (word: string) => Promise<{ results: RefHit[]; truncated?: boolean; error?: string }>;
+      openBrowser: (url?: string) => Promise<{ ok: boolean }>;
+      setBrowserBounds: (b: { x: number; y: number; width: number; height: number }) => Promise<void>;
+      setBrowserVisible: (visible: boolean) => Promise<void>;
+      navigateBrowser: (p: { url?: string; action?: "back" | "forward" | "reload" }) => Promise<void>;
+      closeBrowser: () => Promise<void>;
+      onBrowserState: (cb: (p: BrowserState) => void) => () => void;
+      onBrowserAnnotate: (
+        cb: (p: { text: string; comment?: string; tag?: string; thumb?: string }) => void,
+      ) => () => void;
+      startBrowserAnnotate: () => Promise<{ ok: boolean }>;
+      createTerminal: (cols: number, rows: number) => Promise<{ id: string; cwd: string; shell: string }>;
+      writeTerminal: (id: string, data: string) => Promise<void>;
+      resizeTerminal: (id: string, cols: number, rows: number) => Promise<void>;
+      killTerminal: (id: string) => Promise<void>;
+      onTermData: (cb: (p: { id: string; data: string }) => void) => () => void;
+      onTermExit: (cb: (p: { id: string; exitCode: number }) => void) => () => void;
     };
   }
 }
@@ -314,6 +347,36 @@ export function App() {
   });
   const [sideContext, setSideContext] = useState<string | null>(null);
   const [sideNonce, setSideNonce] = useState(0);
+  // Text handed to the MAIN composer from outside it — the embedded
+  // browser's "Add … to chat" context-menu items land here and are
+  // consumed into annotation chips by the same contextChip mechanism
+  // the side chat uses.
+  const [mainContext, setMainContext] = useState<{
+    text: string;
+    comment?: string;
+    tag?: string;
+    thumb?: string;
+  } | null>(null);
+
+  useEffect(() => window.unbiased.onBrowserAnnotate((p) => setMainContext(p)), []);
+
+  // Access mode is app-global: persisted here, enforced in the main
+  // process (thread policies + per-turn overrides).
+  const [accessMode, setAccessModeState] = useState<AccessMode>(() => {
+    const stored = localStorage.getItem("accessMode");
+    return stored === "auto" || stored === "full" ? stored : "ask";
+  });
+
+  useEffect(() => {
+    void window.unbiased.setAccessMode(accessMode);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  function changeAccessMode(mode: AccessMode) {
+    localStorage.setItem("accessMode", mode);
+    setAccessModeState(mode);
+    void window.unbiased.setAccessMode(mode);
+  }
 
   function setSideOpenPersisted(open: boolean) {
     localStorage.setItem("sideOpen", String(open));
@@ -419,9 +482,10 @@ export function App() {
     setOpenFile(null);
     setFilesOpen(false); // the tree browsed the previous conversation's cwd
     setTreeFile(null);
-    setPanelMode("chat");
-    // A panel that was only showing file views has nothing left.
-    if (!sideChatEnabled) setSideOpenPersisted(false);
+    setTerminalOpen(false); // the shell ran in the previous conversation's cwd
+    // The browser isn't cwd-bound — the page you're reading survives.
+    setPanelMode(browserOpen ? "browser" : "chat");
+    if (!sideChatEnabled && !browserOpen) setSideOpenPersisted(false);
   }
 
   async function newChat(project?: { name: string; path: string }) {
@@ -467,8 +531,12 @@ export function App() {
   const [openFile, setOpenFile] = useState<OpenFileInfo | null>(null);
   // "launcher" = the panel is open with nothing selected yet — it shows
   // big rows asking which surface to open (Codex's empty side panel).
-  const [panelMode, setPanelMode] = useState<"chat" | "file" | "files" | "launcher">("chat");
+  const [panelMode, setPanelMode] = useState<
+    "chat" | "file" | "files" | "launcher" | "terminal" | "browser"
+  >("chat");
   const [filesOpen, setFilesOpen] = useState(false);
+  const [terminalOpen, setTerminalOpen] = useState(false);
+  const [browserOpen, setBrowserOpen] = useState(false);
   // The Files view's tree column can collapse, leaving the viewer full
   // width — Codex's folders toggle. Persisted.
   const [treeVisible, setTreeVisible] = useState(() => localStorage.getItem("filesTreeVisible") !== "false");
@@ -503,10 +571,48 @@ export function App() {
     };
   }, [sidePlusOpen]);
 
+  // The browser is a native layer floating over the panel — it must hide
+  // whenever its spot isn't showing: other tab active, panel closed, the
+  // + menu dropping over it, or the Settings view replacing the whole UI.
+  useEffect(() => {
+    if (!browserOpen) return;
+    void window.unbiased.setBrowserVisible(
+      sideOpen && panelMode === "browser" && !sidePlusOpen && !showSettings,
+    );
+  }, [browserOpen, sideOpen, panelMode, sidePlusOpen, showSettings]);
+
   function openSideChatTab() {
     setSidePlusOpen(false);
     setSideChatEnabled(true);
     setPanelMode("chat");
+  }
+
+  function openBrowserTab() {
+    setSidePlusOpen(false);
+    setBrowserOpen(true);
+    setPanelMode("browser");
+    setSideOpenPersisted(true);
+  }
+
+  // Any http(s) link anywhere in the app lands in the embedded browser:
+  // main-chat links open the side panel on the Browser tab; side-panel
+  // links just switch the tab.
+  function openInBrowser(url: string) {
+    setBrowserOpen(true);
+    setPanelMode("browser");
+    setSideOpenPersisted(true);
+    void window.unbiased.openBrowser(url);
+  }
+
+  function closeBrowserTab() {
+    setBrowserOpen(false);
+    void window.unbiased.closeBrowser();
+    if (panelMode !== "browser") return;
+    if (openFile) setPanelMode("file");
+    else if (filesOpen) setPanelMode("files");
+    else if (terminalOpen) setPanelMode("terminal");
+    else if (sideChatEnabled) setPanelMode("chat");
+    else setSideOpenPersisted(false);
   }
 
   function openFilesTab() {
@@ -526,6 +632,8 @@ export function App() {
     if (sideChatEnabled) setPanelMode("chat");
     else if (openFile) setPanelMode("file");
     else if (filesOpen) setPanelMode("files");
+    else if (terminalOpen) setPanelMode("terminal");
+    else if (browserOpen) setPanelMode("browser");
     else setPanelMode("launcher");
   }
 
@@ -533,6 +641,25 @@ export function App() {
     setFilesOpen(false);
     if (panelMode !== "files") return;
     if (openFile) setPanelMode("file");
+    else if (terminalOpen) setPanelMode("terminal");
+    else if (sideChatEnabled) setPanelMode("chat");
+    else setSideOpenPersisted(false);
+  }
+
+  function openTerminalTab() {
+    setSidePlusOpen(false);
+    setTerminalOpen(true);
+    setPanelMode("terminal");
+    setSideOpenPersisted(true);
+  }
+
+  // Closing the tab KILLS the shell (unmount disposes the PTY) — unlike
+  // the side chat, a dead terminal has no transcript worth preserving.
+  function closeTerminalTab() {
+    setTerminalOpen(false);
+    if (panelMode !== "terminal") return;
+    if (openFile) setPanelMode("file");
+    else if (filesOpen) setPanelMode("files");
     else if (sideChatEnabled) setPanelMode("chat");
     else setSideOpenPersisted(false);
   }
@@ -618,9 +745,11 @@ export function App() {
   const connected = status.state === "connected";
   // Files (workspace tree) only makes sense inside a project — a plain
   // Recents chat lives in the home directory.
-  const inProject =
-    activeProject !== null ||
-    sidebar.projects.some((p) => p.threads.some((t) => t.id === activeThreadId));
+  const activeProjectName =
+    activeProject?.name ??
+    sidebar.projects.find((p) => p.threads.some((t) => t.id === activeThreadId))?.name ??
+    null;
+  const inProject = activeProjectName !== null;
 
   // Whatever file the panel is currently showing, and whether it has a
   // rendered form worth offering.
@@ -863,7 +992,8 @@ export function App() {
           paneId="main"
           connected={connected}
           reset={mainReset}
-          contextLabel={`${activeProject ? `${activeProject.name} · ` : ""}pareto · read-only`}
+          contextChip={mainContext}
+          onContextClear={() => setMainContext(null)}
           emptyState={
             <div style={{ textAlign: "center" }}>
               <h1 style={{ margin: 0, display: "flex", justifyContent: "center" }}>
@@ -887,6 +1017,9 @@ export function App() {
           onAskSideChat={askInSideChat}
           onOpenFile={(p) => void openFileInPanel(p)}
           onPreviewImage={(a) => void openImagePreview(a)}
+          onOpenLink={openInBrowser}
+          accessMode={accessMode}
+          onAccessModeChange={changeAccessMode}
         />
       </div>
 
@@ -1031,6 +1164,70 @@ export function App() {
                 </span>
               </button>
             )}
+            {browserOpen && (
+              <button
+                onClick={() => setPanelMode("browser")}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 8,
+                  background: panelMode === "browser" ? colors.panel : "transparent",
+                  color: panelMode === "browser" ? colors.fg : colors.dim,
+                  border: "none",
+                  borderRadius: 8,
+                  padding: "6px 12px",
+                  fontSize: 13,
+                  cursor: "pointer",
+                  fontFamily: "inherit",
+                }}
+              >
+                <GlobeIcon size={13} />
+                Browser
+                <span
+                  role="button"
+                  aria-label="Close browser"
+                  onClick={(ev) => {
+                    ev.stopPropagation();
+                    closeBrowserTab();
+                  }}
+                  style={{ display: "flex", color: colors.dim, marginLeft: 2 }}
+                >
+                  <CloseIcon />
+                </span>
+              </button>
+            )}
+            {terminalOpen && (
+              <button
+                onClick={() => setPanelMode("terminal")}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 8,
+                  background: panelMode === "terminal" ? colors.panel : "transparent",
+                  color: panelMode === "terminal" ? colors.fg : colors.dim,
+                  border: "none",
+                  borderRadius: 8,
+                  padding: "6px 12px",
+                  fontSize: 13,
+                  cursor: "pointer",
+                  fontFamily: "inherit",
+                }}
+              >
+                <TerminalIcon size={13} />
+                {activeProjectName ?? "Terminal"}
+                <span
+                  role="button"
+                  aria-label="Close terminal"
+                  onClick={(ev) => {
+                    ev.stopPropagation();
+                    closeTerminalTab();
+                  }}
+                  style={{ display: "flex", color: colors.dim, marginLeft: 2 }}
+                >
+                  <CloseIcon />
+                </span>
+              </button>
+            )}
             <span ref={sidePlusRef} style={{ position: "relative", display: "flex" }}>
               <IconButton title="Open side panel tab" onClick={() => setSidePlusOpen((o) => !o)}>
                 <PlusIcon />
@@ -1051,7 +1248,8 @@ export function App() {
                   }}
                 >
                   <MenuItem icon={<ReviewIcon />} label="Review" desc="Soon" disabled onClick={() => {}} />
-                  <MenuItem icon={<TerminalIcon />} label="Terminal" desc="Soon" disabled onClick={() => {}} />
+                  <MenuItem icon={<TerminalIcon />} label="Terminal" onClick={openTerminalTab} />
+                  <MenuItem icon={<GlobeIcon />} label="Browser" onClick={openBrowserTab} />
                   {inProject && (
                     <MenuItem icon={<FolderOutlineIcon size={15} />} label="Files" onClick={openFilesTab} />
                   )}
@@ -1100,12 +1298,18 @@ export function App() {
               {inProject && (
                 <LauncherRow icon={<FolderOutlineIcon size={15} />} label="Files" onClick={openFilesTab} />
               )}
-              <LauncherRow icon={<TerminalIcon />} label="Terminal" hint="Soon" disabled />
+              <LauncherRow icon={<TerminalIcon />} label="Terminal" onClick={openTerminalTab} />
+              <LauncherRow icon={<GlobeIcon />} label="Browser" onClick={openBrowserTab} />
               <LauncherRow icon={<ReviewIcon />} label="Review" hint="Soon" disabled />
             </div>
           )}
           {openFile && panelMode === "file" && (
-            <FileViewer file={openFile} onOpenFile={(p, l) => void openFileInPanel(p, l)} preview={previewOn} />
+            <FileViewer
+              file={openFile}
+              onOpenFile={(p, l) => void openFileInPanel(p, l)}
+              onOpenLink={openInBrowser}
+              preview={previewOn}
+            />
           )}
           {filesOpen && panelMode === "files" && (
             <div style={{ flex: 1, minHeight: 0, display: "flex" }}>
@@ -1119,7 +1323,12 @@ export function App() {
                 }}
               >
                 {treeFile ? (
-                  <FileViewer file={treeFile} onOpenFile={(p, l) => void openFileInTree(p, l)} preview={previewOn} />
+                  <FileViewer
+                    file={treeFile}
+                    onOpenFile={(p, l) => void openFileInTree(p, l)}
+                    onOpenLink={openInBrowser}
+                    preview={previewOn}
+                  />
                 ) : (
                   <div style={{ flex: 1, display: "grid", placeItems: "center" }}>
                     <div style={{ textAlign: "center", color: colors.dim }}>
@@ -1148,6 +1357,30 @@ export function App() {
               )}
             </div>
           )}
+          {terminalOpen && (
+            <div
+              style={{
+                flex: 1,
+                minHeight: 0,
+                display: panelMode === "terminal" ? "flex" : "none",
+                flexDirection: "column",
+              }}
+            >
+              <TerminalPane />
+            </div>
+          )}
+          {browserOpen && (
+            <div
+              style={{
+                flex: 1,
+                minHeight: 0,
+                display: panelMode === "browser" ? "flex" : "none",
+                flexDirection: "column",
+              }}
+            >
+              <BrowserPane />
+            </div>
+          )}
           <div
             style={{
               flex: 1,
@@ -1161,10 +1394,12 @@ export function App() {
             paneId="side"
             connected={connected}
             reset={{ entries: [], nonce: 0 }}
-            contextLabel="pareto · temporary"
             contextChip={sideContext}
             onContextClear={() => setSideContext(null)}
             onPreviewImage={(a) => void openImagePreview(a)}
+            onOpenLink={openInBrowser}
+            accessMode={accessMode}
+            onAccessModeChange={changeAccessMode}
             emptyState={
               <div style={{ textAlign: "center", padding: "0 24px" }}>
                 <div style={{ color: colors.dim, display: "flex", justifyContent: "center", marginBottom: 10 }}>
@@ -1402,6 +1637,332 @@ function FileTreePane({ onOpenFile }: { onOpenFile: (path: string) => void }) {
   );
 }
 
+const TAG_LABELS: Record<string, string> = {
+  h1: "heading",
+  h2: "heading",
+  h3: "heading",
+  h4: "heading",
+  h5: "heading",
+  h6: "heading",
+  code: "code",
+  pre: "code",
+  p: "paragraph",
+  a: "link",
+  img: "image",
+  li: "list item",
+  blockquote: "quote",
+  td: "table cell",
+  th: "table cell",
+};
+
+/** A sent message's annotations, Codex-style: page thumbnails (browser
+ *  annotations) plus a pill that expands into kind + excerpt + comment. */
+function SentAnnotations({ items }: { items: SentAnnotation[] }) {
+  const [open, setOpen] = useState(false);
+  const thumbs = items.filter((a) => a.thumb);
+  return (
+    <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 8, position: "relative" }}>
+      {thumbs.length > 0 && (
+        <div style={{ display: "flex", gap: 10, justifyContent: "flex-end", flexWrap: "wrap" }}>
+          {thumbs.map((a, i) => (
+            <img
+              key={i}
+              src={a.thumb}
+              alt={a.comment || "annotated page"}
+              title={a.comment || a.text.split("\n")[0]}
+              style={{
+                width: 132,
+                height: 132,
+                objectFit: "cover",
+                objectPosition: "top left",
+                borderRadius: 12,
+                border: `1px solid ${colors.border}`,
+                background: "var(--code-bg)",
+              }}
+            />
+          ))}
+        </div>
+      )}
+      <button
+        onClick={() => setOpen((o) => !o)}
+        aria-expanded={open}
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 8,
+          background: "var(--chip)",
+          border: `1px solid ${colors.border}`,
+          borderRadius: 999,
+          padding: "8px 14px",
+          fontSize: 13.5,
+          color: colors.fg,
+          cursor: "pointer",
+          fontFamily: "inherit",
+        }}
+      >
+        <AnnotationIcon />
+        {items.length} annotation{items.length === 1 ? "" : "s"}
+      </button>
+      {open && (
+        <div
+          style={{
+            position: "absolute",
+            bottom: "calc(100% + 8px)",
+            right: 0,
+            width: 340,
+            maxHeight: 320,
+            overflowY: "auto",
+            background: colors.panel,
+            border: `1px solid ${colors.border}`,
+            borderRadius: 14,
+            boxShadow: "0 8px 24px rgba(0,0,0,0.45)",
+            zIndex: 15,
+          }}
+        >
+          {items.map((a, i) => (
+            <div key={i} style={{ padding: "10px 14px", borderTop: i > 0 ? `1px solid ${colors.border}` : "none" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+                <span
+                  style={{
+                    fontSize: 11,
+                    color: colors.dim,
+                    background: "var(--chip)",
+                    border: `1px solid ${colors.border}`,
+                    borderRadius: 6,
+                    padding: "1px 7px",
+                    flexShrink: 0,
+                  }}
+                >
+                  {TAG_LABELS[a.tag ?? ""] ?? a.tag ?? "selection"}
+                </span>
+                <span
+                  style={{
+                    color: colors.dim,
+                    fontSize: 13,
+                    whiteSpace: "nowrap",
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                  }}
+                >
+                  {a.text.split("\n")[0]}
+                </span>
+              </div>
+              {a.comment && <div style={{ color: colors.fg, fontSize: 14, marginTop: 6 }}>{a.comment}</div>}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** The embedded browser's renderer half: toolbar + a placeholder div whose
+ *  bounds the native WebContentsView (main process) is pinned to. The
+ *  actual page pixels are the native layer floating above this spot. */
+function BrowserPane() {
+  const holdRef = useRef<HTMLDivElement>(null);
+  const [urlDraft, setUrlDraft] = useState("");
+  const [state, setState] = useState<BrowserState>({
+    url: "",
+    title: "",
+    canGoBack: false,
+    canGoForward: false,
+    loading: false,
+  });
+  const editingRef = useRef(false);
+
+  useEffect(() => {
+    void window.unbiased.openBrowser();
+    const off = window.unbiased.onBrowserState((s) => {
+      setState(s);
+      if (!editingRef.current) setUrlDraft(s.url === "about:blank" ? "" : s.url);
+    });
+    const el = holdRef.current;
+    if (!el) return off;
+    const sync = () => {
+      const r = el.getBoundingClientRect();
+      void window.unbiased.setBrowserBounds({ x: r.x, y: r.y, width: r.width, height: r.height });
+    };
+    sync();
+    const ro = new ResizeObserver(sync);
+    ro.observe(el);
+    window.addEventListener("resize", sync);
+    return () => {
+      off();
+      ro.disconnect();
+      window.removeEventListener("resize", sync);
+    };
+  }, []);
+
+  const navBtn = (label: string, enabled: boolean, action: "back" | "forward" | "reload") => (
+    <button
+      onClick={() => void window.unbiased.navigateBrowser({ action })}
+      disabled={!enabled}
+      aria-label={label}
+      title={label}
+      style={{
+        background: "transparent",
+        border: "none",
+        color: enabled ? colors.fg : "var(--gutter)",
+        cursor: enabled ? "pointer" : "default",
+        padding: "4px 6px",
+        fontSize: 14,
+        fontFamily: "inherit",
+        lineHeight: 1,
+      }}
+    >
+      {label === "Back" ? "←" : label === "Forward" ? "→" : "⟳"}
+    </button>
+  );
+
+  return (
+    <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 4,
+          padding: "8px 10px",
+          borderBottom: `1px solid ${colors.border}`,
+          flexShrink: 0,
+        }}
+      >
+        {navBtn("Back", state.canGoBack, "back")}
+        {navBtn("Forward", state.canGoForward, "forward")}
+        {navBtn("Reload", state.url !== "", "reload")}
+        <input
+          value={urlDraft}
+          onChange={(e) => setUrlDraft(e.target.value)}
+          onFocus={() => {
+            editingRef.current = true;
+          }}
+          onBlur={() => {
+            editingRef.current = false;
+            setUrlDraft(state.url === "about:blank" ? "" : state.url);
+          }}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && urlDraft.trim()) {
+              void window.unbiased.navigateBrowser({ url: urlDraft.trim() });
+              (e.currentTarget as HTMLInputElement).blur();
+            }
+          }}
+          placeholder="Enter a URL…"
+          spellCheck={false}
+          autoFocus={!state.url || state.url === "about:blank"}
+          style={{
+            flex: 1,
+            background: "var(--panel-2)",
+            border: `1px solid ${colors.border}`,
+            borderRadius: 8,
+            padding: "6px 10px",
+            color: colors.fg,
+            fontSize: 12.5,
+            outline: "none",
+            fontFamily: "inherit",
+            minWidth: 0,
+          }}
+        />
+        {state.loading && <span style={{ color: colors.dim, fontSize: 11, flexShrink: 0 }}>…</span>}
+        <button
+          onClick={() => void window.unbiased.startBrowserAnnotate()}
+          disabled={!state.url || state.url === "about:blank"}
+          title="Annotate"
+          aria-label="Annotate page"
+          style={{
+            background: "transparent",
+            border: "none",
+            color: state.url && state.url !== "about:blank" ? colors.fg : "var(--gutter)",
+            cursor: state.url && state.url !== "about:blank" ? "pointer" : "default",
+            padding: "4px 6px",
+            display: "flex",
+            alignItems: "center",
+            flexShrink: 0,
+          }}
+        >
+          <AnnotationIcon />
+        </button>
+      </div>
+      <div ref={holdRef} style={{ flex: 1, minHeight: 0, background: "var(--code-bg)" }} />
+    </div>
+  );
+}
+
+/** The integrated terminal: xterm.js in front, a PTY (user's shell, cwd =
+ *  the active conversation's root) in the main process. Mounted for as
+ *  long as its tab exists — hiding the tab only hides this component, so
+ *  the shell session survives tab switches. */
+function TerminalPane() {
+  const hostRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const host = hostRef.current;
+    if (!host) return;
+    const cs = getComputedStyle(host);
+    const v = (name: string, fallback: string) => cs.getPropertyValue(name).trim() || fallback;
+    const term = new Terminal({
+      fontFamily: v("--font-code", "Menlo, monospace"),
+      fontSize: 12.5,
+      cursorBlink: true,
+      theme: {
+        background: v("--code-bg", "#0d0d0d"),
+        foreground: v("--fg", "#fcfcfc"),
+        cursor: v("--accent", "#FF563F"),
+        selectionBackground: "rgba(127, 127, 127, 0.35)",
+      },
+    });
+    const fit = new FitAddon();
+    term.loadAddon(fit);
+    term.open(host);
+    fit.fit();
+
+    // StrictMode double-mounts in dev: the disposed flag keeps the first
+    // pass's PTY from leaking once its create resolves after cleanup.
+    let termId: string | null = null;
+    let disposed = false;
+    const offs: (() => void)[] = [];
+    void window.unbiased.createTerminal(term.cols, term.rows).then(({ id }) => {
+      if (disposed) {
+        void window.unbiased.killTerminal(id);
+        return;
+      }
+      termId = id;
+      offs.push(
+        window.unbiased.onTermData((p) => {
+          if (p.id === id) term.write(p.data);
+        }),
+        window.unbiased.onTermExit((p) => {
+          if (p.id === id) term.write(`\r\n[process exited with code ${p.exitCode}]\r\n`);
+        }),
+      );
+    });
+    const dataDisp = term.onData((d) => {
+      if (termId) void window.unbiased.writeTerminal(termId, d);
+    });
+    const ro = new ResizeObserver(() => {
+      if (host.offsetWidth === 0) return; // tab hidden — nothing to fit
+      fit.fit();
+      if (termId) void window.unbiased.resizeTerminal(termId, term.cols, term.rows);
+    });
+    ro.observe(host);
+
+    return () => {
+      disposed = true;
+      ro.disconnect();
+      dataDisp.dispose();
+      offs.forEach((off) => off());
+      if (termId) void window.unbiased.killTerminal(termId);
+      term.dispose();
+    };
+  }, []);
+
+  return (
+    <div
+      ref={hostRef}
+      style={{ flex: 1, minHeight: 0, background: "var(--code-bg)", padding: "8px 4px 8px 12px" }}
+    />
+  );
+}
+
 /** An image inside a markdown preview. Relative srcs resolve against the
  *  markdown file's own directory and load through the main process (the
  *  CSP forbids file:// URLs); http(s) srcs are left alone and simply
@@ -1442,13 +2003,19 @@ function MdImage({ src, alt, baseDir }: { src?: string; alt?: string; baseDir: s
 function FileViewer({
   file,
   onOpenFile,
+  onOpenLink,
   preview,
 }: {
   file: OpenFileInfo;
   onOpenFile?: (path: string, line?: number) => void;
+  onOpenLink?: (url: string) => void;
   preview?: boolean;
 }) {
   const content = file.content ?? "";
+  // The preview component map memoizes per file — the link handler rides a
+  // ref so the memo never closes over a stale prop.
+  const onOpenLinkRef = useRef(onOpenLink);
+  onOpenLinkRef.current = onOpenLink;
   const ext = file.name.split(".").pop()?.toLowerCase() ?? "";
   const lang = EXT_TO_PRISM[ext];
   const grammar = lang ? Prism.languages[lang] : undefined;
@@ -1488,7 +2055,16 @@ function FileViewer({
     const baseDir = file.fullPath.split("/").slice(0, -1).join("/") || "/";
     return {
       a: (props: { href?: string; children?: React.ReactNode }) => (
-        <a href={props.href} target="_blank" rel="noreferrer" style={{ color: "var(--accent)" }}>
+        <a
+          href={props.href}
+          onClick={(e) => {
+            e.preventDefault();
+            const href = props.href ?? "";
+            if (/^https?:/.test(href)) onOpenLinkRef.current?.(href);
+          }}
+          style={{ color: "var(--accent)", cursor: "pointer" }}
+          title="Open in browser tab"
+        >
           {props.children}
         </a>
       ),
@@ -1888,7 +2464,6 @@ function ChatPane({
   paneId,
   connected,
   reset,
-  contextLabel,
   contextChip,
   onContextClear,
   emptyState,
@@ -1897,12 +2472,14 @@ function ChatPane({
   onAskSideChat,
   onOpenFile,
   onPreviewImage,
+  onOpenLink,
+  accessMode,
+  onAccessModeChange,
 }: {
   paneId: PaneId;
   connected: boolean;
   reset: { entries: Entry[]; nonce: number };
-  contextLabel: string;
-  contextChip?: string | null;
+  contextChip?: string | { text: string; comment?: string; tag?: string; thumb?: string } | null;
   onContextClear?: () => void;
   emptyState: React.ReactNode;
   onBusyChange?: (busy: boolean) => void;
@@ -1910,6 +2487,9 @@ function ChatPane({
   onAskSideChat?: (text: string) => void;
   onOpenFile?: (path: string) => void;
   onPreviewImage?: (a: Attachment) => void;
+  onOpenLink?: (url: string) => void;
+  accessMode: AccessMode;
+  onAccessModeChange: (mode: AccessMode) => void;
 }) {
   const [entries, setEntries] = useState<Entry[]>(reset.entries);
   const [draft, setDraft] = useState("");
@@ -1924,7 +2504,8 @@ function ChatPane({
   const [pendingComment, setPendingComment] = useState<string | null>(null);
   useEffect(() => {
     if (!contextChip) return;
-    setAnnotations((list) => [...list, { text: contextChip }]);
+    const a = typeof contextChip === "string" ? { text: contextChip, tag: "selection" } : contextChip;
+    setAnnotations((list) => [...list, a]);
     onContextClear?.();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [contextChip]);
@@ -1961,6 +2542,29 @@ function ChatPane({
     setPlusOpen(true);
   }
 
+  // The access-mode picker popping over the composer.
+  const [modeOpen, setModeOpen] = useState(false);
+  const modeRef = useRef<HTMLSpanElement>(null);
+  const modeMenuRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!modeOpen) return;
+    function onDown(e: MouseEvent) {
+      const t = e.target as Node;
+      if (modeRef.current?.contains(t) || modeMenuRef.current?.contains(t)) return;
+      setModeOpen(false);
+    }
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") setModeOpen(false);
+    }
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [modeOpen]);
+
   function stageAttachment(a: Attachment) {
     setAttachments((list) => (list.some((x) => x.path === a.path) ? list : [...list, a]));
   }
@@ -1995,6 +2599,8 @@ function ChatPane({
   onAskSideChatRef.current = onAskSideChat;
   const onOpenFileRef = useRef(onOpenFile);
   onOpenFileRef.current = onOpenFile;
+  const onOpenLinkRef = useRef(onOpenLink);
+  onOpenLinkRef.current = onOpenLink;
 
   function setBusy(b: boolean) {
     setBusyState(b);
@@ -2138,13 +2744,18 @@ function ChatPane({
     setAttachments([]);
     setAnnotations([]);
     setBusy(true);
-    const suffix = [
-      anns.length > 0 ? `(${anns.length} annotation${anns.length === 1 ? "" : "s"})` : "",
-      sentAttachments.length > 0 ? `📎 ${sentAttachments.map((a) => a.name).join(", ")}` : "",
-    ]
-      .filter(Boolean)
-      .join("\n");
-    setEntries((es) => [...es, { kind: "user", text: [text, suffix].filter(Boolean).join("\n\n") }]);
+    const suffix = sentAttachments.length > 0 ? `📎 ${sentAttachments.map((a) => a.name).join(", ")}` : "";
+    setEntries((es) => [
+      ...es,
+      {
+        kind: "user",
+        text: [text, suffix].filter(Boolean).join("\n\n"),
+        annotations:
+          anns.length > 0
+            ? anns.map((a) => ({ text: a.text, comment: a.comment, tag: a.tag, thumb: a.thumb }))
+            : undefined,
+      },
+    ]);
     try {
       await window.unbiased.sendMessage(paneId, wire, sentAttachments);
     } catch (err) {
@@ -2276,7 +2887,12 @@ function ChatPane({
     const comment = (pendingComment ?? "").trim();
     setAnnotations((list) => [
       ...list,
-      { text: selection.text, comment: comment || undefined, range: savedRangeRef.current?.cloneRange() },
+      {
+        text: selection.text,
+        comment: comment || undefined,
+        range: savedRangeRef.current?.cloneRange(),
+        tag: "selection",
+      },
     ]);
     setPendingComment(null);
     setSelection(null);
@@ -2288,6 +2904,18 @@ function ChatPane({
     setSelection(null);
     window.getSelection()?.removeAllRanges();
   }
+
+  // Escape dismisses the annotate flow at any stage — button pill or
+  // comment box, focused or not.
+  useEffect(() => {
+    if (!selection) return;
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") cancelAnnotation();
+    }
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selection]);
 
   const mdComponents = useMemo(
     () => ({
@@ -2329,7 +2957,16 @@ function ChatPane({
         </CodeBlock>
       ),
       a: (props: { href?: string; children?: React.ReactNode }) => (
-        <a href={props.href} target="_blank" rel="noreferrer" style={{ color: "var(--accent)" }}>
+        <a
+          href={props.href}
+          onClick={(e) => {
+            e.preventDefault();
+            const href = props.href ?? "";
+            if (/^https?:/.test(href)) onOpenLinkRef.current?.(href);
+          }}
+          style={{ color: "var(--accent)", cursor: "pointer" }}
+          title="Open in browser tab"
+        >
           {props.children}
         </a>
       ),
@@ -2362,9 +2999,11 @@ function ChatPane({
             transform: pendingComment !== null ? "none" : "translateX(-50%)",
             zIndex: 10,
             display: "flex",
+            alignItems: "center",
             background: "var(--chip)",
             border: `1px solid ${colors.border}`,
-            borderRadius: 8,
+            // Comment mode is a full pill, matching the in-page picker.
+            borderRadius: pendingComment !== null ? 999 : 8,
             overflow: "hidden",
             boxShadow: "0 4px 16px rgba(0,0,0,0.4)",
           }}
@@ -2403,7 +3042,7 @@ function ChatPane({
                   outline: "none",
                   color: colors.fg,
                   fontSize: 12.5,
-                  padding: "8px 4px 8px 12px",
+                  padding: "10px 6px 10px 16px",
                   fontFamily: "inherit",
                 }}
               />
@@ -2411,7 +3050,21 @@ function ChatPane({
                 onClick={confirmAnnotation}
                 title="Add annotation"
                 aria-label="Add annotation"
-                style={{ ...pillButtonStyle, display: "flex", alignItems: "center", padding: "7px 10px" }}
+                style={{
+                  width: 28,
+                  height: 28,
+                  borderRadius: 14,
+                  background: colors.accent,
+                  color: "var(--accent-fg)",
+                  border: "none",
+                  cursor: "pointer",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  padding: 0,
+                  margin: "4px 5px 4px 0",
+                  flexShrink: 0,
+                }}
               >
                 <CheckIcon />
               </button>
@@ -2462,20 +3115,32 @@ function ChatPane({
             const e = block.entry;
             if (e.kind === "user") {
               return (
-                <div key={block.key} style={{ display: "flex", justifyContent: "flex-end", margin: "10px 0" }}>
-                  <div
-                    style={{
-                      maxWidth: "85%",
-                      padding: "10px 14px",
-                      borderRadius: 12,
-                      background: "var(--user-bubble)",
-                      whiteSpace: "pre-wrap",
-                      lineHeight: 1.55,
-                      fontSize: 14,
-                    }}
-                  >
-                    {e.text}
-                  </div>
+                <div
+                  key={block.key}
+                  style={{
+                    display: "flex",
+                    flexDirection: "column",
+                    alignItems: "flex-end",
+                    gap: 8,
+                    margin: "10px 0",
+                  }}
+                >
+                  {e.annotations && e.annotations.length > 0 && <SentAnnotations items={e.annotations} />}
+                  {e.text && (
+                    <div
+                      style={{
+                        maxWidth: "85%",
+                        padding: "10px 14px",
+                        borderRadius: 12,
+                        background: "var(--user-bubble)",
+                        whiteSpace: "pre-wrap",
+                        lineHeight: 1.55,
+                        fontSize: 14,
+                      }}
+                    >
+                      {e.text}
+                    </div>
+                  )}
                 </div>
               );
             }
@@ -2550,6 +3215,68 @@ function ChatPane({
                 disabled={!clipHasImage}
                 onClick={() => void attachClipboardImage()}
               />
+            </div>
+          )}
+          {modeOpen && (
+            <div
+              ref={modeMenuRef}
+              style={{
+                position: "absolute",
+                bottom: "calc(100% + 8px)",
+                left: 0,
+                right: 0,
+                background: colors.panel,
+                border: `1px solid ${colors.border}`,
+                borderRadius: 16,
+                padding: "10px 8px 8px",
+                zIndex: 20,
+                boxShadow: "0 8px 24px rgba(0,0,0,0.45)",
+              }}
+            >
+              <div style={{ color: colors.dim, fontSize: 13, padding: "0 10px 8px" }}>
+                How should Pareto actions be approved?
+              </div>
+              {ACCESS_MODES.map((m) => {
+                const selected = m.id === accessMode;
+                const tone = m.danger ? colors.amber : colors.fg;
+                return (
+                  <button
+                    key={m.id}
+                    onClick={() => {
+                      onAccessModeChange(m.id);
+                      setModeOpen(false);
+                    }}
+                    style={{
+                      display: "flex",
+                      alignItems: "flex-start",
+                      gap: 12,
+                      width: "100%",
+                      background: "transparent",
+                      border: "none",
+                      borderRadius: 10,
+                      padding: "9px 10px",
+                      cursor: "pointer",
+                      textAlign: "left",
+                      fontFamily: "inherit",
+                    }}
+                  >
+                    <span style={{ color: m.danger ? colors.amber : colors.dim, display: "flex", marginTop: 2, flexShrink: 0 }}>
+                      {m.id === "ask" ? <HandIcon /> : m.id === "auto" ? <ShieldCheckIcon /> : <ShieldAlertIcon />}
+                    </span>
+                    <span style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: 14, color: tone, fontWeight: 500 }}>{m.name}</div>
+                      <div style={{ fontSize: 12.5, color: m.danger ? colors.amber : colors.dim, marginTop: 2 }}>
+                        {m.desc}
+                      </div>
+                    </span>
+                    {selected && (
+                      <span style={{ color: m.danger ? colors.amber : colors.fg, display: "flex", marginTop: 4 }}>
+                        <CheckIcon />
+                      </span>
+                    )}
+                  </button>
+                );
+              })}
             </div>
           )}
           {attachments.length > 0 && (
@@ -2708,7 +3435,7 @@ function ChatPane({
             }}
           />
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginTop: 6 }}>
-            <span style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <span style={{ display: "flex", alignItems: "center", gap: 16 }}>
               <span ref={plusRef} style={{ position: "relative", display: "flex" }}>
                 <button
                   onClick={() => (plusOpen ? setPlusOpen(false) : void openPlusMenu())}
@@ -2717,25 +3444,46 @@ function ChatPane({
                   aria-label="Add"
                   aria-expanded={plusOpen}
                   style={{
-                    width: 28,
-                    height: 28,
-                    borderRadius: 14,
-                    background: plusOpen ? "var(--panel-2)" : "var(--chip)",
+                    background: "transparent",
+                    border: "none",
                     color: connected ? colors.fg : colors.dim,
-                    border: `1px solid ${colors.border}`,
                     cursor: connected ? "pointer" : "default",
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                    fontSize: 15,
+                    padding: "2px 4px",
+                    fontSize: 20,
                     lineHeight: 1,
+                    fontFamily: "inherit",
+                    display: "flex",
                   }}
                 >
                   +
                 </button>
               </span>
-              <span style={{ color: colors.dim, fontSize: 12.5 }}>{contextLabel}</span>
+              <span ref={modeRef} style={{ display: "flex" }}>
+                <button
+                  onClick={() => setModeOpen((o) => !o)}
+                  aria-expanded={modeOpen}
+                  title="How should Pareto actions be approved?"
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 7,
+                    background: modeOpen ? "var(--chip)" : "transparent",
+                    border: "none",
+                    borderRadius: 999,
+                    padding: "4px 10px",
+                    color: accessMode === "full" ? colors.amber : colors.dim,
+                    fontSize: 13.5,
+                    cursor: "pointer",
+                    fontFamily: "inherit",
+                  }}
+                >
+                  {accessMode === "ask" ? <HandIcon /> : accessMode === "auto" ? <ShieldCheckIcon /> : <ShieldAlertIcon />}
+                  {ACCESS_MODES.find((m) => m.id === accessMode)?.name}
+                </button>
+              </span>
             </span>
+            <span style={{ display: "flex", alignItems: "center", gap: 14 }}>
+            <span style={{ color: colors.dim, fontSize: 13.5 }}>Pareto</span>
             {busy ? (
               <button
                 onClick={() => void window.unbiased.interrupt(paneId)}
@@ -2767,8 +3515,8 @@ function ChatPane({
                   width: 32,
                   height: 32,
                   borderRadius: 16,
-                  background: canSend ? colors.accent : "var(--panel-2)",
-                  color: canSend ? "var(--accent-fg)" : colors.dim,
+                  background: canSend ? colors.fg : "var(--panel-2)",
+                  color: canSend ? "var(--bg)" : colors.dim,
                   border: "none",
                   cursor: canSend ? "pointer" : "default",
                   display: "flex",
@@ -2782,6 +3530,7 @@ function ChatPane({
                 </svg>
               </button>
             )}
+            </span>
           </div>
         </div>
       </div>
@@ -3178,6 +3927,36 @@ function PaperclipIcon() {
   );
 }
 
+function HandIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" style={{ flexShrink: 0 }}>
+      <path d="M18 11V6a2 2 0 0 0-2-2a2 2 0 0 0-2 2" />
+      <path d="M14 10V4a2 2 0 0 0-2-2a2 2 0 0 0-2 2v2" />
+      <path d="M10 10.5V6a2 2 0 0 0-2-2a2 2 0 0 0-2 2v8" />
+      <path d="M18 8a2 2 0 1 1 4 0v6a8 8 0 0 1-8 8h-2c-2.8 0-4.5-.86-5.99-2.34l-3.6-3.6a2 2 0 0 1 2.83-2.82L7 15" />
+    </svg>
+  );
+}
+
+function ShieldCheckIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" style={{ flexShrink: 0 }}>
+      <path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z" />
+      <path d="m9 12 2 2 4-4" />
+    </svg>
+  );
+}
+
+function ShieldAlertIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" style={{ flexShrink: 0 }}>
+      <path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z" />
+      <path d="M12 8v4" />
+      <path d="M12 16h.01" />
+    </svg>
+  );
+}
+
 function GearIcon() {
   return (
     <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -3420,6 +4199,16 @@ function FolderOutlineIcon({ size = 18 }: { size?: number } = {}) {
   );
 }
 
+function GlobeIcon({ size = 15 }: { size?: number } = {}) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <circle cx="12" cy="12" r="10" />
+      <path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20" />
+      <path d="M2 12h20" />
+    </svg>
+  );
+}
+
 function FoldersIcon() {
   return (
     <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -3449,9 +4238,9 @@ function ReviewIcon() {
   );
 }
 
-function TerminalIcon() {
+function TerminalIcon({ size = 15 }: { size?: number } = {}) {
   return (
-    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
       <rect x="3" y="3" width="18" height="18" rx="4" />
       <path d="m7.5 9 3 3-3 3" />
       <path d="M13 15h3.5" />
