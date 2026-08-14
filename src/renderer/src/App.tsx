@@ -36,6 +36,7 @@ type CommandItem = {
 
 type Entry =
   | { kind: "user"; text: string; annotations?: SentAnnotation[] }
+  | { kind: "compaction" }
   | { kind: "assistant"; text: string; interrupted?: boolean }
   | {
       kind: "command";
@@ -87,6 +88,18 @@ const ACCESS_MODES: { id: AccessMode; name: string; desc: string; danger?: boole
   { id: "full", name: "Full access", desc: "Unrestricted commands and file access", danger: true },
 ];
 type RefHit = { path: string; rel: string; line: number; text: string };
+type DirtyFile = { file: string; plus: number; minus: number };
+type ReviewLine = { t: "a" | "d" | "c"; no: number; text: string };
+type ReviewHunk = { newStart: number; lines: ReviewLine[] };
+type ReviewFile = { path: string; plus: number; minus: number; hunks: ReviewHunk[] };
+type ReviewData = {
+  files: ReviewFile[];
+  plus: number;
+  minus: number;
+  branch: string;
+  baseLabel: string;
+  error?: string;
+};
 type BlameInfo = {
   hash?: string;
   author?: string;
@@ -169,8 +182,22 @@ declare global {
       interrupt: (paneId: PaneId) => Promise<{ interrupted: boolean }>;
       onTurnStarted: (cb: (p: { paneId: PaneId; turnId: string | null }) => void) => () => void;
       onDelta: (cb: (p: { paneId: PaneId; delta: string }) => void) => () => void;
-      onTurnCompleted: (cb: (p: { paneId: PaneId; status: string }) => void) => () => void;
+      onTurnCompleted: (
+        cb: (p: { paneId: PaneId; status: string; error?: string | null }) => void,
+      ) => () => void;
       setAccessMode: (mode: AccessMode) => Promise<{ mode: string }>;
+      setWorkMode: (mode: string, dir?: string) => Promise<{ ok: boolean }>;
+      setPlanMode: (on: boolean) => Promise<{ planMode: boolean }>;
+      onPlan: (cb: (p: { paneId: PaneId; text: string }) => void) => () => void;
+      listWorktrees: (project: string) => Promise<{ worktrees: { dir: string; branch: string }[] }>;
+      saveTranscript: (threadId: string, entries: Entry[]) => Promise<{ ok: boolean }>;
+      loadTranscript: (threadId: string) => Promise<{ entries: Entry[] | null }>;
+      conversationInfo: () => Promise<{
+        cwd: string | null;
+        isWorktree: boolean;
+        project: string | null;
+        branch: string | null;
+      }>;
       decideApproval: (requestId: string, decision: ApprovalDecision) => Promise<{ ok: boolean }>;
       onApprovalRequest: (
         cb: (p: {
@@ -187,6 +214,7 @@ declare global {
       onCommand: (
         cb: (p: { paneId: PaneId; phase: "started" | "completed"; item: CommandItem }) => void,
       ) => () => void;
+      onCompaction: (cb: (p: { paneId: PaneId }) => void) => () => void;
       listThreads: () => Promise<SidebarData>;
       openThread: (id: string) => Promise<{ id: string; entries: Entry[] }>;
       detachThread: (cwd?: string) => Promise<{ ok: boolean }>;
@@ -202,6 +230,15 @@ declare global {
       searchRefs: (word: string) => Promise<{ results: RefHit[]; truncated?: boolean; error?: string }>;
       blameLine: (file: string, line: number) => Promise<BlameInfo>;
       gitBranch: (path: string) => Promise<{ branch: string | null }>;
+      gitBranches: (
+        path: string,
+      ) => Promise<{ branches: string[]; current: string; dirty: DirtyFile[]; error?: string }>;
+      gitCheckout: (path: string, branch: string, create?: boolean) => Promise<{ ok: boolean; error?: string }>;
+      gitCommitAll: (path: string, message: string) => Promise<{ ok: boolean; error?: string }>;
+      gitDiscard: (path: string) => Promise<{ ok: boolean; error?: string }>;
+      reviewDiff: (path: string, mode: "branch" | "working") => Promise<ReviewData>;
+      reviewCommitPush: (path: string) => Promise<{ ok: boolean; error?: string }>;
+      reviewCreatePr: (path: string) => Promise<{ ok: boolean; error?: string }>;
       openExternal: (url: string) => Promise<{ ok: boolean }>;
       openBrowser: (url?: string) => Promise<{ ok: boolean }>;
       setBrowserBounds: (b: { x: number; y: number; width: number; height: number }) => Promise<void>;
@@ -302,6 +339,8 @@ function themeVars(t: ThemeConfig): Record<string, string> {
     "--dim": mixHex(t.surface, t.ink, 0.52),
     // Between fg and dim: sidebar thread titles, Codex-style.
     "--fg-soft": mixHex(t.surface, t.ink, 0.78),
+    // Assistant prose: a step softer than pure fg, like Codex replies.
+    "--fg-msg": mixHex(t.surface, t.ink, 0.88),
     "--gutter": m(0.25),
     "--font-ui": `${t.fonts.ui}, -apple-system, system-ui, sans-serif`,
     "--font-code": `${t.fonts.code}, ui-monospace, Menlo, monospace`,
@@ -472,6 +511,173 @@ export function App() {
   const seedNonceRef = useRef(1);
   // Current git branch of the active project, for the context strip.
   const [projectBranch, setProjectBranch] = useState<string | null>(null);
+  // Work-in mode for NEW project chats + what the active conversation is
+  // actually in (its worktree cwd when isolated, else null → project dir).
+  // "local" | "worktree" | a specific existing worktree.
+  type WorkSel = { mode: "local" | "worktree" } | { mode: "existing"; dir: string; branch: string };
+  const [workSel, setWorkSelState] = useState<WorkSel>(() =>
+    localStorage.getItem("workMode") === "worktree" ? { mode: "worktree" } : { mode: "local" },
+  );
+  const [existingWts, setExistingWts] = useState<{ dir: string; branch: string }[]>([]);
+  const [convCwd, setConvCwd] = useState<string | null>(null);
+  const [workMenuOpen, setWorkMenuOpen] = useState(false);
+
+  useEffect(() => {
+    void window.unbiased.setWorkMode(workSel.mode, workSel.mode === "existing" ? workSel.dir : undefined);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  function changeWorkMode(sel: WorkSel) {
+    // Only the generic modes persist; a specific worktree is per-session.
+    if (sel.mode !== "existing") localStorage.setItem("workMode", sel.mode);
+    setWorkSelState(sel);
+    void window.unbiased.setWorkMode(sel.mode, sel.mode === "existing" ? sel.dir : undefined);
+    setWorkMenuOpen(false);
+  }
+
+  async function openWorkMenu() {
+    if (activeProjectPath) {
+      const r = await window.unbiased.listWorktrees(activeProjectPath);
+      setExistingWts(r.worktrees);
+    } else {
+      setExistingWts([]);
+    }
+    setWorkMenuOpen(true);
+  }
+
+  useEffect(() => {
+    if (!workMenuOpen) return;
+    function onDown(e: MouseEvent) {
+      if (!(e.target as HTMLElement).closest("[data-workmenu]")) setWorkMenuOpen(false);
+    }
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") setWorkMenuOpen(false);
+    }
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [workMenuOpen]);
+  // The branch switcher: dropdown data, the commit/discard-to-switch
+  // modal, and the create-branch modal.
+  const [branchMenu, setBranchMenu] = useState<{
+    branches: string[];
+    current: string;
+    dirty: DirtyFile[];
+  } | null>(null);
+  const [branchSearch, setBranchSearch] = useState("");
+  const [branchSwitch, setBranchSwitch] = useState<{ target: string; files: DirtyFile[] } | null>(null);
+  const [branchCreate, setBranchCreate] = useState(false);
+  const [branchName, setBranchName] = useState("");
+  const [branchError, setBranchError] = useState<string | null>(null);
+  const [branchBusy, setBranchBusy] = useState(false);
+
+  useEffect(() => {
+    if (!branchMenu) return;
+    function onDown(e: MouseEvent) {
+      if (!(e.target as HTMLElement).closest("[data-branchmenu]")) setBranchMenu(null);
+    }
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") setBranchMenu(null);
+    }
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [branchMenu]);
+
+  useEffect(() => {
+    if (!branchSwitch && !branchCreate) return;
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") {
+        setBranchSwitch(null);
+        setBranchCreate(false);
+        setBranchError(null);
+      }
+    }
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [branchSwitch, branchCreate]);
+
+  async function openBranchMenu() {
+    if (!gitPath) return;
+    const r = await window.unbiased.gitBranches(gitPath);
+    if (r.error) return;
+    setBranchSearch("");
+    setBranchError(null);
+    setBranchMenu({ branches: r.branches, current: r.current, dirty: r.dirty });
+  }
+
+  async function doCheckout(branch: string, create = false): Promise<void> {
+    if (!gitPath) return;
+    setBranchBusy(true);
+    const r = await window.unbiased.gitCheckout(gitPath, branch, create);
+    setBranchBusy(false);
+    if (!r.ok) {
+      setBranchError(r.error ?? "Checkout failed");
+      return;
+    }
+    setProjectBranch(branch);
+    setBranchMenu(null);
+    setBranchSwitch(null);
+    setBranchCreate(false);
+    setBranchName("");
+    setBranchError(null);
+  }
+
+  function pickBranch(branch: string) {
+    if (!branchMenu) return;
+    if (branch === branchMenu.current) {
+      setBranchMenu(null);
+      return;
+    }
+    if (branchMenu.dirty.length > 0) {
+      setBranchSwitch({ target: branch, files: branchMenu.dirty });
+      setBranchMenu(null);
+    } else {
+      void doCheckout(branch);
+    }
+  }
+
+  async function commitAndSwitch() {
+    if (!branchSwitch || !gitPath) return;
+    setBranchBusy(true);
+    const c = await window.unbiased.gitCommitAll(
+      gitPath,
+      `WIP before switching to ${branchSwitch.target}`,
+    );
+    setBranchBusy(false);
+    if (!c.ok) {
+      setBranchError(c.error ?? "Commit failed");
+      return;
+    }
+    void doCheckout(branchSwitch.target);
+  }
+
+  async function discardAndSwitch() {
+    if (!branchSwitch || !gitPath) return;
+    setBranchBusy(true);
+    const d = await window.unbiased.gitDiscard(gitPath);
+    setBranchBusy(false);
+    if (!d.ok) {
+      setBranchError(d.error ?? "Discard failed");
+      return;
+    }
+    void doCheckout(branchSwitch.target);
+  }
+
+  function branchNameError(name: string): string | null {
+    if (!name.trim()) return null;
+    if (name.endsWith("/")) return 'Branch name cannot end with "/".';
+    if (/[\s~^:?*[\\]|\.\.|@\{/.test(name) || name.startsWith("-") || name.endsWith(".lock")) {
+      return "Invalid branch name.";
+    }
+    return null;
+  }
   const [mainReset, setMainReset] = useState<{ entries: Entry[]; nonce: number }>({ entries: [], nonce: 0 });
   // sideOpen = the whole right panel is visible; sideChatEnabled = the chat
   // tab exists in it. Kept separate so opening a file/image preview doesn't
@@ -523,6 +729,16 @@ export function App() {
     localStorage.setItem("accessMode", mode);
     setAccessModeState(mode);
     void window.unbiased.setAccessMode(mode);
+  }
+
+  // Plan mode: research-and-propose, hard read-only. Session-scoped.
+  const [planMode, setPlanModeState] = useState(false);
+
+  function togglePlanMode() {
+    setPlanModeState((on) => {
+      void window.unbiased.setPlanMode(!on);
+      return !on;
+    });
   }
 
   function changeAccessMode(mode: AccessMode) {
@@ -636,6 +852,7 @@ export function App() {
     setFilesOpen(false); // the tree browsed the previous conversation's cwd
     setTreeFile(null);
     setTerminalOpen(false); // the shell ran in the previous conversation's cwd
+    setReviewOpen(false); // the diff reviewed the previous conversation's cwd
     // The browser isn't cwd-bound — the page you're reading survives.
     setPanelMode(browserOpen ? "browser" : "chat");
     if (!sideChatEnabled && !browserOpen) setSideOpenPersisted(false);
@@ -666,10 +883,16 @@ export function App() {
   async function openThread(id: string) {
     if (mainBusy || id === activeThreadId) return;
     const { entries: history } = await window.unbiased.openThread(id);
+    // The engine's history omits renderer-only content (failed-turn
+    // errors, annotation cards). Prefer the cached transcript when it
+    // holds at least as much.
+    const cached = await window.unbiased.loadTranscript(id);
+    const entries =
+      cached.entries && cached.entries.length >= history.length ? cached.entries : history;
     setActiveProject(null);
     setActiveThreadId(id);
-    setMainStarted(history.length > 0);
-    setMainReset((r) => ({ entries: history, nonce: r.nonce + 1 }));
+    setMainStarted(entries.length > 0);
+    setMainReset((r) => ({ entries, nonce: r.nonce + 1 }));
     resetSideView();
   }
 
@@ -689,8 +912,9 @@ export function App() {
   // "launcher" = the panel is open with nothing selected yet — it shows
   // big rows asking which surface to open (Codex's empty side panel).
   const [panelMode, setPanelMode] = useState<
-    "chat" | "file" | "files" | "launcher" | "terminal" | "browser"
+    "chat" | "file" | "files" | "launcher" | "terminal" | "browser" | "review"
   >("chat");
+  const [reviewOpen, setReviewOpen] = useState(false);
   const [filesOpen, setFilesOpen] = useState(false);
   const [terminalOpen, setTerminalOpen] = useState(false);
   const [browserOpen, setBrowserOpen] = useState(false);
@@ -734,9 +958,16 @@ export function App() {
   useEffect(() => {
     if (!browserOpen) return;
     void window.unbiased.setBrowserVisible(
-      sideOpen && panelMode === "browser" && !sidePlusOpen && !showSettings && !confirmDialog && !fullAccessPrompt,
+      sideOpen &&
+        panelMode === "browser" &&
+        !sidePlusOpen &&
+        !showSettings &&
+        !confirmDialog &&
+        !fullAccessPrompt &&
+        !branchSwitch &&
+        !branchCreate,
     );
-  }, [browserOpen, sideOpen, panelMode, sidePlusOpen, showSettings, confirmDialog, fullAccessPrompt]);
+  }, [browserOpen, sideOpen, panelMode, sidePlusOpen, showSettings, confirmDialog, fullAccessPrompt, branchSwitch, branchCreate]);
 
   function openSideChatTab() {
     setSidePlusOpen(false);
@@ -789,6 +1020,7 @@ export function App() {
     if (sideChatEnabled) setPanelMode("chat");
     else if (openFile) setPanelMode("file");
     else if (filesOpen) setPanelMode("files");
+    else if (reviewOpen) setPanelMode("review");
     else if (terminalOpen) setPanelMode("terminal");
     else if (browserOpen) setPanelMode("browser");
     else setPanelMode("launcher");
@@ -798,6 +1030,24 @@ export function App() {
     setFilesOpen(false);
     if (panelMode !== "files") return;
     if (openFile) setPanelMode("file");
+    else if (reviewOpen) setPanelMode("review");
+    else if (terminalOpen) setPanelMode("terminal");
+    else if (sideChatEnabled) setPanelMode("chat");
+    else setSideOpenPersisted(false);
+  }
+
+  function openReviewTab() {
+    setSidePlusOpen(false);
+    setReviewOpen(true);
+    setPanelMode("review");
+    setSideOpenPersisted(true);
+  }
+
+  function closeReviewTab() {
+    setReviewOpen(false);
+    if (panelMode !== "review") return;
+    if (openFile) setPanelMode("file");
+    else if (filesOpen) setPanelMode("files");
     else if (terminalOpen) setPanelMode("terminal");
     else if (sideChatEnabled) setPanelMode("chat");
     else setSideOpenPersisted(false);
@@ -891,20 +1141,43 @@ export function App() {
   const activeProjectName = activeProject?.name ?? activeSidebarProject?.name ?? null;
   const activeProjectPath = activeProject?.path ?? activeSidebarProject?.path ?? null;
   const inProject = activeProjectName !== null;
+  // Git operations target the conversation's actual checkout — the
+  // worktree when isolated, else the project directory. (Referenced by
+  // the branch-switcher handlers above; they run post-render.)
+  const gitPath = convCwd ?? activeProjectPath;
+
+  // A selected worktree belongs to one project — reset when leaving it.
+  useEffect(() => {
+    if (workSel.mode === "existing") changeWorkMode({ mode: "local" });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeProjectPath]);
 
   useEffect(() => {
     if (!activeProjectPath) {
       setProjectBranch(null);
+      setConvCwd(null);
       return;
     }
     let alive = true;
-    void window.unbiased.gitBranch(activeProjectPath).then((r) => {
+    void (async () => {
+      // A started conversation may live in a worktree — branch and git
+      // operations must target ITS checkout, not the project's.
+      let cwd = activeProjectPath;
+      if (mainStarted) {
+        const info = await window.unbiased.conversationInfo();
+        if (info.cwd && info.isWorktree) cwd = info.cwd;
+        if (alive) setConvCwd(info.isWorktree ? info.cwd : null);
+      } else if (alive) {
+        setConvCwd(null);
+      }
+      const r = await window.unbiased.gitBranch(cwd);
       if (alive) setProjectBranch(r.branch);
-    });
+    })();
     return () => {
       alive = false;
     };
-  }, [activeProjectPath]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeProjectPath, mainStarted, activeThreadId]);
 
   // Whatever file the panel is currently showing, and whether it has a
   // rendered form worth offering.
@@ -961,7 +1234,7 @@ export function App() {
           borderRight: `1px solid ${colors.border}`,
           display: "flex",
           flexDirection: "column",
-          background: "var(--nav-bg)",
+          background: colors.panel,
         }}
       >
         <div style={{ padding: "14px 14px 6px" }}>
@@ -999,11 +1272,11 @@ export function App() {
                   alignItems: "center",
                   gap: 10,
                   width: "100%",
-                  background: activeProject?.path === p.path ? colors.panel : "transparent",
+                  background: activeProject?.path === p.path ? "var(--chip)" : "transparent",
                   borderRadius: 8,
                   padding: "8px 8px 6px",
                   fontSize: 14.5,
-                  color: colors.fg,
+                  color: "var(--fg-soft)",
                   boxSizing: "border-box",
                 }}
               >
@@ -1213,6 +1486,10 @@ export function App() {
           paneId="main"
           connected={connected}
           reset={mainReset}
+          threadId={activeThreadId}
+          persistTranscript
+          planMode={planMode}
+          onTogglePlanMode={togglePlanMode}
           contextChip={mainContext}
           onContextClear={() => setMainContext(null)}
           emptyState={
@@ -1245,25 +1522,286 @@ export function App() {
                   borderRadius: 12,
                   fontSize: 13,
                   color: colors.dim,
-                  overflow: "hidden",
+                  // No overflow:hidden here — the branch dropdown escapes
+                  // this box upward; children truncate themselves.
                 }}
               >
                 <span style={{ display: "flex", alignItems: "center", gap: 7, color: colors.fg, minWidth: 0 }}>
-                  <FolderOutlineIcon size={14} />
+                  <span style={{ color: colors.accent, display: "flex" }}>
+                    <FolderOutlineIcon size={14} />
+                  </span>
                   <span style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
                     {activeProjectName}
                   </span>
                 </span>
-                <span style={{ display: "flex", alignItems: "center", gap: 7, flexShrink: 0 }}>
-                  <LaptopIcon />
-                  Local
+                <span data-workmenu style={{ position: "relative", display: "flex", flexShrink: 0 }}>
+                  <button
+                    onClick={() => (workMenuOpen ? setWorkMenuOpen(false) : void openWorkMenu())}
+                    title="Where new chats in this project work"
+                    aria-expanded={workMenuOpen}
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 7,
+                      background: workMenuOpen ? "var(--chip)" : "transparent",
+                      border: "none",
+                      borderRadius: 8,
+                      padding: "3px 8px",
+                      margin: "-3px -8px",
+                      color: colors.dim,
+                      fontSize: 13,
+                      cursor: "pointer",
+                      fontFamily: "inherit",
+                    }}
+                  >
+                    {mainStarted ? (
+                      convCwd !== null ? (
+                        <>
+                          <SteerIcon />
+                          Worktree
+                        </>
+                      ) : (
+                        <>
+                          <LaptopIcon />
+                          Local
+                        </>
+                      )
+                    ) : workSel.mode === "local" ? (
+                      <>
+                        <LaptopIcon />
+                        Local
+                      </>
+                    ) : (
+                      <>
+                        <SteerIcon />
+                        <span style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", maxWidth: 160 }}>
+                          {workSel.mode === "existing" ? workSel.branch : "New worktree"}
+                        </span>
+                      </>
+                    )}
+                  </button>
+                  {workMenuOpen && (
+                    <div
+                      style={{
+                        position: "absolute",
+                        bottom: "calc(100% + 10px)",
+                        left: -8,
+                        width: 250,
+                        background: colors.panel,
+                        border: `1px solid ${colors.border}`,
+                        borderRadius: 14,
+                        padding: 8,
+                        zIndex: 30,
+                        boxShadow: "0 8px 24px rgba(0,0,0,0.45)",
+                      }}
+                    >
+                      <div style={{ color: colors.dim, fontSize: 12.5, padding: "4px 10px 8px" }}>Work in</div>
+                      {(
+                        [
+                          { sel: { mode: "local" } as const, key: "local", label: "Local", icon: <LaptopIcon /> },
+                          { sel: { mode: "worktree" } as const, key: "worktree", label: "New worktree", icon: <SteerIcon /> },
+                          ...existingWts.map((wt) => ({
+                            sel: { mode: "existing", dir: wt.dir, branch: wt.branch } as const,
+                            key: wt.dir,
+                            label: wt.branch,
+                            icon: <BranchIcon />,
+                          })),
+                        ]
+                      ).map((opt, i) => (
+                        <div key={opt.key}>
+                          {i === 2 && (
+                            <div
+                              style={{
+                                color: colors.dim,
+                                fontSize: 12.5,
+                                padding: "8px 10px 4px",
+                                borderTop: `1px solid ${colors.border}`,
+                                marginTop: 6,
+                              }}
+                            >
+                              Existing worktrees
+                            </div>
+                          )}
+                          <button
+                            onClick={() => changeWorkMode(opt.sel)}
+                            style={{
+                              display: "flex",
+                              alignItems: "center",
+                              gap: 10,
+                              width: "100%",
+                              background: "transparent",
+                              border: "none",
+                              borderRadius: 8,
+                              padding: "8px 10px",
+                              fontSize: 13.5,
+                              color: colors.fg,
+                              cursor: "pointer",
+                              textAlign: "left",
+                              fontFamily: "inherit",
+                            }}
+                          >
+                            <span style={{ color: colors.dim, display: "flex", flexShrink: 0 }}>{opt.icon}</span>
+                            <span
+                              style={{ flex: 1, minWidth: 0, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}
+                            >
+                              {opt.label}
+                            </span>
+                            {(workSel.mode === opt.sel.mode &&
+                              (opt.sel.mode !== "existing" ||
+                                (workSel.mode === "existing" && workSel.dir === opt.sel.dir))) && <CheckIcon />}
+                          </button>
+                        </div>
+                      ))}
+                      {mainStarted && (
+                        <div style={{ color: colors.dim, fontSize: 12, padding: "6px 10px 2px", lineHeight: 1.4 }}>
+                          Applies to new chats — this conversation keeps its checkout.
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </span>
                 {projectBranch && (
-                  <span style={{ display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
-                    <BranchIcon />
-                    <span style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                      {projectBranch}
-                    </span>
+                  <span data-branchmenu style={{ position: "relative", display: "flex", minWidth: 0 }}>
+                    <button
+                      onClick={() => (branchMenu ? setBranchMenu(null) : void openBranchMenu())}
+                      title="Switch branch"
+                      aria-expanded={!!branchMenu}
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 7,
+                        minWidth: 0,
+                        background: branchMenu ? "var(--chip)" : "transparent",
+                        border: "none",
+                        borderRadius: 8,
+                        padding: "3px 8px",
+                        margin: "-3px -8px",
+                        color: colors.dim,
+                        fontSize: 13,
+                        cursor: "pointer",
+                        fontFamily: "inherit",
+                      }}
+                    >
+                      <BranchIcon />
+                      <span style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                        {projectBranch}
+                      </span>
+                    </button>
+                    {branchMenu && (
+                      <div
+                        style={{
+                          position: "absolute",
+                          bottom: "calc(100% + 10px)",
+                          left: -8,
+                          width: 320,
+                          maxHeight: 380,
+                          display: "flex",
+                          flexDirection: "column",
+                          background: colors.panel,
+                          border: `1px solid ${colors.border}`,
+                          borderRadius: 14,
+                          padding: 8,
+                          zIndex: 30,
+                          boxShadow: "0 8px 24px rgba(0,0,0,0.45)",
+                        }}
+                      >
+                        <input
+                          autoFocus
+                          value={branchSearch}
+                          onChange={(e) => setBranchSearch(e.target.value)}
+                          placeholder={`Search ${activeProjectName ?? ""} branches`}
+                          spellCheck={false}
+                          style={{
+                            background: "var(--panel-2)",
+                            border: `1px solid ${colors.border}`,
+                            borderRadius: 8,
+                            padding: "7px 10px",
+                            color: colors.fg,
+                            fontSize: 13,
+                            outline: "none",
+                            fontFamily: "inherit",
+                          }}
+                        />
+                        <div style={{ color: colors.dim, fontSize: 12.5, padding: "10px 10px 4px" }}>Branches</div>
+                        <div style={{ overflowY: "auto", flex: 1, minHeight: 0 }}>
+                          {branchMenu.branches
+                            .filter((b) => b.toLowerCase().includes(branchSearch.toLowerCase()))
+                            .map((b) => (
+                              <button
+                                key={b}
+                                onClick={() => pickBranch(b)}
+                                disabled={branchBusy}
+                                style={{
+                                  display: "flex",
+                                  alignItems: "flex-start",
+                                  gap: 10,
+                                  width: "100%",
+                                  background: "transparent",
+                                  border: "none",
+                                  borderRadius: 8,
+                                  padding: "8px 10px",
+                                  fontSize: 13.5,
+                                  color: colors.fg,
+                                  cursor: "pointer",
+                                  textAlign: "left",
+                                  fontFamily: "inherit",
+                                }}
+                              >
+                                <span style={{ color: colors.dim, display: "flex", marginTop: 2, flexShrink: 0 }}>
+                                  <BranchIcon />
+                                </span>
+                                <span style={{ flex: 1, minWidth: 0 }}>
+                                  <div style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                                    {b}
+                                  </div>
+                                  {b === branchMenu.current && branchMenu.dirty.length > 0 && (
+                                    <div style={{ color: colors.dim, fontSize: 12.5, marginTop: 2 }}>
+                                      Uncommitted: {branchMenu.dirty.length} file
+                                      {branchMenu.dirty.length === 1 ? "" : "s"}
+                                    </div>
+                                  )}
+                                </span>
+                                {b === branchMenu.current && (
+                                  <span style={{ color: colors.fg, display: "flex", marginTop: 2 }}>
+                                    <CheckIcon />
+                                  </span>
+                                )}
+                              </button>
+                            ))}
+                        </div>
+                        {branchError && (
+                          <div style={{ color: colors.err, fontSize: 12.5, padding: "6px 10px" }}>{branchError}</div>
+                        )}
+                        <div style={{ borderTop: `1px solid ${colors.border}`, marginTop: 6, paddingTop: 6 }}>
+                          <button
+                            onClick={() => {
+                              setBranchMenu(null);
+                              setBranchName("");
+                              setBranchError(null);
+                              setBranchCreate(true);
+                            }}
+                            style={{
+                              display: "flex",
+                              alignItems: "center",
+                              gap: 10,
+                              width: "100%",
+                              background: "transparent",
+                              border: "none",
+                              borderRadius: 8,
+                              padding: "8px 10px",
+                              fontSize: 13.5,
+                              color: colors.fg,
+                              cursor: "pointer",
+                              textAlign: "left",
+                              fontFamily: "inherit",
+                            }}
+                          >
+                            <PlusIcon />
+                            Create and checkout new branch…
+                          </button>
+                        </div>
+                      </div>
+                    )}
                   </span>
                 )}
               </div>
@@ -1423,6 +1961,38 @@ export function App() {
                 </span>
               </button>
             )}
+            {reviewOpen && (
+              <button
+                onClick={() => setPanelMode("review")}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 8,
+                  background: panelMode === "review" ? colors.panel : "transparent",
+                  color: panelMode === "review" ? colors.fg : colors.dim,
+                  border: "none",
+                  borderRadius: 8,
+                  padding: "6px 12px",
+                  fontSize: 13,
+                  cursor: "pointer",
+                  fontFamily: "inherit",
+                }}
+              >
+                <ReviewIcon />
+                Review
+                <span
+                  role="button"
+                  aria-label="Close review"
+                  onClick={(ev) => {
+                    ev.stopPropagation();
+                    closeReviewTab();
+                  }}
+                  style={{ display: "flex", color: colors.dim, marginLeft: 2 }}
+                >
+                  <CloseIcon />
+                </span>
+              </button>
+            )}
             {browserOpen && (
               <button
                 onClick={() => setPanelMode("browser")}
@@ -1506,7 +2076,7 @@ export function App() {
                     boxShadow: "0 8px 24px rgba(0,0,0,0.45)",
                   }}
                 >
-                  <MenuItem icon={<ReviewIcon />} label="Review" desc="Soon" disabled onClick={() => {}} />
+                  {inProject && <MenuItem icon={<ReviewIcon />} label="Review" onClick={openReviewTab} />}
                   <MenuItem icon={<TerminalIcon />} label="Terminal" onClick={openTerminalTab} />
                   <MenuItem icon={<GlobeIcon />} label="Browser" onClick={openBrowserTab} />
                   {inProject && (
@@ -1561,7 +2131,7 @@ export function App() {
               )}
               <LauncherRow icon={<TerminalIcon />} label="Terminal" onClick={openTerminalTab} />
               <LauncherRow icon={<GlobeIcon />} label="Browser" onClick={openBrowserTab} />
-              <LauncherRow icon={<ReviewIcon />} label="Review" hint="Soon" disabled />
+              {inProject && <LauncherRow icon={<ReviewIcon />} label="Review" onClick={openReviewTab} />}
             </div>
           )}
           {openFile && panelMode === "file" && (
@@ -1572,6 +2142,7 @@ export function App() {
               preview={previewOn}
             />
           )}
+          {reviewOpen && panelMode === "review" && <ReviewPane gitPath={gitPath} />}
           {filesOpen && panelMode === "files" && (
             <div style={{ flex: 1, minHeight: 0, display: "flex" }}>
               <div
@@ -1661,6 +2232,8 @@ export function App() {
             onOpenLink={openInBrowser}
             accessMode={accessMode}
             onAccessModeChange={changeAccessMode}
+            planMode={planMode}
+            onTogglePlanMode={togglePlanMode}
             emptyState={
               <div style={{ textAlign: "center", padding: "0 24px" }}>
                 <div style={{ color: colors.dim, display: "flex", justifyContent: "center", marginBottom: 10 }}>
@@ -1676,6 +2249,265 @@ export function App() {
           />
           </div>
         </div>
+      {branchSwitch && (
+        <div
+          onMouseDown={(e) => {
+            if (e.target === e.currentTarget) {
+              setBranchSwitch(null);
+              setBranchError(null);
+            }
+          }}
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0,0,0,0.55)",
+            display: "grid",
+            placeItems: "center",
+            zIndex: 100,
+          }}
+        >
+          <div
+            style={{
+              width: 520,
+              maxWidth: "calc(100vw - 48px)",
+              background: colors.panel,
+              border: `1px solid ${colors.border}`,
+              borderRadius: 16,
+              padding: "22px 24px 20px",
+              boxShadow: "0 16px 48px rgba(0,0,0,0.55)",
+              position: "relative",
+            }}
+          >
+            <button
+              onClick={() => {
+                setBranchSwitch(null);
+                setBranchError(null);
+              }}
+              aria-label="Close"
+              style={{
+                position: "absolute",
+                top: 16,
+                right: 16,
+                background: "transparent",
+                border: "none",
+                color: colors.dim,
+                cursor: "pointer",
+                padding: 4,
+                display: "flex",
+              }}
+            >
+              <CloseIcon />
+            </button>
+            <div style={{ fontSize: 18, fontWeight: 600, color: colors.fg }}>
+              Commit changes to switch branch
+            </div>
+            <div style={{ color: colors.dim, fontSize: 14, lineHeight: 1.55, marginTop: 10 }}>
+              Your changes to the following files would be overwritten by checkout:
+            </div>
+            <div
+              style={{
+                maxHeight: 170,
+                overflowY: "auto",
+                margin: "12px 0",
+                fontFamily: "var(--font-code)",
+                fontSize: 12.5,
+              }}
+            >
+              {branchSwitch.files.map((f) => (
+                <div key={f.file} style={{ display: "flex", gap: 10, padding: "3px 0", color: colors.fg }}>
+                  <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {f.file}
+                  </span>
+                  <span style={{ color: colors.ok, flexShrink: 0 }}>+{f.plus}</span>
+                  <span style={{ color: colors.err, flexShrink: 0 }}>-{f.minus}</span>
+                </div>
+              ))}
+            </div>
+            <div style={{ color: colors.dim, fontSize: 13.5 }}>
+              Commit or discard your changes to continue.
+            </div>
+            {branchError && (
+              <div style={{ color: colors.err, fontSize: 13, marginTop: 8 }}>{branchError}</div>
+            )}
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 12, marginTop: 20 }}>
+              <button
+                onClick={() => {
+                  setBranchSwitch(null);
+                  setBranchError(null);
+                }}
+                style={{
+                  background: "var(--chip)",
+                  border: "none",
+                  borderRadius: 999,
+                  color: colors.fg,
+                  fontSize: 14,
+                  cursor: "pointer",
+                  fontFamily: "inherit",
+                  padding: "9px 18px",
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => void discardAndSwitch()}
+                disabled={branchBusy}
+                style={{
+                  background: "rgba(240, 149, 149, 0.14)",
+                  border: "none",
+                  borderRadius: 999,
+                  color: colors.err,
+                  fontSize: 14,
+                  cursor: "pointer",
+                  fontFamily: "inherit",
+                  padding: "9px 18px",
+                }}
+              >
+                Discard changes
+              </button>
+              <button
+                onClick={() => void commitAndSwitch()}
+                disabled={branchBusy}
+                style={{
+                  background: colors.fg,
+                  border: "none",
+                  borderRadius: 999,
+                  color: "var(--bg)",
+                  fontSize: 14,
+                  fontWeight: 500,
+                  cursor: "pointer",
+                  fontFamily: "inherit",
+                  padding: "9px 18px",
+                }}
+              >
+                Commit and switch branch…
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {branchCreate && (
+        <div
+          onMouseDown={(e) => {
+            if (e.target === e.currentTarget) {
+              setBranchCreate(false);
+              setBranchError(null);
+            }
+          }}
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0,0,0,0.55)",
+            display: "grid",
+            placeItems: "center",
+            zIndex: 100,
+          }}
+        >
+          <div
+            style={{
+              width: 480,
+              maxWidth: "calc(100vw - 48px)",
+              background: colors.panel,
+              border: `1px solid ${colors.border}`,
+              borderRadius: 16,
+              padding: "22px 24px 20px",
+              boxShadow: "0 16px 48px rgba(0,0,0,0.55)",
+              position: "relative",
+            }}
+          >
+            <button
+              onClick={() => {
+                setBranchCreate(false);
+                setBranchError(null);
+              }}
+              aria-label="Close"
+              style={{
+                position: "absolute",
+                top: 16,
+                right: 16,
+                background: "transparent",
+                border: "none",
+                color: colors.dim,
+                cursor: "pointer",
+                padding: 4,
+                display: "flex",
+              }}
+            >
+              <CloseIcon />
+            </button>
+            <div style={{ fontSize: 18, fontWeight: 600, color: colors.fg }}>Create and checkout branch</div>
+            <div style={{ color: colors.dim, fontSize: 13.5, margin: "16px 0 8px" }}>Branch name</div>
+            <input
+              autoFocus
+              value={branchName}
+              onChange={(e) => {
+                setBranchName(e.target.value);
+                setBranchError(null);
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && branchName.trim() && !branchNameError(branchName)) {
+                  void doCheckout(branchName.trim(), true);
+                }
+              }}
+              spellCheck={false}
+              style={{
+                width: "100%",
+                boxSizing: "border-box",
+                background: "var(--panel-2)",
+                border: `1px solid ${colors.border}`,
+                borderRadius: 10,
+                padding: "10px 12px",
+                color: colors.fg,
+                fontSize: 14,
+                outline: "none",
+                fontFamily: "var(--font-code)",
+              }}
+            />
+            {(branchNameError(branchName) || branchError) && (
+              <div style={{ color: colors.err, fontSize: 13, marginTop: 8 }}>
+                {branchNameError(branchName) ?? branchError}
+              </div>
+            )}
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 12, marginTop: 20 }}>
+              <button
+                onClick={() => {
+                  setBranchCreate(false);
+                  setBranchError(null);
+                }}
+                style={{
+                  background: "var(--chip)",
+                  border: "none",
+                  borderRadius: 999,
+                  color: colors.fg,
+                  fontSize: 14,
+                  cursor: "pointer",
+                  fontFamily: "inherit",
+                  padding: "9px 18px",
+                }}
+              >
+                Close
+              </button>
+              <button
+                onClick={() => void doCheckout(branchName.trim(), true)}
+                disabled={branchBusy || !branchName.trim() || !!branchNameError(branchName)}
+                style={{
+                  background:
+                    branchName.trim() && !branchNameError(branchName) ? colors.fg : "var(--panel-2)",
+                  border: "none",
+                  borderRadius: 999,
+                  color: branchName.trim() && !branchNameError(branchName) ? "var(--bg)" : colors.dim,
+                  fontSize: 14,
+                  fontWeight: 500,
+                  cursor: branchName.trim() && !branchNameError(branchName) ? "pointer" : "default",
+                  fontFamily: "inherit",
+                  padding: "9px 18px",
+                }}
+              >
+                Create and checkout
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       {fullAccessPrompt && (
         <div
           onMouseDown={(e) => {
@@ -2226,6 +3058,470 @@ function SentAnnotations({ items }: { items: SentAnnotation[] }) {
           ))}
         </div>
       )}
+    </div>
+  );
+}
+
+// The review tree: nested dirs (single-child chains compressed) + files.
+type ReviewTreeNode = { name: string; children: ReviewTreeNode[]; file?: ReviewFile };
+
+function buildReviewTree(files: ReviewFile[]): ReviewTreeNode[] {
+  const root: ReviewTreeNode = { name: "", children: [] };
+  for (const f of files) {
+    const parts = f.path.split("/");
+    let node = root;
+    for (let i = 0; i < parts.length - 1; i++) {
+      let child = node.children.find((c) => c.name === parts[i] && !c.file);
+      if (!child) {
+        child = { name: parts[i], children: [] };
+        node.children.push(child);
+      }
+      node = child;
+    }
+    node.children.push({ name: parts[parts.length - 1], children: [], file: f });
+  }
+  // Compress single-child directory chains: a/b/c → "a/b/c".
+  function compress(n: ReviewTreeNode): ReviewTreeNode {
+    while (!n.file && n.children.length === 1 && !n.children[0].file) {
+      n = { name: `${n.name}/${n.children[0].name}`, children: n.children[0].children };
+    }
+    return { ...n, children: n.children.map(compress) };
+  }
+  return root.children.map(compress);
+}
+
+/** Codex-style Review pane: mode selector, +/- totals, commit/push/PR
+ *  actions, a unified diff with unmodified-gap separators, and a
+ *  changed-files tree that scrolls to each file's section. */
+function ReviewPane({ gitPath }: { gitPath: string | null }) {
+  const [mode, setMode] = useState<"branch" | "working">("branch");
+  const [modeMenu, setModeMenu] = useState(false);
+  const [pushMenu, setPushMenu] = useState(false);
+  const [data, setData] = useState<ReviewData | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [actionMsg, setActionMsg] = useState<string | null>(null);
+  const fileRefs = useRef<Map<string, HTMLDivElement>>(new Map());
+  const menusRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!gitPath) return;
+    let alive = true;
+    setLoading(true);
+    void window.unbiased.reviewDiff(gitPath, mode).then((d) => {
+      if (!alive) return;
+      setData(d);
+      setLoading(false);
+    });
+    return () => {
+      alive = false;
+    };
+  }, [gitPath, mode]);
+
+  useEffect(() => {
+    if (!modeMenu && !pushMenu) return;
+    function onDown(e: MouseEvent) {
+      if (!menusRef.current?.contains(e.target as Node)) {
+        setModeMenu(false);
+        setPushMenu(false);
+      }
+    }
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") {
+        setModeMenu(false);
+        setPushMenu(false);
+      }
+    }
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [modeMenu, pushMenu]);
+
+  async function commitPush() {
+    if (!gitPath) return;
+    setBusy(true);
+    setActionMsg(null);
+    const r = await window.unbiased.reviewCommitPush(gitPath);
+    setBusy(false);
+    setActionMsg(r.ok ? "Committed and pushed." : (r.error ?? "Failed"));
+    if (r.ok) {
+      const d = await window.unbiased.reviewDiff(gitPath, mode);
+      setData(d);
+    }
+  }
+
+  async function createPr() {
+    if (!gitPath) return;
+    setBusy(true);
+    setActionMsg(null);
+    const r = await window.unbiased.reviewCreatePr(gitPath);
+    setBusy(false);
+    if (!r.ok) setActionMsg(r.error ?? "Failed to create PR");
+  }
+
+  const grammarFor = (path: string) => {
+    const ext = path.split(".").pop()?.toLowerCase() ?? "";
+    const lang = EXT_TO_PRISM[ext];
+    return lang ? { grammar: Prism.languages[lang], lang } : null;
+  };
+
+  const renderTree = (nodes: ReviewTreeNode[], depth: number): React.ReactNode =>
+    nodes.map((n) =>
+      n.file ? (
+        <button
+          key={n.file.path}
+          onClick={() => fileRefs.current.get(n.file!.path)?.scrollIntoView({ block: "start" })}
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            width: "100%",
+            background: "transparent",
+            border: "none",
+            borderRadius: 6,
+            padding: `5px 10px 5px ${10 + depth * 14}px`,
+            fontSize: 13,
+            color: colors.fg,
+            cursor: "pointer",
+            textAlign: "left",
+            fontFamily: "inherit",
+          }}
+        >
+          <span style={{ flex: 1, minWidth: 0, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+            {n.name}
+          </span>
+          <span
+            style={{
+              width: 8,
+              height: 8,
+              borderRadius: 2,
+              border: "1.5px solid #FF8A50",
+              flexShrink: 0,
+            }}
+          />
+        </button>
+      ) : (
+        <div key={`${depth}-${n.name}`}>
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 8,
+              padding: `5px 10px 5px ${10 + depth * 14}px`,
+              fontSize: 13,
+              color: "var(--fg-soft)",
+            }}
+          >
+            <span style={{ flex: 1, minWidth: 0, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+              {n.name}
+            </span>
+            <span style={{ width: 6, height: 6, borderRadius: 3, background: "#FF8A50", flexShrink: 0 }} />
+          </div>
+          {renderTree(n.children, depth + 1)}
+        </div>
+      ),
+    );
+
+  const tree = data ? buildReviewTree(data.files) : [];
+
+  return (
+    <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
+      <div
+        ref={menusRef}
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 12,
+          padding: "8px 14px",
+          flexShrink: 0,
+        }}
+      >
+        <span style={{ position: "relative", display: "flex" }}>
+          <button
+            onClick={() => setModeMenu((o) => !o)}
+            aria-expanded={modeMenu}
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 6,
+              background: "transparent",
+              border: "none",
+              color: colors.fg,
+              fontSize: 14,
+              fontWeight: 500,
+              cursor: "pointer",
+              fontFamily: "inherit",
+              padding: "4px 0",
+            }}
+          >
+            {mode === "branch" ? "Branch" : "Working Tree"}
+            <span style={{ fontSize: 10, color: colors.dim }}>▾</span>
+          </button>
+          {modeMenu && (
+            <div
+              style={{
+                position: "absolute",
+                top: "calc(100% + 6px)",
+                left: 0,
+                minWidth: 180,
+                background: colors.panel,
+                border: `1px solid ${colors.border}`,
+                borderRadius: 12,
+                padding: 6,
+                zIndex: 30,
+                boxShadow: "0 8px 24px rgba(0,0,0,0.45)",
+              }}
+            >
+              {(
+                [
+                  { id: "branch", label: "Branch" },
+                  { id: "working", label: "Working Tree" },
+                ] as { id: "branch" | "working"; label: string }[]
+              ).map((m) => (
+                <button
+                  key={m.id}
+                  onClick={() => {
+                    setMode(m.id);
+                    setModeMenu(false);
+                  }}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 10,
+                    width: "100%",
+                    background: "transparent",
+                    border: "none",
+                    borderRadius: 8,
+                    padding: "8px 10px",
+                    fontSize: 13.5,
+                    color: colors.fg,
+                    cursor: "pointer",
+                    textAlign: "left",
+                    fontFamily: "inherit",
+                  }}
+                >
+                  <span style={{ flex: 1 }}>{m.label}</span>
+                  {mode === m.id && <CheckIcon />}
+                </button>
+              ))}
+            </div>
+          )}
+        </span>
+        {data && (
+          <span style={{ fontSize: 13.5, fontWeight: 500 }}>
+            <span style={{ color: colors.ok }}>+{data.plus}</span>{" "}
+            <span style={{ color: colors.err }}>-{data.minus}</span>
+          </span>
+        )}
+        <span style={{ flex: 1 }} />
+        {actionMsg && (
+          <span style={{ color: colors.dim, fontSize: 12.5, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", maxWidth: 220 }}>
+            {actionMsg}
+          </span>
+        )}
+        <span style={{ position: "relative", display: "flex" }}>
+          <button
+            onClick={() => void commitPush()}
+            disabled={busy}
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 8,
+              background: "var(--chip)",
+              border: "none",
+              borderRadius: "999px 0 0 999px",
+              padding: "7px 10px 7px 14px",
+              fontSize: 13,
+              color: colors.fg,
+              cursor: "pointer",
+              fontFamily: "inherit",
+            }}
+          >
+            <BranchIcon />
+            Commit or push
+          </button>
+          <button
+            onClick={() => setPushMenu((o) => !o)}
+            aria-label="More actions"
+            aria-expanded={pushMenu}
+            style={{
+              display: "flex",
+              alignItems: "center",
+              background: "var(--chip)",
+              border: "none",
+              borderLeft: `1px solid ${colors.border}`,
+              borderRadius: "0 999px 999px 0",
+              padding: "7px 10px 7px 8px",
+              color: colors.fg,
+              cursor: "pointer",
+            }}
+          >
+            <span style={{ fontSize: 10, color: colors.dim }}>▾</span>
+          </button>
+          {pushMenu && (
+            <div
+              style={{
+                position: "absolute",
+                top: "calc(100% + 6px)",
+                right: 0,
+                minWidth: 200,
+                background: colors.panel,
+                border: `1px solid ${colors.border}`,
+                borderRadius: 12,
+                padding: 6,
+                zIndex: 30,
+                boxShadow: "0 8px 24px rgba(0,0,0,0.45)",
+              }}
+            >
+              <MenuItem
+                icon={<BranchIcon />}
+                label="Commit or push"
+                onClick={() => {
+                  setPushMenu(false);
+                  void commitPush();
+                }}
+              />
+              <MenuItem
+                icon={<SteerIcon />}
+                label="Create PR"
+                onClick={() => {
+                  setPushMenu(false);
+                  void createPr();
+                }}
+              />
+            </div>
+          )}
+        </span>
+      </div>
+      {data && (
+        <div style={{ padding: "0 14px 8px", fontSize: 13, color: colors.dim, flexShrink: 0 }}>
+          {mode === "branch" ? (
+            <>
+              {data.branch} <span style={{ color: "var(--gutter)" }}>→</span> {data.baseLabel}
+            </>
+          ) : (
+            "Uncommitted changes"
+          )}
+        </div>
+      )}
+      <div style={{ flex: 1, minHeight: 0, display: "flex" }}>
+        <div style={{ flex: 1, minWidth: 0, overflowY: "auto", borderRight: `1px solid ${colors.border}` }}>
+          {loading && <div style={{ color: colors.dim, fontSize: 13, padding: 16 }}>Loading diff…</div>}
+          {!loading && data?.error && <div style={{ color: colors.err, fontSize: 13, padding: 16 }}>{data.error}</div>}
+          {!loading && data && !data.error && data.files.length === 0 && (
+            <div style={{ color: colors.dim, fontSize: 13, padding: 16 }}>No changes.</div>
+          )}
+          {!loading &&
+            data?.files.map((f) => {
+              const g = grammarFor(f.path);
+              const dirs = f.path.split("/");
+              const name = dirs.pop();
+              let prevEnd: number | null = null;
+              return (
+                <div
+                  key={f.path}
+                  ref={(el) => {
+                    if (el) fileRefs.current.set(f.path, el);
+                  }}
+                >
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 8,
+                      padding: "9px 14px",
+                      background: colors.panel,
+                      position: "sticky",
+                      top: 0,
+                      zIndex: 5,
+                      fontSize: 13,
+                      fontFamily: "var(--font-code)",
+                    }}
+                  >
+                    <span style={{ minWidth: 0, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                      {dirs.length > 0 && <span style={{ color: colors.dim }}>{dirs.join("/")}/</span>}
+                      <span style={{ color: colors.fg }}>{name}</span>
+                    </span>
+                    <span style={{ color: colors.ok, flexShrink: 0 }}>+{f.plus}</span>
+                    <span style={{ color: colors.err, flexShrink: 0 }}>-{f.minus}</span>
+                  </div>
+                  {f.hunks.map((h, hi) => {
+                    const gap = prevEnd === null ? h.newStart - 1 : h.newStart - prevEnd;
+                    prevEnd = h.newStart + h.lines.filter((l) => l.t !== "d").length;
+                    return (
+                      <div key={hi}>
+                        {gap > 0 && (
+                          <div
+                            style={{
+                              display: "flex",
+                              alignItems: "center",
+                              gap: 10,
+                              padding: "5px 14px",
+                              background: "var(--panel-2)",
+                              color: colors.dim,
+                              fontSize: 12,
+                            }}
+                          >
+                            <span style={{ fontSize: 10 }}>⇕</span>
+                            {gap} unmodified line{gap === 1 ? "" : "s"}
+                          </div>
+                        )}
+                        {h.lines.map((l, li) => (
+                          <div
+                            key={li}
+                            style={{
+                              display: "flex",
+                              fontFamily: "var(--font-code)",
+                              fontSize: 12,
+                              lineHeight: 1.6,
+                              background:
+                                l.t === "a"
+                                  ? "rgba(93, 202, 165, 0.10)"
+                                  : l.t === "d"
+                                    ? "rgba(240, 110, 110, 0.11)"
+                                    : "transparent",
+                            }}
+                          >
+                            <span
+                              style={{
+                                width: 44,
+                                textAlign: "right",
+                                paddingRight: 10,
+                                color: l.t === "a" ? colors.ok : l.t === "d" ? colors.err : "var(--gutter)",
+                                flexShrink: 0,
+                                userSelect: "none",
+                              }}
+                            >
+                              {l.no}
+                            </span>
+                            {g?.grammar ? (
+                              <span
+                                style={{ whiteSpace: "pre", flex: 1, color: "var(--code-fg)" }}
+                                dangerouslySetInnerHTML={{
+                                  __html: Prism.highlight(l.text, g.grammar, g.lang),
+                                }}
+                              />
+                            ) : (
+                              <span style={{ whiteSpace: "pre", flex: 1, color: "var(--code-fg)" }}>{l.text}</span>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    );
+                  })}
+                </div>
+              );
+            })}
+        </div>
+        {data && data.files.length > 0 && (
+          <div style={{ width: "32%", minWidth: 170, maxWidth: 260, flexShrink: 0, overflowY: "auto", padding: "6px 6px 12px" }}>
+            {renderTree(tree, 0)}
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -3119,8 +4415,12 @@ function ChatPane({
   onOpenLink,
   accessMode,
   onAccessModeChange,
+  planMode,
+  onTogglePlanMode,
   draftSeed,
   composerHeader,
+  threadId,
+  persistTranscript,
 }: {
   paneId: PaneId;
   connected: boolean;
@@ -3136,10 +4436,16 @@ function ChatPane({
   onOpenLink?: (url: string) => void;
   accessMode: AccessMode;
   onAccessModeChange: (mode: AccessMode) => void;
+  planMode: boolean;
+  onTogglePlanMode: () => void;
   // Start-page suggestion cards seed the composer through this.
   draftSeed?: { text: string; nonce: number } | null;
   // Rendered above the composer box (the project/branch context strip).
   composerHeader?: React.ReactNode;
+  // The engine thread this pane shows (resumed threads); fresh chats learn
+  // their id from the first send. Drives the transcript cache.
+  threadId?: string | null;
+  persistTranscript?: boolean;
 }) {
   const [entries, setEntries] = useState<Entry[]>(reset.entries);
   const [draft, setDraft] = useState("");
@@ -3268,7 +4574,10 @@ function ChatPane({
     onBusyChange?.(b);
   }
 
+  const threadIdRef = useRef<string | null>(threadId ?? null);
+
   useEffect(() => {
+    threadIdRef.current = threadId ?? null;
     setEntries(reset.entries);
     setBusy(false);
     // Staged annotations belong to the conversation they came from.
@@ -3277,6 +4586,19 @@ function ChatPane({
     setQueue([]);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [reset.nonce]);
+
+  // Persist the rendered transcript per thread (debounced) — the engine's
+  // own history can't hold renderer-only content.
+  useEffect(() => {
+    if (!persistTranscript) return;
+    const id = threadIdRef.current;
+    if (!id || entries.length === 0) return;
+    const timer = setTimeout(() => {
+      void window.unbiased.saveTranscript(id, entries);
+    }, 400);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [entries, persistTranscript]);
 
   // An undecided approval means the agent is waiting on the human — the
   // thinking clock pauses rather than blaming the model for our latency.
@@ -3321,7 +4643,16 @@ function ChatPane({
               next = [...next.slice(0, -1), { ...last, interrupted: true }];
             }
           }
-          return withoutTrailingPlaceholder(next);
+          next = withoutTrailingPlaceholder(next);
+          // A failed turn with no visible cause looks like the app doing
+          // nothing — always say why.
+          if (p.status === "failed") {
+            next = [
+              ...next,
+              { kind: "assistant", text: `⚠ Turn failed${p.error ? `: ${p.error}` : "."}` },
+            ];
+          }
+          return next;
         });
         // One queued message per completed turn.
         const [head, ...rest] = queueRef.current;
@@ -3351,6 +4682,19 @@ function ChatPane({
               approval,
             },
           ];
+        });
+      }),
+      window.unbiased.onPlan((p) => {
+        if (p.paneId !== paneId) return;
+        setEntries((es) => [...withoutTrailingPlaceholder(es), { kind: "assistant", text: p.text }]);
+      }),
+      window.unbiased.onCompaction((p) => {
+        if (p.paneId !== paneId) return;
+        setEntries((es) => {
+          const cleaned = withoutTrailingPlaceholder(es);
+          // Consecutive compactions collapse into one divider.
+          if (cleaned[cleaned.length - 1]?.kind === "compaction") return cleaned;
+          return [...cleaned, { kind: "compaction" }];
         });
       }),
       window.unbiased.onCommand((p) => {
@@ -3402,7 +4746,8 @@ function ChatPane({
     setBusy(true);
     setEntries((es) => [...es, { kind: "user", text: q.text, annotations: q.annotations }]);
     try {
-      await window.unbiased.sendMessage(paneId, q.wire, q.attachments);
+      const res = await window.unbiased.sendMessage(paneId, q.wire, q.attachments);
+      threadIdRef.current = res.threadId;
     } catch (err) {
       setBusy(false);
       setEntries((es) => [...es, { kind: "assistant", text: `Something went wrong: ${String(err)}` }]);
@@ -3650,10 +4995,11 @@ function ChatPane({
             title={isPath ? "Open file" : clickable ? "Open in side chat" : undefined}
             style={{
               fontFamily: "var(--font-code)",
-              fontSize: "0.84em",
+              fontSize: "0.875em",
               background: "var(--chip)",
-              color: "var(--fg)",
-              padding: "2px 6px",
+              // File references read as navigation, not code — accent them.
+              color: isPath ? "var(--accent)" : "var(--fg-msg)",
+              padding: "2.5px 7px",
               borderRadius: 6,
               cursor: clickable ? "pointer" : "inherit",
             }}
@@ -3688,7 +5034,7 @@ function ChatPane({
       ol: (props: { children?: React.ReactNode }) => (
         <ol style={{ margin: "10px 0", paddingLeft: 24 }}>{props.children}</ol>
       ),
-      li: (props: { children?: React.ReactNode }) => <li style={{ margin: "4px 0" }}>{props.children}</li>,
+      li: (props: { children?: React.ReactNode }) => <li style={{ margin: "7px 0" }}>{props.children}</li>,
     }),
     [],
   );
@@ -3856,9 +5202,23 @@ function ChatPane({
                 </div>
               );
             }
+            if (e.kind === "compaction") {
+              return (
+                <div
+                  key={block.key}
+                  style={{ display: "flex", alignItems: "center", gap: 12, margin: "18px 0" }}
+                >
+                  <span style={{ flex: 1, height: 1, background: colors.border }} />
+                  <span style={{ color: colors.dim, fontSize: 11.5, whiteSpace: "nowrap" }}>
+                    context compacted — earlier turns summarized
+                  </span>
+                  <span style={{ flex: 1, height: 1, background: colors.border }} />
+                </div>
+              );
+            }
             if (e.kind === "assistant") {
               return (
-                <div key={block.key} style={{ margin: "16px 0", lineHeight: 1.75, fontSize: 15.5 }}>
+                <div key={block.key} style={{ margin: "16px 0", lineHeight: 1.7, fontSize: 15.5, color: "var(--fg-msg)" }}>
                   <Markdown remarkPlugins={REMARK_PLUGINS} components={mdComponents}>
                     {e.text}
                   </Markdown>
@@ -3950,8 +5310,70 @@ function ChatPane({
                 disabled={!clipHasImage}
                 onClick={() => void attachClipboardImage()}
               />
+              <MenuItem
+                icon={<LightbulbIcon />}
+                label="Plan mode"
+                desc={planMode ? "Turn plan mode off" : "Turn plan mode on"}
+                onClick={() => {
+                  setPlusOpen(false);
+                  onTogglePlanMode();
+                }}
+              />
             </div>
           )}
+          {(() => {
+            const q = draft.startsWith("/") ? draft.slice(1).toLowerCase() : null;
+            const showPlan = q !== null && "plan".startsWith(q);
+            if (!showPlan) return null;
+            return (
+              <div
+                style={{
+                  position: "absolute",
+                  bottom: "calc(100% + 8px)",
+                  left: 0,
+                  right: 0,
+                  background: colors.panel,
+                  border: `1px solid ${colors.border}`,
+                  borderRadius: 14,
+                  padding: 6,
+                  zIndex: 20,
+                  boxShadow: "0 8px 24px rgba(0,0,0,0.45)",
+                }}
+              >
+                <button
+                  onClick={() => {
+                    onTogglePlanMode();
+                    setDraft("");
+                  }}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 10,
+                    width: "100%",
+                    background: "var(--chip)",
+                    border: "none",
+                    borderRadius: 10,
+                    padding: "10px 12px",
+                    fontSize: 13.5,
+                    color: colors.fg,
+                    cursor: "pointer",
+                    textAlign: "left",
+                    fontFamily: "inherit",
+                  }}
+                >
+                  <span style={{ color: colors.dim, display: "flex" }}>
+                    <LightbulbIcon />
+                  </span>
+                  <span style={{ fontWeight: 500 }}>Plan</span>
+                  <span style={{ color: colors.dim }}>mode</span>
+                  <span style={{ flex: 1 }} />
+                  <span style={{ color: colors.dim, fontSize: 12.5 }}>
+                    {planMode ? "Turn plan mode off" : "Turn plan mode on"}
+                  </span>
+                </button>
+              </div>
+            );
+          })()}
           {modeOpen && (
             <div
               ref={modeMenuRef}
@@ -4146,6 +5568,13 @@ function ChatPane({
               // queues automatically while a turn is running).
               if (e.key === "Enter" && !e.shiftKey) {
                 e.preventDefault();
+                // A matching slash command takes Enter before sending.
+                const q = draft.startsWith("/") ? draft.slice(1).toLowerCase() : null;
+                if (q !== null && "plan".startsWith(q)) {
+                  onTogglePlanMode();
+                  setDraft("");
+                  return;
+                }
                 void submit();
               } else if (e.key === "Escape" && busy) {
                 e.preventDefault();
@@ -4198,6 +5627,29 @@ function ChatPane({
                   +
                 </button>
               </span>
+              {planMode && (
+                <button
+                  onClick={onTogglePlanMode}
+                  title="Plan mode is on — the agent researches read-only and proposes a plan. Click to turn off."
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 7,
+                    background: "var(--chip)",
+                    border: "none",
+                    borderRadius: 999,
+                    padding: "4px 10px",
+                    color: colors.accent,
+                    fontSize: 13.5,
+                    cursor: "pointer",
+                    fontFamily: "inherit",
+                  }}
+                >
+                  <LightbulbIcon />
+                  Plan mode
+                  <CloseIcon />
+                </button>
+              )}
               <span ref={modeRef} style={{ display: "flex" }}>
                 <button
                   onClick={() => setModeOpen((o) => !o)}
@@ -4746,9 +6198,11 @@ function StartPage({
             What should we build in{" "}
             <span
               style={{
+                // The logo's lighter coral, not the theme accent.
+                color: "#FF7764",
                 textDecoration: "underline dotted",
                 textUnderlineOffset: 7,
-                textDecorationColor: "var(--accent)",
+                textDecorationColor: "#FF7764",
               }}
             >
               {projectName}
@@ -4927,7 +6381,7 @@ function SidebarAction({
         gap: 10,
         width: "100%",
         background: "transparent",
-        color: disabled ? colors.dim : colors.fg,
+        color: disabled ? colors.dim : "var(--fg-soft)",
         border: "none",
         borderRadius: 8,
         padding: "8px 8px",
@@ -5177,6 +6631,16 @@ function FoldersIcon() {
   );
 }
 
+function LightbulbIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" style={{ flexShrink: 0 }}>
+      <path d="M15 14c.2-1 .7-1.7 1.5-2.5 1-.9 1.5-2.2 1.5-3.5A6 6 0 0 0 6 8c0 1 .2 2.2 1.5 3.5.7.7 1.3 1.5 1.5 2.5" />
+      <path d="M9 18h6" />
+      <path d="M10 22h4" />
+    </svg>
+  );
+}
+
 function PlusIcon() {
   return (
     <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -5354,7 +6818,7 @@ function FolderPlusIcon() {
 
 function FolderIcon() {
   return (
-    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" style={{ color: colors.amber, flexShrink: 0 }}>
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" style={{ color: colors.accent, flexShrink: 0 }}>
       <path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.7-.9L9.2 3.9A2 2 0 0 0 7.5 3H4a2 2 0 0 0-2 2v13c0 1.1.9 2 2 2Z" />
     </svg>
   );
@@ -5408,7 +6872,7 @@ function ThreadRow({
       style={{
         display: "flex",
         alignItems: "center",
-        background: active ? colors.panel : "transparent",
+        background: active ? "var(--chip)" : "transparent",
         borderRadius: 8,
         marginBottom: 1,
         paddingLeft: indent ? 25 : 0,

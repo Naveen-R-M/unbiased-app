@@ -12,7 +12,7 @@ import {
 import type { MenuItemConstructorOptions } from "electron";
 import type { NativeImage } from "electron";
 import { isAbsolute, join, relative } from "node:path";
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { EngineClient, engineVersionFromUserAgent, type EngineStatus } from "./engine";
 import { spawn as ptySpawn, type IPty } from "@lydell/node-pty";
@@ -69,6 +69,69 @@ const MODE_TURN_SANDBOX: Record<AccessMode, Record<string, unknown>> = {
 
 function threadPolicy(): { approvalPolicy: string; sandbox: string } {
   return MODE_THREAD_POLICY[accessMode];
+}
+
+// Plan mode: the agent researches read-only and proposes a plan instead
+// of acting. Enforced two ways — a hard read-only sandbox override on
+// every turn, plus a directive input item shaping the output.
+let planMode = false;
+
+const PLAN_DIRECTIVE =
+  "PLAN MODE is active. Do not modify files, run mutating commands, or take " +
+  "any action with side effects — research read-only. Produce a concrete " +
+  "implementation plan: numbered steps, the files to change and how, risks, " +
+  "and open questions. End by asking whether to proceed with the plan.";
+
+// Work-in mode for NEW project chats: the live checkout, or an isolated
+// git worktree created per conversation (agent works on its own branch,
+// the user's checkout stays untouched).
+let workMode: "local" | "worktree" | { existing: string } = "local";
+
+// worktree dir → its parent project + branch. Used to group worktree
+// conversations under their project in the sidebar.
+function worktreesFile(): string {
+  return join(app.getPath("userData"), "worktrees.json");
+}
+
+function loadWorktrees(): Record<string, { project: string; branch: string }> {
+  try {
+    const parsed = JSON.parse(readFileSync(worktreesFile(), "utf8"));
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+/** Create a fresh worktree for a conversation; null = fall back to local. */
+async function createWorktree(project: string): Promise<string | null> {
+  const stamp = new Date()
+    .toISOString()
+    .replace(/[:.]/g, "")
+    .slice(0, 15)
+    .replace("T", "-");
+  const dir = join(
+    app.getPath("userData"),
+    "worktrees",
+    `${project.split("/").filter(Boolean).pop()}-${stamp}`,
+  );
+  const branch = `pareto/${stamp}`;
+  mkdirSync(join(app.getPath("userData"), "worktrees"), { recursive: true });
+  const result = await new Promise<{ code: number; err: string }>((resolve) => {
+    execFile(
+      "git",
+      ["worktree", "add", dir, "-b", branch],
+      { cwd: project, timeout: 30000 },
+      (error, _out, stderr) => resolve({ code: error ? 1 : 0, err: (stderr ?? "").trim() }),
+    );
+  });
+  if (result.code !== 0) {
+    console.warn("[app] worktree add failed, falling back to local:", result.err);
+    return null;
+  }
+  const map = loadWorktrees();
+  map[dir] = { project, branch };
+  writeFileSync(worktreesFile(), JSON.stringify(map, null, 2) + "\n");
+  return dir;
 }
 
 type ThreadSummary = { id: string; title: string; createdAt?: string };
@@ -154,6 +217,12 @@ function threadToEntries(thread: WireThread): unknown[] {
             exitCode: item.exitCode,
             output: item.aggregatedOutput,
           });
+          break;
+        case "contextCompaction":
+          entries.push({ kind: "compaction" });
+          break;
+        case "plan":
+          entries.push({ kind: "assistant", text: item.text ?? "" });
           break;
       }
     }
@@ -436,6 +505,14 @@ function wireNotifications(): void {
         const phase = msg.method === "item/started" ? "started" : "completed";
         if (item?.type === "commandExecution") {
           send("chat:command", { paneId, phase, item });
+        } else if (item?.type === "plan") {
+          if (phase === "completed") {
+            const planItem = params.item as { text?: string };
+            send("chat:plan", { paneId, text: planItem.text ?? "" });
+          }
+        } else if (item?.type === "contextCompaction") {
+          // Mark where the model's verbatim history got summarized.
+          if (phase === "completed") send("chat:compaction", { paneId });
         } else if (item?.type === "fileChange") {
           // File changes render as command-style cards so the approval
           // buttons have a card to land on.
@@ -455,12 +532,18 @@ function wireNotifications(): void {
         break;
       }
       case "turn/completed": {
-        const turn = params.turn as { status?: string; usage?: unknown } | undefined;
+        const turn = params.turn as
+          | { status?: string; usage?: unknown; error?: { message?: string; additionalDetails?: string | null } | null }
+          | undefined;
         panes[paneId].turnId = null;
         send("chat:turn-completed", {
           paneId,
           status: turn?.status ?? "completed",
           usage: turn?.usage ?? null,
+          // A failed turn is invisible without this — surface the cause.
+          error: turn?.error
+            ? [turn.error.message, turn.error.additionalDetails].filter(Boolean).join(" — ")
+            : null,
         });
         break;
       }
@@ -572,14 +655,26 @@ app.whenReady().then(async () => {
           ephemeral: true,
         })) as { thread: { id: string } };
       } else {
+        // Explicit home when no project is chosen — left implicit, the
+        // engine falls back to its own process cwd (wherever the app
+        // launched from) and the chat wrongly files under that project.
+        let cwd = pendingCwd ?? app.getPath("home");
+        if (pendingCwd && workMode === "worktree") {
+          const wt = await createWorktree(pendingCwd);
+          if (wt) cwd = wt;
+        } else if (pendingCwd && typeof workMode === "object") {
+          // A previously created worktree — validate it still exists and
+          // belongs to this project before trusting it.
+          const info = loadWorktrees()[workMode.existing];
+          if (info && info.project === pendingCwd && existsSync(workMode.existing)) {
+            cwd = workMode.existing;
+          }
+        }
         started = (await engine.request("thread/start", {
           ...threadPolicy(),
-          // Explicit home when no project is chosen — left implicit, the
-          // engine falls back to its own process cwd (wherever the app
-          // launched from) and the chat wrongly files under that project.
-          cwd: pendingCwd ?? app.getPath("home"),
+          cwd,
         })) as { thread: { id: string }; cwd?: string };
-        mainCwd = (started as { cwd?: string }).cwd ?? pendingCwd ?? mainCwd;
+        mainCwd = (started as { cwd?: string }).cwd ?? cwd;
       }
       pane.threadId = started.thread.id;
       created = true;
@@ -597,16 +692,78 @@ app.whenReady().then(async () => {
         input.push({ type: "mention", name: a.name, path: a.path });
       }
     }
+    if (planMode) input.unshift({ type: "text", text: PLAN_DIRECTIVE });
     const result = (await engine.request("turn/start", {
       threadId: pane.threadId,
       input,
       // Turn-level overrides apply "this turn and subsequent turns", so a
-      // mode switched mid-conversation takes effect immediately.
-      approvalPolicy: threadPolicy().approvalPolicy,
-      sandboxPolicy: MODE_TURN_SANDBOX[accessMode],
+      // mode switched mid-conversation takes effect immediately. Plan mode
+      // hard-forces read-only regardless of the access mode.
+      approvalPolicy: planMode ? "on-request" : threadPolicy().approvalPolicy,
+      sandboxPolicy: planMode ? { type: "readOnly" } : MODE_TURN_SANDBOX[accessMode],
     })) as { turn?: { id?: string } };
     if (result.turn?.id) pane.turnId = result.turn.id;
     return { turnId: pane.turnId, threadId: pane.threadId, created };
+  });
+
+  // Client-side transcript cache: the engine's history omits things only
+  // the renderer knows (failed-turn errors, annotation cards, thumbnails),
+  // so the rendered entries persist per thread and win on resume when
+  // richer than what the engine returns.
+  const transcriptsDir = () => {
+    const dir = join(app.getPath("userData"), "transcripts");
+    mkdirSync(dir, { recursive: true });
+    return dir;
+  };
+  const transcriptFile = (threadId: string) =>
+    join(transcriptsDir(), `${threadId.replace(/[^\w.-]/g, "_")}.json`);
+
+  ipcMain.handle("transcript:save", (_e, p: { threadId: string; entries: unknown }) => {
+    try {
+      writeFileSync(transcriptFile(p.threadId), JSON.stringify(p.entries));
+      return { ok: true };
+    } catch {
+      return { ok: false };
+    }
+  });
+
+  ipcMain.handle("transcript:load", (_e, threadId: string) => {
+    try {
+      return { entries: JSON.parse(readFileSync(transcriptFile(threadId), "utf8")) };
+    } catch {
+      return { entries: null };
+    }
+  });
+
+  ipcMain.handle("planmode:set", (_e, on: boolean) => {
+    planMode = !!on;
+    return { planMode };
+  });
+
+  ipcMain.handle("workmode:set", (_e, p: { mode: string; dir?: string }) => {
+    if (p.mode === "local" || p.mode === "worktree") workMode = p.mode;
+    else if (p.mode === "existing" && p.dir) workMode = { existing: p.dir };
+    return { ok: true };
+  });
+
+  // Worktrees previously created for a project (and still on disk).
+  ipcMain.handle("worktrees:list", (_e, project: string) => {
+    const map = loadWorktrees();
+    const worktrees = Object.entries(map)
+      .filter(([dir, info]) => info.project === project && existsSync(dir))
+      .map(([dir, info]) => ({ dir, branch: info.branch }));
+    return { worktrees };
+  });
+
+  // What the ACTIVE main conversation is actually working in.
+  ipcMain.handle("conversation:info", () => {
+    const wt = mainCwd ? loadWorktrees()[mainCwd] : undefined;
+    return {
+      cwd: mainCwd,
+      isWorktree: !!wt,
+      project: wt?.project ?? null,
+      branch: wt?.branch ?? null,
+    };
   });
 
   ipcMain.handle("policy:set-mode", (_e, mode: string) => {
@@ -643,10 +800,13 @@ app.whenReady().then(async () => {
     // projects render even with zero conversations.
     const projectMap = new Map<string, ThreadSummary[]>();
     for (const path of loadProjects()) projectMap.set(path, []);
+    const worktrees = loadWorktrees();
     const recents: ThreadSummary[] = [];
     for (const t of result.data ?? []) {
       const summary: ThreadSummary = { id: t.id, title: threadTitle(t), createdAt: t.createdAt };
-      const group = t.cwd && t.cwd !== home ? projectMap.get(t.cwd) : undefined;
+      // Worktree conversations group under their parent project.
+      const effectiveCwd = t.cwd && worktrees[t.cwd] ? worktrees[t.cwd].project : t.cwd;
+      const group = effectiveCwd && effectiveCwd !== home ? projectMap.get(effectiveCwd) : undefined;
       if (group) group.push(summary);
       else recents.push(summary);
     }
@@ -902,6 +1062,188 @@ app.whenReady().then(async () => {
     });
   });
 
+  const runGit = (cwd: string, args: string[]) =>
+    new Promise<{ out: string; err: string; code: number }>((resolve) => {
+      execFile("git", args, { cwd, timeout: 15000, maxBuffer: 4 * 1024 * 1024 }, (error, stdout, stderr) => {
+        resolve({ out: stdout ?? "", err: stderr ?? "", code: error ? 1 : 0 });
+      });
+    });
+
+  // Branch switcher data: local branches, the current one, and the dirty
+  // working-tree files with +/- stats (drives the commit/discard modal).
+  ipcMain.handle("git:branches", async (_e, path: string) => {
+    const br = await runGit(path, ["branch", "--format=%(refname:short)", "--sort=-committerdate"]);
+    if (br.code !== 0) return { error: "Not a git repository", branches: [], current: "", dirty: [] };
+    const cur = await runGit(path, ["rev-parse", "--abbrev-ref", "HEAD"]);
+    const status = await runGit(path, ["status", "--porcelain"]);
+    const numstat = await runGit(path, ["diff", "HEAD", "--numstat"]);
+    const stats = new Map<string, { plus: number; minus: number }>();
+    for (const line of numstat.out.split("\n")) {
+      const m = /^(\d+|-)\t(\d+|-)\t(.+)$/.exec(line);
+      if (m) stats.set(m[3], { plus: m[1] === "-" ? 0 : Number(m[1]), minus: m[2] === "-" ? 0 : Number(m[2]) });
+    }
+    const dirty = status.out
+      .split("\n")
+      .filter(Boolean)
+      .map((l) => {
+        const raw = l.slice(3).trim();
+        const file = raw.includes(" -> ") ? raw.split(" -> ")[1] : raw;
+        const st = stats.get(file);
+        return { file, plus: st?.plus ?? 0, minus: st?.minus ?? 0 };
+      });
+    return { branches: br.out.split("\n").filter(Boolean), current: cur.out.trim(), dirty };
+  });
+
+  ipcMain.handle("git:checkout", async (_e, p: { path: string; branch: string; create?: boolean }) => {
+    const r = await runGit(p.path, p.create ? ["checkout", "-b", p.branch] : ["checkout", p.branch]);
+    return r.code === 0 ? { ok: true } : { ok: false, error: r.err.trim() || "Checkout failed" };
+  });
+
+  ipcMain.handle("git:commit-all", async (_e, p: { path: string; message: string }) => {
+    const add = await runGit(p.path, ["add", "-A"]);
+    if (add.code !== 0) return { ok: false, error: add.err.trim() };
+    const commit = await runGit(p.path, ["commit", "-m", p.message]);
+    return commit.code === 0
+      ? { ok: true }
+      : { ok: false, error: commit.err.trim() || commit.out.trim() || "Commit failed" };
+  });
+
+  // ---- Review pane: structured diffs + commit/push/PR actions ----
+
+  type ReviewLine = { t: "a" | "d" | "c"; no: number; text: string };
+  type ReviewHunk = { newStart: number; lines: ReviewLine[] };
+  type ReviewFile = { path: string; plus: number; minus: number; hunks: ReviewHunk[] };
+
+  function parseUnifiedDiff(text: string): ReviewFile[] {
+    const files: ReviewFile[] = [];
+    let cur: ReviewFile | null = null;
+    let hunk: ReviewHunk | null = null;
+    let pendingOld = "";
+    let oldNo = 0;
+    let newNo = 0;
+    for (const line of text.split("\n")) {
+      if (line.startsWith("diff --git")) {
+        cur = null;
+        hunk = null;
+        continue;
+      }
+      if (line.startsWith("--- ")) {
+        pendingOld = line.slice(4).replace(/^a\//, "");
+        continue;
+      }
+      if (line.startsWith("+++ ")) {
+        const p = line.slice(4).replace(/^b\//, "");
+        cur = { path: p === "/dev/null" ? pendingOld : p, plus: 0, minus: 0, hunks: [] };
+        files.push(cur);
+        hunk = null;
+        continue;
+      }
+      if (!cur) continue;
+      if (line.startsWith("@@")) {
+        const m = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
+        if (!m) continue;
+        oldNo = Number(m[1]);
+        newNo = Number(m[2]);
+        hunk = { newStart: newNo, lines: [] };
+        cur.hunks.push(hunk);
+        continue;
+      }
+      if (!hunk) continue;
+      if (line.startsWith("+")) {
+        hunk.lines.push({ t: "a", no: newNo++, text: line.slice(1) });
+        cur.plus++;
+      } else if (line.startsWith("-")) {
+        hunk.lines.push({ t: "d", no: oldNo++, text: line.slice(1) });
+        cur.minus++;
+      } else if (line.startsWith("\\")) {
+        // "\ No newline at end of file" — not content
+      } else {
+        hunk.lines.push({ t: "c", no: newNo, text: line.slice(1) });
+        oldNo++;
+        newNo++;
+      }
+    }
+    return files;
+  }
+
+  // Structured diff: "branch" = merge-base(origin main-ish)→working tree
+  // (committed + uncommitted, like Codex's Branch view); "working" = HEAD→
+  // working tree. Untracked files are synthesized as all-added.
+  ipcMain.handle("review:diff", async (_e, p: { path: string; mode: "branch" | "working" }) => {
+    const branch = (await runGit(p.path, ["rev-parse", "--abbrev-ref", "HEAD"])).out.trim();
+    let baseLabel = "Working Tree";
+    let diffArgs = ["diff", "HEAD"];
+    if (p.mode === "branch") {
+      let base = "";
+      for (const ref of ["origin/main", "origin/master", "main", "master"]) {
+        const mb = await runGit(p.path, ["merge-base", "HEAD", ref]);
+        if (mb.code === 0 && mb.out.trim()) {
+          base = mb.out.trim();
+          baseLabel = ref;
+          break;
+        }
+      }
+      if (!base) return { error: "No base branch found (origin/main, main, …)", files: [], plus: 0, minus: 0, branch, baseLabel: "" };
+      diffArgs = ["diff", base];
+    }
+    const diff = await runGit(p.path, diffArgs);
+    if (diff.code !== 0) return { error: diff.err.trim() || "diff failed", files: [], plus: 0, minus: 0, branch, baseLabel };
+    const files = parseUnifiedDiff(diff.out);
+    // Untracked files appear in neither diff — synthesize them.
+    const status = await runGit(p.path, ["status", "--porcelain"]);
+    for (const line of status.out.split("\n")) {
+      if (!line.startsWith("?? ")) continue;
+      const rel = line.slice(3).trim();
+      if (rel.endsWith("/")) continue;
+      try {
+        const content = readFileSync(join(p.path, rel), "utf8");
+        if (content.includes("\u0000") || content.length > 400_000) continue;
+        const lines = content.split("\n");
+        if (lines[lines.length - 1] === "") lines.pop();
+        files.push({
+          path: rel,
+          plus: lines.length,
+          minus: 0,
+          hunks: [{ newStart: 1, lines: lines.map((text, i) => ({ t: "a" as const, no: i + 1, text })) }],
+        });
+      } catch {
+        // unreadable — skip
+      }
+    }
+    const plus = files.reduce((n, f) => n + f.plus, 0);
+    const minus = files.reduce((n, f) => n + f.minus, 0);
+    return { files, plus, minus, branch, baseLabel };
+  });
+
+  ipcMain.handle("review:commit-push", async (_e, path: string) => {
+    const status = await runGit(path, ["status", "--porcelain"]);
+    if (status.out.trim()) {
+      const add = await runGit(path, ["add", "-A"]);
+      if (add.code !== 0) return { ok: false, error: add.err.trim() };
+      const commit = await runGit(path, ["commit", "-m", "Changes from Unbiased"]);
+      if (commit.code !== 0) return { ok: false, error: commit.err.trim() || commit.out.trim() };
+    }
+    const push = await runGit(path, ["push", "-u", "origin", "HEAD"]);
+    return push.code === 0 ? { ok: true } : { ok: false, error: push.err.trim() || "push failed" };
+  });
+
+  ipcMain.handle("review:create-pr", (_e, path: string) => {
+    return new Promise((resolve) => {
+      execFile("gh", ["pr", "create", "--fill", "--web"], { cwd: path, timeout: 60000 }, (err, _o, stderr) => {
+        resolve(err ? { ok: false, error: (stderr ?? "").trim() || "gh pr create failed (is GitHub CLI installed?)" } : { ok: true });
+      });
+    });
+  });
+
+  // Destructive by design — only reachable through the modal that lists
+  // exactly which files will be lost.
+  ipcMain.handle("git:discard", async (_e, path: string) => {
+    const reset = await runGit(path, ["reset", "--hard"]);
+    if (reset.code !== 0) return { ok: false, error: reset.err.trim() };
+    const clean = await runGit(path, ["clean", "-fd"]);
+    return clean.code === 0 ? { ok: true } : { ok: false, error: clean.err.trim() };
+  });
+
   // Line blame for the file viewer (GitLens-style hints). Porcelain output
   // gives hash/author/time/summary; the commit URL derives from the repo's
   // origin remote (ssh remotes normalized to https).
@@ -1020,6 +1362,11 @@ app.whenReady().then(async () => {
 
   ipcMain.handle("threads:delete", async (_e, id: string) => {
     await engine.request("thread/delete", { threadId: id });
+    try {
+      rmSync(transcriptFile(id), { force: true });
+    } catch {
+      // cache cleanup is best-effort
+    }
     if (panes.main.threadId === id) {
       panes.main.threadId = null;
       panes.main.turnId = null;

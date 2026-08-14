@@ -25,10 +25,19 @@ contextBridge.exposeInMainWorld("unbiased", {
   onTurnCompleted: (cb: (p: unknown) => void) => subscribe("chat:turn-completed", cb),
 
   setAccessMode: (mode: string) => ipcRenderer.invoke("policy:set-mode", mode),
+  setWorkMode: (mode: string, dir?: string) => ipcRenderer.invoke("workmode:set", { mode, dir }),
+  setPlanMode: (on: boolean) => ipcRenderer.invoke("planmode:set", on),
+  onPlan: (cb: (p: unknown) => void) => subscribe("chat:plan", cb),
+  listWorktrees: (project: string) => ipcRenderer.invoke("worktrees:list", project),
+  conversationInfo: () => ipcRenderer.invoke("conversation:info"),
+  saveTranscript: (threadId: string, entries: unknown) =>
+    ipcRenderer.invoke("transcript:save", { threadId, entries }),
+  loadTranscript: (threadId: string) => ipcRenderer.invoke("transcript:load", threadId),
   decideApproval: (requestId: string, decision: "accept" | "acceptForSession" | "decline") =>
     ipcRenderer.invoke("chat:approve", { requestId, decision }),
   onApprovalRequest: (cb: (p: unknown) => void) => subscribe("chat:approval-request", cb),
   onCommand: (cb: (p: unknown) => void) => subscribe("chat:command", cb),
+  onCompaction: (cb: (p: unknown) => void) => subscribe("chat:compaction", cb),
 
   listThreads: () => ipcRenderer.invoke("threads:list"),
   openThread: (id: string) => ipcRenderer.invoke("threads:open", id),
@@ -45,6 +54,14 @@ contextBridge.exposeInMainWorld("unbiased", {
   searchRefs: (word: string) => ipcRenderer.invoke("fs:search-refs", word),
   blameLine: (file: string, line: number) => ipcRenderer.invoke("git:blame-line", { file, line }),
   gitBranch: (path: string) => ipcRenderer.invoke("git:branch", path),
+  gitBranches: (path: string) => ipcRenderer.invoke("git:branches", path),
+  gitCheckout: (path: string, branch: string, create?: boolean) =>
+    ipcRenderer.invoke("git:checkout", { path, branch, create }),
+  gitCommitAll: (path: string, message: string) => ipcRenderer.invoke("git:commit-all", { path, message }),
+  gitDiscard: (path: string) => ipcRenderer.invoke("git:discard", path),
+  reviewDiff: (path: string, mode: "branch" | "working") => ipcRenderer.invoke("review:diff", { path, mode }),
+  reviewCommitPush: (path: string) => ipcRenderer.invoke("review:commit-push", path),
+  reviewCreatePr: (path: string) => ipcRenderer.invoke("review:create-pr", path),
   openExternal: (url: string) => ipcRenderer.invoke("browser:open-external", url),
 
   openBrowser: (url?: string) => ipcRenderer.invoke("browser:open", url),
