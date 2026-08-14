@@ -44,9 +44,16 @@ type Entry =
       status: string; // inProgress | completed | failed | declined | awaitingApproval
       exitCode?: number;
       output?: string;
-      approval?: { requestId: string; reason: string | null; decision?: "accept" | "decline" };
+      approval?: {
+        requestId: string;
+        reason: string | null;
+        kind?: "command" | "fileChange";
+        grantRoot?: string | null;
+        decision?: ApprovalDecision;
+      };
     };
 
+type ApprovalDecision = "accept" | "acceptForSession" | "decline";
 type PaneId = "main" | "side";
 type ThreadSummary = { id: string; title: string; createdAt?: string };
 // A transcript excerpt staged for the next send, with an optional comment.
@@ -56,6 +63,15 @@ type ThreadSummary = { id: string; title: string; createdAt?: string };
 type Annotation = { text: string; comment?: string; range?: Range; tag?: string; thumb?: string };
 // What a sent user message keeps for its annotation card.
 type SentAnnotation = { text: string; comment?: string; tag?: string; thumb?: string };
+// A message composed while a turn was running — held above the composer
+// until the turn finishes (or the user steers/edits/deletes it).
+type QueuedMsg = {
+  id: number;
+  text: string; // display text for the transcript entry
+  wire: string; // what actually goes to the engine
+  attachments: Attachment[];
+  annotations?: SentAnnotation[];
+};
 // kind: "image" sends as a localImage input item (model sees the pixels);
 // everything else rides as a mention (engine pulls in the file's text).
 // thumb is a small data-URL preview for the composer card.
@@ -111,15 +127,17 @@ declare global {
       onDelta: (cb: (p: { paneId: PaneId; delta: string }) => void) => () => void;
       onTurnCompleted: (cb: (p: { paneId: PaneId; status: string }) => void) => () => void;
       setAccessMode: (mode: AccessMode) => Promise<{ mode: string }>;
-      decideApproval: (requestId: string, decision: "accept" | "decline") => Promise<{ ok: boolean }>;
+      decideApproval: (requestId: string, decision: ApprovalDecision) => Promise<{ ok: boolean }>;
       onApprovalRequest: (
         cb: (p: {
           paneId: PaneId;
           requestId: string;
+          kind?: "command" | "fileChange";
           itemId: string | null;
           command: string;
           cwd: string | null;
           reason: string | null;
+          grantRoot?: string | null;
         }) => void,
       ) => () => void;
       onCommand: (
@@ -131,6 +149,9 @@ declare global {
       deleteThread: (id: string) => Promise<{ ok: boolean }>;
       resetSideChat: () => Promise<{ ok: boolean }>;
       chooseProject: () => Promise<{ path: string | null; name: string | null }>;
+      archiveProjectChats: (path: string) => Promise<{ archived: number }>;
+      removeProject: (path: string) => Promise<{ ok: boolean }>;
+      revealProject: (path: string) => Promise<{ ok: boolean }>;
       readFile: (path: string) => Promise<{ fullPath: string; relPath?: string; content?: string; error?: string }>;
       readImage: (path: string) => Promise<{ dataUrl?: string; error?: string }>;
       listDir: (dir?: string) => Promise<{ dir: string; entries: DirEntry[]; error?: string }>;
@@ -269,6 +290,12 @@ const REMARK_PLUGINS = [remarkGfm];
 // Scripts can't run regardless — the CSP has no unsafe-inline.
 const REHYPE_PLUGINS = [rehypeRaw];
 
+/** "12.3s" under a minute, "2m 20s" beyond. */
+function formatElapsed(seconds: number): string {
+  if (seconds < 60) return `${seconds.toFixed(1)}s`;
+  return `${Math.floor(seconds / 60)}m ${Math.floor(seconds % 60)}s`;
+}
+
 /** Drop a trailing empty assistant placeholder. */
 function withoutTrailingPlaceholder(es: Entry[]): Entry[] {
   const last = es[es.length - 1];
@@ -314,6 +341,53 @@ export function App() {
   const [activeProject, setActiveProject] = useState<{ name: string; path: string } | null>(null);
   const [hoveredThreadId, setHoveredThreadId] = useState<string | null>(null);
   const [hoveredProject, setHoveredProject] = useState<string | null>(null);
+  // Which project row's ⋯ menu is open, and the pending confirm dialog.
+  const [projMenuPath, setProjMenuPath] = useState<string | null>(null);
+  const [confirmDialog, setConfirmDialog] = useState<{
+    kind: "archive" | "remove";
+    path: string;
+    name: string;
+    count: number;
+  } | null>(null);
+
+  useEffect(() => {
+    if (!projMenuPath) return;
+    function onDown(e: MouseEvent) {
+      if (!(e.target as HTMLElement).closest("[data-projmenu]")) setProjMenuPath(null);
+    }
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") setProjMenuPath(null);
+    }
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [projMenuPath]);
+
+  async function runConfirmedAction() {
+    if (!confirmDialog) return;
+    const { kind, path } = confirmDialog;
+    if (kind === "archive") {
+      await window.unbiased.archiveProjectChats(path);
+      // The active conversation may have just been archived.
+      const wasActive = sidebar.projects.some(
+        (p) => p.path === path && p.threads.some((t) => t.id === activeThreadId),
+      );
+      if (wasActive) {
+        await window.unbiased.detachThread();
+        setActiveThreadId(null);
+        setMainReset((r) => ({ entries: [], nonce: r.nonce + 1 }));
+        resetSideView();
+      }
+    } else {
+      await window.unbiased.removeProject(path);
+      if (activeProject?.path === path) setActiveProject(null);
+    }
+    setConfirmDialog(null);
+    void refreshThreads();
+  }
   // Sidebar sections fold independently; both states persist.
   const [projectsCollapsed, setProjectsCollapsed] = useState(
     () => localStorage.getItem("navProjectsCollapsed") === "true",
@@ -577,9 +651,9 @@ export function App() {
   useEffect(() => {
     if (!browserOpen) return;
     void window.unbiased.setBrowserVisible(
-      sideOpen && panelMode === "browser" && !sidePlusOpen && !showSettings,
+      sideOpen && panelMode === "browser" && !sidePlusOpen && !showSettings && !confirmDialog,
     );
-  }, [browserOpen, sideOpen, panelMode, sidePlusOpen, showSettings]);
+  }, [browserOpen, sideOpen, panelMode, sidePlusOpen, showSettings, confirmDialog]);
 
   function openSideChatTab() {
     setSidePlusOpen(false);
@@ -867,23 +941,88 @@ export function App() {
                 >
                   {p.name}
                 </span>
-                {hoveredProject === p.path && !mainBusy && (
-                  <button
-                    onClick={() => void newChat({ name: p.name, path: p.path })}
-                    title={`New chat in ${p.name}`}
-                    aria-label={`New chat in ${p.name}`}
-                    style={{
-                      background: "transparent",
-                      border: "none",
-                      color: colors.dim,
-                      cursor: "pointer",
-                      padding: 0,
-                      display: "flex",
-                      flexShrink: 0,
-                    }}
-                  >
-                    <PencilIcon />
-                  </button>
+                {(hoveredProject === p.path || projMenuPath === p.path) && !mainBusy && (
+                  <span data-projmenu style={{ position: "relative", display: "flex", alignItems: "center", gap: 6, flexShrink: 0 }}>
+                    <button
+                      onClick={() => setProjMenuPath((cur) => (cur === p.path ? null : p.path))}
+                      title="Project options"
+                      aria-label="Project options"
+                      aria-expanded={projMenuPath === p.path}
+                      style={{
+                        background: "transparent",
+                        border: "none",
+                        color: colors.dim,
+                        cursor: "pointer",
+                        padding: 0,
+                        display: "flex",
+                      }}
+                    >
+                      <EllipsisIcon />
+                    </button>
+                    <button
+                      onClick={() => void newChat({ name: p.name, path: p.path })}
+                      title={`New chat in ${p.name}`}
+                      aria-label={`New chat in ${p.name}`}
+                      style={{
+                        background: "transparent",
+                        border: "none",
+                        color: colors.dim,
+                        cursor: "pointer",
+                        padding: 0,
+                        display: "flex",
+                      }}
+                    >
+                      <PencilIcon />
+                    </button>
+                    {projMenuPath === p.path && (
+                      <div
+                        style={{
+                          position: "absolute",
+                          top: "calc(100% + 8px)",
+                          right: -4,
+                          minWidth: 210,
+                          background: colors.panel,
+                          border: `1px solid ${colors.border}`,
+                          borderRadius: 12,
+                          padding: 6,
+                          zIndex: 40,
+                          boxShadow: "0 8px 24px rgba(0,0,0,0.45)",
+                        }}
+                      >
+                        <MenuItem
+                          icon={<FolderOutlineIcon size={15} />}
+                          label="Reveal in Finder"
+                          onClick={() => {
+                            setProjMenuPath(null);
+                            void window.unbiased.revealProject(p.path);
+                          }}
+                        />
+                        <MenuItem
+                          icon={<ArchiveIcon />}
+                          label="Archive chats"
+                          disabled={p.threads.length === 0}
+                          desc={p.threads.length === 0 ? "No chats" : undefined}
+                          onClick={() => {
+                            setProjMenuPath(null);
+                            setConfirmDialog({
+                              kind: "archive",
+                              path: p.path,
+                              name: p.name,
+                              count: p.threads.length,
+                            });
+                          }}
+                        />
+                        <MenuItem
+                          icon={<CloseIcon />}
+                          label="Remove"
+                          onClick={() => {
+                            setProjMenuPath(null);
+                            setConfirmDialog({ kind: "remove", path: p.path, name: p.name, count: 0 });
+                          }}
+                        />
+                      </div>
+                    )}
+                  </span>
                 )}
               </div>
               {p.threads.map((t) => (
@@ -1415,6 +1554,94 @@ export function App() {
           />
           </div>
         </div>
+      {confirmDialog && (
+        <div
+          onMouseDown={(e) => {
+            if (e.target === e.currentTarget) setConfirmDialog(null);
+          }}
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0,0,0,0.55)",
+            display: "grid",
+            placeItems: "center",
+            zIndex: 100,
+          }}
+        >
+          <div
+            style={{
+              width: 480,
+              maxWidth: "calc(100vw - 48px)",
+              background: colors.panel,
+              border: `1px solid ${colors.border}`,
+              borderRadius: 16,
+              padding: "22px 24px 20px",
+              boxShadow: "0 16px 48px rgba(0,0,0,0.55)",
+              position: "relative",
+            }}
+          >
+            <button
+              onClick={() => setConfirmDialog(null)}
+              aria-label="Close"
+              style={{
+                position: "absolute",
+                top: 16,
+                right: 16,
+                background: "transparent",
+                border: "none",
+                color: colors.dim,
+                cursor: "pointer",
+                padding: 4,
+                display: "flex",
+              }}
+            >
+              <CloseIcon />
+            </button>
+            <div style={{ fontSize: 18, fontWeight: 600, color: colors.fg }}>
+              {confirmDialog.kind === "archive"
+                ? `Archive ${confirmDialog.count} chat${confirmDialog.count === 1 ? "" : "s"}?`
+                : `Remove ${confirmDialog.name}?`}
+            </div>
+            <div style={{ color: colors.dim, fontSize: 14, lineHeight: 1.55, marginTop: 10 }}>
+              {confirmDialog.kind === "archive"
+                ? `This will archive the chats in ${confirmDialog.name}. You can find them later in your archived chats.`
+                : "This removes the project from the app. Files on your computer and existing chats won't be deleted."}
+            </div>
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 12, marginTop: 22 }}>
+              <button
+                onClick={() => setConfirmDialog(null)}
+                style={{
+                  background: "transparent",
+                  border: "none",
+                  color: colors.dim,
+                  fontSize: 14.5,
+                  cursor: "pointer",
+                  fontFamily: "inherit",
+                  padding: "9px 14px",
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => void runConfirmedAction()}
+                style={{
+                  background: "rgba(240, 149, 149, 0.14)",
+                  border: "none",
+                  borderRadius: 10,
+                  color: colors.err,
+                  fontSize: 14.5,
+                  fontWeight: 500,
+                  cursor: "pointer",
+                  fontFamily: "inherit",
+                  padding: "9px 18px",
+                }}
+              >
+                {confirmDialog.kind === "archive" ? "Archive all" : "Remove project"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -2582,6 +2809,12 @@ function ChatPane({
   }
   const [busy, setBusyState] = useState(false);
   const [elapsed, setElapsed] = useState(0);
+  // Messages queued while a turn runs; flushed one per turn completion.
+  const [queue, setQueue] = useState<QueuedMsg[]>([]);
+  const queueRef = useRef(queue);
+  queueRef.current = queue;
+  const nextQueueIdRef = useRef(1);
+  const [sendHover, setSendHover] = useState(false);
   // x = the selection's horizontal midpoint (anchors the button pill);
   // right = its bounding-box right edge (anchors the comment box beside
   // the numbered badge); y = its top.
@@ -2613,20 +2846,30 @@ function ChatPane({
     // Staged annotations belong to the conversation they came from.
     setAnnotations([]);
     setPendingComment(null);
+    setQueue([]);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [reset.nonce]);
 
+  // An undecided approval means the agent is waiting on the human — the
+  // thinking clock pauses rather than blaming the model for our latency.
+  const awaitingApproval = entries.some(
+    (e) => e.kind === "command" && e.status === "awaitingApproval" && e.approval && !e.approval.decision,
+  );
+
   // Pareto completes the whole response before its first byte arrives
   // (~3-5s of silence), so the wait needs to look attended, not frozen.
+  // The clock accumulates across approval pauses instead of resetting.
   useEffect(() => {
     if (!busy) {
       setElapsed(0);
       return;
     }
-    const startedAt = Date.now();
+    if (awaitingApproval) return; // frozen while the human decides
+    const startedAt = Date.now() - elapsed * 1000;
     const timer = setInterval(() => setElapsed((Date.now() - startedAt) / 1000), 100);
     return () => clearInterval(timer);
-  }, [busy]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [busy, awaitingApproval]);
 
   useEffect(() => {
     const offs = [
@@ -2652,12 +2895,18 @@ function ChatPane({
           }
           return withoutTrailingPlaceholder(next);
         });
+        // One queued message per completed turn.
+        const [head, ...rest] = queueRef.current;
+        if (head) {
+          setQueue(rest);
+          void sendNow(head);
+        }
       }),
       window.unbiased.onApprovalRequest((p) => {
         if (p.paneId !== paneId) return;
         setEntries((es) => {
           const cleaned = withoutTrailingPlaceholder(es);
-          const approval = { requestId: p.requestId, reason: p.reason };
+          const approval = { requestId: p.requestId, reason: p.reason, kind: p.kind, grantRoot: p.grantRoot };
           const idx = cleaned.findIndex((e) => e.kind === "command" && e.itemId === p.itemId);
           if (idx !== -1) {
             const cmd = cleaned[idx] as CommandEntry;
@@ -2720,11 +2969,23 @@ function ChatPane({
   const showThinking = busy && !(lastEntry?.kind === "assistant" && lastEntry.text !== "");
   const canSend = connected && (draft.trim() !== "" || annotations.length > 0);
 
+  /** Send a prepared message right now (fresh sends and queue flushes). */
+  async function sendNow(q: QueuedMsg) {
+    setBusy(true);
+    setEntries((es) => [...es, { kind: "user", text: q.text, annotations: q.annotations }]);
+    try {
+      await window.unbiased.sendMessage(paneId, q.wire, q.attachments);
+    } catch (err) {
+      setBusy(false);
+      setEntries((es) => [...es, { kind: "assistant", text: `Something went wrong: ${String(err)}` }]);
+    }
+  }
+
   async function submit() {
     const text = draft.trim();
     // Annotations alone are a sendable message — the excerpts plus their
     // comments carry the intent even without accompanying prose.
-    if ((!text && annotations.length === 0) || busy || !connected) return;
+    if ((!text && annotations.length === 0) || !connected) return;
     const anns = annotations;
     const wire = (
       anns.length > 0
@@ -2743,28 +3004,50 @@ function ChatPane({
     setDraft("");
     setAttachments([]);
     setAnnotations([]);
-    setBusy(true);
     const suffix = sentAttachments.length > 0 ? `📎 ${sentAttachments.map((a) => a.name).join(", ")}` : "";
-    setEntries((es) => [
-      ...es,
-      {
-        kind: "user",
-        text: [text, suffix].filter(Boolean).join("\n\n"),
-        annotations:
-          anns.length > 0
-            ? anns.map((a) => ({ text: a.text, comment: a.comment, tag: a.tag, thumb: a.thumb }))
-            : undefined,
-      },
-    ]);
-    try {
-      await window.unbiased.sendMessage(paneId, wire, sentAttachments);
-    } catch (err) {
-      setBusy(false);
-      setEntries((es) => [...es, { kind: "assistant", text: `Something went wrong: ${String(err)}` }]);
+    const msg: QueuedMsg = {
+      id: nextQueueIdRef.current++,
+      text: [text, suffix].filter(Boolean).join("\n\n"),
+      wire,
+      attachments: sentAttachments,
+      annotations:
+        anns.length > 0
+          ? anns.map((a) => ({ text: a.text, comment: a.comment, tag: a.tag, thumb: a.thumb }))
+          : undefined,
+    };
+    // A running turn means the message queues by default, Codex-style.
+    if (busy) {
+      setQueue((list) => [...list, msg]);
+      return;
     }
+    await sendNow(msg);
   }
 
-  async function decide(itemId: string, requestId: string, decision: "accept" | "decline") {
+  // Queue row actions. Steer = run this message next, immediately: it goes
+  // to the queue front and the current turn is interrupted; the completion
+  // flush sends it.
+  function steerQueued(q: QueuedMsg) {
+    if (!busy) {
+      setQueue((list) => list.filter((x) => x.id !== q.id));
+      void sendNow(q);
+      return;
+    }
+    setQueue((list) => [q, ...list.filter((x) => x.id !== q.id)]);
+    void window.unbiased.interrupt(paneId);
+  }
+
+  function deleteQueued(q: QueuedMsg) {
+    setQueue((list) => list.filter((x) => x.id !== q.id));
+  }
+
+  function editQueued(q: QueuedMsg) {
+    setQueue((list) => list.filter((x) => x.id !== q.id));
+    setDraft(q.text);
+    setAttachments(q.attachments);
+    if (q.annotations) setAnnotations(q.annotations);
+  }
+
+  async function decide(itemId: string, requestId: string, decision: ApprovalDecision) {
     setEntries((es) =>
       es.map((e) =>
         e.kind === "command" && e.itemId === itemId && e.approval
@@ -2780,7 +3063,7 @@ function ChatPane({
   }
 
   const statusLabel = (e: CommandEntry) => {
-    if (e.status === "awaitingApproval") return { text: "▸ needs approval", color: colors.amber };
+    if (e.status === "awaitingApproval") return { text: "▸ needs approval", color: colors.dim };
     if (e.status === "inProgress") return { text: "▸ running", color: colors.amber };
     if (e.status === "declined") return { text: "▸ declined", color: colors.dim };
     if (e.status === "failed" || (e.exitCode ?? 0) !== 0)
@@ -3169,7 +3452,9 @@ function ChatPane({
                   color: colors.dim,
                 }}
               >
-                thinking… {elapsed.toFixed(1)}s
+                {awaitingApproval
+                  ? `thinking… ${formatElapsed(elapsed)} · waiting for user input…`
+                  : `thinking… ${formatElapsed(elapsed)}`}
               </div>
             </div>
           )}
@@ -3177,6 +3462,27 @@ function ChatPane({
       </div>
 
       <div style={{ padding: "8px 16px 16px" }}>
+        {queue.length > 0 && (
+          <div style={{ maxWidth: 720, margin: "0 auto 8px", display: "flex", flexDirection: "column", gap: 6 }}>
+            {queue.map((q) => (
+              <QueuedRow
+                key={q.id}
+                q={q}
+                onSteer={() => steerQueued(q)}
+                onDelete={() => deleteQueued(q)}
+                onEdit={() => editQueued(q)}
+                onOpenSideChat={
+                  onAskSideChat
+                    ? () => {
+                        deleteQueued(q);
+                        onAskSideChat(q.text);
+                      }
+                    : undefined
+                }
+              />
+            ))}
+          </div>
+        )}
         <div
           style={{
             position: "relative",
@@ -3407,9 +3713,14 @@ function ChatPane({
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
             onKeyDown={(e) => {
+              // ⌘Enter queues explicitly; plain Enter sends (which also
+              // queues automatically while a turn is running).
               if (e.key === "Enter" && !e.shiftKey) {
                 e.preventDefault();
                 void submit();
+              } else if (e.key === "Escape" && busy) {
+                e.preventDefault();
+                void window.unbiased.interrupt(paneId);
               }
             }}
             onPaste={(e) => {
@@ -3506,29 +3817,74 @@ function ChatPane({
                 ■
               </button>
             ) : (
-              <button
-                onClick={() => void submit()}
-                disabled={!canSend}
-                title="Send"
-                aria-label="Send"
-                style={{
-                  width: 32,
-                  height: 32,
-                  borderRadius: 16,
-                  background: canSend ? colors.fg : "var(--panel-2)",
-                  color: canSend ? "var(--bg)" : colors.dim,
-                  border: "none",
-                  cursor: canSend ? "pointer" : "default",
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                }}
+              <span
+                style={{ position: "relative", display: "flex" }}
+                onMouseEnter={() => setSendHover(true)}
+                onMouseLeave={() => setSendHover(false)}
               >
-                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-                  <path d="M12 19V5" />
-                  <path d="M5 12l7-7 7 7" />
-                </svg>
-              </button>
+                {sendHover && canSend && (
+                  <div
+                    style={{
+                      position: "absolute",
+                      bottom: "calc(100% + 8px)",
+                      right: 0,
+                      background: colors.panel,
+                      border: `1px solid ${colors.border}`,
+                      borderRadius: 10,
+                      padding: 6,
+                      zIndex: 20,
+                      boxShadow: "0 8px 24px rgba(0,0,0,0.45)",
+                      whiteSpace: "nowrap",
+                      fontSize: 12.5,
+                    }}
+                  >
+                    {[
+                      { label: "Send", keys: "⏎" },
+                      { label: "Queue", keys: "⌘⏎" },
+                    ].map((o) => (
+                      <div
+                        key={o.label}
+                        style={{ display: "flex", alignItems: "center", gap: 18, padding: "5px 8px", color: colors.fg }}
+                      >
+                        <span style={{ flex: 1 }}>{o.label}</span>
+                        <span
+                          style={{
+                            background: "var(--panel-2)",
+                            color: colors.dim,
+                            borderRadius: 6,
+                            padding: "1px 7px",
+                            fontSize: 11,
+                          }}
+                        >
+                          {o.keys}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                <button
+                  onClick={() => void submit()}
+                  disabled={!canSend}
+                  aria-label="Send"
+                  style={{
+                    width: 32,
+                    height: 32,
+                    borderRadius: 16,
+                    background: canSend ? colors.fg : "var(--panel-2)",
+                    color: canSend ? "var(--bg)" : colors.dim,
+                    border: "none",
+                    cursor: canSend ? "pointer" : "default",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                  }}
+                >
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                    <path d="M12 19V5" />
+                    <path d="M5 12l7-7 7 7" />
+                  </svg>
+                </button>
+              </span>
             )}
             </span>
           </div>
@@ -4401,6 +4757,16 @@ function FolderIcon() {
   );
 }
 
+function ArchiveIcon() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" style={{ flexShrink: 0 }}>
+      <rect x="2" y="4" width="20" height="5" rx="1" />
+      <path d="M4 9v9a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9" />
+      <path d="M10 13h4" />
+    </svg>
+  );
+}
+
 function TrashIcon() {
   return (
     <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -4493,6 +4859,374 @@ function ThreadRow({
   );
 }
 
+function QueueIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" style={{ flexShrink: 0 }}>
+      <path d="M4 6h13" />
+      <path d="M4 11h9" />
+      <path d="M4 16h6" />
+      <path d="m14 14 3 3-3 3" />
+    </svg>
+  );
+}
+
+function SteerIcon() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" style={{ flexShrink: 0 }}>
+      <path d="m15 5 5 5-5 5" />
+      <path d="M4 18v-4a4 4 0 0 1 4-4h12" />
+    </svg>
+  );
+}
+
+function EllipsisIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" stroke="none" aria-hidden="true">
+      <circle cx="5" cy="12" r="1.7" />
+      <circle cx="12" cy="12" r="1.7" />
+      <circle cx="19" cy="12" r="1.7" />
+    </svg>
+  );
+}
+
+/** A message waiting its turn, shown above the composer: Steer (run it
+ *  next, interrupting the current turn), delete, and a ⋯ menu. */
+function QueuedRow({
+  q,
+  onSteer,
+  onDelete,
+  onEdit,
+  onOpenSideChat,
+}: {
+  q: QueuedMsg;
+  onSteer: () => void;
+  onDelete: () => void;
+  onEdit: () => void;
+  onOpenSideChat?: () => void;
+}) {
+  const [menuOpen, setMenuOpen] = useState(false);
+  const menuRef = useRef<HTMLSpanElement>(null);
+
+  useEffect(() => {
+    if (!menuOpen) return;
+    function onDown(e: MouseEvent) {
+      if (!menuRef.current?.contains(e.target as Node)) setMenuOpen(false);
+    }
+    document.addEventListener("mousedown", onDown);
+    return () => document.removeEventListener("mousedown", onDown);
+  }, [menuOpen]);
+
+  return (
+    <div
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 10,
+        background: colors.panel,
+        border: `1px solid ${colors.border}`,
+        borderRadius: 14,
+        padding: "9px 10px 9px 14px",
+      }}
+    >
+      <span style={{ color: colors.dim, display: "flex" }}>
+        <QueueIcon />
+      </span>
+      <span
+        style={{
+          flex: 1,
+          minWidth: 0,
+          whiteSpace: "nowrap",
+          overflow: "hidden",
+          textOverflow: "ellipsis",
+          fontSize: 14,
+          color: colors.fg,
+        }}
+        title={q.text}
+      >
+        {q.text.split("\n")[0]}
+      </span>
+      <button
+        onClick={onSteer}
+        title="Interrupt the current turn and run this next"
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 7,
+          background: "transparent",
+          border: "none",
+          color: colors.dim,
+          fontSize: 13.5,
+          cursor: "pointer",
+          fontFamily: "inherit",
+          padding: "4px 6px",
+          flexShrink: 0,
+        }}
+      >
+        <SteerIcon />
+        Steer
+      </button>
+      <button
+        onClick={onDelete}
+        title="Remove from queue"
+        aria-label="Remove from queue"
+        style={{
+          display: "flex",
+          background: "transparent",
+          border: "none",
+          color: colors.dim,
+          cursor: "pointer",
+          padding: 4,
+          flexShrink: 0,
+        }}
+      >
+        <TrashIcon />
+      </button>
+      <span ref={menuRef} style={{ position: "relative", display: "flex", flexShrink: 0 }}>
+        <button
+          onClick={() => setMenuOpen((o) => !o)}
+          aria-label="More options"
+          aria-expanded={menuOpen}
+          style={{
+            display: "flex",
+            background: menuOpen ? "var(--chip)" : "transparent",
+            border: "none",
+            borderRadius: 8,
+            color: colors.dim,
+            cursor: "pointer",
+            padding: 5,
+          }}
+        >
+          <EllipsisIcon />
+        </button>
+        {menuOpen && (
+          <div
+            style={{
+              position: "absolute",
+              top: "calc(100% + 6px)",
+              right: 0,
+              minWidth: 210,
+              background: colors.panel,
+              border: `1px solid ${colors.border}`,
+              borderRadius: 12,
+              padding: 6,
+              zIndex: 25,
+              boxShadow: "0 8px 24px rgba(0,0,0,0.45)",
+            }}
+          >
+            <MenuItem
+              icon={<PencilIcon />}
+              label="Edit message"
+              onClick={() => {
+                setMenuOpen(false);
+                onEdit();
+              }}
+            />
+            {onOpenSideChat && (
+              <MenuItem
+                icon={<ChatPlusIcon />}
+                label="Open in side chat"
+                onClick={() => {
+                  setMenuOpen(false);
+                  onOpenSideChat();
+                }}
+              />
+            )}
+          </div>
+        )}
+      </span>
+    </div>
+  );
+}
+
+/** Codex-style Permissions card: title derived from what's being asked,
+ *  Deny (Esc) and a split Allow button — once (Enter) or, via the
+ *  chevron, for the whole conversation (acceptForSession). */
+function PermissionsPrompt({
+  approval,
+  onDecide,
+}: {
+  approval: { reason: string | null; kind?: "command" | "fileChange"; grantRoot?: string | null };
+  onDecide: (d: ApprovalDecision) => void;
+}) {
+  const [menuOpen, setMenuOpen] = useState(false);
+  const menuRef = useRef<HTMLSpanElement>(null);
+
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (e.defaultPrevented) return;
+      const t = e.target as HTMLElement | null;
+      // Never steal Enter/Escape from the composer or other inputs.
+      if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) return;
+      if (e.key === "Escape") {
+        e.preventDefault();
+        onDecide("decline");
+      } else if (e.key === "Enter") {
+        e.preventDefault();
+        onDecide("accept");
+      }
+    }
+    function onDown(e: MouseEvent) {
+      if (!menuRef.current?.contains(e.target as Node)) setMenuOpen(false);
+    }
+    document.addEventListener("keydown", onKey);
+    document.addEventListener("mousedown", onDown);
+    return () => {
+      document.removeEventListener("keydown", onKey);
+      document.removeEventListener("mousedown", onDown);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const rootName = approval.grantRoot?.split("/").filter(Boolean).pop();
+  const title =
+    approval.kind === "fileChange" ? (
+      rootName ? (
+        <>
+          Allow Pareto to edit the contents of{" "}
+          <span style={{ color: colors.accent, display: "inline-flex", alignItems: "center", gap: 4 }}>
+            <FolderOutlineIcon size={13} />
+            {rootName}
+          </span>
+          ?
+        </>
+      ) : (
+        <>Allow Pareto to apply these file changes?</>
+      )
+    ) : (
+      <>Allow Pareto to run this command?</>
+    );
+
+  return (
+    <div style={{ marginTop: 12, fontFamily: "var(--font-ui)" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, color: colors.dim, fontSize: 12.5 }}>
+        <HandIcon />
+        Permissions
+      </div>
+      <div style={{ fontSize: 14, fontWeight: 600, color: colors.fg, marginTop: 8 }}>{title}</div>
+      {approval.reason && <div style={{ color: colors.dim, fontSize: 13, marginTop: 4 }}>{approval.reason}</div>}
+      <div style={{ display: "flex", justifyContent: "flex-end", alignItems: "center", gap: 10, marginTop: 14 }}>
+        <button
+          onClick={() => onDecide("decline")}
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            background: "var(--chip)",
+            color: colors.fg,
+            border: "none",
+            borderRadius: 999,
+            padding: "8px 14px",
+            fontSize: 13.5,
+            cursor: "pointer",
+            fontFamily: "inherit",
+          }}
+        >
+          Deny
+          <span
+            style={{
+              background: "var(--panel-2)",
+              color: colors.dim,
+              borderRadius: 6,
+              padding: "1px 7px",
+              fontSize: 11,
+            }}
+          >
+            Esc
+          </span>
+        </button>
+        <span ref={menuRef} style={{ position: "relative", display: "flex" }}>
+          <button
+            onClick={() => onDecide("accept")}
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 8,
+              background: colors.fg,
+              color: "var(--bg)",
+              border: "none",
+              borderRadius: "999px 0 0 999px",
+              padding: "8px 10px 8px 16px",
+              fontSize: 13.5,
+              fontWeight: 500,
+              cursor: "pointer",
+              fontFamily: "inherit",
+            }}
+          >
+            Allow once
+            <span style={{ opacity: 0.55, fontSize: 12 }}>⏎</span>
+          </button>
+          <button
+            onClick={() => setMenuOpen((o) => !o)}
+            aria-label="More allow options"
+            aria-expanded={menuOpen}
+            style={{
+              display: "flex",
+              alignItems: "center",
+              background: colors.fg,
+              color: "var(--bg)",
+              border: "none",
+              borderLeft: "1px solid var(--gutter)",
+              borderRadius: "0 999px 999px 0",
+              padding: "8px 10px 8px 8px",
+              cursor: "pointer",
+            }}
+          >
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <path d="m6 9 6 6 6-6" />
+            </svg>
+          </button>
+          {menuOpen && (
+            <div
+              style={{
+                position: "absolute",
+                bottom: "calc(100% + 8px)",
+                right: 0,
+                minWidth: 230,
+                background: colors.panel,
+                border: `1px solid ${colors.border}`,
+                borderRadius: 12,
+                padding: 6,
+                zIndex: 20,
+                boxShadow: "0 8px 24px rgba(0,0,0,0.45)",
+              }}
+            >
+              {(
+                [
+                  { label: "Allow once", d: "accept" },
+                  { label: "Allow this conversation", d: "acceptForSession" },
+                ] as { label: string; d: ApprovalDecision }[]
+              ).map((opt) => (
+                <button
+                  key={opt.d}
+                  onClick={() => {
+                    setMenuOpen(false);
+                    onDecide(opt.d);
+                  }}
+                  style={{
+                    display: "block",
+                    width: "100%",
+                    background: "transparent",
+                    border: "none",
+                    borderRadius: 8,
+                    padding: "9px 12px",
+                    fontSize: 13.5,
+                    color: colors.fg,
+                    cursor: "pointer",
+                    textAlign: "left",
+                    fontFamily: "inherit",
+                  }}
+                >
+                  {opt.label}
+                </button>
+              ))}
+            </div>
+          )}
+        </span>
+      </div>
+    </div>
+  );
+}
+
 function ChatFooter({ status, busy }: { status: EngineStatus; busy: boolean }) {
   return (
     <footer
@@ -4543,7 +5277,7 @@ function StepsGroup({
 }: {
   items: CommandEntry[];
   statusLabel: (e: CommandEntry) => { text: string; color: string };
-  decide: (itemId: string, requestId: string, decision: "accept" | "decline") => Promise<void>;
+  decide: (itemId: string, requestId: string, decision: ApprovalDecision) => Promise<void>;
 }) {
   const [open, setOpen] = useState(false);
   const [openItems, setOpenItems] = useState<Set<string>>(new Set());
@@ -4562,7 +5296,7 @@ function StepsGroup({
   const expanded = open || needsApproval;
 
   const summary = needsApproval
-    ? { text: "Needs your approval", color: colors.amber }
+    ? { text: "Needs your approval", color: colors.fg }
     : running
       ? { text: "Working…", color: colors.amber }
       : {
@@ -4642,42 +5376,11 @@ function StepsGroup({
                 <span style={{ color: label.color, flexShrink: 0 }}>{label.text}</span>
                 <span style={{ whiteSpace: "pre-wrap", color: colors.fg }}>{e.command}</span>
               </div>
-              {e.approval?.reason && (
-                <div style={{ color: colors.dim, marginTop: 6, fontFamily: "inherit" }}>{e.approval.reason}</div>
-              )}
               {e.status === "awaitingApproval" && e.approval && !e.approval.decision && (
-                <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
-                  <button
-                    onClick={() => void decide(e.itemId, e.approval!.requestId, "accept")}
-                    style={{
-                      background: colors.ok,
-                      color: "#04342C",
-                      border: "none",
-                      borderRadius: 8,
-                      padding: "6px 16px",
-                      fontSize: 13,
-                      cursor: "pointer",
-                      fontFamily: "var(--font-ui)",
-                    }}
-                  >
-                    Approve
-                  </button>
-                  <button
-                    onClick={() => void decide(e.itemId, e.approval!.requestId, "decline")}
-                    style={{
-                      background: "transparent",
-                      color: colors.err,
-                      border: `1px solid ${colors.err}`,
-                      borderRadius: 8,
-                      padding: "6px 16px",
-                      fontSize: 13,
-                      cursor: "pointer",
-                      fontFamily: "var(--font-ui)",
-                    }}
-                  >
-                    Decline
-                  </button>
-                </div>
+                <PermissionsPrompt
+                  approval={e.approval}
+                  onDecide={(d) => void decide(e.itemId, e.approval!.requestId, d)}
+                />
               )}
               {e.output && itemOpen && (
                 <pre

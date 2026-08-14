@@ -53,7 +53,11 @@ type AccessMode = "ask" | "auto" | "full";
 let accessMode: AccessMode = "ask";
 
 const MODE_THREAD_POLICY: Record<AccessMode, { approvalPolicy: string; sandbox: string }> = {
-  ask: { approvalPolicy: "untrusted", sandbox: "read-only" },
+  // NOT "untrusted": that policy forbids escalation outright — the model
+  // can't even ASK to write, so no approval card ever appears. on-request
+  // + read-only means reads run free and every write/network action
+  // surfaces an approval request.
+  ask: { approvalPolicy: "on-request", sandbox: "read-only" },
   auto: { approvalPolicy: "on-request", sandbox: "workspace-write" },
   full: { approvalPolicy: "never", sandbox: "danger-full-access" },
 };
@@ -426,12 +430,26 @@ function wireNotifications(): void {
       }
       case "item/started":
       case "item/completed": {
-        const item = params.item as { type?: string } | undefined;
+        const item = params.item as
+          | { type?: string; id?: string; status?: string; changes?: { path?: string }[] }
+          | undefined;
+        const phase = msg.method === "item/started" ? "started" : "completed";
         if (item?.type === "commandExecution") {
+          send("chat:command", { paneId, phase, item });
+        } else if (item?.type === "fileChange") {
+          // File changes render as command-style cards so the approval
+          // buttons have a card to land on.
+          const files = (item.changes ?? [])
+            .map((c) => c.path?.split("/").filter(Boolean).pop() ?? "?")
+            .join(", ");
           send("chat:command", {
             paneId,
-            phase: msg.method === "item/started" ? "started" : "completed",
-            item,
+            phase,
+            item: {
+              id: item.id,
+              command: `Apply changes: ${files || "(files)"}`,
+              status: item.status,
+            },
           });
         }
         break;
@@ -460,6 +478,7 @@ function wireNotifications(): void {
         send("chat:approval-request", {
           paneId,
           requestId,
+          kind: "command",
           // itemId ties the request to its commandExecution item so the
           // renderer can put the buttons ON the command card.
           itemId: (params.itemId as string) ?? null,
@@ -469,7 +488,26 @@ function wireNotifications(): void {
         });
         return;
       }
-      // Anything we don't render yet (file changes, user-input tools):
+      if (msg.method === "item/fileChange/requestApproval") {
+        const paneId = paneForThread(params.threadId) ?? "main";
+        const requestId = `apr_${msg.id}`;
+        pendingApprovals.set(requestId, msg.id);
+        send("chat:approval-request", {
+          paneId,
+          requestId,
+          kind: "fileChange",
+          // Lands on the fileChange item's card (same itemId), which
+          // already names the files being changed.
+          itemId: (params.itemId as string) ?? null,
+          command: "Apply file changes",
+          cwd: null,
+          reason: (params.reason as string) ?? null,
+          // The write root the agent wants access to (e.g. ~/Desktop).
+          grantRoot: (params.grantRoot as string) ?? null,
+        });
+        return;
+      }
+      // Anything we don't render yet (user-input tools, permissions):
       // declining beats hanging the turn on a question nobody can see.
       console.warn("[app] declining unhandled server request:", msg.method);
       engine.respond(msg.id, { decision: "decline" });
@@ -583,7 +621,10 @@ app.whenReady().then(async () => {
     return { interrupted: true };
   });
 
-  ipcMain.handle("chat:approve", (_e, payload: { requestId: string; decision: "accept" | "decline" }) => {
+  ipcMain.handle("chat:approve", (_e, payload: {
+    requestId: string;
+    decision: "accept" | "acceptForSession" | "decline";
+  }) => {
     const engineRequestId = pendingApprovals.get(payload.requestId);
     if (engineRequestId === undefined) return { ok: false };
     pendingApprovals.delete(payload.requestId);
@@ -594,22 +635,20 @@ app.whenReady().then(async () => {
   ipcMain.handle("threads:list", async () => {
     const result = (await engine.request("thread/list", { limit: 100 })) as { data?: WireThread[] };
     const home = app.getPath("home");
-    // Codex-style sections: threads that ran inside a project folder group
-    // under that folder's name; home-dir (or cwd-less) threads are Recents.
-    // Keyed by full path so two folders sharing a basename stay distinct.
-    // Explicitly opened projects render even with zero conversations.
+    // Codex-style sections: threads group under a project only when the
+    // user has explicitly opened (and not removed) that folder — the
+    // projects.json list is authoritative. Everything else, including
+    // chats of removed projects, lists under Recents. Keyed by full path
+    // so two folders sharing a basename stay distinct; explicitly opened
+    // projects render even with zero conversations.
     const projectMap = new Map<string, ThreadSummary[]>();
     for (const path of loadProjects()) projectMap.set(path, []);
     const recents: ThreadSummary[] = [];
     for (const t of result.data ?? []) {
       const summary: ThreadSummary = { id: t.id, title: threadTitle(t), createdAt: t.createdAt };
-      if (t.cwd && t.cwd !== home) {
-        const list = projectMap.get(t.cwd) ?? [];
-        list.push(summary);
-        projectMap.set(t.cwd, list);
-      } else {
-        recents.push(summary);
-      }
+      const group = t.cwd && t.cwd !== home ? projectMap.get(t.cwd) : undefined;
+      if (group) group.push(summary);
+      else recents.push(summary);
     }
     return {
       projects: [...projectMap].map(([path, threads]) => ({
@@ -619,6 +658,36 @@ app.whenReady().then(async () => {
       })),
       recents,
     };
+  });
+
+  // Archive every chat in a project (engine-side thread/archive — they
+  // drop out of thread/list but survive for a future archived view).
+  ipcMain.handle("project:archive-chats", async (_e, path: string) => {
+    const result = (await engine.request("thread/list", { limit: 100 })) as { data?: WireThread[] };
+    const targets = (result.data ?? []).filter((t) => t.cwd === path);
+    for (const t of targets) {
+      await engine.request("thread/archive", { threadId: t.id });
+      if (panes.main.threadId === t.id) {
+        panes.main.threadId = null;
+        panes.main.turnId = null;
+        panes.side.threadId = null;
+        panes.side.turnId = null;
+      }
+    }
+    return { archived: targets.length };
+  });
+
+  // Remove = forget the project in the app. Files and chats survive;
+  // its chats regroup under Recents (see threads:list).
+  ipcMain.handle("project:remove", (_e, path: string) => {
+    const projects = loadProjects().filter((p) => p !== path);
+    writeFileSync(projectsFile(), JSON.stringify(projects, null, 2) + "\n");
+    return { ok: true };
+  });
+
+  ipcMain.handle("project:reveal", (_e, path: string) => {
+    void shell.openPath(path);
+    return { ok: true };
   });
 
   ipcMain.handle("project:choose", async () => {

@@ -25,7 +25,7 @@ contextBridge.exposeInMainWorld("unbiased", {
   onTurnCompleted: (cb: (p: unknown) => void) => subscribe("chat:turn-completed", cb),
 
   setAccessMode: (mode: string) => ipcRenderer.invoke("policy:set-mode", mode),
-  decideApproval: (requestId: string, decision: "accept" | "decline") =>
+  decideApproval: (requestId: string, decision: "accept" | "acceptForSession" | "decline") =>
     ipcRenderer.invoke("chat:approve", { requestId, decision }),
   onApprovalRequest: (cb: (p: unknown) => void) => subscribe("chat:approval-request", cb),
   onCommand: (cb: (p: unknown) => void) => subscribe("chat:command", cb),
@@ -36,6 +36,9 @@ contextBridge.exposeInMainWorld("unbiased", {
   deleteThread: (id: string) => ipcRenderer.invoke("threads:delete", id),
   resetSideChat: () => ipcRenderer.invoke("side:reset"),
   chooseProject: () => ipcRenderer.invoke("project:choose"),
+  archiveProjectChats: (path: string) => ipcRenderer.invoke("project:archive-chats", path),
+  removeProject: (path: string) => ipcRenderer.invoke("project:remove", path),
+  revealProject: (path: string) => ipcRenderer.invoke("project:reveal", path),
   readFile: (path: string) => ipcRenderer.invoke("file:read", path),
   readImage: (path: string) => ipcRenderer.invoke("file:read-image", path),
   listDir: (dir?: string) => ipcRenderer.invoke("fs:list", dir),
