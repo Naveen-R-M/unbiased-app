@@ -43,6 +43,8 @@ contextBridge.exposeInMainWorld("unbiased", {
   readImage: (path: string) => ipcRenderer.invoke("file:read-image", path),
   listDir: (dir?: string) => ipcRenderer.invoke("fs:list", dir),
   searchRefs: (word: string) => ipcRenderer.invoke("fs:search-refs", word),
+  blameLine: (file: string, line: number) => ipcRenderer.invoke("git:blame-line", { file, line }),
+  openExternal: (url: string) => ipcRenderer.invoke("browser:open-external", url),
 
   openBrowser: (url?: string) => ipcRenderer.invoke("browser:open", url),
   setBrowserBounds: (b: { x: number; y: number; width: number; height: number }) =>

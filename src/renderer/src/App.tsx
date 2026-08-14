@@ -87,6 +87,50 @@ const ACCESS_MODES: { id: AccessMode; name: string; desc: string; danger?: boole
   { id: "full", name: "Full access", desc: "Unrestricted commands and file access", danger: true },
 ];
 type RefHit = { path: string; rel: string; line: number; text: string };
+type BlameInfo = {
+  hash?: string;
+  author?: string;
+  time?: number;
+  summary?: string;
+  uncommitted?: boolean;
+  url?: string | null;
+  error?: string;
+};
+
+// Monospace character width per font string, measured once — the code
+// view is monospace, so line width = chars × charWidth.
+const monoWidthCache = new Map<string, number>();
+let measureCanvas: HTMLCanvasElement | null = null;
+function monoCharWidth(font: string): number {
+  const cached = monoWidthCache.get(font);
+  if (cached !== undefined) return cached;
+  measureCanvas ??= document.createElement("canvas");
+  const ctx = measureCanvas.getContext("2d");
+  if (!ctx) return 7.5;
+  ctx.font = font;
+  const w = ctx.measureText("0000000000").width / 10;
+  monoWidthCache.set(font, w);
+  return w;
+}
+
+/** "just now", "40 minutes ago", "3 days ago", else a locale date. */
+function relTime(ms: number): string {
+  const s = (Date.now() - ms) / 1000;
+  if (s < 60) return "just now";
+  if (s < 3600) {
+    const m = Math.floor(s / 60);
+    return `${m} minute${m === 1 ? "" : "s"} ago`;
+  }
+  if (s < 86400) {
+    const h = Math.floor(s / 3600);
+    return `${h} hour${h === 1 ? "" : "s"} ago`;
+  }
+  if (s < 30 * 86400) {
+    const d = Math.floor(s / 86400);
+    return `${d} day${d === 1 ? "" : "s"} ago`;
+  }
+  return new Date(ms).toLocaleDateString();
+}
 type OpenFileInfo = {
   name: string;
   relPath: string;
@@ -156,6 +200,8 @@ declare global {
       readImage: (path: string) => Promise<{ dataUrl?: string; error?: string }>;
       listDir: (dir?: string) => Promise<{ dir: string; entries: DirEntry[]; error?: string }>;
       searchRefs: (word: string) => Promise<{ results: RefHit[]; truncated?: boolean; error?: string }>;
+      blameLine: (file: string, line: number) => Promise<BlameInfo>;
+      openExternal: (url: string) => Promise<{ ok: boolean }>;
       openBrowser: (url?: string) => Promise<{ ok: boolean }>;
       setBrowserBounds: (b: { x: number; y: number; width: number; height: number }) => Promise<void>;
       setBrowserVisible: (visible: boolean) => Promise<void>;
@@ -341,8 +387,10 @@ export function App() {
   const [activeProject, setActiveProject] = useState<{ name: string; path: string } | null>(null);
   const [hoveredThreadId, setHoveredThreadId] = useState<string | null>(null);
   const [hoveredProject, setHoveredProject] = useState<string | null>(null);
-  // Which project row's ⋯ menu is open, and the pending confirm dialog.
-  const [projMenuPath, setProjMenuPath] = useState<string | null>(null);
+  // Which project row's ⋯ menu is open (fixed-positioned at the button's
+  // screen rect — the nav's overflow would clip an absolute menu at
+  // narrow sidebar widths), and the pending confirm dialog.
+  const [projMenu, setProjMenu] = useState<{ path: string; x: number; y: number } | null>(null);
   const [confirmDialog, setConfirmDialog] = useState<{
     kind: "archive" | "remove";
     path: string;
@@ -351,20 +399,25 @@ export function App() {
   } | null>(null);
 
   useEffect(() => {
-    if (!projMenuPath) return;
+    if (!projMenu) return;
     function onDown(e: MouseEvent) {
-      if (!(e.target as HTMLElement).closest("[data-projmenu]")) setProjMenuPath(null);
+      if (!(e.target as HTMLElement).closest("[data-projmenu]")) setProjMenu(null);
     }
     function onKey(e: KeyboardEvent) {
-      if (e.key === "Escape") setProjMenuPath(null);
+      if (e.key === "Escape") setProjMenu(null);
+    }
+    function onScroll() {
+      setProjMenu(null); // fixed menu would drift from its scrolled row
     }
     document.addEventListener("mousedown", onDown);
     document.addEventListener("keydown", onKey);
+    document.addEventListener("scroll", onScroll, true);
     return () => {
       document.removeEventListener("mousedown", onDown);
       document.removeEventListener("keydown", onKey);
+      document.removeEventListener("scroll", onScroll, true);
     };
-  }, [projMenuPath]);
+  }, [projMenu]);
 
   async function runConfirmedAction() {
     if (!confirmDialog) return;
@@ -887,7 +940,7 @@ export function App() {
           <div style={{ display: "flex", marginBottom: 14, padding: "2px 0" }}>
             <Wordmark height={15} />
           </div>
-          <SidebarAction onClick={() => void newChat()} disabled={mainBusy} icon={<PencilIcon />}>
+          <SidebarAction onClick={() => void newChat()} disabled={mainBusy} icon={<NewChatIcon />}>
             New chat
           </SidebarAction>
           <SidebarAction onClick={() => void openProjectDialog()} disabled={mainBusy} icon={<FolderPlusIcon />}>
@@ -941,13 +994,18 @@ export function App() {
                 >
                   {p.name}
                 </span>
-                {(hoveredProject === p.path || projMenuPath === p.path) && !mainBusy && (
-                  <span data-projmenu style={{ position: "relative", display: "flex", alignItems: "center", gap: 6, flexShrink: 0 }}>
+                {(hoveredProject === p.path || projMenu?.path === p.path) && !mainBusy && (
+                  <span data-projmenu style={{ display: "flex", alignItems: "center", gap: 6, flexShrink: 0 }}>
                     <button
-                      onClick={() => setProjMenuPath((cur) => (cur === p.path ? null : p.path))}
+                      onClick={(e) => {
+                        const r = (e.currentTarget as HTMLButtonElement).getBoundingClientRect();
+                        setProjMenu((cur) =>
+                          cur?.path === p.path ? null : { path: p.path, x: r.right, y: r.bottom + 6 },
+                        );
+                      }}
                       title="Project options"
                       aria-label="Project options"
-                      aria-expanded={projMenuPath === p.path}
+                      aria-expanded={projMenu?.path === p.path}
                       style={{
                         background: "transparent",
                         border: "none",
@@ -972,20 +1030,20 @@ export function App() {
                         display: "flex",
                       }}
                     >
-                      <PencilIcon />
+                      <NewChatIcon />
                     </button>
-                    {projMenuPath === p.path && (
+                    {projMenu?.path === p.path && (
                       <div
                         style={{
-                          position: "absolute",
-                          top: "calc(100% + 8px)",
-                          right: -4,
-                          minWidth: 210,
+                          position: "fixed",
+                          top: projMenu.y,
+                          left: Math.max(8, Math.min(projMenu.x - 210, window.innerWidth - 226)),
+                          width: 210,
                           background: colors.panel,
                           border: `1px solid ${colors.border}`,
                           borderRadius: 12,
                           padding: 6,
-                          zIndex: 40,
+                          zIndex: 60,
                           boxShadow: "0 8px 24px rgba(0,0,0,0.45)",
                         }}
                       >
@@ -993,7 +1051,7 @@ export function App() {
                           icon={<FolderOutlineIcon size={15} />}
                           label="Reveal in Finder"
                           onClick={() => {
-                            setProjMenuPath(null);
+                            setProjMenu(null);
                             void window.unbiased.revealProject(p.path);
                           }}
                         />
@@ -1003,7 +1061,7 @@ export function App() {
                           disabled={p.threads.length === 0}
                           desc={p.threads.length === 0 ? "No chats" : undefined}
                           onClick={() => {
-                            setProjMenuPath(null);
+                            setProjMenu(null);
                             setConfirmDialog({
                               kind: "archive",
                               path: p.path,
@@ -1016,7 +1074,7 @@ export function App() {
                           icon={<CloseIcon />}
                           label="Remove"
                           onClick={() => {
-                            setProjMenuPath(null);
+                            setProjMenu(null);
                             setConfirmDialog({ kind: "remove", path: p.path, name: p.name, count: 0 });
                           }}
                         />
@@ -1100,7 +1158,6 @@ export function App() {
         <header
           style={{
             padding: "10px 16px",
-            borderBottom: `1px solid ${colors.border}`,
             display: "flex",
             alignItems: "center",
             gap: 10,
@@ -1193,7 +1250,6 @@ export function App() {
           <header
             style={{
               padding: "8px 12px",
-              borderBottom: `1px solid ${colors.border}`,
               display: "flex",
               alignItems: "center",
               gap: 6,
@@ -2091,6 +2147,24 @@ function BrowserPane() {
         />
         {state.loading && <span style={{ color: colors.dim, fontSize: 11, flexShrink: 0 }}>…</span>}
         <button
+          onClick={() => void window.unbiased.openExternal(state.url)}
+          disabled={!/^https?:/.test(state.url)}
+          title="Open in external browser"
+          aria-label="Open in external browser"
+          style={{
+            background: "transparent",
+            border: "none",
+            color: /^https?:/.test(state.url) ? colors.fg : "var(--gutter)",
+            cursor: /^https?:/.test(state.url) ? "pointer" : "default",
+            padding: "4px 6px",
+            display: "flex",
+            alignItems: "center",
+            flexShrink: 0,
+          }}
+        >
+          <ExternalLinkIcon />
+        </button>
+        <button
           onClick={() => void window.unbiased.startBrowserAnnotate()}
           disabled={!state.url || state.url === "about:blank"}
           title="Annotate"
@@ -2335,10 +2409,44 @@ function FileViewer({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [file.fullPath]);
 
+  // GitLens-style line blame: plain-click a line for the inline hint;
+  // click the hint for the detail popup with an open-commit link.
+  const [blame, setBlame] = useState<({ line: number; loading?: boolean } & BlameInfo) | null>(null);
+  const [blameOpen, setBlameOpen] = useState(false);
+  const blamePanelRef = useRef<HTMLDivElement>(null);
+  const codePreRef = useRef<HTMLPreElement>(null);
+
+  /** X position just past the end of a line's text (content coords). */
+  function lineEndX(line: number): number {
+    const pre = codePreRef.current;
+    if (!pre) return 16;
+    const cs = getComputedStyle(pre);
+    const text = (content.split("\n")[line - 1] ?? "").replace(/\t/g, "        ");
+    return pre.offsetLeft + parseFloat(cs.paddingLeft) + text.length * monoCharWidth(cs.font) + 16;
+  }
+
   useEffect(() => {
     setCrumbMenu(null);
     setRefs(null);
+    setBlame(null);
+    setBlameOpen(false);
   }, [file.fullPath]);
+
+  useEffect(() => {
+    if (!blameOpen) return;
+    function onDown(e: MouseEvent) {
+      if (!blamePanelRef.current?.contains(e.target as Node)) setBlameOpen(false);
+    }
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") setBlameOpen(false);
+    }
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [blameOpen]);
 
   // Land the target line in the upper third of the viewport.
   useEffect(() => {
@@ -2366,7 +2474,24 @@ function FileViewer({
   }, [refs]);
 
   function handleCodeClick(e: React.MouseEvent<HTMLDivElement>) {
-    if (!onOpenFile || !(e.metaKey || e.ctrlKey)) return;
+    // Plain click = line blame; ⌘/Ctrl-click = references.
+    if (!(e.metaKey || e.ctrlKey)) {
+      if (!window.getSelection()?.isCollapsed) return; // selecting, not clicking
+      const el = scrollBodyRef.current;
+      if (!el) return;
+      const rect = el.getBoundingClientRect();
+      const contentY = e.clientY - rect.top + el.scrollTop;
+      const line = Math.floor(Math.max(contentY - PAD_TOP, 0) / LINE_H) + 1;
+      if (line < 1 || line > lineCount) return;
+      if (blame?.line === line) return; // already showing this line
+      setBlameOpen(false);
+      setBlame({ line, loading: true });
+      void window.unbiased.blameLine(file.fullPath, line).then((r) => {
+        setBlame((cur) => (cur?.line === line ? { line, ...r } : cur));
+      });
+      return;
+    }
+    if (!onOpenFile) return;
     const range = document.caretRangeFromPoint(e.clientX, e.clientY);
     const node = range?.startContainer;
     if (!node || node.nodeType !== Node.TEXT_NODE) return;
@@ -2653,6 +2778,106 @@ function FileViewer({
           </div>
               );
             })()}
+          {blame && (
+            <span
+              onClick={(e) => {
+                e.stopPropagation();
+                if (!blame.loading && !blame.error) setBlameOpen(true);
+              }}
+              title={blame.error ?? "Show commit details"}
+              style={{
+                position: "absolute",
+                top: PAD_TOP + (blame.line - 1) * LINE_H,
+                left: lineEndX(blame.line),
+                height: LINE_H,
+                display: "flex",
+                alignItems: "center",
+                whiteSpace: "nowrap",
+                fontFamily: "var(--font-code)",
+                fontSize: 11.5,
+                color: "var(--gutter)",
+                cursor: blame.loading || blame.error ? "default" : "pointer",
+                zIndex: 4,
+              }}
+            >
+              {blame.loading
+                ? "…"
+                : blame.error
+                  ? blame.error
+                  : blame.uncommitted
+                    ? "You • Uncommitted changes"
+                    : `${blame.author}, ${relTime(blame.time ?? 0)} • ${blame.summary}`}
+            </span>
+          )}
+          {blameOpen && blame && !blame.loading && !blame.error && (
+            <div
+              ref={blamePanelRef}
+              style={{
+                position: "absolute",
+                top: PAD_TOP + blame.line * LINE_H + 8,
+                left: Math.max(
+                  16,
+                  Math.min(lineEndX(blame.line), (scrollBodyRef.current?.clientWidth ?? 400) - 356),
+                ),
+                width: 340,
+                maxWidth: "calc(100% - 24px)",
+                background: colors.panel,
+                border: `1px solid ${colors.border}`,
+                borderRadius: 12,
+                padding: "12px 14px",
+                zIndex: 30,
+                boxShadow: "0 8px 24px rgba(0,0,0,0.45)",
+                fontFamily: "var(--font-ui)",
+              }}
+            >
+              <div style={{ fontSize: 13.5, color: colors.fg, fontWeight: 500 }}>
+                {blame.uncommitted ? "You" : blame.author}
+                <span style={{ color: colors.dim, fontWeight: 400 }}>
+                  {" · "}
+                  {relTime(blame.time ?? 0)}
+                  {blame.time ? ` (${new Date(blame.time).toLocaleString()})` : ""}
+                </span>
+              </div>
+              <div style={{ color: colors.dim, fontSize: 13, marginTop: 6 }}>
+                {blame.uncommitted ? "Uncommitted changes" : blame.summary}
+              </div>
+              {!blame.uncommitted && (
+                <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 10 }}>
+                  <code
+                    style={{
+                      fontFamily: "var(--font-code)",
+                      fontSize: 11.5,
+                      background: "var(--chip)",
+                      borderRadius: 6,
+                      padding: "2px 7px",
+                      color: colors.dim,
+                    }}
+                  >
+                    {blame.hash?.slice(0, 7)}
+                  </code>
+                  {blame.url && onOpenLink && (
+                    <button
+                      onClick={() => {
+                        setBlameOpen(false);
+                        onOpenLink(blame.url!);
+                      }}
+                      style={{
+                        background: "transparent",
+                        border: "none",
+                        color: colors.accent,
+                        fontSize: 13,
+                        cursor: "pointer",
+                        fontFamily: "inherit",
+                        padding: 0,
+                      }}
+                    >
+                      Open commit ↗
+                    </button>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
           <pre
             aria-hidden="true"
             style={{
@@ -2670,6 +2895,7 @@ function FileViewer({
             {Array.from({ length: lineCount }, (_, i) => i + 1).join("\n")}
           </pre>
           <pre
+            ref={codePreRef}
             style={{
               margin: 0,
               padding: "14px 16px",
@@ -3424,6 +3650,7 @@ function ChatPane({
                       {e.text}
                     </div>
                   )}
+                  {e.text && <CopyButton text={e.text} />}
                 </div>
               );
             }
@@ -3489,7 +3716,6 @@ function ChatPane({
             maxWidth: 720,
             margin: "0 auto",
             background: colors.panel,
-            border: `1px solid ${colors.border}`,
             borderRadius: 16,
             padding: "12px 14px 10px",
           }}
@@ -4469,6 +4695,15 @@ function SectionLabel({
   );
 }
 
+/** Material Symbols edit_square — the new-chat glyph. */
+function NewChatIcon({ size = 15 }: { size?: number } = {}) {
+  return (
+    <svg width={size} height={size} viewBox="0 -960 960 960" fill="currentColor" aria-hidden="true" style={{ flexShrink: 0 }}>
+      <path d="M200-120q-33 0-56.5-23.5T120-200v-560q0-33 23.5-56.5T200-840h357l-80 80H200v560h560v-278l80-80v358q0 33-23.5 56.5T760-120H200Zm280-360ZM360-360v-170l367-367q12-12 27-18t30-6q16 0 30.5 6t26.5 18l56 57q11 12 17 26.5t6 29.5q0 15-5.5 29.5T897-728L530-360H360Zm481-424-56-56 56 56ZM440-440h56l232-232-28-28-29-28-231 231v57Zm260-260-29-28 29 28 28 28-28-28Z" />
+    </svg>
+  );
+}
+
 function PencilIcon() {
   return (
     <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -4551,6 +4786,16 @@ function FolderOutlineIcon({ size = 18 }: { size?: number } = {}) {
   return (
     <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
       <path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.7-.9L9.2 3.9A2 2 0 0 0 7.5 3H4a2 2 0 0 0-2 2v13c0 1.1.9 2 2 2Z" />
+    </svg>
+  );
+}
+
+function ExternalLinkIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" style={{ flexShrink: 0 }}>
+      <path d="M15 3h6v6" />
+      <path d="M10 14 21 3" />
+      <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
     </svg>
   );
 }

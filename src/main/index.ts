@@ -893,6 +893,47 @@ app.whenReady().then(async () => {
     }
   });
 
+  // Line blame for the file viewer (GitLens-style hints). Porcelain output
+  // gives hash/author/time/summary; the commit URL derives from the repo's
+  // origin remote (ssh remotes normalized to https).
+  ipcMain.handle("git:blame-line", async (_e, p: { file: string; line: number }) => {
+    const dir = p.file.split("/").slice(0, -1).join("/") || "/";
+    const run = (args: string[]) =>
+      new Promise<string>((resolve) => {
+        execFile("git", args, { cwd: dir, timeout: 5000 }, (err, stdout) => resolve(err ? "" : stdout));
+      });
+    const out = await run(["blame", "-L", `${p.line},${p.line}`, "--porcelain", "--", p.file]);
+    if (!out) return { error: "No blame information" };
+    const hash = out.split(/\s/)[0] ?? "";
+    const field = (key: string) =>
+      out
+        .split("\n")
+        .find((l) => l.startsWith(key + " "))
+        ?.slice(key.length + 1) ?? "";
+    const uncommitted = /^0+$/.test(hash);
+    let url: string | null = null;
+    if (!uncommitted) {
+      let remote = (await run(["config", "--get", "remote.origin.url"])).trim().replace(/\.git$/, "");
+      const ssh = /^git@([^:]+):(.+)$/.exec(remote);
+      if (ssh) remote = `https://${ssh[1]}/${ssh[2]}`;
+      if (/^https?:/.test(remote)) url = `${remote}/commit/${hash}`;
+    }
+    return {
+      hash,
+      author: field("author"),
+      time: Number(field("author-time")) * 1000,
+      summary: field("summary"),
+      uncommitted,
+      url,
+    };
+  });
+
+  // "Open in external browser" from the browser toolbar.
+  ipcMain.handle("browser:open-external", (_e, url: string) => {
+    if (/^https?:/.test(url)) void shell.openExternal(url);
+    return { ok: true };
+  });
+
   // Whole-word references search across the active project — the engine
   // behind ⌘-click in the file viewer. Text-based (grep), not semantic:
   // works for every language, no language servers. execFile with an args
