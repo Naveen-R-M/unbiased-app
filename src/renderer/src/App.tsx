@@ -201,6 +201,7 @@ declare global {
       listDir: (dir?: string) => Promise<{ dir: string; entries: DirEntry[]; error?: string }>;
       searchRefs: (word: string) => Promise<{ results: RefHit[]; truncated?: boolean; error?: string }>;
       blameLine: (file: string, line: number) => Promise<BlameInfo>;
+      gitBranch: (path: string) => Promise<{ branch: string | null }>;
       openExternal: (url: string) => Promise<{ ok: boolean }>;
       openBrowser: (url?: string) => Promise<{ ok: boolean }>;
       setBrowserBounds: (b: { x: number; y: number; width: number; height: number }) => Promise<void>;
@@ -298,7 +299,6 @@ function themeVars(t: ThemeConfig): Record<string, string> {
     "--panel-2": m(0.09),
     "--chip": m(0.09),
     "--border": m(0.095),
-    "--user-bubble": m(0.13),
     "--dim": mixHex(t.surface, t.ink, 0.52),
     // Between fg and dim: sidebar thread titles, Codex-style.
     "--fg-soft": mixHex(t.surface, t.ink, 0.78),
@@ -431,6 +431,7 @@ export function App() {
       if (wasActive) {
         await window.unbiased.detachThread();
         setActiveThreadId(null);
+        setMainStarted(false);
         setMainReset((r) => ({ entries: [], nonce: r.nonce + 1 }));
         resetSideView();
       }
@@ -463,15 +464,21 @@ export function App() {
     });
   }
   const [mainBusy, setMainBusy] = useState(false);
+  // Whether the main conversation has any content — a side chat forks the
+  // main thread, so offering one before anything exists makes no sense.
+  const [mainStarted, setMainStarted] = useState(false);
+  // Start-page suggestion cards seed the main composer through this.
+  const [mainSeed, setMainSeed] = useState<{ text: string; nonce: number } | null>(null);
+  const seedNonceRef = useRef(1);
+  // Current git branch of the active project, for the context strip.
+  const [projectBranch, setProjectBranch] = useState<string | null>(null);
   const [mainReset, setMainReset] = useState<{ entries: Entry[]; nonce: number }>({ entries: [], nonce: 0 });
   // sideOpen = the whole right panel is visible; sideChatEnabled = the chat
   // tab exists in it. Kept separate so opening a file/image preview doesn't
-  // drag the side chat along with it.
-  const [sideOpen, setSideOpen] = useState(() => localStorage.getItem("sideOpen") === "true");
-  const [sideChatEnabled, setSideChatEnabledState] = useState(() => {
-    const stored = localStorage.getItem("sideChatEnabled");
-    return stored !== null ? stored === "true" : localStorage.getItem("sideOpen") === "true";
-  });
+  // drag the side chat along with it. Neither restores across launches —
+  // the app always starts with the panel closed.
+  const [sideOpen, setSideOpen] = useState(false);
+  const [sideChatEnabled, setSideChatEnabledState] = useState(false);
   const [sideContext, setSideContext] = useState<string | null>(null);
   const [sideNonce, setSideNonce] = useState(0);
   // Text handed to the MAIN composer from outside it — the embedded
@@ -499,19 +506,38 @@ export function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  function changeAccessMode(mode: AccessMode) {
+  // Turning Full Access ON demands an explicit confirmation (capability
+  // disclosure modal) — every other transition applies immediately.
+  const [fullAccessPrompt, setFullAccessPrompt] = useState(false);
+
+  useEffect(() => {
+    if (!fullAccessPrompt) return;
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") setFullAccessPrompt(false);
+    }
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [fullAccessPrompt]);
+
+  function applyAccessMode(mode: AccessMode) {
     localStorage.setItem("accessMode", mode);
     setAccessModeState(mode);
     void window.unbiased.setAccessMode(mode);
   }
 
+  function changeAccessMode(mode: AccessMode) {
+    if (mode === "full" && accessMode !== "full") {
+      setFullAccessPrompt(true);
+      return;
+    }
+    applyAccessMode(mode);
+  }
+
   function setSideOpenPersisted(open: boolean) {
-    localStorage.setItem("sideOpen", String(open));
     setSideOpen(open);
   }
 
   function setSideChatEnabled(v: boolean) {
-    localStorage.setItem("sideChatEnabled", String(v));
     setSideChatEnabledState(v);
   }
   const [navOpen, setNavOpen] = useState(() => localStorage.getItem("navOpen") !== "false");
@@ -620,6 +646,7 @@ export function App() {
     await window.unbiased.detachThread(project?.path);
     setActiveProject(project ?? null);
     setActiveThreadId(null);
+    setMainStarted(false);
     setMainReset((r) => ({ entries: [], nonce: r.nonce + 1 }));
     resetSideView();
   }
@@ -630,6 +657,7 @@ export function App() {
     if (!path || !name) return; // cancelled
     setActiveProject({ name, path });
     setActiveThreadId(null);
+    setMainStarted(false);
     setMainReset((r) => ({ entries: [], nonce: r.nonce + 1 }));
     resetSideView();
     void refreshThreads(); // the project shows in the sidebar immediately
@@ -640,6 +668,7 @@ export function App() {
     const { entries: history } = await window.unbiased.openThread(id);
     setActiveProject(null);
     setActiveThreadId(id);
+    setMainStarted(history.length > 0);
     setMainReset((r) => ({ entries: history, nonce: r.nonce + 1 }));
     resetSideView();
   }
@@ -649,6 +678,7 @@ export function App() {
     await window.unbiased.deleteThread(id);
     if (id === activeThreadId) {
       setActiveThreadId(null);
+      setMainStarted(false);
       setMainReset((r) => ({ entries: [], nonce: r.nonce + 1 }));
       resetSideView();
     }
@@ -704,9 +734,9 @@ export function App() {
   useEffect(() => {
     if (!browserOpen) return;
     void window.unbiased.setBrowserVisible(
-      sideOpen && panelMode === "browser" && !sidePlusOpen && !showSettings && !confirmDialog,
+      sideOpen && panelMode === "browser" && !sidePlusOpen && !showSettings && !confirmDialog && !fullAccessPrompt,
     );
-  }, [browserOpen, sideOpen, panelMode, sidePlusOpen, showSettings, confirmDialog]);
+  }, [browserOpen, sideOpen, panelMode, sidePlusOpen, showSettings, confirmDialog, fullAccessPrompt]);
 
   function openSideChatTab() {
     setSidePlusOpen(false);
@@ -791,13 +821,6 @@ export function App() {
     else setSideOpenPersisted(false);
   }
 
-  // File previews don't persist across launches — a panel restored open
-  // with no chat tab would be an empty shell.
-  useEffect(() => {
-    if (sideOpen && !sideChatEnabled) setSideOpenPersisted(false);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
   function askInSideChat(text: string) {
     setSideContext(text);
     setSideChatEnabled(true);
@@ -859,24 +882,29 @@ export function App() {
     else setSideOpenPersisted(false);
   }
 
-  function toggleSideChat() {
-    if (sideChatEnabled) {
-      closeSideChat();
-    } else {
-      setSideChatEnabled(true);
-      setPanelMode("chat");
-      setSideOpenPersisted(true);
-    }
-  }
-
   const connected = status.state === "connected";
   // Files (workspace tree) only makes sense inside a project — a plain
   // Recents chat lives in the home directory.
-  const activeProjectName =
-    activeProject?.name ??
-    sidebar.projects.find((p) => p.threads.some((t) => t.id === activeThreadId))?.name ??
-    null;
+  const activeSidebarProject = sidebar.projects.find((p) =>
+    p.threads.some((t) => t.id === activeThreadId),
+  );
+  const activeProjectName = activeProject?.name ?? activeSidebarProject?.name ?? null;
+  const activeProjectPath = activeProject?.path ?? activeSidebarProject?.path ?? null;
   const inProject = activeProjectName !== null;
+
+  useEffect(() => {
+    if (!activeProjectPath) {
+      setProjectBranch(null);
+      return;
+    }
+    let alive = true;
+    void window.unbiased.gitBranch(activeProjectPath).then((r) => {
+      if (alive) setProjectBranch(r.branch);
+    });
+    return () => {
+      alive = false;
+    };
+  }, [activeProjectPath]);
 
   // Whatever file the panel is currently showing, and whether it has a
   // rendered form worth offering.
@@ -945,9 +973,6 @@ export function App() {
           </SidebarAction>
           <SidebarAction onClick={() => void openProjectDialog()} disabled={mainBusy} icon={<FolderPlusIcon />}>
             Open project…
-          </SidebarAction>
-          <SidebarAction onClick={toggleSideChat} disabled={false} icon={<SideChatIcon />}>
-            {sideChatEnabled ? "Close side chat" : "Side chat"}
           </SidebarAction>
         </div>
         <div style={{ flex: 1, overflowY: "auto", padding: "0 8px 12px" }}>
@@ -1191,24 +1216,63 @@ export function App() {
           contextChip={mainContext}
           onContextClear={() => setMainContext(null)}
           emptyState={
-            <div style={{ textAlign: "center" }}>
-              <h1 style={{ margin: 0, display: "flex", justifyContent: "center" }}>
-                <Wordmark height={36} />
-              </h1>
-              <p style={{ color: colors.dim, marginTop: 8 }}>
-                {!connected ? (
-                  "Waiting for the engine…"
-                ) : activeProject ? (
-                  <>
-                    New chat in <span style={{ color: colors.fg }}>{activeProject.name}</span>
-                  </>
-                ) : (
-                  "Ask Pareto anything."
-                )}
-              </p>
-            </div>
+            !connected ? (
+              <div style={{ textAlign: "center" }}>
+                <h1 style={{ margin: 0, display: "flex", justifyContent: "center" }}>
+                  <Wordmark height={36} />
+                </h1>
+                <p style={{ color: colors.dim, marginTop: 8 }}>Waiting for the engine…</p>
+              </div>
+            ) : (
+              <StartPage
+                projectName={activeProjectName}
+                onPick={(text) => setMainSeed({ text, nonce: seedNonceRef.current++ })}
+              />
+            )
           }
-          onBusyChange={setMainBusy}
+          draftSeed={mainSeed}
+          composerHeader={
+            activeProjectPath ? (
+              <div
+                style={{
+                  maxWidth: 720,
+                  margin: "0 auto 8px",
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 18,
+                  padding: "8px 14px",
+                  background: colors.panel,
+                  borderRadius: 12,
+                  fontSize: 13,
+                  color: colors.dim,
+                  overflow: "hidden",
+                }}
+              >
+                <span style={{ display: "flex", alignItems: "center", gap: 7, color: colors.fg, minWidth: 0 }}>
+                  <FolderOutlineIcon size={14} />
+                  <span style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                    {activeProjectName}
+                  </span>
+                </span>
+                <span style={{ display: "flex", alignItems: "center", gap: 7, flexShrink: 0 }}>
+                  <LaptopIcon />
+                  Local
+                </span>
+                {projectBranch && (
+                  <span style={{ display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
+                    <BranchIcon />
+                    <span style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                      {projectBranch}
+                    </span>
+                  </span>
+                )}
+              </div>
+            ) : undefined
+          }
+          onBusyChange={(b) => {
+            setMainBusy(b);
+            if (b) setMainStarted(true);
+          }}
           onTurnLanded={refreshThreads}
           onAskSideChat={askInSideChat}
           onOpenFile={(p) => void openFileInPanel(p)}
@@ -1448,7 +1512,9 @@ export function App() {
                   {inProject && (
                     <MenuItem icon={<FolderOutlineIcon size={15} />} label="Files" onClick={openFilesTab} />
                   )}
-                  <MenuItem icon={<ChatPlusIcon />} label="Side chat" onClick={openSideChatTab} />
+                  {mainStarted && (
+                    <MenuItem icon={<ChatPlusIcon />} label="Side chat" onClick={openSideChatTab} />
+                  )}
                 </div>
               )}
             </span>
@@ -1489,7 +1555,7 @@ export function App() {
                 gap: 10,
               }}
             >
-              <LauncherRow icon={<ChatPlusIcon />} label="Side chat" onClick={openSideChatTab} />
+              {mainStarted && <LauncherRow icon={<ChatPlusIcon />} label="Side chat" onClick={openSideChatTab} />}
               {inProject && (
                 <LauncherRow icon={<FolderOutlineIcon size={15} />} label="Files" onClick={openFilesTab} />
               )}
@@ -1610,6 +1676,131 @@ export function App() {
           />
           </div>
         </div>
+      {fullAccessPrompt && (
+        <div
+          onMouseDown={(e) => {
+            if (e.target === e.currentTarget) setFullAccessPrompt(false);
+          }}
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0,0,0,0.55)",
+            display: "grid",
+            placeItems: "center",
+            zIndex: 100,
+          }}
+        >
+          <div
+            style={{
+              width: 560,
+              maxWidth: "calc(100vw - 48px)",
+              background: colors.panel,
+              border: `1px solid ${colors.border}`,
+              borderRadius: 18,
+              padding: "24px 26px 22px",
+              boxShadow: "0 16px 48px rgba(0,0,0,0.55)",
+            }}
+          >
+            <div style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 19, fontWeight: 600, color: colors.fg }}>
+              <span style={{ color: colors.amber, display: "flex" }}>
+                <ShieldAlertIcon />
+              </span>
+              Turn on Full Access?
+            </div>
+            <div style={{ color: colors.dim, fontSize: 14, lineHeight: 1.55, marginTop: 12 }}>
+              Pareto will be able to run commands, use the internet, and create and edit files
+              anywhere on this computer without your permission. This includes but is not limited to:
+            </div>
+            <div
+              style={{
+                background: "var(--panel-2)",
+                borderRadius: 14,
+                padding: "4px 16px",
+                marginTop: 16,
+              }}
+            >
+              {[
+                {
+                  icon: <FolderOutlineIcon size={17} />,
+                  title: "Files and folders",
+                  desc: "Read, create, modify, or delete files anywhere on this computer",
+                },
+                {
+                  icon: <TerminalIcon size={17} />,
+                  title: "Terminal commands",
+                  desc: "Run commands, install software, and change system settings",
+                },
+                {
+                  icon: <GlobeIcon size={17} />,
+                  title: "Internet access",
+                  desc: "Access websites and send data",
+                },
+              ].map((row, i) => (
+                <div
+                  key={row.title}
+                  style={{
+                    display: "flex",
+                    alignItems: "flex-start",
+                    gap: 14,
+                    padding: "13px 0",
+                    borderTop: i > 0 ? `1px solid ${colors.border}` : "none",
+                  }}
+                >
+                  <span style={{ color: colors.fg, display: "flex", marginTop: 2, flexShrink: 0 }}>{row.icon}</span>
+                  <span style={{ minWidth: 0 }}>
+                    <div style={{ fontSize: 14.5, fontWeight: 600, color: colors.fg }}>{row.title}</div>
+                    <div style={{ fontSize: 13.5, color: colors.dim, marginTop: 2, lineHeight: 1.45 }}>{row.desc}</div>
+                  </span>
+                </div>
+              ))}
+            </div>
+            <div style={{ color: colors.dim, fontSize: 13.5, lineHeight: 1.5, marginTop: 16 }}>
+              This comes with risks like loss or exposure of sensitive data and prompt injection.
+              You can turn this off at any time.
+            </div>
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 12, marginTop: 20 }}>
+              <button
+                onClick={() => setFullAccessPrompt(false)}
+                style={{
+                  background: "var(--chip)",
+                  border: "none",
+                  borderRadius: 999,
+                  color: colors.fg,
+                  fontSize: 14.5,
+                  cursor: "pointer",
+                  fontFamily: "inherit",
+                  padding: "10px 20px",
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => {
+                  setFullAccessPrompt(false);
+                  applyAccessMode("full");
+                }}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 8,
+                  background: "rgba(240, 149, 149, 0.14)",
+                  border: "none",
+                  borderRadius: 999,
+                  color: colors.err,
+                  fontSize: 14.5,
+                  fontWeight: 500,
+                  cursor: "pointer",
+                  fontFamily: "inherit",
+                  padding: "10px 20px",
+                }}
+              >
+                <ShieldAlertIcon />
+                Confirm
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       {confirmDialog && (
         <div
           onMouseDown={(e) => {
@@ -2928,6 +3119,8 @@ function ChatPane({
   onOpenLink,
   accessMode,
   onAccessModeChange,
+  draftSeed,
+  composerHeader,
 }: {
   paneId: PaneId;
   connected: boolean;
@@ -2943,10 +3136,19 @@ function ChatPane({
   onOpenLink?: (url: string) => void;
   accessMode: AccessMode;
   onAccessModeChange: (mode: AccessMode) => void;
+  // Start-page suggestion cards seed the composer through this.
+  draftSeed?: { text: string; nonce: number } | null;
+  // Rendered above the composer box (the project/branch context strip).
+  composerHeader?: React.ReactNode;
 }) {
   const [entries, setEntries] = useState<Entry[]>(reset.entries);
   const [draft, setDraft] = useState("");
   const [attachments, setAttachments] = useState<Attachment[]>([]);
+
+  useEffect(() => {
+    if (draftSeed) setDraft(draftSeed.text);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [draftSeed?.nonce]);
   // Annotations staged for the next send: transcript excerpts, each with an
   // optional comment, all attached together when the message goes out. The
   // side pane's handed-down selection (contextChip) is consumed into the
@@ -3641,7 +3843,7 @@ function ChatPane({
                         maxWidth: "85%",
                         padding: "10px 14px",
                         borderRadius: 12,
-                        background: "var(--user-bubble)",
+                        background: colors.panel,
                         whiteSpace: "pre-wrap",
                         lineHeight: 1.55,
                         fontSize: 14,
@@ -3689,6 +3891,7 @@ function ChatPane({
       </div>
 
       <div style={{ padding: "8px 16px 16px" }}>
+        {composerHeader}
         {queue.length > 0 && (
           <div style={{ maxWidth: 720, margin: "0 auto 8px", display: "flex", flexDirection: "column", gap: 6 }}>
             {queue.map((q) => (
@@ -4178,7 +4381,7 @@ function CodeBlock({ children, onOpenCode }: { children?: React.ReactNode; onOpe
       }
       title={onOpenCode ? "Open in side chat" : undefined}
       style={{
-        background: "var(--code-bg)",
+        background: colors.panel,
         border: `1px solid ${colors.border}`,
         borderRadius: 10,
         margin: "12px 0",
@@ -4484,6 +4687,161 @@ function SettingsView({
         </div>
       </div>
     </div>
+  );
+}
+
+/** The brand's two-arc mark in its launcher colors. */
+function BrandMark({ size = 48 }: { size?: number } = {}) {
+  return (
+    <svg width={size} height={Math.round(size * (62 / 55.95))} viewBox="0 0 55.9498 62.0001" fill="none" aria-hidden="true">
+      <path d="M14.0857 0C14.0857 7.63412 20.3039 13.8227 27.9747 13.8227C35.6454 13.8227 41.8639 7.63413 41.8639 0H55.9493C55.9493 15.3762 43.4246 27.8411 27.9747 27.8411C12.5248 27.8411 5.31346e-05 15.3761 5.31346e-05 0H14.0857Z" fill="#FF7764" />
+      <path d="M41.8642 62.0001C41.8642 54.3659 35.6459 48.1774 27.9752 48.1774C20.3044 48.1774 14.0859 54.3659 14.0859 62.0001L0.000534272 62.0001C0.000535623 46.6239 12.5252 34.159 27.9752 34.159C43.4251 34.159 55.9498 46.6239 55.9498 62.0001L41.8642 62.0001Z" fill="#FF563F" />
+    </svg>
+  );
+}
+
+/** Codex-style start page: brand mark, "What should we build in X?", and
+ *  suggestion cards that seed the composer. */
+function StartPage({
+  projectName,
+  onPick,
+}: {
+  projectName: string | null;
+  onPick: (text: string) => void;
+}) {
+  const cards = [
+    {
+      icon: <TelescopeIcon />,
+      color: "#5B9DFF",
+      label: "Explore and understand code",
+      prompt: "Explore this codebase and explain how it works at a high level.",
+    },
+    {
+      icon: <HammerIcon />,
+      color: "#B58CFF",
+      label: "Build a new feature, app, or tool",
+      prompt: "Help me build a new feature: ",
+    },
+    {
+      icon: <ReviewIcon />,
+      color: "#5DCAA5",
+      label: "Review code and suggest changes",
+      prompt: "Review the current changes and suggest improvements.",
+    },
+    {
+      icon: <BugIcon />,
+      color: "#FF8A50",
+      label: "Fix issues and failures",
+      prompt: "Help me find and fix issues or failing tests.",
+    },
+  ];
+  return (
+    <div style={{ textAlign: "center", padding: "0 24px" }}>
+      <div style={{ display: "flex", justifyContent: "center", marginBottom: 18 }}>
+        <BrandMark size={32} />
+      </div>
+      <h1 style={{ fontSize: 26, fontWeight: 500, letterSpacing: -0.3, margin: 0, color: colors.fg }}>
+        {projectName ? (
+          <>
+            What should we build in{" "}
+            <span
+              style={{
+                textDecoration: "underline dotted",
+                textUnderlineOffset: 7,
+                textDecorationColor: "var(--accent)",
+              }}
+            >
+              {projectName}
+            </span>
+            ?
+          </>
+        ) : (
+          "What should we build?"
+        )}
+      </h1>
+      <div style={{ display: "flex", gap: 12, justifyContent: "center", marginTop: 30, flexWrap: "wrap" }}>
+        {cards.map((c) => (
+          <button
+            key={c.label}
+            onClick={() => onPick(c.prompt)}
+            style={{
+              width: 168,
+              textAlign: "left",
+              background: "transparent",
+              border: `1px solid ${colors.border}`,
+              borderRadius: 14,
+              padding: "14px 14px 16px",
+              cursor: "pointer",
+              fontFamily: "inherit",
+            }}
+          >
+            <span style={{ color: c.color, display: "flex", marginBottom: 12 }}>{c.icon}</span>
+            <div style={{ fontSize: 13.5, color: colors.fg, lineHeight: 1.45 }}>{c.label}</div>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function TelescopeIcon() {
+  return (
+    <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="m10.065 12.493-6.18 1.318a.934.934 0 0 1-1.108-.702l-.537-2.15a1.07 1.07 0 0 1 .691-1.265l13.504-4.44" />
+      <path d="m13.56 11.747 4.332-.924" />
+      <path d="m16 21-3.105-6.21" />
+      <path d="M16.485 5.94a2 2 0 0 1 1.455-2.425l1.09-.272a1 1 0 0 1 1.212.727l1.515 6.06a1 1 0 0 1-.727 1.213l-1.09.272a2 2 0 0 1-2.425-1.455z" />
+      <path d="m6.158 8.633 1.114 4.456" />
+      <path d="m8 21 3.105-6.21" />
+      <circle cx="12" cy="13" r="2" />
+    </svg>
+  );
+}
+
+function HammerIcon() {
+  return (
+    <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="m15 12-8.373 8.373a1 1 0 1 1-3-3L12 9" />
+      <path d="m18 15 4-4" />
+      <path d="m21.5 11.5-1.914-1.914A2 2 0 0 1 19 8.172V7l-2.26-2.26a6 6 0 0 0-4.202-1.756L9 2.96l.92.82A6.18 6.18 0 0 1 12 8.4V10l2 2h1.172a2 2 0 0 1 1.414.586L18.5 14.5" />
+    </svg>
+  );
+}
+
+function BugIcon() {
+  return (
+    <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="m8 2 1.88 1.88" />
+      <path d="M14.12 3.88 16 2" />
+      <path d="M9 7.13v-1a3.003 3.003 0 1 1 6 0v1" />
+      <path d="M12 20c-3.3 0-6-2.7-6-6v-3a4 4 0 0 1 4-4h4a4 4 0 0 1 4 4v3c0 3.3-2.7 6-6 6" />
+      <path d="M12 20v-9" />
+      <path d="M6.53 9C4.6 8.8 3 7.1 3 5" />
+      <path d="M6 13H2" />
+      <path d="M3 21c0-2.1 1.7-3.9 3.8-4" />
+      <path d="M20.97 5c0 2.1-1.6 3.8-3.5 4" />
+      <path d="M22 13h-4" />
+      <path d="M17.2 17c2.1.1 3.8 1.9 3.8 4" />
+    </svg>
+  );
+}
+
+function LaptopIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" style={{ flexShrink: 0 }}>
+      <path d="M20 16V7a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v9m16 0H4m16 0 1.28 2.55a1 1 0 0 1-.9 1.45H3.62a1 1 0 0 1-.9-1.45L4 16" />
+    </svg>
+  );
+}
+
+function BranchIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" style={{ flexShrink: 0 }}>
+      <line x1="6" x2="6" y1="3" y2="15" />
+      <circle cx="18" cy="6" r="3" />
+      <circle cx="6" cy="18" r="3" />
+      <path d="M18 9a9 9 0 0 1-9 9" />
+    </svg>
   );
 }
 

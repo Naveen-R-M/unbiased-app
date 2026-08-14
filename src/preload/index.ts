@@ -44,6 +44,7 @@ contextBridge.exposeInMainWorld("unbiased", {
   listDir: (dir?: string) => ipcRenderer.invoke("fs:list", dir),
   searchRefs: (word: string) => ipcRenderer.invoke("fs:search-refs", word),
   blameLine: (file: string, line: number) => ipcRenderer.invoke("git:blame-line", { file, line }),
+  gitBranch: (path: string) => ipcRenderer.invoke("git:branch", path),
   openExternal: (url: string) => ipcRenderer.invoke("browser:open-external", url),
 
   openBrowser: (url?: string) => ipcRenderer.invoke("browser:open", url),

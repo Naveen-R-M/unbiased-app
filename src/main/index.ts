@@ -893,6 +893,15 @@ app.whenReady().then(async () => {
     }
   });
 
+  // Current branch of a project, for the composer's context strip.
+  ipcMain.handle("git:branch", (_e, path: string) => {
+    return new Promise((resolve) => {
+      execFile("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd: path, timeout: 3000 }, (err, stdout) => {
+        resolve({ branch: err ? null : stdout.trim() });
+      });
+    });
+  });
+
   // Line blame for the file viewer (GitLens-style hints). Porcelain output
   // gives hash/author/time/summary; the commit URL derives from the repo's
   // origin remote (ssh remotes normalized to https).
