@@ -29,9 +29,15 @@ export class EngineClient extends EventEmitter {
     return this.proc?.pid ?? null;
   }
 
-  start(enginePath: string): void {
+  start(enginePath: string, extraEnv?: Record<string, string>): void {
     this.emitStatus({ state: "starting" });
-    this.proc = spawn(enginePath, [], { stdio: ["pipe", "pipe", "pipe"] });
+    this.proc = spawn(enginePath, [], {
+      stdio: ["pipe", "pipe", "pipe"],
+      // extraEnv lets the caller pin the API key for THIS launch (login flow)
+      // so a stale process-level UNBIASED_API_KEY can't override the key the
+      // user just signed in with.
+      env: extraEnv ? { ...process.env, ...extraEnv } : process.env,
+    });
 
     const lines = createInterface({ input: this.proc.stdout });
     lines.on("line", (line) => {

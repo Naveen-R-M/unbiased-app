@@ -191,6 +191,17 @@ type SidebarData = {
   running?: string[];
 };
 
+type WhoamiResult =
+  | {
+      ok: true;
+      organization: { id: string; name: string };
+      workload: { id: string; name: string };
+      keyName: string;
+      accessStatus: string;
+      paretoRolloutPercent?: number | null;
+    }
+  | { ok: false; error: string; code?: string; status?: number };
+
 // An approval request replayed when a backgrounded conversation reopens
 // (same payload as the live chat:approval-request event, minus paneId).
 type HeldApproval = {
@@ -208,6 +219,10 @@ declare global {
     unbiased: {
       getEngineStatus: () => Promise<EngineStatus>;
       onEngineStatus: (cb: (status: EngineStatus) => void) => () => void;
+      authStatus: () => Promise<{ hasKey: boolean; source: "env" | "file" | null }>;
+      authValidate: (key?: string) => Promise<WhoamiResult>;
+      authLogin: (key?: string) => Promise<WhoamiResult>;
+      authLogout: () => Promise<{ ok: boolean; envKeyRemains: boolean }>;
       sendMessage: (
         paneId: PaneId,
         text: string,
@@ -217,6 +232,7 @@ declare global {
       clipboardHasImage: () => Promise<boolean>;
       clipboardImage: () => Promise<{ attachment: Attachment | null }>;
       interrupt: (paneId: PaneId) => Promise<{ interrupted: boolean }>;
+      compact: (paneId: PaneId) => Promise<{ ok: boolean; error?: string }>;
       onTurnStarted: (cb: (p: { paneId: PaneId; turnId: string | null }) => void) => () => void;
       onDelta: (cb: (p: { paneId: PaneId; delta: string }) => void) => () => void;
       onTurnCompleted: (
@@ -482,6 +498,44 @@ export function App() {
   const [theme, setTheme] = useState<ThemeConfig>(loadTheme);
   const [showSettings, setShowSettings] = useState(false);
   const [status, setStatus] = useState<EngineStatus>({ state: "starting" });
+  // Sign-in gate: "checking" until we know, then either the login screen or
+  // the app. A remembered session (prior successful login) with a stored key
+  // signs in automatically; otherwise the login screen prompts.
+  const [authed, setAuthed] = useState<"checking" | "in" | "out">("checking");
+
+  useEffect(() => {
+    let alive = true;
+    void (async () => {
+      const st = await window.unbiased.authStatus();
+      const remembered = localStorage.getItem("unbiased.authed") === "1";
+      if (st.hasKey && (remembered || st.source === "env")) {
+        // Validate + start the engine with the stored key.
+        const who = await window.unbiased.authLogin();
+        if (!alive) return;
+        if (who.ok) {
+          localStorage.setItem("unbiased.authed", "1");
+          setAuthed("in");
+          return;
+        }
+      }
+      if (alive) setAuthed("out");
+    })();
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  function onSignedIn() {
+    localStorage.setItem("unbiased.authed", "1");
+    setAuthed("in");
+  }
+
+  async function signOut() {
+    await window.unbiased.authLogout();
+    localStorage.removeItem("unbiased.authed");
+    setShowSettings(false);
+    setAuthed("out");
+  }
 
   function applyTheme(next: ThemeConfig) {
     setTheme(next);
@@ -1420,6 +1474,24 @@ export function App() {
     return activeProject ? `New chat · ${activeProject.name}` : "New chat";
   })();
 
+  // Sign-in gate takes over the whole window until authenticated.
+  if (authed !== "in") {
+    return (
+      <div
+        style={{
+          ...themeVars(theme),
+          height: "100vh",
+          display: "flex",
+          background: colors.bg,
+          color: colors.fg,
+          fontFamily: "var(--font-ui)",
+        }}
+      >
+        {authed === "checking" ? <AuthSplash /> : <LoginView onSignedIn={onSignedIn} />}
+      </div>
+    );
+  }
+
   if (showSettings) {
     return (
       <div
@@ -1432,7 +1504,12 @@ export function App() {
           fontFamily: "var(--font-ui)",
         }}
       >
-        <SettingsView theme={theme} onChange={applyTheme} onBack={() => setShowSettings(false)} />
+        <SettingsView
+          theme={theme}
+          onChange={applyTheme}
+          onBack={() => setShowSettings(false)}
+          onSignOut={signOut}
+        />
       </div>
     );
   }
@@ -4903,6 +4980,7 @@ function ChatPane({
   const [sendHover, setSendHover] = useState(false);
   // Live context occupancy (per turn, from the engine) + the usage popover.
   const [ctxUsage, setCtxUsage] = useState<{ used: number; window: number | null; percent: number | null } | null>(null);
+  const [compacting, setCompacting] = useState(false);
   const [usageOpen, setUsageOpen] = useState(false);
   const [usageData, setUsageData] = useState<Awaited<ReturnType<typeof window.unbiased.readUsage>> | null>(null);
   const usageRef = useRef<HTMLSpanElement>(null);
@@ -4944,6 +5022,23 @@ function ChatPane({
   const savedRangeRef = useRef<Range | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const paneRef = useRef<HTMLDivElement>(null);
+
+  // Failsafe: if the compaction completion event never arrives (engine error,
+  // or a compaction that produced nothing), don't strand the UI in the
+  // "compacting" state forever — release it and flush the queue.
+  useEffect(() => {
+    if (!compacting) return;
+    const timer = setTimeout(() => {
+      setCompacting(false);
+      const [head, ...rest] = queueRef.current;
+      if (head) {
+        setQueue(rest);
+        void sendNow(head);
+      }
+    }, 180000);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [compacting]);
 
   // These props get a fresh identity on every parent render. The markdown
   // component map below must stay referentially stable — React reads a new
@@ -5125,6 +5220,15 @@ function ChatPane({
           if (cleaned[cleaned.length - 1]?.kind === "compaction") return cleaned;
           return [...cleaned, { kind: "compaction" }];
         });
+        // Manual compaction finished — clear the state and release anything
+        // the user queued while it ran (one send; its completion flushes the
+        // rest, matching the per-turn queue drain).
+        setCompacting(false);
+        const [head, ...rest] = queueRef.current;
+        if (head) {
+          setQueue(rest);
+          void sendNow(head);
+        }
       }),
       window.unbiased.onCommand((p) => {
         if (p.paneId !== paneId) return;
@@ -5170,6 +5274,15 @@ function ChatPane({
   const lastEntry = entries[entries.length - 1];
   const showThinking = busy && !(lastEntry?.kind === "assistant" && lastEntry.text !== "");
   const canSend = connected && (draft.trim() !== "" || annotations.length > 0);
+  // Compaction is offerable only when there IS uncompacted content: a
+  // non-empty conversation whose last entry isn't already a compaction
+  // divider, and nothing else in flight.
+  const canCompact =
+    !!threadIdRef.current &&
+    !compacting &&
+    !busy &&
+    entries.length > 0 &&
+    lastEntry?.kind !== "compaction";
 
   /** Send a prepared message right now (fresh sends and queue flushes). */
   async function sendNow(q: QueuedMsg) {
@@ -5219,8 +5332,9 @@ function ChatPane({
           ? anns.map((a) => ({ text: a.text, comment: a.comment, tag: a.tag, thumb: a.thumb }))
           : undefined,
     };
-    // A running turn means the message queues by default, Codex-style.
-    if (busy) {
+    // A running turn — or an in-progress compaction — means the message
+    // queues by default, Codex-style; it flushes when the work completes.
+    if (busy || compacting) {
       setQueue((list) => [...list, msg]);
       return;
     }
@@ -5412,18 +5526,13 @@ function ChatPane({
           return <code style={{ fontFamily: "inherit", fontSize: "inherit" }}>{props.children}</code>;
         }
         const text = extractText(props.children);
+        // Only file references are interactive — they open in the panel.
+        // Plain inline code is not clickable (it no longer opens a side chat).
         const isPath = Boolean(onOpenFileRef.current) && looksLikeFilePath(text);
-        const clickable = isPath || Boolean(onAskSideChatRef.current);
         return (
           <code
-            onClick={
-              isPath
-                ? () => onOpenFileRef.current!(text)
-                : clickable
-                  ? () => onAskSideChatRef.current!(text)
-                  : undefined
-            }
-            title={isPath ? "Open file" : clickable ? "Open in side chat" : undefined}
+            onClick={isPath ? () => onOpenFileRef.current!(text) : undefined}
+            title={isPath ? "Open file" : undefined}
             style={{
               fontFamily: "var(--font-code)",
               fontSize: "0.875em",
@@ -5432,7 +5541,7 @@ function ChatPane({
               color: isPath ? "var(--accent)" : "var(--fg-msg)",
               padding: "3px 8px",
               borderRadius: 6,
-              cursor: clickable ? "pointer" : "inherit",
+              cursor: isPath ? "pointer" : "inherit",
             }}
           >
             {props.children}
@@ -5675,7 +5784,36 @@ function ChatPane({
             }
             return null;
           })}
-          {showThinking && (
+          {compacting && (
+            <div style={{ display: "flex", justifyContent: "flex-start", margin: "10px 0" }}>
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 9,
+                  padding: "10px 14px",
+                  borderRadius: 12,
+                  background: colors.panel,
+                  border: `1px solid ${colors.border}`,
+                  fontSize: 14,
+                  color: colors.dim,
+                }}
+              >
+                <span
+                  style={{
+                    width: 12,
+                    height: 12,
+                    borderRadius: 6,
+                    border: `2px solid ${colors.border}`,
+                    borderTopColor: colors.accent,
+                    animation: "unbiased-spin 0.8s linear infinite",
+                  }}
+                />
+                Compacting conversation…
+              </div>
+            </div>
+          )}
+          {showThinking && !compacting && (
             <div style={{ display: "flex", justifyContent: "flex-start", margin: "10px 0" }}>
               <div
                 style={{
@@ -6236,6 +6374,48 @@ function ChatPane({
                     {usageData?.error && (
                       <div style={{ color: colors.dim, marginTop: 12 }}>Usage limits unavailable.</div>
                     )}
+                    {/* Manual compaction: summarizes the history, which both
+                        frees context AND cuts the tool-call density that can
+                        make a long conversation return empty responses. */}
+                    <div style={{ borderTop: `1px solid ${colors.border}`, margin: "14px 0 0" }} />
+                    <button
+                      disabled={!canCompact}
+                      onClick={async () => {
+                        // Stays "compacting" until the engine emits the
+                        // contextCompaction item (onCompaction clears it); the
+                        // start RPC resolving only means it kicked off.
+                        setCompacting(true);
+                        setUsageOpen(false);
+                        const r = await window.unbiased.compact(paneId);
+                        if (!r.ok) setCompacting(false);
+                      }}
+                      style={{
+                        width: "100%",
+                        textAlign: "left",
+                        background: "transparent",
+                        border: "none",
+                        color: canCompact ? colors.fg : colors.dim,
+                        fontSize: 13,
+                        cursor: canCompact ? "pointer" : "default",
+                        fontFamily: "inherit",
+                        padding: "12px 0 2px",
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 8,
+                      }}
+                    >
+                      <span style={{ color: colors.dim, display: "flex" }}>
+                        <CompactIcon />
+                      </span>
+                      {compacting
+                        ? "Compacting…"
+                        : lastEntry?.kind === "compaction"
+                          ? "Nothing new to compact"
+                          : "Compact conversation"}
+                    </button>
+                    <div style={{ color: colors.dim, fontSize: 11.5, lineHeight: 1.4 }}>
+                      Summarizes older history to free context and fix a long conversation that returns empty replies.
+                    </div>
                   </div>
                 )}
               </span>
@@ -6469,6 +6649,279 @@ const pillButtonStyle: React.CSSProperties = {
   fontFamily: "inherit",
   whiteSpace: "nowrap",
 };
+
+/** Shown for the brief moment while we check for a remembered session. */
+function AuthSplash() {
+  return (
+    <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center" }}>
+      <div style={{ opacity: 0.6 }}>
+        <BrandMark size={40} />
+      </div>
+    </div>
+  );
+}
+
+/** The sign-in screen: paste a key, or continue with a found one. Validates
+ *  against the platform's whoami (free, no model call) before letting the
+ *  engine start. */
+function LoginView({ onSignedIn }: { onSignedIn: () => void }) {
+  const [phase, setPhase] = useState<"loading" | "found" | "manual">("loading");
+  const [source, setSource] = useState<"env" | "file" | null>(null);
+  const [foundIdentity, setFoundIdentity] = useState<WhoamiResult | null>(null);
+  const [keyInput, setKeyInput] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [warn, setWarn] = useState<string | null>(null);
+  const [showCreate, setShowCreate] = useState(false);
+
+  // On mount: is there a stored key? If so, validate it and offer "continue".
+  useEffect(() => {
+    let alive = true;
+    void (async () => {
+      const st = await window.unbiased.authStatus();
+      if (!alive) return;
+      setSource(st.source);
+      if (st.hasKey) {
+        const who = await window.unbiased.authValidate();
+        if (!alive) return;
+        setFoundIdentity(who);
+        setPhase("found");
+      } else {
+        setPhase("manual");
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  // Rollout guidance: warn (don't block) if the platform reports <100%.
+  function rolloutWarning(who: WhoamiResult): string | null {
+    if (who.ok && typeof who.paretoRolloutPercent === "number" && who.paretoRolloutPercent < 100) {
+      return `This workload's Pareto rollout is ${who.paretoRolloutPercent}% — set it to 100% in the dashboard so every request routes to Pareto.`;
+    }
+    return null;
+  }
+
+  async function completeLogin(key?: string) {
+    setBusy(true);
+    setError(null);
+    setWarn(null);
+    const who = await window.unbiased.authLogin(key);
+    setBusy(false);
+    if (!who.ok) {
+      setError(who.error);
+      return;
+    }
+    if (who.accessStatus && who.accessStatus !== "granted" && who.accessStatus !== "active") {
+      setError(`This organization's access is "${who.accessStatus}". Contact your admin before signing in.`);
+      return;
+    }
+    const w = rolloutWarning(who);
+    if (w) setWarn(w); // shown briefly; we still proceed
+    onSignedIn();
+  }
+
+  const cardStyle: React.CSSProperties = {
+    width: 380,
+    background: colors.panel,
+    border: `1px solid ${colors.border}`,
+    borderRadius: 16,
+    padding: 28,
+  };
+  const inputStyle: React.CSSProperties = {
+    width: "100%",
+    boxSizing: "border-box",
+    background: "var(--panel-2)",
+    color: colors.fg,
+    border: `1px solid ${error ? colors.err : colors.border}`,
+    borderRadius: 10,
+    padding: "10px 12px",
+    fontSize: 13,
+    fontFamily: "var(--font-code)",
+    outline: "none",
+  };
+  const primaryBtn = (enabled: boolean): React.CSSProperties => ({
+    width: "100%",
+    background: enabled ? colors.accent : "var(--panel-2)",
+    color: enabled ? "var(--accent-fg)" : colors.dim,
+    border: "none",
+    borderRadius: 10,
+    padding: "10px 16px",
+    fontSize: 14,
+    fontWeight: 500,
+    cursor: enabled ? "pointer" : "default",
+    fontFamily: "inherit",
+    marginTop: 14,
+  });
+
+  return (
+    <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center" }}>
+      <div style={cardStyle}>
+        <div style={{ display: "flex", flexDirection: "column", alignItems: "center", marginBottom: 22 }}>
+          <BrandMark size={38} />
+          <div style={{ fontSize: 18, fontWeight: 600, marginTop: 14 }}>Sign in to Unbiased</div>
+          <div style={{ fontSize: 13, color: colors.dim, marginTop: 4, textAlign: "center" }}>
+            Connect your Pareto API key to start.
+          </div>
+        </div>
+
+        {phase === "loading" && <div style={{ textAlign: "center", color: colors.dim, fontSize: 13 }}>Checking…</div>}
+
+        {phase === "found" && (
+          <>
+            {foundIdentity?.ok ? (
+              <div
+                style={{
+                  border: `1px solid ${colors.border}`,
+                  borderRadius: 12,
+                  padding: 14,
+                  background: "var(--panel-2)",
+                }}
+              >
+                <div style={{ fontSize: 12, color: colors.dim, marginBottom: 4 }}>
+                  Found a key {source === "env" ? "in your environment" : "on this machine"}
+                </div>
+                <div style={{ fontSize: 15, fontWeight: 600 }}>{foundIdentity.organization.name}</div>
+                <div style={{ fontSize: 12.5, color: colors.dim, marginTop: 2 }}>
+                  {foundIdentity.workload.name} · {foundIdentity.keyName}
+                </div>
+              </div>
+            ) : (
+              <div style={{ fontSize: 13, color: colors.err }}>
+                {foundIdentity?.ok === false ? foundIdentity.error : "The stored key couldn't be validated."}
+              </div>
+            )}
+            {error && <div style={{ color: colors.err, fontSize: 12.5, marginTop: 10 }}>{error}</div>}
+            <button
+              disabled={busy || !foundIdentity?.ok}
+              onClick={() => void completeLogin()}
+              style={primaryBtn(!busy && !!foundIdentity?.ok)}
+            >
+              {busy ? "Signing in…" : "Continue"}
+            </button>
+            <button
+              onClick={() => {
+                setPhase("manual");
+                setError(null);
+              }}
+              style={{
+                width: "100%",
+                background: "transparent",
+                border: "none",
+                color: colors.dim,
+                fontSize: 12.5,
+                cursor: "pointer",
+                marginTop: 10,
+                fontFamily: "inherit",
+              }}
+            >
+              Use a different key
+            </button>
+          </>
+        )}
+
+        {phase === "manual" && (
+          <>
+            <input
+              type="password"
+              value={keyInput}
+              onChange={(e) => {
+                setKeyInput(e.target.value);
+                setError(null);
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && keyInput.trim() && !busy) void completeLogin(keyInput.trim());
+              }}
+              placeholder="Paste your Unbiased API key"
+              spellCheck={false}
+              autoFocus
+              style={inputStyle}
+            />
+            {error && <div style={{ color: colors.err, fontSize: 12.5, marginTop: 8 }}>{error}</div>}
+            <button
+              disabled={busy || !keyInput.trim()}
+              onClick={() => void completeLogin(keyInput.trim())}
+              style={primaryBtn(!busy && !!keyInput.trim())}
+            >
+              {busy ? "Validating…" : "Sign in"}
+            </button>
+
+            <button
+              onClick={() => setShowCreate((v) => !v)}
+              style={{
+                width: "100%",
+                background: "transparent",
+                border: "none",
+                color: colors.accent,
+                fontSize: 12.5,
+                cursor: "pointer",
+                marginTop: 14,
+                fontFamily: "inherit",
+              }}
+            >
+              Don't have a key? Create one
+            </button>
+            {showCreate && (
+              <div
+                style={{
+                  marginTop: 10,
+                  border: `1px solid ${colors.border}`,
+                  borderRadius: 10,
+                  padding: 12,
+                  background: "var(--panel-2)",
+                  fontSize: 12.5,
+                  color: colors.dim,
+                  lineHeight: 1.5,
+                }}
+              >
+                <div style={{ marginBottom: 8 }}>
+                  Create a key in the Unbiased dashboard, then paste it above:
+                </div>
+                <button
+                  onClick={() => void window.unbiased.openExternal("https://platform.unbiased.ai/dashboard")}
+                  style={{
+                    background: "transparent",
+                    border: `1px solid ${colors.border}`,
+                    color: colors.fg,
+                    borderRadius: 8,
+                    padding: "6px 12px",
+                    fontSize: 12.5,
+                    cursor: "pointer",
+                    fontFamily: "inherit",
+                    marginBottom: 10,
+                  }}
+                >
+                  Open dashboard ↗
+                </button>
+                <div
+                  style={{
+                    display: "flex",
+                    gap: 8,
+                    alignItems: "flex-start",
+                    color: colors.fg,
+                    background: "rgba(255, 138, 80, 0.10)",
+                    border: "1px solid rgba(255, 138, 80, 0.35)",
+                    borderRadius: 8,
+                    padding: "8px 10px",
+                  }}
+                >
+                  <span style={{ flexShrink: 0 }}>⚠️</span>
+                  <span>
+                    Set the workload's <b>Pareto rollout to 100%</b> when creating the key — otherwise requests
+                    may route to other models instead of Pareto.
+                  </span>
+                </div>
+              </div>
+            )}
+          </>
+        )}
+
+        {warn && <div style={{ color: "#FF8A50", fontSize: 12, marginTop: 12, lineHeight: 1.4 }}>{warn}</div>}
+      </div>
+    </div>
+  );
+}
 
 function fmtBytes(n: number): string {
   if (n >= 1 << 30) return `${(n / (1 << 30)).toFixed(2)} GB`;
@@ -6774,14 +7227,21 @@ function SettingsView({
   theme,
   onChange,
   onBack,
+  onSignOut,
 }: {
   theme: ThemeConfig;
   onChange: (t: ThemeConfig) => void;
   onBack: () => void;
+  onSignOut: () => void;
 }) {
-  const [tab, setTab] = useState<"appearance" | "resources">("appearance");
+  const [tab, setTab] = useState<"appearance" | "resources" | "account">("appearance");
   const [importText, setImportText] = useState("");
   const [importError, setImportError] = useState<string | null>(null);
+  const [account, setAccount] = useState<WhoamiResult | null>(null);
+
+  useEffect(() => {
+    if (tab === "account" && !account) void window.unbiased.authValidate().then(setAccount);
+  }, [tab, account]);
 
   const rowStyle: React.CSSProperties = {
     display: "flex",
@@ -6858,6 +7318,7 @@ function SettingsView({
           [
             { id: "appearance", label: "Appearance" },
             { id: "resources", label: "Resources" },
+            { id: "account", label: "Account" },
           ] as const
         ).map((item) => (
           <button
@@ -6886,6 +7347,62 @@ function SettingsView({
       <div style={{ flex: 1, overflowY: "auto", padding: "40px 48px" }}>
         {tab === "resources" ? (
           <ResourcesView />
+        ) : tab === "account" ? (
+          <div style={{ maxWidth: 640, margin: "0 auto" }}>
+            <h1 style={{ fontSize: 22, fontWeight: 600, margin: "0 0 24px" }}>Account</h1>
+            <div
+              style={{
+                border: `1px solid ${colors.border}`,
+                borderRadius: 12,
+                background: colors.panel,
+                overflow: "hidden",
+              }}
+            >
+              {account?.ok ? (
+                <>
+                  <div style={rowStyle}>
+                    <span style={{ color: colors.dim }}>Organization</span>
+                    <span>{account.organization.name}</span>
+                  </div>
+                  <div style={rowStyle}>
+                    <span style={{ color: colors.dim }}>Workload</span>
+                    <span>{account.workload.name}</span>
+                  </div>
+                  <div style={rowStyle}>
+                    <span style={{ color: colors.dim }}>Key</span>
+                    <span style={{ fontFamily: "var(--font-code)", fontSize: 13 }}>{account.keyName}</span>
+                  </div>
+                  <div style={{ ...rowStyle, borderBottom: "none" }}>
+                    <span style={{ color: colors.dim }}>Access</span>
+                    <span>{account.accessStatus}</span>
+                  </div>
+                </>
+              ) : (
+                <div style={{ ...rowStyle, borderBottom: "none", color: colors.dim }}>
+                  {account && !account.ok ? account.error : "Loading…"}
+                </div>
+              )}
+            </div>
+            <button
+              onClick={onSignOut}
+              style={{
+                marginTop: 20,
+                background: "transparent",
+                border: `1px solid ${colors.err}`,
+                color: colors.err,
+                borderRadius: 10,
+                padding: "9px 18px",
+                fontSize: 13.5,
+                cursor: "pointer",
+                fontFamily: "inherit",
+              }}
+            >
+              Sign out
+            </button>
+            <div style={{ fontSize: 12, color: colors.dim, marginTop: 10 }}>
+              Signing out stops the engine and removes the saved key from this machine.
+            </div>
+          </div>
         ) : (
         <div style={{ maxWidth: 640, margin: "0 auto" }}>
           <h1 style={{ fontSize: 22, fontWeight: 600, margin: "0 0 24px" }}>Appearance</h1>
@@ -7265,6 +7782,17 @@ function EnvIcon() {
       <path d="M4 12.5l1.5 1.5L8 11.5" />
       <path d="M4 19l1.5 1.5L8 18" />
       <path d="M11.5 6.5H20M11.5 13H20M11.5 19.5H20" />
+    </svg>
+  );
+}
+
+/** Two arrows folding toward a center line — "compact". */
+function CompactIcon() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M4 12h16" />
+      <path d="M8 8l4-4 4 4" />
+      <path d="M8 16l4 4 4-4" />
     </svg>
   );
 }

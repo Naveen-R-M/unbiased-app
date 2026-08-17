@@ -6,6 +6,7 @@ import {
   ipcMain,
   Menu,
   nativeImage,
+  screen,
   shell,
   WebContentsView,
 } from "electron";
@@ -316,6 +317,72 @@ function pushStatus(status: EngineStatus): void {
   win?.webContents.send("engine:status", status);
 }
 
+// ── Auth / credentials ───────────────────────────────────────────────
+// The desktop's sign-in surface. The engine wrapper reads the key from
+// UNBIASED_API_KEY (env) else ~/.unbiased/credentials.json; the login flow
+// writes the file and pins the key into the engine's launch env.
+const PLATFORM_BASE = "https://platform.unbiased.ai";
+function credentialsPath(): string {
+  return join(app.getPath("home"), ".unbiased", "credentials.json");
+}
+
+/** The key the engine would use, and where it came from. Env wins (matches
+ *  the wrapper's own ResolveKey order), then the credentials file. */
+function readStoredKey(): { key: string; source: "env" | "file" } | null {
+  const envKey = process.env.UNBIASED_API_KEY?.trim();
+  if (envKey) return { key: envKey, source: "env" };
+  try {
+    const cred = JSON.parse(readFileSync(credentialsPath(), "utf8")) as { apiKey?: unknown };
+    if (typeof cred.apiKey === "string" && cred.apiKey.trim()) return { key: cred.apiKey.trim(), source: "file" };
+  } catch {
+    // no file
+  }
+  return null;
+}
+
+type WhoamiResult =
+  | {
+      ok: true;
+      organization: { id: string; name: string };
+      workload: { id: string; name: string };
+      keyName: string;
+      accessStatus: string;
+      // Present only once the platform's whoami is extended to return it.
+      paretoRolloutPercent?: number | null;
+    }
+  | { ok: false; error: string; code?: string; status?: number };
+
+/** Validate a key against the platform's CLI whoami. Never billable, never
+ *  hits the model — a pure identity check safe to run before sign-in. */
+async function whoamiValidate(key: string): Promise<WhoamiResult> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15000);
+  try {
+    const res = await fetch(`${PLATFORM_BASE}/api/cli/whoami`, {
+      headers: { Authorization: `Bearer ${key}` },
+      signal: controller.signal,
+    });
+    if (res.status === 401) return { ok: false, error: "That API key isn't valid.", code: "invalid_api_key", status: 401 };
+    if (res.status === 503) return { ok: false, error: "The platform is temporarily unavailable — try again shortly.", code: "unavailable", status: 503 };
+    if (!res.ok) return { ok: false, error: `Validation failed (HTTP ${res.status}).`, status: res.status };
+    const body = (await res.json()) as Record<string, unknown>;
+    return {
+      ok: true,
+      organization: body.organization as { id: string; name: string },
+      workload: body.workload as { id: string; name: string },
+      keyName: String(body.keyName ?? ""),
+      accessStatus: String(body.accessStatus ?? "unknown"),
+      paretoRolloutPercent:
+        typeof body.paretoRolloutPercent === "number" ? body.paretoRolloutPercent : undefined,
+    };
+  } catch (err) {
+    const aborted = (err as { name?: string })?.name === "AbortError";
+    return { ok: false, error: aborted ? "Validation timed out — check your connection." : "Couldn't reach the platform.", code: "network" };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // ── Secret redaction at the display boundary ─────────────────────────
 // Known local secret VALUES (the Unbiased API key). Every engine event
 // forwarded to the renderer passes through send(), so masking here
@@ -327,20 +394,16 @@ let knownSecrets: string[] | null = null;
 function loadKnownSecrets(): string[] {
   if (knownSecrets) return knownSecrets;
   const vals: string[] = [];
-  try {
-    const cred = JSON.parse(
-      readFileSync(join(app.getPath("home"), ".unbiased", "credentials.json"), "utf8"),
-    ) as { apiKey?: unknown };
-    // Length floor: never build a replacer from a trivial string that
-    // could mangle ordinary text.
-    if (typeof cred.apiKey === "string" && cred.apiKey.length >= 12) vals.push(cred.apiKey);
-  } catch {
-    // no credentials file — nothing to redact
-  }
-  const envKey = process.env.UNBIASED_API_KEY;
-  if (envKey && envKey.length >= 12 && !vals.includes(envKey)) vals.push(envKey);
+  const stored = readStoredKey();
+  // Length floor: never build a replacer from a trivial string that could
+  // mangle ordinary text.
+  if (stored && stored.key.length >= 12) vals.push(stored.key);
   knownSecrets = vals;
   return vals;
+}
+/** Invalidate the redaction cache after a key change (login/logout). */
+function resetKnownSecrets(): void {
+  knownSecrets = null;
 }
 
 /** Mask known secret values anywhere in a JSON-serializable payload.
@@ -372,19 +435,82 @@ function resolveIconPath(): string {
     : join(app.getAppPath(), "resources", "icon.png");
 }
 
+/** Remembered window bounds, so the app reopens at the size/place the user
+ *  left it. Falls back to a large default sized to the current display. */
+function windowStateFile(): string {
+  return join(app.getPath("userData"), "window-state.json");
+}
+function loadWindowBounds(): { width: number; height: number; x?: number; y?: number } {
+  const { width: sw, height: sh } = screen.getPrimaryDisplay().workAreaSize;
+  // Default: fill most of the screen, capped so it isn't unwieldy on huge
+  // monitors and never smaller than a usable floor.
+  const fallback = {
+    width: Math.max(1100, Math.min(1680, Math.round(sw * 0.85))),
+    height: Math.max(720, Math.min(1050, Math.round(sh * 0.88))),
+  };
+  try {
+    const saved = JSON.parse(readFileSync(windowStateFile(), "utf8")) as {
+      width?: number;
+      height?: number;
+      x?: number;
+      y?: number;
+    };
+    // Only trust saved bounds that still fit on some connected display.
+    if (
+      typeof saved.width === "number" &&
+      typeof saved.height === "number" &&
+      saved.width >= 800 &&
+      saved.height >= 600
+    ) {
+      const onScreen =
+        saved.x === undefined ||
+        saved.y === undefined ||
+        screen.getAllDisplays().some((d) => {
+          const b = d.workArea;
+          return saved.x! < b.x + b.width && saved.x! + 100 > b.x && saved.y! < b.y + b.height && saved.y! + 40 > b.y;
+        });
+      return onScreen ? { ...fallback, ...saved } : { width: saved.width, height: saved.height };
+    }
+  } catch {
+    // no saved state
+  }
+  return fallback;
+}
+
 function createWindow(): void {
   const iconPath = resolveIconPath();
   // macOS ignores BrowserWindow icons — the dock owns the launcher icon.
   if (process.platform === "darwin" && existsSync(iconPath)) {
     app.dock?.setIcon(iconPath);
   }
+  const bounds = loadWindowBounds();
   win = new BrowserWindow({
-    width: 1100,
-    height: 700,
+    width: bounds.width,
+    height: bounds.height,
+    ...(bounds.x !== undefined && bounds.y !== undefined ? { x: bounds.x, y: bounds.y } : {}),
+    minWidth: 800,
+    minHeight: 600,
     title: "Unbiased",
     ...(process.platform !== "darwin" && existsSync(iconPath) ? { icon: iconPath } : {}),
     webPreferences: { preload: join(__dirname, "../preload/index.js") },
   });
+  if (bounds.x === undefined) win.center();
+
+  // Persist size/position (debounced) so the next launch restores them.
+  let saveTimer: ReturnType<typeof setTimeout> | null = null;
+  const persistBounds = () => {
+    if (!win || win.isDestroyed()) return;
+    if (saveTimer) clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => {
+      try {
+        if (win && !win.isDestroyed()) writeFileSync(windowStateFile(), JSON.stringify(win.getBounds()));
+      } catch {
+        // best-effort
+      }
+    }, 400);
+  };
+  win.on("resize", persistBounds);
+  win.on("move", persistBounds);
   // Links in rendered markdown are real anchors now — route them to the
   // system browser instead of navigating (or spawning) app windows.
   win.webContents.setWindowOpenHandler(({ url }) => {
@@ -775,6 +901,7 @@ function wireNotifications(): void {
   );
 }
 
+let engineWired = false;
 async function startEngine(): Promise<void> {
   const engineDir = resolveEngineDir();
   const bin = join(engineDir, "unbiased-app-engine");
@@ -786,10 +913,22 @@ async function startEngine(): Promise<void> {
     });
     return;
   }
+  // The engine refuses to start without a key; gate here so the renderer's
+  // login screen shows instead of a cryptic "no API key" exit.
+  const stored = readStoredKey();
+  if (!stored) {
+    pushStatus({ state: "exited", code: null, detail: "not signed in" });
+    return;
+  }
 
-  engine.on("status", pushStatus);
-  wireNotifications();
-  engine.start(bin);
+  // Listeners attach once; a re-login stops the old process and starts fresh.
+  if (!engineWired) {
+    engine.on("status", pushStatus);
+    wireNotifications();
+    engineWired = true;
+  }
+  engine.stop();
+  engine.start(bin, { UNBIASED_API_KEY: stored.key });
 
   const result = await engine.handshake(app.getVersion());
   pushStatus({
@@ -802,6 +941,60 @@ async function startEngine(): Promise<void> {
 
 app.whenReady().then(async () => {
   ipcMain.handle("engine:status", () => lastStatus);
+
+  // ── Auth IPC ────────────────────────────────────────────────────────
+  // Presence + source of the stored key (no network). keyName is the
+  // credentials-file label if we wrote one; env keys are opaque.
+  ipcMain.handle("auth:status", () => {
+    const stored = readStoredKey();
+    return { hasKey: !!stored, source: stored?.source ?? null };
+  });
+
+  // Validate a key (or the stored one) against the platform. Pure check —
+  // no persistence, no engine start.
+  ipcMain.handle("auth:validate", async (_e, key?: string) => {
+    const k = (key ?? readStoredKey()?.key ?? "").trim();
+    if (!k) return { ok: false, error: "No API key to validate." };
+    return whoamiValidate(k);
+  });
+
+  // Sign in: validate, persist (unless the key comes from the environment),
+  // then (re)start the engine with it. Returns the whoami identity.
+  ipcMain.handle("auth:login", async (_e, payload: { key?: string }) => {
+    const fromEnv = process.env.UNBIASED_API_KEY?.trim();
+    const key = (payload?.key ?? fromEnv ?? readStoredKey()?.key ?? "").trim();
+    if (!key) return { ok: false, error: "No API key provided." };
+    const who = await whoamiValidate(key);
+    if (!who.ok) return who;
+    // Only persist a user-entered key; an env key is the environment's to own.
+    const isEnvKey = key === fromEnv;
+    if (!isEnvKey) {
+      try {
+        mkdirSync(join(app.getPath("home"), ".unbiased"), { recursive: true });
+        writeFileSync(credentialsPath(), JSON.stringify({ apiKey: key }, null, 2), { mode: 0o600 });
+      } catch (err) {
+        return { ok: false, error: `Couldn't save credentials: ${String(err)}` };
+      }
+    }
+    resetKnownSecrets();
+    startEngine().catch((err) => pushStatus({ state: "exited", code: null, detail: String(err) }));
+    return who;
+  });
+
+  // Sign out: stop the engine and remove the stored credentials file. An
+  // env-provided key can't be removed by us — report that so the UI can say so.
+  ipcMain.handle("auth:logout", () => {
+    engine.stop();
+    pushStatus({ state: "exited", code: null, detail: "signed out" });
+    const envKey = !!process.env.UNBIASED_API_KEY?.trim();
+    try {
+      rmSync(credentialsPath(), { force: true });
+    } catch {
+      // nothing to remove
+    }
+    resetKnownSecrets();
+    return { ok: true, envKeyRemains: envKey };
+  });
 
   ipcMain.handle("chat:send", async (_e, payload: {
     paneId: PaneId;
@@ -1069,6 +1262,22 @@ app.whenReady().then(async () => {
     if (!pane.threadId || !turnId) return { interrupted: false };
     await engine.request("turn/interrupt", { threadId: pane.threadId, turnId });
     return { interrupted: true };
+  });
+
+  // Manually summarize the conversation's history. Useful when a very
+  // tool-dense conversation starts returning empty completions: replacing
+  // the verbatim tool-call log with a summary cuts the density that trips
+  // the gateway's cascade. Emits a contextCompaction item on completion,
+  // which the renderer already renders as a divider.
+  ipcMain.handle("chat:compact", async (_e, paneId: PaneId) => {
+    const pane = panes[paneId];
+    if (!pane.threadId) return { ok: false, error: "no conversation" };
+    try {
+      await engine.request("thread/compact/start", { threadId: pane.threadId });
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: String(err) };
+    }
   });
 
   ipcMain.handle("chat:approve", (_e, payload: {
@@ -1710,11 +1919,9 @@ app.whenReady().then(async () => {
   });
 
   createWindow();
-  try {
-    await startEngine();
-  } catch (err) {
-    pushStatus({ state: "exited", code: null, detail: String(err) });
-  }
+  // The engine no longer auto-starts: the renderer's login gate decides
+  // whether to sign in (a stored key + remembered session) or prompt first,
+  // then calls auth:login, which validates and starts the engine.
 });
 
 app.on("window-all-closed", () => {

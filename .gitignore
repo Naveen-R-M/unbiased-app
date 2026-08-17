@@ -2,3 +2,5 @@ node_modules/
 out/
 dist/
 .dirac-cache/
+# Packaged installers (hundreds of MB — the engine ships inside them).
+release/

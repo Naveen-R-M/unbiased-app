@@ -14,12 +14,18 @@ contextBridge.exposeInMainWorld("unbiased", {
   getEngineStatus: () => ipcRenderer.invoke("engine:status"),
   onEngineStatus: (cb: (status: unknown) => void) => subscribe("engine:status", cb),
 
+  authStatus: () => ipcRenderer.invoke("auth:status"),
+  authValidate: (key?: string) => ipcRenderer.invoke("auth:validate", key),
+  authLogin: (key?: string) => ipcRenderer.invoke("auth:login", { key }),
+  authLogout: () => ipcRenderer.invoke("auth:logout"),
+
   sendMessage: (paneId: string, text: string, attachments?: { name: string; path: string; kind?: string }[]) =>
     ipcRenderer.invoke("chat:send", { paneId, text, attachments }),
   chooseAttachments: () => ipcRenderer.invoke("attach:choose"),
   clipboardHasImage: () => ipcRenderer.invoke("clipboard:has-image"),
   clipboardImage: () => ipcRenderer.invoke("attach:clipboard-image"),
   interrupt: (paneId: string) => ipcRenderer.invoke("chat:interrupt", paneId),
+  compact: (paneId: string) => ipcRenderer.invoke("chat:compact", paneId),
   onTurnStarted: (cb: (p: unknown) => void) => subscribe("chat:turn-started", cb),
   onDelta: (cb: (p: unknown) => void) => subscribe("chat:delta", cb),
   onTurnCompleted: (cb: (p: unknown) => void) => subscribe("chat:turn-completed", cb),

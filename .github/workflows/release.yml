@@ -1,0 +1,139 @@
+name: Release
+
+# Tag-driven releases, published CROSS-REPO to the public releases repo
+# (circuitandchisel/unbiased-app-releases) — this source repo stays private,
+# the same shape as unbiased-cli. Push a v* tag here and this builds the DMG,
+# checksums it, publishes the release over there, and syncs install.sh so the
+# public copy never drifts from the source of truth in scripts/.
+#
+#   git tag v1.0.0 && git push origin v1.0.0
+#
+# REQUIRES two secrets:
+#   RELEASES_TOKEN — fine-grained PAT, "Contents: read and write" on
+#                    unbiased-app-releases ONLY. The default github.token
+#                    cannot write to another repository.
+#   ENGINE_TOKEN   — fine-grained PAT, "Contents: read" on unbiased-app-engine.
+#                    The engine is a separate private repo and its bundle must
+#                    be built here; nothing else crosses that boundary.
+#
+# Runs on macOS because a .dmg can only be built (and codesigned) on macOS.
+# macos-15 is an Apple Silicon runner, which matches our arm64-only target —
+# the bundled Pareto engine has no x64 slice, so this cannot cross-compile.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  RELEASES_REPO: circuitandchisel/unbiased-app-releases
+
+jobs:
+  release:
+    runs-on: macos-15
+    steps:
+      - name: checkout app
+        uses: actions/checkout@v4
+        with:
+          path: unbiased-app
+
+      # The engine must sit BESIDE the app: package.json's extraResources
+      # copies from ../unbiased-app-engine/dist/bundle.
+      - name: checkout engine
+        uses: actions/checkout@v4
+        with:
+          repository: circuitandchisel/unbiased-app-engine
+          token: ${{ secrets.ENGINE_TOKEN }}
+          path: unbiased-app-engine
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: unbiased-app-engine/go.mod
+          cache: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # The full gate runs again here: a tag can be pushed on any commit, so
+      # the release build must not assume CI already blessed it.
+      - name: engine tests
+        working-directory: unbiased-app-engine
+        run: make test
+
+      # fetch-engine.sh pulls the pinned upstream engine through the
+      # engine.lock checksum gate (public openai/codex release — no secret).
+      - name: build engine bundle
+        working-directory: unbiased-app-engine
+        run: make bundle
+
+      - name: install app deps
+        working-directory: unbiased-app
+        run: npm ci
+
+      - name: typecheck
+        working-directory: unbiased-app
+        run: npm run typecheck
+
+      # electron-builder's afterPack hook ad-hoc signs the bundle and FAILS
+      # the build if the signature doesn't verify, so a broken app can't ship.
+      - name: build DMG
+        working-directory: unbiased-app
+        run: npm run dist
+
+      - name: checksums
+        working-directory: unbiased-app/release
+        run: shasum -a 256 *.dmg > SHA256SUMS
+
+      - name: verify the packaged app
+        working-directory: unbiased-app
+        run: |
+          app="release/mac-arm64/Unbiased.app"
+          # The engine really is inside the bundle (the whole point of shipping
+          # one file), and the signature seals it.
+          test -x "$app/Contents/Resources/engine/unbiased-app-engine"
+          test -x "$app/Contents/Resources/engine/pareto-app-server"
+          codesign --verify --deep --strict "$app"
+          ls -lh release/*.dmg
+
+      - name: publish release to the public repo
+        working-directory: unbiased-app
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$RELEASES_REPO" \
+            --title "$GITHUB_REF_NAME" \
+            --notes "Apple Silicon Mac, macOS 12+.
+
+          Install:
+          \`\`\`
+          curl -fsSL https://raw.githubusercontent.com/$RELEASES_REPO/main/install.sh | bash
+          \`\`\`
+          Or download the .dmg below, drag Unbiased to Applications, then right-click → Open the first time (the app is ad-hoc signed, not notarized).
+
+          On first launch, paste your Unbiased API key." \
+            release/*.dmg \
+            release/SHA256SUMS
+
+      # scripts/install.sh (here, private) is the source of truth and already
+      # points its REPO at the public releases repo. Push a verbatim copy
+      # every release so the public copy can never drift.
+      - name: sync install.sh to the public repo
+        working-directory: unbiased-app
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+        run: |
+          current_sha=$(gh api "repos/$RELEASES_REPO/contents/install.sh" --jq .sha 2>/dev/null || true)
+          if [ -n "$current_sha" ]; then
+            existing=$(gh api "repos/$RELEASES_REPO/contents/install.sh" --jq .content | base64 -d)
+            if [ "$existing" = "$(cat scripts/install.sh)" ]; then
+              echo "install.sh already up to date"; exit 0
+            fi
+          fi
+          gh api -X PUT "repos/$RELEASES_REPO/contents/install.sh" \
+            -f message="Sync install.sh from source ($GITHUB_REF_NAME)" \
+            -f content="$(base64 < scripts/install.sh | tr -d '\n')" \
+            ${current_sha:+-f sha="$current_sha"}
