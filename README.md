@@ -6,6 +6,10 @@ app is a pure client: all agent intelligence lives in a separate
 binary (a Pareto-locked codex app-server wrapper) that the app spawns and
 speaks to over stdio.
 
+**New here?** [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md) explains the whole
+chain — UI, supervisor, codex app-server, gateway — and traces one message
+from keystroke to file on disk.
+
 <p align="center">
   <img src="resources/icon.png" alt="Unbiased icon" width="128" />
 </p>
@@ -62,6 +66,10 @@ speaks to over stdio.
   minimal.
 - `src/renderer/src/App.tsx` — the entire UI. No CSS files; styling is
   inline against CSS variables set from the active theme.
+
+For what sits *below* this diagram — what the engine wrapper does, what the
+codex app-server owns, how a turn reaches the model, and where conversations
+live on disk — see [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md).
 
 ## Development
 
