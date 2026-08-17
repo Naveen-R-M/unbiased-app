@@ -88,15 +88,26 @@ mnt="$(hdiutil attach "$dmg" -nobrowse -mountrandom /tmp | awk -F'\t' '/\/tmp\//
 [ -n "$mnt" ] && [ -d "$mnt/$APP_NAME" ] || die "could not find $APP_NAME inside the disk image"
 
 target="$INSTALL_DIR/$APP_NAME"
-if [ -d "$target" ]; then
-  info "replacing existing install at $target"
-  rm -rf "$target" 2>/dev/null || die "could not remove $target (try: sudo rm -rf '$target')"
-fi
+staged="$INSTALL_DIR/.$APP_NAME.incoming"
 
 # ditto preserves the code signature and resource forks; cp -R can break the
 # bundle's seal, which would make macOS reject the app.
-info "installing to $INSTALL_DIR…"
-ditto "$mnt/$APP_NAME" "$target" || die "install failed (no write access to $INSTALL_DIR?)"
+#
+# Stage the new copy BESIDE the target and swap only once it has landed.
+# Deleting the old app first means any later failure — bad payload, full
+# disk, no write access — leaves the user with no app at all.
+#
+# Braces around every expansion are not decoration: `$INSTALL_DIR…` makes
+# bash 3.2 in a UTF-8 locale read the ellipsis bytes as part of the variable
+# NAME, so `set -u` kills the script mid-install. ${INSTALL_DIR} is immune.
+info "installing to ${INSTALL_DIR}…"
+rm -rf "$staged"
+ditto "$mnt/$APP_NAME" "$staged" || die "install failed (no write access to ${INSTALL_DIR}?)"
+if [ -d "$target" ]; then
+  info "replacing existing install at ${target}"
+  rm -rf "$target" || { rm -rf "$staged"; die "could not remove ${target} (try: sudo rm -rf '${target}')"; }
+fi
+mv "$staged" "$target" || { rm -rf "$staged"; die "could not move the new app into place"; }
 
 hdiutil detach "$mnt" -quiet || true
 mnt=""

@@ -540,10 +540,21 @@ async function installUpdate(info: UpdateInfo): Promise<{ ok: boolean; error?: s
     }
 
     const target = appBundlePath();
+    // Stage beside the target, then swap. Deleting the installed app first
+    // means a failure here (full disk, permissions) leaves the user with no
+    // app at all — which is exactly what the shell installer did once.
     // ditto (not cp -R) preserves the code signature; a broken seal would
     // make macOS refuse to launch the updated app.
-    rmSync(target, { recursive: true, force: true });
-    execFileSync("ditto", [join(mounted, srcApp), target]);
+    const staged = `${target}.incoming`;
+    rmSync(staged, { recursive: true, force: true });
+    execFileSync("ditto", [join(mounted, srcApp), staged]);
+    try {
+      rmSync(target, { recursive: true, force: true });
+      execFileSync("mv", [staged, target]);
+    } catch (swapErr) {
+      rmSync(staged, { recursive: true, force: true });
+      throw swapErr;
+    }
     try {
       execFileSync("xattr", ["-dr", "com.apple.quarantine", target]);
     } catch {
