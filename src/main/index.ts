@@ -463,6 +463,13 @@ async function readBilling(): Promise<BillingResult> {
 // same steps work here: download → verify SHA-256 → mount → replace → relaunch.
 const UPDATE_REPO = "circuitandchisel/unbiased-app-releases";
 const UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1000;
+// A desktop app stays open for days, so a timer alone means a release can go
+// unnoticed for hours (the check fires at launch, then not again until the
+// interval elapses). Re-check when the window regains focus — that's when
+// someone is actually looking at the sidebar — throttled so alt-tabbing
+// doesn't hammer the API.
+const UPDATE_FOCUS_THROTTLE_MS = 10 * 60 * 1000;
+let lastUpdateCheck = 0;
 
 type UpdateInfo = { version: string; dmgUrl: string; sumsUrl: string | null };
 let pendingUpdate: UpdateInfo | null = null;
@@ -496,6 +503,7 @@ function compareVersions(a: string, b: string): number {
 
 /** Ask the public releases repo what the latest version is. */
 async function checkForUpdate(): Promise<UpdateInfo | null> {
+  lastUpdateCheck = Date.now();
   // Dev preview: UNBIASED_FAKE_UPDATE=1 surfaces the banner without a
   // packaged build, so the update UI can be iterated on with `npm run dev`.
   // Installing is still gated on isPackaged, so this can't swap anything.
@@ -808,6 +816,13 @@ function createWindow(): void {
   };
   win.on("resize", persistBounds);
   win.on("move", persistBounds);
+
+  // Coming back to the app is the moment a new release should surface.
+  win.on("focus", () => {
+    if (stagedUpdate) return; // already downloaded; nothing to re-check
+    if (Date.now() - lastUpdateCheck < UPDATE_FOCUS_THROTTLE_MS) return;
+    void checkForUpdate();
+  });
   // Links in rendered markdown are real anchors now — route them to the
   // system browser instead of navigating (or spawning) app windows.
   win.webContents.setWindowOpenHandler(({ url }) => {
