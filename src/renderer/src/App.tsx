@@ -6688,6 +6688,59 @@ const pillButtonStyle: React.CSSProperties = {
   whiteSpace: "nowrap",
 };
 
+/** Original mascot: a pup peeking over the update card with its paws draped
+ *  on the top edge. Drawn inline (like every other icon here) so it scales,
+ *  needs no asset pipeline, and picks up the theme's border colour. */
+function DogPeek({ size = 104 }: { size?: number }) {
+  return (
+    <svg width={size} height={size * (80 / 140)} viewBox="0 0 140 80" aria-hidden="true">
+      {/* floppy ears, behind the head */}
+      <path d="M47 13 C33 9 24 21 24 40 C24 57 29 70 38 69 C45 68 45 46 47 27 Z" fill="#FF7764" />
+      <path d="M93 13 C107 9 116 21 116 40 C116 57 111 70 102 69 C95 68 95 46 93 27 Z" fill="#FF7764" />
+      {/* head */}
+      <path
+        d="M70 6 C90 6 102 20 102 40 C102 58 88 70 70 70 C52 70 38 58 38 40 C38 20 50 6 70 6 Z"
+        fill="#F4F1EC"
+        stroke="var(--border)"
+        strokeWidth="0.8"
+      />
+      <path d="M52 14 C64 11 71 18 70 28 C69 37 61 41 53 39 C44 36 43 17 52 14 Z" fill="#FF9068" />
+      <ellipse cx="58" cy="32" rx="6.2" ry="7" fill="#211F1E" />
+      <ellipse cx="84" cy="32" rx="6.2" ry="7" fill="#211F1E" />
+      <circle cx="60.2" cy="29" r="2.2" fill="#fff" />
+      <circle cx="86.2" cy="29" r="2.2" fill="#fff" />
+      <ellipse cx="71" cy="53" rx="19" ry="13" fill="#FCFBF9" />
+      <path
+        d="M71 43 C77.5 43 81 46.5 81 49.5 C81 53 76.5 55.5 71 55.5 C65.5 55.5 61 53 61 49.5 C61 46.5 64.5 43 71 43 Z"
+        fill="#211F1E"
+      />
+      <path d="M71 55.5 L71 59" stroke="#211F1E" strokeWidth="1.9" strokeLinecap="round" />
+      <path d="M71 59 C68.5 62.5 64 61.8 63 59.2" stroke="#211F1E" strokeWidth="1.9" strokeLinecap="round" fill="none" />
+      <path d="M71 59 C73.5 62.5 78 61.8 79 59.2" stroke="#211F1E" strokeWidth="1.9" strokeLinecap="round" fill="none" />
+      <path d="M69 61 C69 66.5 74 68 75.6 64 C76.6 61.3 74.6 60 72 60 Z" fill="#FF8FA3" />
+      <circle cx="61" cy="49" r="0.9" fill="#DCD7D0" />
+      <circle cx="64.5" cy="52.5" r="0.9" fill="#DCD7D0" />
+      <circle cx="81" cy="49" r="0.9" fill="#DCD7D0" />
+      <circle cx="77.5" cy="52.5" r="0.9" fill="#DCD7D0" />
+      {/* paws gripping the card's top edge */}
+      <path
+        d="M30 64 C30 59 36 57 42 59 C48 61 50 66 50 70 C50 76 46 79 40 79 L34 79 C30 79 30 70 30 64 Z"
+        fill="#FCFBF9"
+        stroke="var(--border)"
+        strokeWidth="0.8"
+      />
+      <path
+        d="M110 64 C110 59 104 57 98 59 C92 61 90 66 90 70 C90 76 94 79 100 79 L106 79 C110 79 110 70 110 64 Z"
+        fill="#FCFBF9"
+        stroke="var(--border)"
+        strokeWidth="0.8"
+      />
+      <path d="M36 62.5 L36 77 M41 62 L41 78 M46 65 L46 78" stroke="#E4DFD7" strokeWidth="1.3" strokeLinecap="round" />
+      <path d="M104 62.5 L104 77 M99 62 L99 78 M94 65 L94 78" stroke="#E4DFD7" strokeWidth="1.3" strokeLinecap="round" />
+    </svg>
+  );
+}
+
 /** Sidebar card offering the newer release. Click = download, verify, swap
  *  the app bundle, relaunch. Progress replaces the label in place so the
  *  card never changes size mid-update. */
@@ -6716,6 +6769,11 @@ function UpdateBanner({
             : "Relaunch to update";
   return (
     <div style={{ padding: "6px 14px 2px", flexShrink: 0 }}>
+      {/* The pup sits above the card; its paws overlap the top edge so the
+          card reads as the sign it's holding up. */}
+      <div style={{ display: "flex", justifyContent: "center", marginBottom: -14, pointerEvents: "none" }}>
+        <DogPeek size={104} />
+      </div>
       <button
         onClick={() => !busy && onInstall()}
         disabled={busy}
@@ -6749,9 +6807,7 @@ function UpdateBanner({
             }}
           />
         )}
-        <span style={{ display: "flex", flexShrink: 0, color: error ? colors.err : colors.accent, zIndex: 1 }}>
-          <UpdateIcon />
-        </span>
+        {/* No icon here — the pup above the card is the visual. */}
         <span style={{ flex: 1, minWidth: 0, zIndex: 1 }}>
           <span
             style={{
@@ -7909,17 +7965,6 @@ function EnvIcon() {
       <path d="M4 12.5l1.5 1.5L8 11.5" />
       <path d="M4 19l1.5 1.5L8 18" />
       <path d="M11.5 6.5H20M11.5 13H20M11.5 19.5H20" />
-    </svg>
-  );
-}
-
-/** Downward arrow into a tray — an available update. */
-function UpdateIcon() {
-  return (
-    <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
-      <path d="M12 3v11" />
-      <path d="M7.5 9.5 12 14l4.5-4.5" />
-      <path d="M4 17.5v1.5a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-1.5" />
     </svg>
   );
 }
