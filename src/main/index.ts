@@ -394,6 +394,67 @@ async function whoamiValidate(key: string): Promise<WhoamiResult> {
   }
 }
 
+type BillingResult =
+  | {
+      ok: true;
+      organization: { name: string };
+      balanceCents: number | null;
+      monthToDateSpendCents: number | null;
+      spendSyncedAt: string | null;
+      tokens: { input: number; cached: number; output: number } | null;
+    }
+  | { ok: false; error: string };
+
+/** Credits and month-to-date spend, from the platform's CLI billing route.
+ *  Replaces the engine's account/rateLimits/read, which is ChatGPT-plan
+ *  plumbing and always fails under gateway API-key auth. Pareto has no quota
+ *  windows to report — it's prepaid credit — so this is what "usage" means. */
+async function readBilling(): Promise<BillingResult> {
+  const stored = readStoredKey();
+  if (!stored) return { ok: false, error: "not signed in" };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15000);
+  try {
+    const res = await fetch(`${PLATFORM_BASE}/api/cli/billing`, {
+      headers: { Authorization: `Bearer ${stored.key}` },
+      signal: controller.signal,
+    });
+    if (!res.ok) return { ok: false, error: `HTTP ${res.status}` };
+    const b = (await res.json()) as {
+      organization?: { name?: string };
+      balance?: { available?: boolean; balanceCents?: number };
+      usage?: {
+        available?: boolean;
+        monthToDateSpendCents?: number | null;
+        spendSyncedAt?: string | null;
+        monthToDateUsage?: { totalInputTokens?: number; totalCachedTokens?: number; totalOutputTokens?: number };
+      };
+    };
+    // Balance and usage fail independently upstream, so each is reported
+    // separately rather than collapsing the whole card on one outage.
+    const u = b.usage?.monthToDateUsage;
+    return {
+      ok: true,
+      organization: { name: b.organization?.name ?? "" },
+      balanceCents: b.balance?.available ? (b.balance.balanceCents ?? null) : null,
+      monthToDateSpendCents: b.usage?.available ? (b.usage.monthToDateSpendCents ?? null) : null,
+      spendSyncedAt: b.usage?.spendSyncedAt ?? null,
+      tokens: u
+        ? {
+            input: u.totalInputTokens ?? 0,
+            cached: u.totalCachedTokens ?? 0,
+            output: u.totalOutputTokens ?? 0,
+          }
+        : null,
+    };
+  } catch (err) {
+    const aborted = (err as { name?: string })?.name === "AbortError";
+    return { ok: false, error: aborted ? "timed out" : "could not reach the platform" };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // ── Self-update ──────────────────────────────────────────────────────
 // We install updates OURSELVES rather than using electron-updater, because
 // Squirrel.Mac refuses to update a bundle that isn't Developer ID signed —
@@ -1359,13 +1420,8 @@ app.whenReady().then(async () => {
     return { usage: loadCtxUsage()[threadId] ?? null };
   });
 
-  ipcMain.handle("usage:read", async () => {
-    try {
-      return await engine.request("account/rateLimits/read", {});
-    } catch (err) {
-      return { error: String(err) };
-    }
-  });
+  ipcMain.handle("usage:billing", () => readBilling());
+
 
   // ── Resource + storage stats (Settings → Resources) ─────────────────
   // Live process metrics: Chromium's own processes via getAppMetrics(),

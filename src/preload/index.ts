@@ -55,7 +55,7 @@ contextBridge.exposeInMainWorld("unbiased", {
   onCommand: (cb: (p: unknown) => void) => subscribe("chat:command", cb),
   onCompaction: (cb: (p: unknown) => void) => subscribe("chat:compaction", cb),
   onTokenUsage: (cb: (p: unknown) => void) => subscribe("chat:token-usage", cb),
-  readUsage: () => ipcRenderer.invoke("usage:read"),
+  readBilling: () => ipcRenderer.invoke("usage:billing"),
   contextUsage: (threadId: string) => ipcRenderer.invoke("usage:context", threadId),
   resourceStats: () => ipcRenderer.invoke("stats:resources"),
   storageStats: () => ipcRenderer.invoke("stats:storage"),

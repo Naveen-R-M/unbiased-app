@@ -133,24 +133,6 @@ function fmtTokens(n: number): string {
   return String(n);
 }
 
-function fmtWindowLabel(mins: number | null | undefined): string {
-  if (!mins) return "Usage limit";
-  if (mins < 90) return `${mins}-minute limit`;
-  if (mins <= 1800) return `${Math.round(mins / 60)}-hour limit`;
-  if (Math.abs(mins - 10080) < 720) return "Weekly limit";
-  return `${Math.round(mins / 1440)}-day limit`;
-}
-
-function fmtReset(resetsAt: number | null | undefined): string {
-  if (!resetsAt) return "";
-  const ms = resetsAt * 1000 - Date.now();
-  if (ms <= 0) return "Resets soon";
-  if (ms < 3600_000) return `Resets in ${Math.max(1, Math.round(ms / 60000))} min`;
-  if (ms < 86400_000) return `Resets in ${Math.round(ms / 3600_000)}h`;
-  const d = new Date(resetsAt * 1000);
-  return `Resets ${d.toLocaleDateString(undefined, { weekday: "short" })} ${d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })}`;
-}
-
 /** "just now", "40 minutes ago", "3 days ago", else a locale date. */
 function relTime(ms: number): string {
   const s = (Date.now() - ms) / 1000;
@@ -191,6 +173,22 @@ type SidebarData = {
   recents: ThreadSummary[];
   running?: string[];
 };
+
+type BillingResult =
+  | {
+      ok: true;
+      organization: { name: string };
+      balanceCents: number | null;
+      monthToDateSpendCents: number | null;
+      spendSyncedAt: string | null;
+      tokens: { input: number; cached: number; output: number } | null;
+    }
+  | { ok: false; error: string };
+
+/** Cents → "$12.34". The platform reports fractional cents; round for display. */
+function fmtMoney(cents: number): string {
+  return `$${(cents / 100).toFixed(2)}`;
+}
 
 type UpdateInfo = { version: string; dmgUrl: string; sumsUrl: string | null };
 type UpdatePhase = "downloading" | "verifying" | "installing" | "relaunching";
@@ -293,15 +291,7 @@ declare global {
         worktrees: { dir: string; project: string; branch: string; kb: number }[];
         engineHomeKB: number;
       }>;
-      readUsage: () => Promise<{
-        rateLimits?: {
-          primary?: { usedPercent: number; resetsAt?: number | null; windowDurationMins?: number | null } | null;
-          secondary?: { usedPercent: number; resetsAt?: number | null; windowDurationMins?: number | null } | null;
-          credits?: { balance?: string | null; hasCredits: boolean; unlimited: boolean } | null;
-          limitName?: string | null;
-        } | null;
-        error?: string;
-      }>;
+      readBilling: () => Promise<BillingResult>;
       listThreads: () => Promise<SidebarData>;
       openThread: (id: string) => Promise<{
         id: string;
@@ -5037,7 +5027,7 @@ function ChatPane({
   const [ctxUsage, setCtxUsage] = useState<{ used: number; window: number | null; percent: number | null } | null>(null);
   const [compacting, setCompacting] = useState(false);
   const [usageOpen, setUsageOpen] = useState(false);
-  const [usageData, setUsageData] = useState<Awaited<ReturnType<typeof window.unbiased.readUsage>> | null>(null);
+  const [billing, setBilling] = useState<BillingResult | null>(null);
   const usageRef = useRef<HTMLSpanElement>(null);
 
   // Seed the gauge from the persisted reading on open/resume; live
@@ -6323,7 +6313,8 @@ function ChatPane({
                       return;
                     }
                     setUsageOpen(true);
-                    setUsageData(await window.unbiased.readUsage());
+                    setBilling(null);
+                    setBilling(await window.unbiased.readBilling());
                   }}
                   title={`Context: ${ctxUsage.percent}% used`}
                   aria-label="Context and usage"
@@ -6385,49 +6376,65 @@ function ChatPane({
                         }}
                       />
                     </div>
-                    {usageData?.rateLimits && (
+                    {/* Credits and spend from the platform. Pareto on an API
+                        key is prepaid, not quota'd, so there are no reset
+                        windows to show — balance is the number that matters. */}
+                    {billing === null && (
+                      <div style={{ color: colors.dim, marginTop: 14 }}>Loading usage…</div>
+                    )}
+                    {billing?.ok && (
                       <>
-                        <div style={{ color: colors.dim, margin: "14px 0 4px" }}>
-                          Your usage limits{usageData.rateLimits.limitName ? ` · ${usageData.rateLimits.limitName}` : ""}
+                        <div style={{ color: colors.dim, margin: "14px 0 6px" }}>
+                          {billing.organization.name || "Your account"}
                         </div>
-                        {([usageData.rateLimits.primary, usageData.rateLimits.secondary].filter(Boolean) as {
-                          usedPercent: number;
-                          resetsAt?: number | null;
-                          windowDurationMins?: number | null;
-                        }[]).map((w, i) => (
-                          <div key={i} style={{ marginTop: 10 }}>
-                            <div style={{ display: "flex", justifyContent: "space-between", color: colors.fg, marginBottom: 5 }}>
-                              <span>{fmtWindowLabel(w.windowDurationMins)}</span>
-                              <span style={{ color: colors.dim }}>
-                                {fmtReset(w.resetsAt)} <span style={{ color: colors.fg }}>{w.usedPercent}%</span>
+                        <div style={{ display: "flex", justifyContent: "space-between", color: colors.fg }}>
+                          <span>Credits</span>
+                          <span style={{ fontVariantNumeric: "tabular-nums" }}>
+                            {billing.balanceCents === null ? (
+                              <span style={{ color: colors.dim }}>unavailable</span>
+                            ) : (
+                              <span style={{ color: billing.balanceCents <= 0 ? colors.err : colors.fg }}>
+                                {fmtMoney(billing.balanceCents)}
                               </span>
-                            </div>
-                            <div style={{ height: 4, borderRadius: 2, background: "var(--panel-2)", overflow: "hidden" }}>
-                              <div
-                                style={{
-                                  width: `${Math.min(100, w.usedPercent)}%`,
-                                  height: "100%",
-                                  borderRadius: 2,
-                                  background: colors.accent,
-                                }}
-                              />
-                            </div>
-                          </div>
-                        ))}
-                        {usageData.rateLimits.credits && (
-                          <div style={{ display: "flex", justifyContent: "space-between", marginTop: 12, color: colors.fg }}>
-                            <span>Usage credits</span>
-                            <span style={{ color: colors.dim }}>
-                              {usageData.rateLimits.credits.unlimited
-                                ? "Unlimited"
-                                : usageData.rateLimits.credits.balance ?? (usageData.rateLimits.credits.hasCredits ? "Available" : "None")}
+                            )}
+                          </span>
+                        </div>
+                        <div style={{ display: "flex", justifyContent: "space-between", color: colors.fg, marginTop: 8 }}>
+                          <span>Spent this month</span>
+                          <span style={{ fontVariantNumeric: "tabular-nums" }}>
+                            {billing.monthToDateSpendCents === null ? (
+                              <span style={{ color: colors.dim }}>unavailable</span>
+                            ) : (
+                              fmtMoney(billing.monthToDateSpendCents)
+                            )}
+                          </span>
+                        </div>
+                        {billing.tokens && (
+                          <div
+                            style={{
+                              display: "flex",
+                              justifyContent: "space-between",
+                              color: colors.dim,
+                              fontSize: 12,
+                              marginTop: 8,
+                            }}
+                          >
+                            <span>Tokens this month</span>
+                            <span style={{ fontVariantNumeric: "tabular-nums" }}>
+                              {fmtTokens(billing.tokens.input + billing.tokens.cached)} in ·{" "}
+                              {fmtTokens(billing.tokens.output)} out
                             </span>
+                          </div>
+                        )}
+                        {billing.balanceCents !== null && billing.balanceCents <= 0 && (
+                          <div style={{ color: colors.err, fontSize: 12, marginTop: 10, lineHeight: 1.4 }}>
+                            You're out of credits — turns will fail until the balance is topped up.
                           </div>
                         )}
                       </>
                     )}
-                    {usageData?.error && (
-                      <div style={{ color: colors.dim, marginTop: 12 }}>Usage limits unavailable.</div>
+                    {billing && !billing.ok && (
+                      <div style={{ color: colors.dim, marginTop: 14 }}>Usage unavailable — {billing.error}.</div>
                     )}
                     {/* Manual compaction: summarizes the history, which both
                         frees context AND cuts the tool-call density that can
