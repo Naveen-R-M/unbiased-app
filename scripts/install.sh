@@ -82,7 +82,9 @@ fi
 
 # ── Install ─────────────────────────────────────────────────────────────
 info "mounting…"
-mnt="$(hdiutil attach "$dmg" -nobrowse -quiet -mountrandom /tmp | awk '/\/tmp\//{print $NF; exit}')"
+# NOT -quiet: it suppresses the attach table we parse the mount point out of,
+# which would leave the image mounted and this script unable to find the app.
+mnt="$(hdiutil attach "$dmg" -nobrowse -mountrandom /tmp | awk -F'\t' '/\/tmp\//{print $NF; exit}')"
 [ -n "$mnt" ] && [ -d "$mnt/$APP_NAME" ] || die "could not find $APP_NAME inside the disk image"
 
 target="$INSTALL_DIR/$APP_NAME"

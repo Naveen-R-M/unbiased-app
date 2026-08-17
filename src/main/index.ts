@@ -518,13 +518,26 @@ async function installUpdate(info: UpdateInfo): Promise<{ ok: boolean; error?: s
 
     // ── swap the bundle ──
     send("update:progress", { phase: "installing", percent: 100 });
+    // NOT -quiet: it suppresses the very table we parse the mount point out
+    // of, leaving us mounted with no idea where. Columns are tab-separated;
+    // the mount point is the last field of the volume's row.
     const out = execFileSync("hdiutil", [
-      "attach", dmgPath, "-nobrowse", "-quiet", "-mountrandom", tmpdir(),
+      "attach", dmgPath, "-nobrowse", "-mountrandom", "/tmp",
     ]).toString();
-    mounted = out.trim().split(/\s+/).pop() ?? null;
-    if (!mounted) throw new Error("could not mount the disk image");
+    mounted =
+      out
+        .split("\n")
+        .map((line) => line.split("\t").pop()?.trim() ?? "")
+        .filter((p) => p.startsWith("/"))
+        .pop() ?? null;
+    if (!mounted) throw new Error("could not determine the disk image mount point");
     const srcApp = readdirSync(mounted).find((n) => n.endsWith(".app"));
     if (!srcApp) throw new Error("no .app inside the disk image");
+    // Sanity-check the payload BEFORE deleting the installed app: a DMG
+    // missing the engine would leave the user with a bundle that can't run.
+    if (!existsSync(join(mounted, srcApp, "Contents/Resources/engine/unbiased-app-engine"))) {
+      throw new Error("the downloaded app is missing its engine — update refused");
+    }
 
     const target = appBundlePath();
     // ditto (not cp -R) preserves the code signature; a broken seal would
