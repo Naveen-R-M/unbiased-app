@@ -18,6 +18,11 @@
          accent #FF563F; per-pane names, see ChatPane's highlight effects. */
       ::highlight(pending-main), ::highlight(pending-side) { background: rgba(255, 86, 63, 0.32); }
       ::highlight(annotations-main), ::highlight(annotations-side) { background: rgba(255, 86, 63, 0.22); }
+      /* Sidebar activity dot for threads with a running turn. */
+      @keyframes unbiased-pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.35; }
+      }
     </style>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>

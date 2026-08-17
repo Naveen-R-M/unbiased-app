@@ -24,6 +24,11 @@ export class EngineClient extends EventEmitter {
   private nextId = 1;
   private pending = new Map<number, Pending>();
 
+  /** Engine process id, for resource accounting. Null before start/after exit. */
+  get pid(): number | null {
+    return this.proc?.pid ?? null;
+  }
+
   start(enginePath: string): void {
     this.emitStatus({ state: "starting" });
     this.proc = spawn(enginePath, [], { stdio: ["pipe", "pipe", "pipe"] });

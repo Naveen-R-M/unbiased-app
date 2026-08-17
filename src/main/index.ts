@@ -12,6 +12,7 @@ import {
 import type { MenuItemConstructorOptions } from "electron";
 import type { NativeImage } from "electron";
 import { isAbsolute, join, relative } from "node:path";
+import { homedir } from "node:os";
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { EngineClient, engineVersionFromUserAgent, type EngineStatus } from "./engine";
@@ -36,6 +37,22 @@ function paneForThread(threadId: unknown): PaneId | null {
   if (panes.side.threadId === threadId) return "side";
   return null;
 }
+
+// Turns outlive the pane that started them: switching conversations leaves
+// the engine turn running, so live turns are tracked by THREAD. That lets a
+// backgrounded conversation be reopened mid-turn with its busy state, the
+// partial assistant text, and any approval request the agent is blocked on.
+const runningTurns = new Map<string, string>(); // threadId → turnId
+// The in-flight assistant message per thread. Deltas reach the renderer only
+// while a pane owns the thread, so this is the sole record of text streamed
+// while a conversation was backgrounded. Cleared when the message completes.
+const bgStream = new Map<string, string>();
+// Approval requests that arrived for an unwatched thread. Never auto-decline
+// these — the engine waits, and they replay when the thread is reopened.
+const heldApprovals = new Map<string, Record<string, unknown>[]>();
+// Failure of a backgrounded turn — the "⚠ Turn failed" entry is renderer-only,
+// so without this a failure while away would vanish entirely.
+const heldErrors = new Map<string, string>();
 
 // The active main conversation's working directory — file references in
 // chat resolve against it. Kept in sync with thread starts/resumes.
@@ -63,12 +80,55 @@ const MODE_THREAD_POLICY: Record<AccessMode, { approvalPolicy: string; sandbox: 
 };
 const MODE_TURN_SANDBOX: Record<AccessMode, Record<string, unknown>> = {
   ask: { type: "readOnly" },
-  auto: { type: "workspaceWrite" },
+  // Network on + the Go caches writable: without these, every `go test`
+  // (httptest's TCP listener, ~/Library/Caches/go-build) becomes an
+  // escalation prompt, which defeats the point of an auto mode. The
+  // trade-off is deliberate: networked commands run un-prompted here.
+  auto: {
+    type: "workspaceWrite",
+    networkAccess: true,
+    writableRoots: [
+      join(homedir(), "Library/Caches/go-build"),
+      join(homedir(), "go/pkg/mod"),
+    ],
+  },
   full: { type: "dangerFullAccess" },
 };
 
 function threadPolicy(): { approvalPolicy: string; sandbox: string } {
   return MODE_THREAD_POLICY[accessMode];
+}
+
+/** The turn's sandbox policy, worktree-aware: a git worktree's real repo
+ *  data lives in the PARENT repo's .git, so without that as a writable
+ *  root every `git commit`/`push` from a worktree conversation becomes
+ *  an escalation prompt — defeating "Approve for me". */
+function turnSandbox(cwd: string | null): Record<string, unknown> {
+  const base = MODE_TURN_SANDBOX[accessMode];
+  if (base.type !== "workspaceWrite" || !cwd) return base;
+  const info = loadWorktrees()[cwd];
+  if (!info) return base;
+  return {
+    ...base,
+    writableRoots: [...((base.writableRoots as string[]) ?? []), join(info.project, ".git")],
+  };
+}
+
+// Last known context usage per thread — lets the composer gauge appear
+// immediately on resume instead of waiting for the next turn.
+function ctxUsageFile(): string {
+  return join(app.getPath("userData"), "context-usage.json");
+}
+let ctxUsageCache: Record<string, { used: number; window: number | null; percent: number | null }> | null = null;
+function loadCtxUsage(): Record<string, { used: number; window: number | null; percent: number | null }> {
+  if (!ctxUsageCache) {
+    try {
+      ctxUsageCache = JSON.parse(readFileSync(ctxUsageFile(), "utf8"));
+    } catch {
+      ctxUsageCache = {};
+    }
+  }
+  return ctxUsageCache!;
 }
 
 // Plan mode: the agent researches read-only and proposes a plan instead
@@ -256,8 +316,52 @@ function pushStatus(status: EngineStatus): void {
   win?.webContents.send("engine:status", status);
 }
 
+// ── Secret redaction at the display boundary ─────────────────────────
+// Known local secret VALUES (the Unbiased API key). Every engine event
+// forwarded to the renderer passes through send(), so masking here
+// guarantees a leaked key never renders in the UI or lands in the
+// transcript cache — even when a command's output echoes it. This is
+// display-layer only: the engine talks to the gateway directly, so what
+// the MODEL sees cannot be filtered from this process.
+let knownSecrets: string[] | null = null;
+function loadKnownSecrets(): string[] {
+  if (knownSecrets) return knownSecrets;
+  const vals: string[] = [];
+  try {
+    const cred = JSON.parse(
+      readFileSync(join(app.getPath("home"), ".unbiased", "credentials.json"), "utf8"),
+    ) as { apiKey?: unknown };
+    // Length floor: never build a replacer from a trivial string that
+    // could mangle ordinary text.
+    if (typeof cred.apiKey === "string" && cred.apiKey.length >= 12) vals.push(cred.apiKey);
+  } catch {
+    // no credentials file — nothing to redact
+  }
+  const envKey = process.env.UNBIASED_API_KEY;
+  if (envKey && envKey.length >= 12 && !vals.includes(envKey)) vals.push(envKey);
+  knownSecrets = vals;
+  return vals;
+}
+
+/** Mask known secret values anywhere in a JSON-serializable payload.
+ *  Keys are base64url-ish (no JSON-escaped chars), so a straight replace
+ *  on the serialized form is exact and catches every nesting depth. */
+function redactSecrets<T>(payload: T): T {
+  const secrets = loadKnownSecrets();
+  if (!secrets.length) return payload;
+  let s = JSON.stringify(payload);
+  let hit = false;
+  for (const sec of secrets) {
+    if (s.includes(sec)) {
+      hit = true;
+      s = s.split(sec).join("•••unbiased-api-key•••");
+    }
+  }
+  return hit ? (JSON.parse(s) as T) : payload;
+}
+
 function send(channel: string, payload: unknown): void {
-  win?.webContents.send(channel, payload);
+  win?.webContents.send(channel, redactSecrets(payload));
 }
 
 /** Launcher icon (rasterized from resources/icon.svg). In development it
@@ -484,17 +588,29 @@ function ensureBrowserView(): WebContentsView {
 function wireNotifications(): void {
   engine.on("notification", (msg: { method: string; params?: Record<string, unknown> }) => {
     const params = msg.params ?? {};
+    // Per-thread bookkeeping runs for EVERY notification; only the
+    // pane-targeted sends require a pane to currently own the thread.
     const paneId = paneForThread(params.threadId);
-    if (!paneId) return; // a thread no pane owns (e.g. just deleted)
+    const threadId = typeof params.threadId === "string" ? params.threadId : null;
     switch (msg.method) {
       case "turn/started": {
         const turn = params.turn as { id?: string } | undefined;
+        if (threadId && turn?.id) {
+          runningTurns.set(threadId, turn.id);
+          bgStream.delete(threadId);
+          send("chat:thread-activity", { threadId, running: true });
+        }
+        if (!paneId) break;
         if (turn?.id) panes[paneId].turnId = turn.id;
         send("chat:turn-started", { paneId, turnId: panes[paneId].turnId });
         break;
       }
       case "item/agentMessage/delta": {
-        send("chat:delta", { paneId, delta: (params.delta as string) ?? "" });
+        const delta = (params.delta as string) ?? "";
+        // Always accumulate — this is what seeds the transcript when a
+        // backgrounded conversation is reopened mid-stream.
+        if (threadId) bgStream.set(threadId, (bgStream.get(threadId) ?? "") + delta);
+        if (paneId) send("chat:delta", { paneId, delta });
         break;
       }
       case "item/started":
@@ -503,6 +619,12 @@ function wireNotifications(): void {
           | { type?: string; id?: string; status?: string; changes?: { path?: string }[] }
           | undefined;
         const phase = msg.method === "item/started" ? "started" : "completed";
+        // A finished assistant message lands in the engine's history — the
+        // partial-stream buffer for it is no longer needed.
+        if (item?.type === "agentMessage" && phase === "completed" && threadId) {
+          bgStream.delete(threadId);
+        }
+        if (!paneId) break; // history holds these for a backgrounded thread
         if (item?.type === "commandExecution") {
           send("chat:command", { paneId, phase, item });
         } else if (item?.type === "plan") {
@@ -531,10 +653,53 @@ function wireNotifications(): void {
         }
         break;
       }
+      case "thread/tokenUsage/updated": {
+        const tu = params.tokenUsage as
+          | {
+              last?: { inputTokens?: number; outputTokens?: number; totalTokens?: number };
+              modelContextWindow?: number | null;
+            }
+          | undefined;
+        const last = tu?.last;
+        // Context occupancy ≈ the latest request's full prompt + completion.
+        // cachedInputTokens is a SUBSET of inputTokens (the cache-hit
+        // breakdown), NOT an addition — summing it double-counted cached
+        // history and showed an impossible >100% context.
+        const used = last?.totalTokens ?? (last?.inputTokens ?? 0) + (last?.outputTokens ?? 0);
+        const window = tu?.modelContextWindow ?? null;
+        const usage = {
+          used,
+          window,
+          percent: window ? Math.min(100, Math.round((used / window) * 100)) : null,
+        };
+        // Persist per thread so the gauge survives restarts and resumes.
+        try {
+          const map = loadCtxUsage();
+          map[String(params.threadId)] = usage;
+          writeFileSync(ctxUsageFile(), JSON.stringify(map));
+        } catch {
+          // best-effort
+        }
+        if (paneId) send("chat:token-usage", { paneId, ...usage });
+        break;
+      }
       case "turn/completed": {
         const turn = params.turn as
           | { status?: string; usage?: unknown; error?: { message?: string; additionalDetails?: string | null } | null }
           | undefined;
+        if (threadId) {
+          runningTurns.delete(threadId);
+          bgStream.delete(threadId);
+          if (!paneId && turn?.status === "failed") {
+            heldErrors.set(
+              threadId,
+              [turn.error?.message, turn.error?.additionalDetails].filter(Boolean).join(" — ") ||
+                "unknown error",
+            );
+          }
+          send("chat:thread-activity", { threadId, running: false });
+        }
+        if (!paneId) break;
         panes[paneId].turnId = null;
         send("chat:turn-completed", {
           paneId,
@@ -554,12 +719,26 @@ function wireNotifications(): void {
     "server-request",
     (msg: { id: number | string; method: string; params?: Record<string, unknown> }) => {
       const params = msg.params ?? {};
+      // Route an approval to the owning pane, or hold it if the thread is
+      // backgrounded — the engine waits on the request, and it replays when
+      // the conversation is reopened. Auto-declining here would silently
+      // reject work the user asked for.
+      function deliverApproval(payload: Record<string, unknown>): void {
+        const paneId = paneForThread(params.threadId);
+        if (paneId) {
+          send("chat:approval-request", { paneId, ...payload });
+        } else if (typeof params.threadId === "string") {
+          const held = heldApprovals.get(params.threadId) ?? [];
+          held.push(payload);
+          heldApprovals.set(params.threadId, held);
+        } else {
+          send("chat:approval-request", { paneId: "main", ...payload });
+        }
+      }
       if (msg.method === "item/commandExecution/requestApproval") {
-        const paneId = paneForThread(params.threadId) ?? "main";
         const requestId = `apr_${msg.id}`;
         pendingApprovals.set(requestId, msg.id);
-        send("chat:approval-request", {
-          paneId,
+        deliverApproval({
           requestId,
           kind: "command",
           // itemId ties the request to its commandExecution item so the
@@ -572,11 +751,9 @@ function wireNotifications(): void {
         return;
       }
       if (msg.method === "item/fileChange/requestApproval") {
-        const paneId = paneForThread(params.threadId) ?? "main";
         const requestId = `apr_${msg.id}`;
         pendingApprovals.set(requestId, msg.id);
-        send("chat:approval-request", {
-          paneId,
+        deliverApproval({
           requestId,
           kind: "fileChange",
           // Lands on the fileChange item's card (same itemId), which
@@ -700,7 +877,8 @@ app.whenReady().then(async () => {
       // mode switched mid-conversation takes effect immediately. Plan mode
       // hard-forces read-only regardless of the access mode.
       approvalPolicy: planMode ? "on-request" : threadPolicy().approvalPolicy,
-      sandboxPolicy: planMode ? { type: "readOnly" } : MODE_TURN_SANDBOX[accessMode],
+      // The side pane forks the main thread, so mainCwd is right for both.
+      sandboxPolicy: planMode ? { type: "readOnly" } : turnSandbox(mainCwd),
     })) as { turn?: { id?: string } };
     if (result.turn?.id) pane.turnId = result.turn.id;
     return { turnId: pane.turnId, threadId: pane.threadId, created };
@@ -729,10 +907,122 @@ app.whenReady().then(async () => {
 
   ipcMain.handle("transcript:load", (_e, threadId: string) => {
     try {
-      return { entries: JSON.parse(readFileSync(transcriptFile(threadId), "utf8")) };
+      // Caches written before redaction existed may hold raw values.
+      return redactSecrets({ entries: JSON.parse(readFileSync(transcriptFile(threadId), "utf8")) });
     } catch {
       return { entries: null };
     }
+  });
+
+  ipcMain.handle("usage:context", (_e, threadId: string) => {
+    return { usage: loadCtxUsage()[threadId] ?? null };
+  });
+
+  ipcMain.handle("usage:read", async () => {
+    try {
+      return await engine.request("account/rateLimits/read", {});
+    } catch (err) {
+      return { error: String(err) };
+    }
+  });
+
+  // ── Resource + storage stats (Settings → Resources) ─────────────────
+  // Live process metrics: Chromium's own processes via getAppMetrics(),
+  // plus the children WE spawn (engine, terminal shells), which Chromium
+  // doesn't track — measured with one `ps` call.
+  ipcMain.handle("stats:resources", async () => {
+    const procs = app.getAppMetrics().map((m) => ({
+      pid: m.pid,
+      kind: m.type, // Browser | Tab | GPU | Utility …
+      memMB: (m.memory?.workingSetSize ?? 0) / 1024,
+      cpu: m.cpu?.percentCPUUsage ?? 0,
+    }));
+    const extras: { pid: number; kind: string }[] = [];
+    if (engine.pid) extras.push({ pid: engine.pid, kind: "engine" });
+    for (const pty of ptys.values()) extras.push({ pid: pty.pid, kind: "terminal" });
+    const extraProcs: { pid: number; kind: string; memMB: number; cpu: number }[] = [];
+    if (extras.length) {
+      try {
+        const out = await new Promise<string>((resolve, reject) =>
+          execFile(
+            "ps",
+            ["-o", "pid=,rss=,pcpu=", "-p", extras.map((e) => e.pid).join(",")],
+            (err, stdout) => (err ? reject(err) : resolve(stdout)),
+          ),
+        );
+        for (const line of out.trim().split("\n")) {
+          const [pid, rss, pcpu] = line.trim().split(/\s+/);
+          const kind = extras.find((e) => e.pid === Number(pid))?.kind;
+          if (kind) extraProcs.push({ pid: Number(pid), kind, memMB: Number(rss) / 1024, cpu: Number(pcpu) });
+        }
+      } catch {
+        // some pid exited between listing and ps — fine, report what we have
+      }
+    }
+    return { procs: [...procs, ...extraProcs] };
+  });
+
+  // What each conversation costs on disk: the engine's append-only rollout
+  // (filename embeds the thread id) + our transcript cache. Worktrees and
+  // the engine home measured with `du`.
+  ipcMain.handle("stats:storage", async () => {
+    const engineHome =
+      lastStatus.state === "connected"
+        ? lastStatus.codexHome
+        : join(app.getPath("home"), ".unbiased", "app-engine", "home");
+    const threads: Record<string, { rolloutBytes: number; transcriptBytes: number; mtime: number }> = {};
+    const entry = (id: string) => (threads[id] ??= { rolloutBytes: 0, transcriptBytes: 0, mtime: 0 });
+    const walkSessions = (dir: string): void => {
+      let names: string[];
+      try {
+        names = readdirSync(dir);
+      } catch {
+        return;
+      }
+      for (const n of names) {
+        const p = join(dir, n);
+        let st;
+        try {
+          st = statSync(p);
+        } catch {
+          continue;
+        }
+        if (st.isDirectory()) walkSessions(p);
+        else {
+          const m = n.match(/^rollout-.*-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i);
+          if (m) {
+            const e = entry(m[1]);
+            e.rolloutBytes += st.size;
+            e.mtime = Math.max(e.mtime, st.mtimeMs);
+          }
+        }
+      }
+    };
+    walkSessions(join(engineHome, "sessions"));
+    try {
+      for (const n of readdirSync(transcriptsDir())) {
+        if (!n.endsWith(".json")) continue;
+        try {
+          entry(n.slice(0, -5)).transcriptBytes = statSync(join(transcriptsDir(), n)).size;
+        } catch {
+          // race with deletion
+        }
+      }
+    } catch {
+      // no transcripts yet
+    }
+    const duKB = (dir: string): Promise<number> =>
+      new Promise((resolve) =>
+        execFile("du", ["-sk", dir], (err, stdout) => resolve(err ? 0 : Number(stdout.split(/\s+/)[0]) || 0)),
+      );
+    const wtMap = loadWorktrees();
+    const worktrees = await Promise.all(
+      Object.entries(wtMap)
+        .filter(([dir]) => existsSync(dir))
+        .map(async ([dir, info]) => ({ dir, project: info.project, branch: info.branch, kb: await duKB(dir) })),
+    );
+    const engineHomeKB = await duKB(engineHome);
+    return { threads, worktrees, engineHomeKB };
   });
 
   ipcMain.handle("planmode:set", (_e, on: boolean) => {
@@ -773,8 +1063,11 @@ app.whenReady().then(async () => {
 
   ipcMain.handle("chat:interrupt", async (_e, paneId: PaneId) => {
     const pane = panes[paneId];
-    if (!pane.threadId || !pane.turnId) return { interrupted: false };
-    await engine.request("turn/interrupt", { threadId: pane.threadId, turnId: pane.turnId });
+    // The per-thread record covers a conversation reopened mid-turn,
+    // where the pane's own turnId may not have been set by turn/started.
+    const turnId = pane.turnId ?? (pane.threadId ? runningTurns.get(pane.threadId) : null);
+    if (!pane.threadId || !turnId) return { interrupted: false };
+    await engine.request("turn/interrupt", { threadId: pane.threadId, turnId });
     return { interrupted: true };
   });
 
@@ -817,6 +1110,8 @@ app.whenReady().then(async () => {
         threads,
       })),
       recents,
+      // Threads with a live turn — seeds the sidebar activity indicators.
+      running: [...runningTurns.keys()],
     };
   });
 
@@ -870,18 +1165,42 @@ app.whenReady().then(async () => {
   });
 
   ipcMain.handle("threads:open", async (_e, id: string) => {
-    const result = (await engine.request("thread/resume", { threadId: id, ...threadPolicy() })) as {
-      thread: WireThread;
-      cwd?: string;
-    };
+    const running = runningTurns.has(id);
+    // A thread with a live turn is already loaded in the engine —
+    // thread/read returns its history without disturbing the turn;
+    // re-resuming it is what thread/resume is NOT for.
+    const result = running
+      ? ((await engine.request("thread/read", { threadId: id, includeTurns: true })) as {
+          thread: WireThread;
+          cwd?: string;
+        })
+      : ((await engine.request("thread/resume", { threadId: id, ...threadPolicy() })) as {
+          thread: WireThread;
+          cwd?: string;
+        });
     mainCwd = result.cwd ?? result.thread.cwd ?? null;
     panes.main.threadId = id;
-    panes.main.turnId = null;
+    panes.main.turnId = runningTurns.get(id) ?? null;
     // The side chat (if any) was forked from the previous conversation;
     // it resets alongside every main-context switch.
     panes.side.threadId = null;
     panes.side.turnId = null;
-    return { id, entries: threadToEntries(result.thread) };
+    // Everything that happened while this thread was backgrounded: the
+    // partial assistant stream, approval requests the agent is blocked
+    // on, and a turn failure nobody saw. Held items are consumed here.
+    const approvals = heldApprovals.get(id) ?? [];
+    heldApprovals.delete(id);
+    const failure = heldErrors.get(id) ?? null;
+    heldErrors.delete(id);
+    // History replays raw engine content — same redaction as live events.
+    return redactSecrets({
+      id,
+      entries: threadToEntries(result.thread),
+      running,
+      streamText: bgStream.get(id) ?? "",
+      approvals,
+      failure,
+    });
   });
 
   ipcMain.handle("threads:detach", (_e, cwd?: string) => {
@@ -1361,6 +1680,20 @@ app.whenReady().then(async () => {
   });
 
   ipcMain.handle("threads:delete", async (_e, id: string) => {
+    // A running turn dies with its thread — stop it first so the engine
+    // isn't left executing against a deleted conversation.
+    const turnId = runningTurns.get(id);
+    if (turnId) {
+      try {
+        await engine.request("turn/interrupt", { threadId: id, turnId });
+      } catch {
+        // the delete below is the outcome that matters
+      }
+    }
+    runningTurns.delete(id);
+    bgStream.delete(id);
+    heldApprovals.delete(id);
+    heldErrors.delete(id);
     await engine.request("thread/delete", { threadId: id });
     try {
       rmSync(transcriptFile(id), { force: true });

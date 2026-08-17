@@ -84,7 +84,7 @@ type BrowserState = { url: string; title: string; canGoBack: boolean; canGoForwa
 type AccessMode = "ask" | "auto" | "full";
 const ACCESS_MODES: { id: AccessMode; name: string; desc: string; danger?: boolean }[] = [
   { id: "ask", name: "Ask for approval", desc: "Read-only — every command needs your approval" },
-  { id: "auto", name: "Approve for me", desc: "Can edit project files; asks for risky commands" },
+  { id: "auto", name: "Approve for me", desc: "Can edit project files and use the network; asks before writing elsewhere" },
   { id: "full", name: "Full access", desc: "Unrestricted commands and file access", danger: true },
 ];
 type RefHit = { path: string; rel: string; line: number; text: string };
@@ -126,6 +126,30 @@ function monoCharWidth(font: string): number {
   return w;
 }
 
+function fmtTokens(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
+  return String(n);
+}
+
+function fmtWindowLabel(mins: number | null | undefined): string {
+  if (!mins) return "Usage limit";
+  if (mins < 90) return `${mins}-minute limit`;
+  if (mins <= 1800) return `${Math.round(mins / 60)}-hour limit`;
+  if (Math.abs(mins - 10080) < 720) return "Weekly limit";
+  return `${Math.round(mins / 1440)}-day limit`;
+}
+
+function fmtReset(resetsAt: number | null | undefined): string {
+  if (!resetsAt) return "";
+  const ms = resetsAt * 1000 - Date.now();
+  if (ms <= 0) return "Resets soon";
+  if (ms < 3600_000) return `Resets in ${Math.max(1, Math.round(ms / 60000))} min`;
+  if (ms < 86400_000) return `Resets in ${Math.round(ms / 3600_000)}h`;
+  const d = new Date(resetsAt * 1000);
+  return `Resets ${d.toLocaleDateString(undefined, { weekday: "short" })} ${d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })}`;
+}
+
 /** "just now", "40 minutes ago", "3 days ago", else a locale date. */
 function relTime(ms: number): string {
   const s = (Date.now() - ms) / 1000;
@@ -164,6 +188,19 @@ function looksLikeFilePath(text: string): boolean {
 type SidebarData = {
   projects: { name: string; path: string; threads: ThreadSummary[] }[];
   recents: ThreadSummary[];
+  running?: string[];
+};
+
+// An approval request replayed when a backgrounded conversation reopens
+// (same payload as the live chat:approval-request event, minus paneId).
+type HeldApproval = {
+  requestId: string;
+  kind?: "command" | "fileChange";
+  itemId: string | null;
+  command: string;
+  cwd: string | null;
+  reason: string | null;
+  grantRoot?: string | null;
 };
 
 declare global {
@@ -185,6 +222,7 @@ declare global {
       onTurnCompleted: (
         cb: (p: { paneId: PaneId; status: string; error?: string | null }) => void,
       ) => () => void;
+      onThreadActivity: (cb: (p: { threadId: string; running: boolean }) => void) => () => void;
       setAccessMode: (mode: AccessMode) => Promise<{ mode: string }>;
       setWorkMode: (mode: string, dir?: string) => Promise<{ ok: boolean }>;
       setPlanMode: (on: boolean) => Promise<{ planMode: boolean }>;
@@ -215,8 +253,36 @@ declare global {
         cb: (p: { paneId: PaneId; phase: "started" | "completed"; item: CommandItem }) => void,
       ) => () => void;
       onCompaction: (cb: (p: { paneId: PaneId }) => void) => () => void;
+      onTokenUsage: (
+        cb: (p: { paneId: PaneId; used: number; window: number | null; percent: number | null }) => void,
+      ) => () => void;
+      contextUsage: (
+        threadId: string,
+      ) => Promise<{ usage: { used: number; window: number | null; percent: number | null } | null }>;
+      resourceStats: () => Promise<{ procs: { pid: number; kind: string; memMB: number; cpu: number }[] }>;
+      storageStats: () => Promise<{
+        threads: Record<string, { rolloutBytes: number; transcriptBytes: number; mtime: number }>;
+        worktrees: { dir: string; project: string; branch: string; kb: number }[];
+        engineHomeKB: number;
+      }>;
+      readUsage: () => Promise<{
+        rateLimits?: {
+          primary?: { usedPercent: number; resetsAt?: number | null; windowDurationMins?: number | null } | null;
+          secondary?: { usedPercent: number; resetsAt?: number | null; windowDurationMins?: number | null } | null;
+          credits?: { balance?: string | null; hasCredits: boolean; unlimited: boolean } | null;
+          limitName?: string | null;
+        } | null;
+        error?: string;
+      }>;
       listThreads: () => Promise<SidebarData>;
-      openThread: (id: string) => Promise<{ id: string; entries: Entry[] }>;
+      openThread: (id: string) => Promise<{
+        id: string;
+        entries: Entry[];
+        running: boolean;
+        streamText: string;
+        approvals: HeldApproval[];
+        failure: string | null;
+      }>;
       detachThread: (cwd?: string) => Promise<{ ok: boolean }>;
       deleteThread: (id: string) => Promise<{ ok: boolean }>;
       resetSideChat: () => Promise<{ ok: boolean }>;
@@ -422,6 +488,22 @@ export function App() {
     saveTheme(next);
   }
   const [sidebar, setSidebar] = useState<SidebarData>({ projects: [], recents: [] });
+  // Threads with a turn running right now — including backgrounded ones.
+  const [runningThreads, setRunningThreads] = useState<ReadonlySet<string>>(new Set());
+
+  useEffect(() => {
+    return window.unbiased.onThreadActivity((p) => {
+      setRunningThreads((cur) => {
+        const next = new Set(cur);
+        if (p.running) next.add(p.threadId);
+        else next.delete(p.threadId);
+        return next;
+      });
+      // A finished background turn may retitle/reorder its thread.
+      if (!p.running) void refreshThreads();
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
   const [activeProject, setActiveProject] = useState<{ name: string; path: string } | null>(null);
   const [hoveredThreadId, setHoveredThreadId] = useState<string | null>(null);
@@ -515,21 +597,30 @@ export function App() {
   // actually in (its worktree cwd when isolated, else null → project dir).
   // "local" | "worktree" | a specific existing worktree.
   type WorkSel = { mode: "local" | "worktree" } | { mode: "existing"; dir: string; branch: string };
-  const [workSel, setWorkSelState] = useState<WorkSel>(() =>
-    localStorage.getItem("workMode") === "worktree" ? { mode: "worktree" } : { mode: "local" },
-  );
+  const [workSel, setWorkSelState] = useState<WorkSel>({ mode: "local" });
   const [existingWts, setExistingWts] = useState<{ dir: string; branch: string }[]>([]);
   const [convCwd, setConvCwd] = useState<string | null>(null);
   const [workMenuOpen, setWorkMenuOpen] = useState(false);
 
-  useEffect(() => {
-    void window.unbiased.setWorkMode(workSel.mode, workSel.mode === "existing" ? workSel.dir : undefined);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  // The persisted choice is keyed by project — a single global here once
+  // carried "New worktree" into a freshly opened project and silently
+  // created a worktree on its first chat.
+  function workModeStore(): Record<string, "local" | "worktree"> {
+    try {
+      const parsed = JSON.parse(localStorage.getItem("workModeByProject") ?? "{}");
+      return parsed && typeof parsed === "object" ? parsed : {};
+    } catch {
+      return {};
+    }
+  }
 
   function changeWorkMode(sel: WorkSel) {
     // Only the generic modes persist; a specific worktree is per-session.
-    if (sel.mode !== "existing") localStorage.setItem("workMode", sel.mode);
+    if (sel.mode !== "existing" && activeProjectPath) {
+      const store = workModeStore();
+      store[activeProjectPath] = sel.mode;
+      localStorage.setItem("workModeByProject", JSON.stringify(store));
+    }
     setWorkSelState(sel);
     void window.unbiased.setWorkMode(sel.mode, sel.mode === "existing" ? sel.dir : undefined);
     setWorkMenuOpen(false);
@@ -678,7 +769,14 @@ export function App() {
     }
     return null;
   }
-  const [mainReset, setMainReset] = useState<{ entries: Entry[]; nonce: number }>({ entries: [], nonce: 0 });
+  // `resume` carries what a reopened conversation was doing while
+  // backgrounded: a still-running turn (busy state) and any approval
+  // requests the agent is blocked on.
+  const [mainReset, setMainReset] = useState<{
+    entries: Entry[];
+    nonce: number;
+    resume?: { running: boolean; approvals: HeldApproval[] } | null;
+  }>({ entries: [], nonce: 0 });
   // sideOpen = the whole right panel is visible; sideChatEnabled = the chat
   // tab exists in it. Kept separate so opening a file/image preview doesn't
   // drag the side chat along with it. Neither restores across launches —
@@ -828,7 +926,9 @@ export function App() {
   }, []);
 
   async function refreshThreads() {
-    setSidebar(await window.unbiased.listThreads());
+    const data = await window.unbiased.listThreads();
+    setSidebar(data);
+    if (data.running) setRunningThreads(new Set(data.running));
   }
 
   useEffect(() => {
@@ -858,8 +958,10 @@ export function App() {
     if (!sideChatEnabled && !browserOpen) setSideOpenPersisted(false);
   }
 
+  // Switching away from a running conversation is fine — its turn keeps
+  // going in the engine and the sidebar shows it as active. Only genuinely
+  // destructive actions still wait.
   async function newChat(project?: { name: string; path: string }) {
-    if (mainBusy) return;
     await window.unbiased.detachThread(project?.path);
     setActiveProject(project ?? null);
     setActiveThreadId(null);
@@ -869,7 +971,6 @@ export function App() {
   }
 
   async function openProjectDialog() {
-    if (mainBusy) return;
     const { path, name } = await window.unbiased.chooseProject();
     if (!path || !name) return; // cancelled
     setActiveProject({ name, path });
@@ -881,23 +982,41 @@ export function App() {
   }
 
   async function openThread(id: string) {
-    if (mainBusy || id === activeThreadId) return;
-    const { entries: history } = await window.unbiased.openThread(id);
+    if (id === activeThreadId) return;
+    const res = await window.unbiased.openThread(id);
+    const history = res.entries;
     // The engine's history omits renderer-only content (failed-turn
     // errors, annotation cards). Prefer the cached transcript when it
     // holds at least as much.
     const cached = await window.unbiased.loadTranscript(id);
-    const entries =
+    let entries =
       cached.entries && cached.entries.length >= history.length ? cached.entries : history;
+    if (res.running && res.streamText) {
+      // The reply is still streaming. Main accumulated the full partial
+      // text; a shorter prefix of it may already sit in the cached
+      // transcript (saved before switching away) — swap it out.
+      const last = entries[entries.length - 1];
+      if (last?.kind === "assistant" && res.streamText.startsWith(last.text)) {
+        entries = entries.slice(0, -1);
+      }
+      entries = [...entries, { kind: "assistant", text: res.streamText }];
+    }
+    if (res.failure) {
+      // The turn died while nobody was watching.
+      entries = [...entries, { kind: "assistant", text: `⚠ Turn failed: ${res.failure}` }];
+    }
     setActiveProject(null);
     setActiveThreadId(id);
     setMainStarted(entries.length > 0);
-    setMainReset((r) => ({ entries, nonce: r.nonce + 1 }));
+    setMainReset((r) => ({
+      entries,
+      nonce: r.nonce + 1,
+      resume: res.running ? { running: true, approvals: res.approvals } : null,
+    }));
     resetSideView();
   }
 
   async function deleteThread(id: string) {
-    if (mainBusy) return;
     await window.unbiased.deleteThread(id);
     if (id === activeThreadId) {
       setActiveThreadId(null);
@@ -918,6 +1037,42 @@ export function App() {
   const [filesOpen, setFilesOpen] = useState(false);
   const [terminalOpen, setTerminalOpen] = useState(false);
   const [browserOpen, setBrowserOpen] = useState(false);
+
+  // ── Tab order + close fallback ──────────────────────────────────────
+  // The strip renders tabs in the order they were OPENED (new ones append
+  // at the back), and closing the active tab falls back to the remaining
+  // most-recent tab — one rule, instead of six hand-rolled chains that
+  // each forgot a tab (closing Files with only Browser left used to kill
+  // the whole panel).
+  type PanelTab = "chat" | "file" | "files" | "review" | "browser" | "terminal";
+  const TAB_FLAGS: Record<PanelTab, boolean> = {
+    chat: sideChatEnabled,
+    file: !!openFile,
+    files: filesOpen,
+    review: reviewOpen,
+    browser: browserOpen,
+    terminal: terminalOpen,
+  };
+  // Seq numbers survive re-renders; assigning during render is idempotent.
+  const tabSeqRef = useRef<Map<PanelTab, number>>(new Map());
+  const tabSeqCounter = useRef(0);
+  for (const t of Object.keys(TAB_FLAGS) as PanelTab[]) {
+    if (TAB_FLAGS[t] && !tabSeqRef.current.has(t)) tabSeqRef.current.set(t, ++tabSeqCounter.current);
+    if (!TAB_FLAGS[t]) tabSeqRef.current.delete(t);
+  }
+  const tabOrder = (Object.keys(TAB_FLAGS) as PanelTab[])
+    .filter((t) => TAB_FLAGS[t])
+    .sort((a, b) => tabSeqRef.current.get(a)! - tabSeqRef.current.get(b)!);
+
+  // When the active tab's flag drops, activate the most recent survivor;
+  // only an empty strip closes the panel.
+  useEffect(() => {
+    if (!sideOpen || panelMode === "launcher") return;
+    if (TAB_FLAGS[panelMode as PanelTab] !== false) return;
+    if (tabOrder.length > 0) setPanelMode(tabOrder[tabOrder.length - 1]);
+    else setSideOpenPersisted(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sideOpen, panelMode, sideChatEnabled, openFile, filesOpen, reviewOpen, browserOpen, terminalOpen]);
   // The Files view's tree column can collapse, leaving the viewer full
   // width — Codex's folders toggle. Persisted.
   const [treeVisible, setTreeVisible] = useState(() => localStorage.getItem("filesTreeVisible") !== "false");
@@ -952,6 +1107,91 @@ export function App() {
     };
   }, [sidePlusOpen]);
 
+  // Environment popover (header): Codex-style summary of the active
+  // conversation's checkout — changes, worktree, branch, ship actions.
+  // The composer strip only shows before a chat starts; this replaces it.
+  const [envOpen, setEnvOpen] = useState(false);
+  const envRef = useRef<HTMLSpanElement>(null);
+  const [envDiff, setEnvDiff] = useState<{ plus: number; minus: number } | null>(null);
+  const [envBranches, setEnvBranches] = useState<{
+    branches: string[];
+    current: string;
+    dirty: DirtyFile[];
+  } | null>(null);
+  const [envSection, setEnvSection] = useState<"workin" | "branch" | null>(null);
+  const [envBranchSearch, setEnvBranchSearch] = useState("");
+  const [envMsg, setEnvMsg] = useState<string | null>(null);
+  const [envBusy, setEnvBusy] = useState(false);
+
+  useEffect(() => {
+    if (!envOpen) return;
+    function onDown(e: MouseEvent) {
+      if (!envRef.current?.contains(e.target as Node)) setEnvOpen(false);
+    }
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") setEnvOpen(false);
+    }
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [envOpen]);
+
+  async function openEnvMenu() {
+    setEnvSection(null);
+    setEnvMsg(null);
+    setEnvBranchSearch("");
+    setEnvDiff(null);
+    setEnvBranches(null);
+    setEnvOpen(true);
+    // All fetches fill in as they land; the popover opens immediately.
+    if (activeProjectPath) {
+      void window.unbiased.listWorktrees(activeProjectPath).then((r) => setExistingWts(r.worktrees));
+    }
+    if (gitPath) {
+      void window.unbiased.reviewDiff(gitPath, "branch").then((d) => {
+        setEnvDiff({ plus: d.plus ?? 0, minus: d.minus ?? 0 });
+      });
+      void window.unbiased.gitBranches(gitPath).then((r) => {
+        if (!r.error) setEnvBranches({ branches: r.branches, current: r.current, dirty: r.dirty });
+      });
+    }
+  }
+
+  function envPickBranch(b: string) {
+    if (!envBranches || b === envBranches.current) return;
+    if (envBranches.dirty.length > 0) {
+      // Same guard as the strip's switcher: dirty checkout → the
+      // commit-or-discard modal decides before any switch happens.
+      setBranchSwitch({ target: b, files: envBranches.dirty });
+      setEnvOpen(false);
+      return;
+    }
+    void doCheckout(b).then(() => setEnvOpen(false));
+  }
+
+  async function envCommitPush() {
+    if (!gitPath || envBusy) return;
+    setEnvBusy(true);
+    setEnvMsg("Committing and pushing…");
+    const r = await window.unbiased.reviewCommitPush(gitPath);
+    setEnvBusy(false);
+    setEnvMsg(r.ok ? "Committed and pushed." : (r.error ?? "Failed"));
+    if (r.ok) void window.unbiased.reviewDiff(gitPath, "branch").then((d) => setEnvDiff({ plus: d.plus ?? 0, minus: d.minus ?? 0 }));
+  }
+
+  async function envCreatePr() {
+    if (!gitPath || envBusy) return;
+    setEnvBusy(true);
+    setEnvMsg("Opening pull request…");
+    const r = await window.unbiased.reviewCreatePr(gitPath);
+    setEnvBusy(false);
+    setEnvMsg(r.ok ? null : (r.error ?? "Failed to create PR"));
+    if (r.ok) setEnvOpen(false);
+  }
+
   // The browser is a native layer floating over the panel — it must hide
   // whenever its spot isn't showing: other tab active, panel closed, the
   // + menu dropping over it, or the Settings view replacing the whole UI.
@@ -961,13 +1201,14 @@ export function App() {
       sideOpen &&
         panelMode === "browser" &&
         !sidePlusOpen &&
+        !envOpen &&
         !showSettings &&
         !confirmDialog &&
         !fullAccessPrompt &&
         !branchSwitch &&
         !branchCreate,
     );
-  }, [browserOpen, sideOpen, panelMode, sidePlusOpen, showSettings, confirmDialog, fullAccessPrompt, branchSwitch, branchCreate]);
+  }, [browserOpen, sideOpen, panelMode, sidePlusOpen, envOpen, showSettings, confirmDialog, fullAccessPrompt, branchSwitch, branchCreate]);
 
   function openSideChatTab() {
     setSidePlusOpen(false);
@@ -995,12 +1236,7 @@ export function App() {
   function closeBrowserTab() {
     setBrowserOpen(false);
     void window.unbiased.closeBrowser();
-    if (panelMode !== "browser") return;
-    if (openFile) setPanelMode("file");
-    else if (filesOpen) setPanelMode("files");
-    else if (terminalOpen) setPanelMode("terminal");
-    else if (sideChatEnabled) setPanelMode("chat");
-    else setSideOpenPersisted(false);
+    // Fallback to a surviving tab happens in the tab-order effect.
   }
 
   function openFilesTab() {
@@ -1028,12 +1264,6 @@ export function App() {
 
   function closeFilesTab() {
     setFilesOpen(false);
-    if (panelMode !== "files") return;
-    if (openFile) setPanelMode("file");
-    else if (reviewOpen) setPanelMode("review");
-    else if (terminalOpen) setPanelMode("terminal");
-    else if (sideChatEnabled) setPanelMode("chat");
-    else setSideOpenPersisted(false);
   }
 
   function openReviewTab() {
@@ -1045,12 +1275,6 @@ export function App() {
 
   function closeReviewTab() {
     setReviewOpen(false);
-    if (panelMode !== "review") return;
-    if (openFile) setPanelMode("file");
-    else if (filesOpen) setPanelMode("files");
-    else if (terminalOpen) setPanelMode("terminal");
-    else if (sideChatEnabled) setPanelMode("chat");
-    else setSideOpenPersisted(false);
   }
 
   function openTerminalTab() {
@@ -1064,11 +1288,6 @@ export function App() {
   // the side chat, a dead terminal has no transcript worth preserving.
   function closeTerminalTab() {
     setTerminalOpen(false);
-    if (panelMode !== "terminal") return;
-    if (openFile) setPanelMode("file");
-    else if (filesOpen) setPanelMode("files");
-    else if (sideChatEnabled) setPanelMode("chat");
-    else setSideOpenPersisted(false);
   }
 
   function askInSideChat(text: string) {
@@ -1128,8 +1347,6 @@ export function App() {
   // An open file preview keeps the panel itself alive.
   function closeSideChat() {
     setSideChatEnabled(false);
-    if (openFile) setPanelMode("file");
-    else setSideOpenPersisted(false);
   }
 
   const connected = status.state === "connected";
@@ -1146,9 +1363,14 @@ export function App() {
   // the branch-switcher handlers above; they run post-render.)
   const gitPath = convCwd ?? activeProjectPath;
 
-  // A selected worktree belongs to one project — reset when leaving it.
+  // Entering a project loads ITS Work-in choice (default Local) and pushes
+  // it to main so the next thread/start uses it. This also drops any
+  // selected existing worktree — it belonged to the previous project.
   useEffect(() => {
-    if (workSel.mode === "existing") changeWorkMode({ mode: "local" });
+    const stored = activeProjectPath ? workModeStore()[activeProjectPath] : undefined;
+    const sel: WorkSel = stored === "worktree" ? { mode: "worktree" } : { mode: "local" };
+    setWorkSelState(sel);
+    void window.unbiased.setWorkMode(sel.mode);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeProjectPath]);
 
@@ -1241,10 +1463,10 @@ export function App() {
           <div style={{ display: "flex", marginBottom: 14, padding: "2px 0" }}>
             <Wordmark height={15} />
           </div>
-          <SidebarAction onClick={() => void newChat()} disabled={mainBusy} icon={<NewChatIcon />}>
+          <SidebarAction onClick={() => void newChat()} disabled={false} icon={<NewChatIcon />}>
             New chat
           </SidebarAction>
-          <SidebarAction onClick={() => void openProjectDialog()} disabled={mainBusy} icon={<FolderPlusIcon />}>
+          <SidebarAction onClick={() => void openProjectDialog()} disabled={false} icon={<FolderPlusIcon />}>
             Open project…
           </SidebarAction>
         </div>
@@ -1292,7 +1514,7 @@ export function App() {
                 >
                   {p.name}
                 </span>
-                {(hoveredProject === p.path || projMenu?.path === p.path) && !mainBusy && (
+                {(hoveredProject === p.path || projMenu?.path === p.path) && (
                   <span data-projmenu style={{ display: "flex", alignItems: "center", gap: 6, flexShrink: 0 }}>
                     <button
                       onClick={(e) => {
@@ -1387,7 +1609,7 @@ export function App() {
                   thread={t}
                   active={t.id === activeThreadId}
                   hovered={hoveredThreadId === t.id}
-                  busy={mainBusy}
+                  running={runningThreads.has(t.id)}
                   indent
                   onHover={setHoveredThreadId}
                   onOpen={openThread}
@@ -1409,7 +1631,7 @@ export function App() {
               thread={t}
               active={t.id === activeThreadId}
               hovered={hoveredThreadId === t.id}
-              busy={mainBusy}
+              running={runningThreads.has(t.id)}
               onHover={setHoveredThreadId}
               onOpen={openThread}
               onDelete={deleteThread}
@@ -1478,6 +1700,209 @@ export function App() {
             {mainTitle}
           </span>
           <span style={{ flex: 1 }} />
+          {inProject && mainStarted && (
+            <span ref={envRef} style={{ position: "relative", display: "flex" }}>
+              <IconButton title="Environment" onClick={() => (envOpen ? setEnvOpen(false) : void openEnvMenu())}>
+                <EnvIcon />
+              </IconButton>
+              {envOpen && (
+                <div
+                  style={{
+                    position: "absolute",
+                    top: "calc(100% + 8px)",
+                    right: 0,
+                    width: 300,
+                    background: colors.panel,
+                    border: `1px solid ${colors.border}`,
+                    borderRadius: 14,
+                    padding: 8,
+                    zIndex: 60,
+                    boxShadow: "0 8px 24px rgba(0,0,0,0.45)",
+                  }}
+                >
+                  <div style={{ color: colors.dim, fontSize: 12.5, padding: "4px 10px 8px" }}>Environment</div>
+                  <EnvRow
+                    icon={<ChangesIcon />}
+                    label="Changes"
+                    right={
+                      envDiff ? (
+                        <span style={{ fontVariantNumeric: "tabular-nums" }}>
+                          <span style={{ color: colors.ok }}>+{envDiff.plus}</span>{" "}
+                          <span style={{ color: colors.err }}>-{envDiff.minus}</span>
+                        </span>
+                      ) : (
+                        <span style={{ color: colors.dim }}>…</span>
+                      )
+                    }
+                    onClick={() => {
+                      openReviewTab();
+                      setEnvOpen(false);
+                    }}
+                  />
+                  <EnvRow
+                    icon={convCwd ? <SteerIcon /> : <LaptopIcon />}
+                    label={convCwd ? "Worktree" : "Local"}
+                    right={<Chevron open={envSection === "workin"} />}
+                    onClick={() => setEnvSection((s) => (s === "workin" ? null : "workin"))}
+                  />
+                  {envSection === "workin" && (
+                    <div style={{ padding: "0 0 4px 12px" }}>
+                      {(
+                        [
+                          { sel: { mode: "local" } as const, key: "local", label: "Local", icon: <LaptopIcon /> },
+                          { sel: { mode: "worktree" } as const, key: "worktree", label: "New worktree", icon: <SteerIcon /> },
+                          ...existingWts.map((wt) => ({
+                            sel: { mode: "existing", dir: wt.dir, branch: wt.branch } as const,
+                            key: wt.dir,
+                            label: wt.branch,
+                            icon: <BranchIcon />,
+                          })),
+                        ]
+                      ).map((opt) => (
+                        <button
+                          key={opt.key}
+                          onClick={() => changeWorkMode(opt.sel)}
+                          style={{
+                            display: "flex",
+                            alignItems: "center",
+                            gap: 10,
+                            width: "100%",
+                            background: "transparent",
+                            border: "none",
+                            borderRadius: 8,
+                            padding: "7px 10px",
+                            fontSize: 13,
+                            color: colors.fg,
+                            cursor: "pointer",
+                            textAlign: "left",
+                            fontFamily: "inherit",
+                          }}
+                        >
+                          <span style={{ color: colors.dim, display: "flex", flexShrink: 0 }}>{opt.icon}</span>
+                          <span style={{ flex: 1, minWidth: 0, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                            {opt.label}
+                          </span>
+                          {opt.sel.mode === "existing" && opt.sel.dir === convCwd && (
+                            <span
+                              style={{
+                                color: colors.dim,
+                                fontSize: 11,
+                                border: `1px solid ${colors.border}`,
+                                borderRadius: 5,
+                                padding: "1px 6px",
+                                flexShrink: 0,
+                              }}
+                            >
+                              current
+                            </span>
+                          )}
+                          {(workSel.mode === opt.sel.mode &&
+                            (opt.sel.mode !== "existing" ||
+                              (workSel.mode === "existing" && workSel.dir === opt.sel.dir))) && <CheckIcon />}
+                        </button>
+                      ))}
+                      <div style={{ color: colors.dim, fontSize: 11.5, padding: "4px 10px 2px", lineHeight: 1.4 }}>
+                        Applies to new chats in {activeProjectName ?? "this project"} — this conversation keeps its
+                        checkout.
+                      </div>
+                    </div>
+                  )}
+                  <EnvRow
+                    icon={<BranchIcon />}
+                    label={envBranches?.current ?? projectBranch ?? "…"}
+                    right={<Chevron open={envSection === "branch"} />}
+                    onClick={() => setEnvSection((s) => (s === "branch" ? null : "branch"))}
+                  />
+                  {envSection === "branch" && envBranches && (
+                    <div style={{ padding: "0 0 4px 12px" }}>
+                      <input
+                        value={envBranchSearch}
+                        onChange={(e) => setEnvBranchSearch(e.target.value)}
+                        placeholder="Find a branch…"
+                        spellCheck={false}
+                        style={{
+                          width: "100%",
+                          boxSizing: "border-box",
+                          background: "var(--panel-2)",
+                          color: colors.fg,
+                          border: `1px solid ${colors.border}`,
+                          borderRadius: 8,
+                          padding: "6px 10px",
+                          fontSize: 12.5,
+                          outline: "none",
+                          margin: "2px 0 4px",
+                          fontFamily: "inherit",
+                        }}
+                      />
+                      <div style={{ maxHeight: 180, overflowY: "auto" }}>
+                        {envBranches.branches
+                          .filter((b) => b.toLowerCase().includes(envBranchSearch.toLowerCase()))
+                          .slice(0, 30)
+                          .map((b) => (
+                            <button
+                              key={b}
+                              onClick={() => envPickBranch(b)}
+                              style={{
+                                display: "flex",
+                                alignItems: "center",
+                                gap: 10,
+                                width: "100%",
+                                background: "transparent",
+                                border: "none",
+                                borderRadius: 8,
+                                padding: "6px 10px",
+                                fontSize: 13,
+                                color: colors.fg,
+                                cursor: "pointer",
+                                textAlign: "left",
+                                fontFamily: "var(--font-code)",
+                              }}
+                            >
+                              <span style={{ flex: 1, minWidth: 0, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                                {b}
+                              </span>
+                              {b === envBranches.current && <CheckIcon />}
+                            </button>
+                          ))}
+                      </div>
+                      <button
+                        onClick={() => {
+                          setBranchCreate(true);
+                          setEnvOpen(false);
+                        }}
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          gap: 10,
+                          width: "100%",
+                          background: "transparent",
+                          border: "none",
+                          borderRadius: 8,
+                          padding: "6px 10px",
+                          fontSize: 13,
+                          color: colors.fg,
+                          cursor: "pointer",
+                          textAlign: "left",
+                          fontFamily: "inherit",
+                        }}
+                      >
+                        <span style={{ color: colors.dim, display: "flex" }}>
+                          <PlusIcon />
+                        </span>
+                        Create new branch…
+                      </button>
+                    </div>
+                  )}
+                  <div style={{ borderTop: `1px solid ${colors.border}`, margin: "6px 4px" }} />
+                  <EnvRow icon={<CommitIcon />} label="Commit or push" onClick={() => void envCommitPush()} />
+                  <EnvRow icon={<PrIcon />} label="Create pull request" onClick={() => void envCreatePr()} />
+                  {envMsg && (
+                    <div style={{ color: colors.dim, fontSize: 12, padding: "6px 10px 2px" }}>{envMsg}</div>
+                  )}
+                </div>
+              )}
+            </span>
+          )}
           <IconButton title={sideOpen ? "Close side panel" : "Open side panel"} onClick={toggleSidePanel}>
             <SideChatIcon />
           </IconButton>
@@ -1509,10 +1934,12 @@ export function App() {
           }
           draftSeed={mainSeed}
           composerHeader={
-            activeProjectPath ? (
+            // Only before the chat exists — once active, the header's
+            // Environment popover carries this information instead.
+            activeProjectPath && !mainStarted ? (
               <div
                 style={{
-                  maxWidth: 720,
+                  maxWidth: 768,
                   margin: "0 auto 8px",
                   display: "flex",
                   alignItems: "center",
@@ -1646,17 +2073,36 @@ export function App() {
                             >
                               {opt.label}
                             </span>
+                            {/* The ✓ is the NEXT-chat choice; tag where THIS
+                                conversation actually runs so the two never
+                                get read as one. */}
+                            {opt.sel.mode === "existing" && opt.sel.dir === convCwd && (
+                              <span
+                                style={{
+                                  color: colors.dim,
+                                  fontSize: 11,
+                                  border: `1px solid ${colors.border}`,
+                                  borderRadius: 5,
+                                  padding: "1px 6px",
+                                  flexShrink: 0,
+                                }}
+                              >
+                                current
+                              </span>
+                            )}
                             {(workSel.mode === opt.sel.mode &&
                               (opt.sel.mode !== "existing" ||
                                 (workSel.mode === "existing" && workSel.dir === opt.sel.dir))) && <CheckIcon />}
                           </button>
                         </div>
                       ))}
-                      {mainStarted && (
-                        <div style={{ color: colors.dim, fontSize: 12, padding: "6px 10px 2px", lineHeight: 1.4 }}>
-                          Applies to new chats — this conversation keeps its checkout.
-                        </div>
-                      )}
+                      {/* The choice binds to THIS project — picking it here while
+                          meaning "my next chat elsewhere" is how a worktree once
+                          landed in the wrong repo, so always name the scope. */}
+                      <div style={{ color: colors.dim, fontSize: 12, padding: "6px 10px 2px", lineHeight: 1.4 }}>
+                        Applies to new chats in {activeProjectName ?? "this project"}
+                        {mainStarted ? " — this conversation keeps its checkout." : "."}
+                      </div>
                     </div>
                   )}
                 </span>
@@ -1858,205 +2304,67 @@ export function App() {
               flexShrink: 0,
             }}
           >
-            {sideChatEnabled && (
-              <button
-                onClick={() => setPanelMode("chat")}
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 8,
-                  background: panelMode === "chat" ? colors.panel : "transparent",
-                  color: panelMode === "chat" ? colors.fg : colors.dim,
-                  border: "none",
-                  borderRadius: 8,
-                  padding: "6px 12px",
-                  fontSize: 13,
-                  cursor: "pointer",
-                  fontFamily: "inherit",
-                }}
-              >
-                <ChatPlusIcon />
-                Side chat
-                <span
-                  role="button"
-                  aria-label="Close side chat"
-                  onClick={(ev) => {
-                    ev.stopPropagation();
-                    closeSideChat();
+            {tabOrder.map((t) => {
+              const cfg: { icon: React.ReactNode; label: string; close: () => void; aria: string; title?: string } =
+                t === "chat"
+                  ? { icon: <ChatPlusIcon />, label: "Side chat", close: closeSideChat, aria: "Close side chat" }
+                  : t === "file"
+                    ? {
+                        icon: null,
+                        label: openFile?.name ?? "",
+                        close: () => setOpenFile(null),
+                        aria: "Close file",
+                        title: openFile?.fullPath,
+                      }
+                    : t === "files"
+                      ? { icon: <FolderOutlineIcon size={13} />, label: "Files", close: closeFilesTab, aria: "Close files" }
+                      : t === "review"
+                        ? { icon: <ReviewIcon />, label: "Review", close: closeReviewTab, aria: "Close review" }
+                        : t === "browser"
+                          ? { icon: <GlobeIcon size={13} />, label: "Browser", close: closeBrowserTab, aria: "Close browser" }
+                          : {
+                              icon: <TerminalIcon size={13} />,
+                              label: activeProjectName ?? "Terminal",
+                              close: closeTerminalTab,
+                              aria: "Close terminal",
+                            };
+              return (
+                <button
+                  key={t}
+                  onClick={() => setPanelMode(t)}
+                  title={cfg.title}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 8,
+                    background: panelMode === t ? colors.panel : "transparent",
+                    color: panelMode === t ? colors.fg : colors.dim,
+                    border: "none",
+                    borderRadius: 8,
+                    padding: "6px 12px",
+                    fontSize: 13,
+                    cursor: "pointer",
+                    fontFamily: "inherit",
+                    minWidth: 0,
+                    ...(t === "file" ? { maxWidth: 220 } : {}),
                   }}
-                  style={{ display: "flex", color: colors.dim, marginLeft: 2 }}
                 >
-                  <CloseIcon />
-                </span>
-              </button>
-            )}
-            {openFile && (
-              <button
-                onClick={() => setPanelMode("file")}
-                title={openFile.fullPath}
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 8,
-                  background: panelMode === "file" ? colors.panel : "transparent",
-                  color: panelMode === "file" ? colors.fg : colors.dim,
-                  border: "none",
-                  borderRadius: 8,
-                  padding: "6px 12px",
-                  fontSize: 13,
-                  cursor: "pointer",
-                  fontFamily: "inherit",
-                  minWidth: 0,
-                  maxWidth: 220,
-                }}
-              >
-                <span style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                  {openFile.name}
-                </span>
-                <span
-                  role="button"
-                  aria-label="Close file"
-                  onClick={(ev) => {
-                    ev.stopPropagation();
-                    setOpenFile(null);
-                    // No chat tab behind it → nothing left in the panel.
-                    if (sideChatEnabled) setPanelMode("chat");
-                    else setSideOpenPersisted(false);
-                  }}
-                  style={{ display: "flex", color: colors.dim }}
-                >
-                  <CloseIcon />
-                </span>
-              </button>
-            )}
-            {filesOpen && (
-              <button
-                onClick={() => setPanelMode("files")}
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 8,
-                  background: panelMode === "files" ? colors.panel : "transparent",
-                  color: panelMode === "files" ? colors.fg : colors.dim,
-                  border: "none",
-                  borderRadius: 8,
-                  padding: "6px 12px",
-                  fontSize: 13,
-                  cursor: "pointer",
-                  fontFamily: "inherit",
-                }}
-              >
-                <FolderOutlineIcon size={13} />
-                Files
-                <span
-                  role="button"
-                  aria-label="Close files"
-                  onClick={(ev) => {
-                    ev.stopPropagation();
-                    closeFilesTab();
-                  }}
-                  style={{ display: "flex", color: colors.dim, marginLeft: 2 }}
-                >
-                  <CloseIcon />
-                </span>
-              </button>
-            )}
-            {reviewOpen && (
-              <button
-                onClick={() => setPanelMode("review")}
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 8,
-                  background: panelMode === "review" ? colors.panel : "transparent",
-                  color: panelMode === "review" ? colors.fg : colors.dim,
-                  border: "none",
-                  borderRadius: 8,
-                  padding: "6px 12px",
-                  fontSize: 13,
-                  cursor: "pointer",
-                  fontFamily: "inherit",
-                }}
-              >
-                <ReviewIcon />
-                Review
-                <span
-                  role="button"
-                  aria-label="Close review"
-                  onClick={(ev) => {
-                    ev.stopPropagation();
-                    closeReviewTab();
-                  }}
-                  style={{ display: "flex", color: colors.dim, marginLeft: 2 }}
-                >
-                  <CloseIcon />
-                </span>
-              </button>
-            )}
-            {browserOpen && (
-              <button
-                onClick={() => setPanelMode("browser")}
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 8,
-                  background: panelMode === "browser" ? colors.panel : "transparent",
-                  color: panelMode === "browser" ? colors.fg : colors.dim,
-                  border: "none",
-                  borderRadius: 8,
-                  padding: "6px 12px",
-                  fontSize: 13,
-                  cursor: "pointer",
-                  fontFamily: "inherit",
-                }}
-              >
-                <GlobeIcon size={13} />
-                Browser
-                <span
-                  role="button"
-                  aria-label="Close browser"
-                  onClick={(ev) => {
-                    ev.stopPropagation();
-                    closeBrowserTab();
-                  }}
-                  style={{ display: "flex", color: colors.dim, marginLeft: 2 }}
-                >
-                  <CloseIcon />
-                </span>
-              </button>
-            )}
-            {terminalOpen && (
-              <button
-                onClick={() => setPanelMode("terminal")}
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 8,
-                  background: panelMode === "terminal" ? colors.panel : "transparent",
-                  color: panelMode === "terminal" ? colors.fg : colors.dim,
-                  border: "none",
-                  borderRadius: 8,
-                  padding: "6px 12px",
-                  fontSize: 13,
-                  cursor: "pointer",
-                  fontFamily: "inherit",
-                }}
-              >
-                <TerminalIcon size={13} />
-                {activeProjectName ?? "Terminal"}
-                <span
-                  role="button"
-                  aria-label="Close terminal"
-                  onClick={(ev) => {
-                    ev.stopPropagation();
-                    closeTerminalTab();
-                  }}
-                  style={{ display: "flex", color: colors.dim, marginLeft: 2 }}
-                >
-                  <CloseIcon />
-                </span>
-              </button>
-            )}
+                  {cfg.icon}
+                  <span style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{cfg.label}</span>
+                  <span
+                    role="button"
+                    aria-label={cfg.aria}
+                    onClick={(ev) => {
+                      ev.stopPropagation();
+                      cfg.close();
+                    }}
+                    style={{ display: "flex", color: colors.dim, marginLeft: 2 }}
+                  >
+                    <CloseIcon />
+                  </span>
+                </button>
+              );
+            })}
             <span ref={sidePlusRef} style={{ position: "relative", display: "flex" }}>
               <IconButton title="Open side panel tab" onClick={() => setSidePlusOpen((o) => !o)}>
                 <PlusIcon />
@@ -3101,7 +3409,19 @@ function ReviewPane({ gitPath }: { gitPath: string | null }) {
   const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState(false);
   const [actionMsg, setActionMsg] = useState<string | null>(null);
+  // Files whose diff is folded away — reviewed ones collapse so the next
+  // file's header lands at the top.
+  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const fileRefs = useRef<Map<string, HTMLDivElement>>(new Map());
+
+  function toggleCollapsed(path: string) {
+    setCollapsed((prev) => {
+      const s = new Set(prev);
+      if (s.has(path)) s.delete(path);
+      else s.add(path);
+      return s;
+    });
+  }
   const menusRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -3173,7 +3493,16 @@ function ReviewPane({ gitPath }: { gitPath: string | null }) {
       n.file ? (
         <button
           key={n.file.path}
-          onClick={() => fileRefs.current.get(n.file!.path)?.scrollIntoView({ block: "start" })}
+          onClick={() => {
+            // Jumping to a file implies reviewing it — unfold if collapsed.
+            setCollapsed((prev) => {
+              if (!prev.has(n.file!.path)) return prev;
+              const s = new Set(prev);
+              s.delete(n.file!.path);
+              return s;
+            });
+            fileRefs.current.get(n.file!.path)?.scrollIntoView({ block: "start" });
+          }}
           style={{
             display: "flex",
             alignItems: "center",
@@ -3419,6 +3748,7 @@ function ReviewPane({ gitPath }: { gitPath: string | null }) {
               const g = grammarFor(f.path);
               const dirs = f.path.split("/");
               const name = dirs.pop();
+              const isCollapsed = collapsed.has(f.path);
               let prevEnd: number | null = null;
               return (
                 <div
@@ -3428,6 +3758,8 @@ function ReviewPane({ gitPath }: { gitPath: string | null }) {
                   }}
                 >
                   <div
+                    onClick={() => toggleCollapsed(f.path)}
+                    title={isCollapsed ? "Expand file" : "Collapse file"}
                     style={{
                       display: "flex",
                       alignItems: "center",
@@ -3439,8 +3771,23 @@ function ReviewPane({ gitPath }: { gitPath: string | null }) {
                       zIndex: 5,
                       fontSize: 13,
                       fontFamily: "var(--font-code)",
+                      cursor: "pointer",
+                      userSelect: "none",
                     }}
                   >
+                    <span
+                      style={{
+                        display: "flex",
+                        flexShrink: 0,
+                        color: colors.dim,
+                        transform: isCollapsed ? "rotate(-90deg)" : "none",
+                        transition: "transform 120ms",
+                      }}
+                    >
+                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M6 9l6 6 6-6" />
+                      </svg>
+                    </span>
                     <span style={{ minWidth: 0, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
                       {dirs.length > 0 && <span style={{ color: colors.dim }}>{dirs.join("/")}/</span>}
                       <span style={{ color: colors.fg }}>{name}</span>
@@ -3448,7 +3795,7 @@ function ReviewPane({ gitPath }: { gitPath: string | null }) {
                     <span style={{ color: colors.ok, flexShrink: 0 }}>+{f.plus}</span>
                     <span style={{ color: colors.err, flexShrink: 0 }}>-{f.minus}</span>
                   </div>
-                  {f.hunks.map((h, hi) => {
+                  {!isCollapsed && f.hunks.map((h, hi) => {
                     const gap = prevEnd === null ? h.newStart - 1 : h.newStart - prevEnd;
                     prevEnd = h.newStart + h.lines.filter((l) => l.t !== "d").length;
                     return (
@@ -4424,7 +4771,12 @@ function ChatPane({
 }: {
   paneId: PaneId;
   connected: boolean;
-  reset: { entries: Entry[]; nonce: number };
+  reset: {
+    entries: Entry[];
+    nonce: number;
+    // Present when the conversation was reopened mid-turn.
+    resume?: { running: boolean; approvals: HeldApproval[] } | null;
+  };
   contextChip?: string | { text: string; comment?: string; tag?: string; thumb?: string } | null;
   onContextClear?: () => void;
   emptyState: React.ReactNode;
@@ -4549,6 +4901,42 @@ function ChatPane({
   queueRef.current = queue;
   const nextQueueIdRef = useRef(1);
   const [sendHover, setSendHover] = useState(false);
+  // Live context occupancy (per turn, from the engine) + the usage popover.
+  const [ctxUsage, setCtxUsage] = useState<{ used: number; window: number | null; percent: number | null } | null>(null);
+  const [usageOpen, setUsageOpen] = useState(false);
+  const [usageData, setUsageData] = useState<Awaited<ReturnType<typeof window.unbiased.readUsage>> | null>(null);
+  const usageRef = useRef<HTMLSpanElement>(null);
+
+  // Seed the gauge from the persisted reading on open/resume; live
+  // notifications take over from there.
+  useEffect(() => {
+    let alive = true;
+    setCtxUsage(null);
+    if (!threadId) return;
+    void window.unbiased.contextUsage(threadId).then((r) => {
+      if (alive && r.usage) setCtxUsage(r.usage);
+    });
+    return () => {
+      alive = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [threadId]);
+
+  useEffect(() => {
+    if (!usageOpen) return;
+    function onDown(e: MouseEvent) {
+      if (!usageRef.current?.contains(e.target as Node)) setUsageOpen(false);
+    }
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") setUsageOpen(false);
+    }
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [usageOpen]);
   // x = the selection's horizontal midpoint (anchors the button pill);
   // right = its bounding-box right edge (anchors the comment box beside
   // the numbered badge); y = its top.
@@ -4575,11 +4963,49 @@ function ChatPane({
   }
 
   const threadIdRef = useRef<string | null>(threadId ?? null);
+  // Did the current turn emit anything visible (text, command, plan)? A
+  // turn that completes having produced NOTHING — the gateway returned an
+  // empty completion — otherwise leaves the chat looking frozen with no
+  // error. Reset on send, set on the first sign of output.
+  const producedRef = useRef(true);
+  // Consecutive empty turns. One is likely a transient upstream blip; two+
+  // means something in the conversation history is being suppressed every
+  // turn (e.g. Pareto's safety guard on credential-exfil content), so
+  // retrying THIS chat won't help — a fresh chat will.
+  const emptyStreakRef = useRef(0);
+
+  // Attach an approval request to its command card (or make one). Shared
+  // by the live event and the replay of requests held while backgrounded.
+  function applyApproval(p: HeldApproval): void {
+    setEntries((es) => {
+      const cleaned = withoutTrailingPlaceholder(es);
+      const approval = { requestId: p.requestId, reason: p.reason, kind: p.kind, grantRoot: p.grantRoot };
+      const idx = cleaned.findIndex((e) => e.kind === "command" && e.itemId === p.itemId);
+      if (idx !== -1) {
+        const cmd = cleaned[idx] as CommandEntry;
+        const updated: Entry = { ...cmd, status: "awaitingApproval", approval };
+        return [...cleaned.slice(0, idx), updated, ...cleaned.slice(idx + 1)];
+      }
+      return [
+        ...cleaned,
+        {
+          kind: "command",
+          itemId: p.itemId ?? p.requestId,
+          command: p.command,
+          status: "awaitingApproval",
+          approval,
+        },
+      ];
+    });
+  }
 
   useEffect(() => {
     threadIdRef.current = threadId ?? null;
     setEntries(reset.entries);
-    setBusy(false);
+    // A reopened conversation may still be mid-turn: restore its busy
+    // state and any approval requests the agent is blocked on.
+    setBusy(!!reset.resume?.running);
+    for (const held of reset.resume?.approvals ?? []) applyApproval(held);
     // Staged annotations belong to the conversation they came from.
     setAnnotations([]);
     setPendingComment(null);
@@ -4625,6 +5051,7 @@ function ChatPane({
     const offs = [
       window.unbiased.onDelta((p) => {
         if (p.paneId !== paneId) return;
+        producedRef.current = true;
         setEntries((es) => {
           const last = es[es.length - 1];
           if (!last || last.kind !== "assistant") return [...es, { kind: "assistant", text: p.delta }];
@@ -4635,6 +5062,8 @@ function ChatPane({
         if (p.paneId !== paneId) return;
         setBusy(false);
         onTurnLanded?.();
+        // A turn that produced anything breaks the empty streak.
+        if (producedRef.current) emptyStreakRef.current = 0;
         setEntries((es) => {
           let next = es;
           if (p.status === "interrupted") {
@@ -4651,6 +5080,20 @@ function ChatPane({
               ...next,
               { kind: "assistant", text: `⚠ Turn failed${p.error ? `: ${p.error}` : "."}` },
             ];
+          } else if (p.status !== "interrupted" && !producedRef.current) {
+            // "Completed" with zero output: the model returned an empty
+            // completion. Indistinguishable from a hang unless we say so.
+            emptyStreakRef.current += 1;
+            const persistent = emptyStreakRef.current >= 2;
+            next = [
+              ...next,
+              {
+                kind: "assistant",
+                text: persistent
+                  ? "⚠ The model returned an empty response again. Something earlier in this conversation is being suppressed every turn — start a new chat to continue."
+                  : "⚠ The model returned an empty response — try sending again.",
+              },
+            ];
           }
           return next;
         });
@@ -4663,29 +5106,15 @@ function ChatPane({
       }),
       window.unbiased.onApprovalRequest((p) => {
         if (p.paneId !== paneId) return;
-        setEntries((es) => {
-          const cleaned = withoutTrailingPlaceholder(es);
-          const approval = { requestId: p.requestId, reason: p.reason, kind: p.kind, grantRoot: p.grantRoot };
-          const idx = cleaned.findIndex((e) => e.kind === "command" && e.itemId === p.itemId);
-          if (idx !== -1) {
-            const cmd = cleaned[idx] as CommandEntry;
-            const updated: Entry = { ...cmd, status: "awaitingApproval", approval };
-            return [...cleaned.slice(0, idx), updated, ...cleaned.slice(idx + 1)];
-          }
-          return [
-            ...cleaned,
-            {
-              kind: "command",
-              itemId: p.itemId ?? p.requestId,
-              command: p.command,
-              status: "awaitingApproval",
-              approval,
-            },
-          ];
-        });
+        applyApproval(p);
+      }),
+      window.unbiased.onTokenUsage((p) => {
+        if (p.paneId !== paneId) return;
+        setCtxUsage({ used: p.used, window: p.window, percent: p.percent });
       }),
       window.unbiased.onPlan((p) => {
         if (p.paneId !== paneId) return;
+        producedRef.current = true;
         setEntries((es) => [...withoutTrailingPlaceholder(es), { kind: "assistant", text: p.text }]);
       }),
       window.unbiased.onCompaction((p) => {
@@ -4699,6 +5128,7 @@ function ChatPane({
       }),
       window.unbiased.onCommand((p) => {
         if (p.paneId !== paneId) return;
+        producedRef.current = true;
         const item = p.item;
         setEntries((es) => {
           const cleaned = withoutTrailingPlaceholder(es);
@@ -4744,6 +5174,7 @@ function ChatPane({
   /** Send a prepared message right now (fresh sends and queue flushes). */
   async function sendNow(q: QueuedMsg) {
     setBusy(true);
+    producedRef.current = false;
     setEntries((es) => [...es, { kind: "user", text: q.text, annotations: q.annotations }]);
     try {
       const res = await window.unbiased.sendMessage(paneId, q.wire, q.attachments);
@@ -4999,7 +5430,7 @@ function ChatPane({
               background: "var(--chip)",
               // File references read as navigation, not code — accent them.
               color: isPath ? "var(--accent)" : "var(--fg-msg)",
-              padding: "2.5px 7px",
+              padding: "3px 8px",
               borderRadius: 6,
               cursor: clickable ? "pointer" : "inherit",
             }}
@@ -5027,7 +5458,22 @@ function ChatPane({
           {props.children}
         </a>
       ),
-      p: (props: { children?: React.ReactNode }) => <p style={{ margin: "10px 0" }}>{props.children}</p>,
+      p: (props: { children?: React.ReactNode }) => <p style={{ margin: "12px 0" }}>{props.children}</p>,
+      h1: (props: { children?: React.ReactNode }) => (
+        <h1 style={{ fontSize: "1.5em", fontWeight: 650, margin: "28px 0 12px", color: "var(--fg)" }}>
+          {props.children}
+        </h1>
+      ),
+      h2: (props: { children?: React.ReactNode }) => (
+        <h2 style={{ fontSize: "1.35em", fontWeight: 650, margin: "26px 0 12px", color: "var(--fg)" }}>
+          {props.children}
+        </h2>
+      ),
+      h3: (props: { children?: React.ReactNode }) => (
+        <h3 style={{ fontSize: "1.15em", fontWeight: 600, margin: "22px 0 10px", color: "var(--fg)" }}>
+          {props.children}
+        </h3>
+      ),
       ul: (props: { children?: React.ReactNode }) => (
         <ul style={{ margin: "10px 0", paddingLeft: 24 }}>{props.children}</ul>
       ),
@@ -5134,7 +5580,7 @@ function ChatPane({
         {entries.length === 0 && (
           <div style={{ height: "100%", display: "grid", placeItems: "center" }}>{emptyState}</div>
         )}
-        <div ref={contentRef} style={{ maxWidth: 720, margin: "0 auto", padding: "0 24px", position: "relative" }}>
+        <div ref={contentRef} style={{ maxWidth: 768, margin: "0 auto", padding: "0 24px", position: "relative" }}>
           {badges.map((b) => (
             <span
               key={b.n}
@@ -5253,7 +5699,7 @@ function ChatPane({
       <div style={{ padding: "8px 16px 16px" }}>
         {composerHeader}
         {queue.length > 0 && (
-          <div style={{ maxWidth: 720, margin: "0 auto 8px", display: "flex", flexDirection: "column", gap: 6 }}>
+          <div style={{ maxWidth: 768, margin: "0 auto 8px", display: "flex", flexDirection: "column", gap: 6 }}>
             {queue.map((q) => (
               <QueuedRow
                 key={q.id}
@@ -5276,7 +5722,7 @@ function ChatPane({
         <div
           style={{
             position: "relative",
-            maxWidth: 720,
+            maxWidth: 768,
             margin: "0 auto",
             background: colors.panel,
             borderRadius: 16,
@@ -5675,6 +6121,125 @@ function ChatPane({
               </span>
             </span>
             <span style={{ display: "flex", alignItems: "center", gap: 14 }}>
+            {ctxUsage && ctxUsage.percent !== null && (
+              <span ref={usageRef} style={{ position: "relative", display: "flex" }}>
+                <button
+                  onClick={async () => {
+                    if (usageOpen) {
+                      setUsageOpen(false);
+                      return;
+                    }
+                    setUsageOpen(true);
+                    setUsageData(await window.unbiased.readUsage());
+                  }}
+                  title={`Context: ${ctxUsage.percent}% used`}
+                  aria-label="Context and usage"
+                  style={{
+                    background: "transparent",
+                    border: "none",
+                    padding: 2,
+                    cursor: "pointer",
+                    display: "flex",
+                  }}
+                >
+                  <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+                    <circle cx="8" cy="8" r="6.5" fill="none" stroke="var(--gutter)" strokeWidth="2.5" />
+                    <circle
+                      cx="8"
+                      cy="8"
+                      r="6.5"
+                      fill="none"
+                      stroke={
+                        ctxUsage.percent > 90 ? colors.err : ctxUsage.percent > 70 ? colors.amber : colors.dim
+                      }
+                      strokeWidth="2.5"
+                      strokeLinecap="round"
+                      strokeDasharray={`${(ctxUsage.percent / 100) * 40.8} 40.8`}
+                      transform="rotate(-90 8 8)"
+                    />
+                  </svg>
+                </button>
+                {usageOpen && (
+                  <div
+                    style={{
+                      position: "absolute",
+                      bottom: "calc(100% + 10px)",
+                      right: -40,
+                      width: 320,
+                      background: colors.panel,
+                      border: `1px solid ${colors.border}`,
+                      borderRadius: 14,
+                      padding: "14px 16px",
+                      zIndex: 30,
+                      boxShadow: "0 8px 24px rgba(0,0,0,0.45)",
+                      fontSize: 13,
+                    }}
+                  >
+                    <div style={{ display: "flex", justifyContent: "space-between", color: colors.dim, marginBottom: 6 }}>
+                      <span>Context window</span>
+                      <span>
+                        {fmtTokens(ctxUsage.used)}
+                        {ctxUsage.window ? ` / ${fmtTokens(ctxUsage.window)} (${ctxUsage.percent}%)` : ""}
+                      </span>
+                    </div>
+                    <div style={{ height: 4, borderRadius: 2, background: "var(--panel-2)", overflow: "hidden" }}>
+                      <div
+                        style={{
+                          width: `${ctxUsage.percent}%`,
+                          height: "100%",
+                          borderRadius: 2,
+                          background: ctxUsage.percent > 90 ? colors.err : ctxUsage.percent > 70 ? colors.amber : colors.accent,
+                        }}
+                      />
+                    </div>
+                    {usageData?.rateLimits && (
+                      <>
+                        <div style={{ color: colors.dim, margin: "14px 0 4px" }}>
+                          Your usage limits{usageData.rateLimits.limitName ? ` · ${usageData.rateLimits.limitName}` : ""}
+                        </div>
+                        {([usageData.rateLimits.primary, usageData.rateLimits.secondary].filter(Boolean) as {
+                          usedPercent: number;
+                          resetsAt?: number | null;
+                          windowDurationMins?: number | null;
+                        }[]).map((w, i) => (
+                          <div key={i} style={{ marginTop: 10 }}>
+                            <div style={{ display: "flex", justifyContent: "space-between", color: colors.fg, marginBottom: 5 }}>
+                              <span>{fmtWindowLabel(w.windowDurationMins)}</span>
+                              <span style={{ color: colors.dim }}>
+                                {fmtReset(w.resetsAt)} <span style={{ color: colors.fg }}>{w.usedPercent}%</span>
+                              </span>
+                            </div>
+                            <div style={{ height: 4, borderRadius: 2, background: "var(--panel-2)", overflow: "hidden" }}>
+                              <div
+                                style={{
+                                  width: `${Math.min(100, w.usedPercent)}%`,
+                                  height: "100%",
+                                  borderRadius: 2,
+                                  background: colors.accent,
+                                }}
+                              />
+                            </div>
+                          </div>
+                        ))}
+                        {usageData.rateLimits.credits && (
+                          <div style={{ display: "flex", justifyContent: "space-between", marginTop: 12, color: colors.fg }}>
+                            <span>Usage credits</span>
+                            <span style={{ color: colors.dim }}>
+                              {usageData.rateLimits.credits.unlimited
+                                ? "Unlimited"
+                                : usageData.rateLimits.credits.balance ?? (usageData.rateLimits.credits.hasCredits ? "Available" : "None")}
+                            </span>
+                          </div>
+                        )}
+                      </>
+                    )}
+                    {usageData?.error && (
+                      <div style={{ color: colors.dim, marginTop: 12 }}>Usage limits unavailable.</div>
+                    )}
+                  </div>
+                )}
+              </span>
+            )}
             <span style={{ color: colors.dim, fontSize: 13.5 }}>Pareto</span>
             {busy ? (
               <button
@@ -5905,6 +6470,306 @@ const pillButtonStyle: React.CSSProperties = {
   whiteSpace: "nowrap",
 };
 
+function fmtBytes(n: number): string {
+  if (n >= 1 << 30) return `${(n / (1 << 30)).toFixed(2)} GB`;
+  if (n >= 1 << 20) return `${(n / (1 << 20)).toFixed(1)} MB`;
+  if (n >= 1024) return `${Math.round(n / 1024)} KB`;
+  return `${Math.round(n)} B`;
+}
+
+/** Minimal SVG area chart for the Resources view — no chart lib, just a
+ *  polyline over the sample window with a soft fill. */
+function AreaChart({
+  label,
+  value,
+  color,
+  data,
+  floor,
+}: {
+  label: string;
+  value: string;
+  color: string;
+  data: number[];
+  /** Minimum y-axis ceiling so early samples don't look like mountains. */
+  floor?: number;
+}) {
+  const W = 100;
+  const H = 36;
+  const max = Math.max(floor ?? 0, ...data, 1);
+  const n = Math.max(data.length, 2);
+  const pts = data.map((v, i) => `${((i / (n - 1)) * W).toFixed(2)},${(H - (v / max) * (H - 3)).toFixed(2)}`);
+  return (
+    <div
+      style={{
+        flex: 1,
+        minWidth: 0,
+        border: `1px solid ${colors.border}`,
+        borderRadius: 12,
+        background: colors.panel,
+        padding: "12px 14px",
+      }}
+    >
+      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, color: colors.dim, marginBottom: 6 }}>
+        <span>{label}</span>
+        <span style={{ color: colors.fg, fontVariantNumeric: "tabular-nums" }}>{value}</span>
+      </div>
+      <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" style={{ width: "100%", height: 56, display: "block" }}>
+        {data.length >= 2 && (
+          <>
+            <polygon points={`0,${H} ${pts.join(" ")} ${W},${H}`} fill={color} opacity={0.14} />
+            <polyline
+              points={pts.join(" ")}
+              fill="none"
+              stroke={color}
+              strokeWidth={1.5}
+              vectorEffect="non-scaling-stroke"
+              strokeLinejoin="round"
+            />
+          </>
+        )}
+      </svg>
+    </div>
+  );
+}
+
+/** Settings → Resources: live process metrics (2s samples) and what each
+ *  conversation costs on disk. */
+function ResourcesView() {
+  const [procs, setProcs] = useState<{ pid: number; kind: string; memMB: number; cpu: number }[]>([]);
+  const [hist, setHist] = useState<{ mem: number; cpu: number }[]>([]);
+  const [storage, setStorage] = useState<{
+    threads: Record<string, { rolloutBytes: number; transcriptBytes: number; mtime: number }>;
+    worktrees: { dir: string; project: string; branch: string; kb: number }[];
+    engineHomeKB: number;
+  } | null>(null);
+  const [titles, setTitles] = useState<Map<string, string>>(new Map());
+  const [showAllConvs, setShowAllConvs] = useState(false);
+
+  useEffect(() => {
+    let alive = true;
+    async function tick() {
+      try {
+        const r = await window.unbiased.resourceStats();
+        if (!alive) return;
+        setProcs(r.procs);
+        setHist((h) => [
+          ...h.slice(-89),
+          {
+            mem: r.procs.reduce((n, p) => n + p.memMB, 0),
+            cpu: r.procs.reduce((n, p) => n + p.cpu, 0),
+          },
+        ]);
+      } catch {
+        // a process exited mid-sample; next tick recovers
+      }
+    }
+    void tick();
+    const iv = setInterval(tick, 2000);
+    return () => {
+      alive = false;
+      clearInterval(iv);
+    };
+  }, []);
+
+  useEffect(() => {
+    void window.unbiased.storageStats().then(setStorage);
+    void window.unbiased.listThreads().then((d) => {
+      const m = new Map<string, string>();
+      for (const p of d.projects) for (const t of p.threads) m.set(t.id, t.title);
+      for (const t of d.recents) m.set(t.id, t.title);
+      setTitles(m);
+    });
+  }, []);
+
+  const KIND_LABEL: Record<string, string> = {
+    Browser: "Main process",
+    Tab: "Interface (renderer)",
+    GPU: "GPU compositor",
+    Utility: "Utility",
+    Zygote: "Zygote",
+    engine: "Pareto engine",
+    terminal: "Terminal shell",
+  };
+  const memNow = procs.reduce((n, p) => n + p.memMB, 0);
+  const cpuNow = procs.reduce((n, p) => n + p.cpu, 0);
+  const sortedProcs = [...procs].sort((a, b) => b.memMB - a.memMB);
+
+  const convRows = storage
+    ? Object.entries(storage.threads)
+        .map(([id, t]) => ({
+          id,
+          title: titles.get(id) ?? `${id.slice(0, 13)}…`,
+          bytes: t.rolloutBytes + t.transcriptBytes,
+        }))
+        .sort((a, b) => b.bytes - a.bytes)
+    : [];
+  const convTotal = convRows.reduce((n, r) => n + r.bytes, 0);
+  const maxConv = convRows[0]?.bytes ?? 1;
+  const wtTotalKB = storage?.worktrees.reduce((n, w) => n + w.kb, 0) ?? 0;
+  const shownConvs = showAllConvs ? convRows : convRows.slice(0, 12);
+
+  const cardStyle: React.CSSProperties = {
+    border: `1px solid ${colors.border}`,
+    borderRadius: 12,
+    background: colors.panel,
+    overflow: "hidden",
+    marginBottom: 24,
+  };
+  const rowStyle: React.CSSProperties = {
+    display: "flex",
+    alignItems: "center",
+    gap: 12,
+    padding: "9px 18px",
+    borderBottom: `1px solid ${colors.border}`,
+    fontSize: 13,
+  };
+
+  return (
+    <div style={{ maxWidth: 640, margin: "0 auto" }}>
+      <h1 style={{ fontSize: 22, fontWeight: 600, margin: "0 0 24px" }}>Resources</h1>
+
+      <div style={{ display: "flex", gap: 12, marginBottom: 24 }}>
+        <AreaChart
+          label="Memory"
+          value={fmtBytes(memNow * 1024 * 1024)}
+          color={colors.accent}
+          data={hist.map((h) => h.mem)}
+        />
+        <AreaChart
+          label="CPU"
+          value={`${cpuNow.toFixed(0)}%`}
+          color="#5B9DFF"
+          data={hist.map((h) => h.cpu)}
+          floor={100}
+        />
+      </div>
+
+      <div style={cardStyle}>
+        <div style={{ ...rowStyle, fontWeight: 500, color: colors.dim, fontSize: 12.5 }}>
+          <span style={{ flex: 1 }}>Process</span>
+          <span style={{ width: 80, textAlign: "right" }}>Memory</span>
+          <span style={{ width: 56, textAlign: "right" }}>CPU</span>
+        </div>
+        {sortedProcs.map((p, i) => (
+          <div key={p.pid} style={{ ...rowStyle, ...(i === sortedProcs.length - 1 ? { borderBottom: "none" } : {}) }}>
+            <span style={{ flex: 1, minWidth: 0, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+              {KIND_LABEL[p.kind] ?? p.kind}
+              <span style={{ color: colors.dim, marginLeft: 8, fontSize: 11.5 }}>pid {p.pid}</span>
+            </span>
+            <span style={{ width: 80, textAlign: "right", fontVariantNumeric: "tabular-nums" }}>
+              {fmtBytes(p.memMB * 1024 * 1024)}
+            </span>
+            <span style={{ width: 56, textAlign: "right", fontVariantNumeric: "tabular-nums", color: colors.dim }}>
+              {p.cpu.toFixed(1)}%
+            </span>
+          </div>
+        ))}
+      </div>
+
+      <h2 style={{ fontSize: 15, fontWeight: 600, margin: "0 0 12px" }}>Storage</h2>
+      <div style={cardStyle}>
+        <div style={rowStyle}>
+          <span style={{ flex: 1 }}>Engine data (sessions, state, caches)</span>
+          <span style={{ fontVariantNumeric: "tabular-nums" }}>
+            {storage ? fmtBytes(storage.engineHomeKB * 1024) : "…"}
+          </span>
+        </div>
+        <div style={rowStyle}>
+          <span style={{ flex: 1 }}>Conversations ({convRows.length})</span>
+          <span style={{ fontVariantNumeric: "tabular-nums" }}>{fmtBytes(convTotal)}</span>
+        </div>
+        <div style={{ ...rowStyle, borderBottom: "none" }}>
+          <span style={{ flex: 1 }}>Worktrees ({storage?.worktrees.length ?? 0})</span>
+          <span style={{ fontVariantNumeric: "tabular-nums" }}>{fmtBytes(wtTotalKB * 1024)}</span>
+        </div>
+      </div>
+
+      <h2 style={{ fontSize: 15, fontWeight: 600, margin: "0 0 4px" }}>Per conversation</h2>
+      <div style={{ fontSize: 12.5, color: colors.dim, marginBottom: 12 }}>
+        Engine rollout log + this app's transcript cache.
+      </div>
+      <div style={cardStyle}>
+        {shownConvs.map((r, i) => (
+          <div
+            key={r.id}
+            style={{ ...rowStyle, ...(i === shownConvs.length - 1 && convRows.length <= 12 ? { borderBottom: "none" } : {}) }}
+          >
+            <span style={{ flex: 1, minWidth: 0 }}>
+              <span
+                style={{
+                  display: "block",
+                  whiteSpace: "nowrap",
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                  marginBottom: 5,
+                }}
+              >
+                {r.title}
+              </span>
+              <span
+                style={{
+                  display: "block",
+                  height: 4,
+                  borderRadius: 2,
+                  width: `${Math.max(2, (r.bytes / maxConv) * 100)}%`,
+                  background: colors.accent,
+                  opacity: 0.75,
+                }}
+              />
+            </span>
+            <span style={{ width: 80, textAlign: "right", fontVariantNumeric: "tabular-nums", flexShrink: 0 }}>
+              {fmtBytes(r.bytes)}
+            </span>
+          </div>
+        ))}
+        {convRows.length > 12 && (
+          <button
+            onClick={() => setShowAllConvs((v) => !v)}
+            style={{
+              width: "100%",
+              background: "transparent",
+              border: "none",
+              color: colors.dim,
+              fontSize: 12.5,
+              padding: "9px 18px",
+              cursor: "pointer",
+              fontFamily: "inherit",
+              textAlign: "left",
+            }}
+          >
+            {showAllConvs ? "Show fewer" : `Show all ${convRows.length}`}
+          </button>
+        )}
+        {storage && convRows.length === 0 && (
+          <div style={{ ...rowStyle, borderBottom: "none", color: colors.dim }}>No conversations yet.</div>
+        )}
+      </div>
+
+      {storage && storage.worktrees.length > 0 && (
+        <>
+          <h2 style={{ fontSize: 15, fontWeight: 600, margin: "0 0 12px" }}>Worktrees</h2>
+          <div style={cardStyle}>
+            {storage.worktrees.map((w, i) => (
+              <div
+                key={w.dir}
+                style={{ ...rowStyle, ...(i === storage.worktrees.length - 1 ? { borderBottom: "none" } : {}) }}
+              >
+                <span style={{ flex: 1, minWidth: 0, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                  {w.branch}
+                  <span style={{ color: colors.dim, marginLeft: 8, fontSize: 11.5 }}>
+                    {w.project.split("/").pop()}
+                  </span>
+                </span>
+                <span style={{ fontVariantNumeric: "tabular-nums", flexShrink: 0 }}>{fmtBytes(w.kb * 1024)}</span>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 function SettingsView({
   theme,
   onChange,
@@ -5914,6 +6779,7 @@ function SettingsView({
   onChange: (t: ThemeConfig) => void;
   onBack: () => void;
 }) {
+  const [tab, setTab] = useState<"appearance" | "resources">("appearance");
   const [importText, setImportText] = useState("");
   const [importError, setImportError] = useState<string | null>(null);
 
@@ -5988,20 +6854,39 @@ function SettingsView({
           ← Back to app
         </button>
         <SectionLabel>Personal</SectionLabel>
-        <div
-          style={{
-            background: colors.panel,
-            color: colors.fg,
-            borderRadius: 8,
-            padding: "8px 10px",
-            fontSize: 13.5,
-          }}
-        >
-          Appearance
-        </div>
+        {(
+          [
+            { id: "appearance", label: "Appearance" },
+            { id: "resources", label: "Resources" },
+          ] as const
+        ).map((item) => (
+          <button
+            key={item.id}
+            onClick={() => setTab(item.id)}
+            style={{
+              display: "block",
+              width: "100%",
+              textAlign: "left",
+              background: tab === item.id ? colors.panel : "transparent",
+              color: tab === item.id ? colors.fg : colors.dim,
+              border: "none",
+              borderRadius: 8,
+              padding: "8px 10px",
+              fontSize: 13.5,
+              cursor: "pointer",
+              fontFamily: "inherit",
+              marginBottom: 2,
+            }}
+          >
+            {item.label}
+          </button>
+        ))}
       </nav>
 
       <div style={{ flex: 1, overflowY: "auto", padding: "40px 48px" }}>
+        {tab === "resources" ? (
+          <ResourcesView />
+        ) : (
         <div style={{ maxWidth: 640, margin: "0 auto" }}>
           <h1 style={{ fontSize: 22, fontWeight: 600, margin: "0 0 24px" }}>Appearance</h1>
 
@@ -6137,6 +7022,7 @@ function SettingsView({
             </div>
           </div>
         </div>
+        )}
       </div>
     </div>
   );
@@ -6276,6 +7162,109 @@ function BugIcon() {
       <path d="M20.97 5c0 2.1-1.6 3.8-3.5 4" />
       <path d="M22 13h-4" />
       <path d="M17.2 17c2.1.1 3.8 1.9 3.8 4" />
+    </svg>
+  );
+}
+
+/** One row of the header's Environment popover. */
+function EnvRow({
+  icon,
+  label,
+  right,
+  onClick,
+}: {
+  icon: React.ReactNode;
+  label: string;
+  right?: React.ReactNode;
+  onClick?: () => void;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 10,
+        width: "100%",
+        background: "transparent",
+        border: "none",
+        borderRadius: 8,
+        padding: "8px 10px",
+        fontSize: 13.5,
+        color: colors.fg,
+        cursor: "pointer",
+        textAlign: "left",
+        fontFamily: "inherit",
+      }}
+    >
+      <span style={{ color: colors.dim, display: "flex", flexShrink: 0 }}>{icon}</span>
+      <span style={{ flex: 1, minWidth: 0, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+        {label}
+      </span>
+      {right}
+    </button>
+  );
+}
+
+function Chevron({ open }: { open: boolean }) {
+  return (
+    <span
+      style={{
+        display: "flex",
+        color: colors.dim,
+        transform: open ? "none" : "rotate(-90deg)",
+        transition: "transform 120ms",
+        flexShrink: 0,
+      }}
+    >
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M6 9l6 6 6-6" />
+      </svg>
+    </span>
+  );
+}
+
+/** Squared ± mark for the Changes row. */
+function ChangesIcon() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round">
+      <rect x="3" y="3" width="18" height="18" rx="4" />
+      <path d="M12 7.5v5M9.5 10h5M9.5 15.5h5" />
+    </svg>
+  );
+}
+
+/** Commit dot on a line. */
+function CommitIcon() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round">
+      <circle cx="12" cy="12" r="3.5" />
+      <path d="M2.5 12h6M15.5 12h6" />
+    </svg>
+  );
+}
+
+/** Pull-request glyph: branch merging back. */
+function PrIcon() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="6" cy="6" r="2.5" />
+      <circle cx="6" cy="18" r="2.5" />
+      <circle cx="18" cy="18" r="2.5" />
+      <path d="M6 8.5v7M13 6h2.5A2.5 2.5 0 0 1 18 8.5v7" />
+      <path d="M11 3.5 13 6l-2 2.5" />
+    </svg>
+  );
+}
+
+/** Checklist glyph for the header's Environment button. */
+function EnvIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M4 6l1.5 1.5L8 5" />
+      <path d="M4 12.5l1.5 1.5L8 11.5" />
+      <path d="M4 19l1.5 1.5L8 18" />
+      <path d="M11.5 6.5H20M11.5 13H20M11.5 19.5H20" />
     </svg>
   );
 }
@@ -6850,7 +7839,7 @@ function ThreadRow({
   thread,
   active,
   hovered,
-  busy,
+  running,
   indent,
   onHover,
   onOpen,
@@ -6859,7 +7848,7 @@ function ThreadRow({
   thread: ThreadSummary;
   active: boolean;
   hovered: boolean;
-  busy: boolean;
+  running?: boolean;
   indent?: boolean;
   onHover: (id: string | null) => void;
   onOpen: (id: string) => Promise<void>;
@@ -6880,27 +7869,48 @@ function ThreadRow({
     >
       <button
         onClick={() => void onOpen(thread.id)}
-        disabled={busy}
         title={thread.title}
         style={{
           flex: 1,
           minWidth: 0,
+          display: "flex",
+          alignItems: "center",
+          gap: 7,
           background: "transparent",
           color: active ? colors.fg : "var(--fg-soft)",
           border: "none",
           padding: "8px 4px 8px 8px",
           fontSize: 14,
           textAlign: "left",
-          cursor: busy ? "default" : "pointer",
-          whiteSpace: "nowrap",
-          overflow: "hidden",
-          textOverflow: "ellipsis",
+          cursor: "pointer",
           fontFamily: "inherit",
         }}
       >
-        {thread.title}
+        <span
+          style={{
+            minWidth: 0,
+            whiteSpace: "nowrap",
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+          }}
+        >
+          {thread.title}
+        </span>
+        {running && (
+          <span
+            aria-label="Turn running"
+            style={{
+              width: 7,
+              height: 7,
+              borderRadius: "50%",
+              background: "var(--accent)",
+              flexShrink: 0,
+              animation: "unbiased-pulse 1.2s ease-in-out infinite",
+            }}
+          />
+        )}
       </button>
-      {hovered && !busy && (
+      {hovered && (
         <button
           onClick={() => void onDelete(thread.id)}
           title="Delete conversation"

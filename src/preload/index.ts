@@ -23,6 +23,7 @@ contextBridge.exposeInMainWorld("unbiased", {
   onTurnStarted: (cb: (p: unknown) => void) => subscribe("chat:turn-started", cb),
   onDelta: (cb: (p: unknown) => void) => subscribe("chat:delta", cb),
   onTurnCompleted: (cb: (p: unknown) => void) => subscribe("chat:turn-completed", cb),
+  onThreadActivity: (cb: (p: unknown) => void) => subscribe("chat:thread-activity", cb),
 
   setAccessMode: (mode: string) => ipcRenderer.invoke("policy:set-mode", mode),
   setWorkMode: (mode: string, dir?: string) => ipcRenderer.invoke("workmode:set", { mode, dir }),
@@ -38,6 +39,11 @@ contextBridge.exposeInMainWorld("unbiased", {
   onApprovalRequest: (cb: (p: unknown) => void) => subscribe("chat:approval-request", cb),
   onCommand: (cb: (p: unknown) => void) => subscribe("chat:command", cb),
   onCompaction: (cb: (p: unknown) => void) => subscribe("chat:compaction", cb),
+  onTokenUsage: (cb: (p: unknown) => void) => subscribe("chat:token-usage", cb),
+  readUsage: () => ipcRenderer.invoke("usage:read"),
+  contextUsage: (threadId: string) => ipcRenderer.invoke("usage:context", threadId),
+  resourceStats: () => ipcRenderer.invoke("stats:resources"),
+  storageStats: () => ipcRenderer.invoke("stats:storage"),
 
   listThreads: () => ipcRenderer.invoke("threads:list"),
   openThread: (id: string) => ipcRenderer.invoke("threads:open", id),
