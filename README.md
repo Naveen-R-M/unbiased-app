@@ -2,7 +2,7 @@
 
 Unbiased desktop — a Pareto-powered coding agent in an Electron shell. The
 app is a pure client: all agent intelligence lives in a separate
-[`unbiased-app-engine`](https://github.com/R-M-Naveen/unbiased-app-engine)
+[`unbiased-app-engine`](https://github.com/circuitandchisel/unbiased-app-engine)
 binary (a Pareto-locked codex app-server wrapper) that the app spawns and
 speaks to over stdio.
 
