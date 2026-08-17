@@ -19,6 +19,7 @@ import "prismjs/components/prism-yaml";
 import "prismjs/components/prism-sql";
 import "prismjs/components/prism-markdown";
 import "prismjs/themes/prism-tomorrow.css";
+import { DogMark } from "./DogMark";
 
 type EngineStatus =
   | { state: "starting" }
@@ -223,8 +224,10 @@ declare global {
       getEngineStatus: () => Promise<EngineStatus>;
       onEngineStatus: (cb: (status: EngineStatus) => void) => () => void;
       checkUpdate: () => Promise<UpdateInfo | { none: true }>;
-      pendingUpdate: () => Promise<UpdateInfo | null>;
-      installUpdate: () => Promise<{ ok: boolean; error?: string }>;
+      pendingUpdate: () => Promise<{ update: UpdateInfo | null; staged: { version: string } | null }>;
+      downloadUpdate: () => Promise<{ ok: boolean; error?: string }>;
+      applyUpdate: () => Promise<{ ok: boolean; error?: string }>;
+      onUpdateStaged: (cb: (p: { version: string }) => void) => () => void;
       onUpdateAvailable: (cb: (p: UpdateInfo) => void) => () => void;
       onUpdateProgress: (cb: (p: { phase: UpdatePhase; percent: number }) => void) => () => void;
       onUpdateError: (cb: (p: { message: string }) => void) => () => void;
@@ -516,17 +519,28 @@ export function App() {
   const [update, setUpdate] = useState<UpdateInfo | null>(null);
   const [updateProgress, setUpdateProgress] = useState<{ phase: UpdatePhase; percent: number } | null>(null);
   const [updateError, setUpdateError] = useState<string | null>(null);
+  // Downloaded, verified, and waiting beside the installed app.
+  const [updateStaged, setUpdateStaged] = useState(false);
 
   useEffect(() => {
-    void window.unbiased.pendingUpdate().then((u) => u && setUpdate(u));
+    void window.unbiased.pendingUpdate().then((p) => {
+      if (p.update) setUpdate(p.update);
+      if (p.staged) setUpdateStaged(true);
+    });
     const offs = [
       window.unbiased.onUpdateAvailable((u) => setUpdate(u)),
+      window.unbiased.onUpdateStaged(() => {
+        // Downloaded and verified — now it's the user's call when to restart.
+        setUpdateProgress(null);
+        setUpdateStaged(true);
+      }),
       window.unbiased.onUpdateProgress((p) => {
         setUpdateProgress(p);
         setUpdateError(null);
       }),
       window.unbiased.onUpdateError((e) => {
         setUpdateProgress(null);
+        setUpdateStaged(false);
         setUpdateError(e.message);
       }),
     ];
@@ -1750,7 +1764,10 @@ export function App() {
             version={update.version}
             progress={updateProgress}
             error={updateError}
-            onInstall={() => void window.unbiased.installUpdate()}
+            staged={updateStaged}
+            onAct={() =>
+              void (updateStaged ? window.unbiased.applyUpdate() : window.unbiased.downloadUpdate())
+            }
           />
         )}
         <div style={{ padding: "4px 14px 2px", flexShrink: 0 }}>
@@ -6688,59 +6705,6 @@ const pillButtonStyle: React.CSSProperties = {
   whiteSpace: "nowrap",
 };
 
-/** Original mascot: a pup peeking over the update card with its paws draped
- *  on the top edge. Drawn inline (like every other icon here) so it scales,
- *  needs no asset pipeline, and picks up the theme's border colour. */
-function DogPeek({ size = 104 }: { size?: number }) {
-  return (
-    <svg width={size} height={size * (80 / 140)} viewBox="0 0 140 80" aria-hidden="true">
-      {/* floppy ears, behind the head */}
-      <path d="M47 13 C33 9 24 21 24 40 C24 57 29 70 38 69 C45 68 45 46 47 27 Z" fill="#FF7764" />
-      <path d="M93 13 C107 9 116 21 116 40 C116 57 111 70 102 69 C95 68 95 46 93 27 Z" fill="#FF7764" />
-      {/* head */}
-      <path
-        d="M70 6 C90 6 102 20 102 40 C102 58 88 70 70 70 C52 70 38 58 38 40 C38 20 50 6 70 6 Z"
-        fill="#F4F1EC"
-        stroke="var(--border)"
-        strokeWidth="0.8"
-      />
-      <path d="M52 14 C64 11 71 18 70 28 C69 37 61 41 53 39 C44 36 43 17 52 14 Z" fill="#FF9068" />
-      <ellipse cx="58" cy="32" rx="6.2" ry="7" fill="#211F1E" />
-      <ellipse cx="84" cy="32" rx="6.2" ry="7" fill="#211F1E" />
-      <circle cx="60.2" cy="29" r="2.2" fill="#fff" />
-      <circle cx="86.2" cy="29" r="2.2" fill="#fff" />
-      <ellipse cx="71" cy="53" rx="19" ry="13" fill="#FCFBF9" />
-      <path
-        d="M71 43 C77.5 43 81 46.5 81 49.5 C81 53 76.5 55.5 71 55.5 C65.5 55.5 61 53 61 49.5 C61 46.5 64.5 43 71 43 Z"
-        fill="#211F1E"
-      />
-      <path d="M71 55.5 L71 59" stroke="#211F1E" strokeWidth="1.9" strokeLinecap="round" />
-      <path d="M71 59 C68.5 62.5 64 61.8 63 59.2" stroke="#211F1E" strokeWidth="1.9" strokeLinecap="round" fill="none" />
-      <path d="M71 59 C73.5 62.5 78 61.8 79 59.2" stroke="#211F1E" strokeWidth="1.9" strokeLinecap="round" fill="none" />
-      <path d="M69 61 C69 66.5 74 68 75.6 64 C76.6 61.3 74.6 60 72 60 Z" fill="#FF8FA3" />
-      <circle cx="61" cy="49" r="0.9" fill="#DCD7D0" />
-      <circle cx="64.5" cy="52.5" r="0.9" fill="#DCD7D0" />
-      <circle cx="81" cy="49" r="0.9" fill="#DCD7D0" />
-      <circle cx="77.5" cy="52.5" r="0.9" fill="#DCD7D0" />
-      {/* paws gripping the card's top edge */}
-      <path
-        d="M30 64 C30 59 36 57 42 59 C48 61 50 66 50 70 C50 76 46 79 40 79 L34 79 C30 79 30 70 30 64 Z"
-        fill="#FCFBF9"
-        stroke="var(--border)"
-        strokeWidth="0.8"
-      />
-      <path
-        d="M110 64 C110 59 104 57 98 59 C92 61 90 66 90 70 C90 76 94 79 100 79 L106 79 C110 79 110 70 110 64 Z"
-        fill="#FCFBF9"
-        stroke="var(--border)"
-        strokeWidth="0.8"
-      />
-      <path d="M36 62.5 L36 77 M41 62 L41 78 M46 65 L46 78" stroke="#E4DFD7" strokeWidth="1.3" strokeLinecap="round" />
-      <path d="M104 62.5 L104 77 M99 62 L99 78 M94 65 L94 78" stroke="#E4DFD7" strokeWidth="1.3" strokeLinecap="round" />
-    </svg>
-  );
-}
-
 /** Sidebar card offering the newer release. Click = download, verify, swap
  *  the app bundle, relaunch. Progress replaces the label in place so the
  *  card never changes size mid-update. */
@@ -6748,12 +6712,14 @@ function UpdateBanner({
   version,
   progress,
   error,
-  onInstall,
+  staged,
+  onAct,
 }: {
   version: string;
   progress: { phase: UpdatePhase; percent: number } | null;
   error: string | null;
-  onInstall: () => void;
+  staged: boolean;
+  onAct: () => void;
 }) {
   const busy = progress !== null;
   const label = error
@@ -6766,18 +6732,29 @@ function UpdateBanner({
           ? "Installing…"
           : progress?.phase === "relaunching"
             ? "Relaunching…"
-            : "Relaunch to update";
+            : staged
+              ? "Relaunch to update"
+              : `Update to v${version}`;
   return (
     <div style={{ padding: "6px 14px 2px", flexShrink: 0 }}>
-      {/* The pup sits above the card; its paws overlap the top edge so the
-          card reads as the sign it's holding up. */}
-      <div style={{ display: "flex", justifyContent: "center", marginBottom: -14, pointerEvents: "none" }}>
-        <DogPeek size={104} />
+      {/* The dog sits above the card; its resting paws overlap the top edge
+          so the card reads as the sign it's holding up. */}
+      <div
+        style={{
+          display: "flex",
+          justifyContent: "center",
+          marginBottom: -18,
+          pointerEvents: "none",
+          color: "var(--fg-soft)",
+        }}
+      >
+        {/* Tongue out once the update is downloaded and only a relaunch away. */}
+        <DogMark size={96} happy={staged && !error} />
       </div>
       <button
-        onClick={() => !busy && onInstall()}
+        onClick={() => !busy && onAct()}
         disabled={busy}
-        title={error ?? `Version ${version} is available`}
+        title={error ?? (staged ? `v${version} is ready — relaunch to apply` : `Version ${version} is available`)}
         style={{
           position: "relative",
           overflow: "hidden",

@@ -406,6 +406,19 @@ const UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1000;
 type UpdateInfo = { version: string; dmgUrl: string; sumsUrl: string | null };
 let pendingUpdate: UpdateInfo | null = null;
 let updateInstalling = false;
+// Where a downloaded-and-verified bundle waits until the user relaunches.
+// Two-phase on purpose: downloading 190MB and then yanking the app away in
+// one click loses whatever the user was doing. Download in the background,
+// then let them pick the moment to relaunch.
+let stagedUpdate: { path: string; version: string } | null = null;
+
+/** Hidden sibling of the installed app, so a staged bundle doesn't show up
+ *  in Finder as a second "Unbiased" while it waits. */
+function stagedPathFor(target: string): string {
+  const dir = join(target, "..");
+  const name = target.split("/").pop() ?? "Unbiased.app";
+  return join(dir, `.${name}.incoming`);
+}
 
 /** Numeric-segment compare: "1.10.0" > "1.9.9". Returns >0 if a is newer. */
 function compareVersions(a: string, b: string): number {
@@ -422,6 +435,20 @@ function compareVersions(a: string, b: string): number {
 
 /** Ask the public releases repo what the latest version is. */
 async function checkForUpdate(): Promise<UpdateInfo | null> {
+  // Dev preview: UNBIASED_FAKE_UPDATE=1 surfaces the banner without a
+  // packaged build, so the update UI can be iterated on with `npm run dev`.
+  // Installing is still gated on isPackaged, so this can't swap anything.
+  if (process.env.UNBIASED_FAKE_UPDATE) {
+    const info: UpdateInfo = { version: "9.9.9", dmgUrl: "", sumsUrl: null };
+    pendingUpdate = info;
+    send("update:available", info);
+    // =2 previews the downloaded/"ready to relaunch" state (happy dog).
+    if (process.env.UNBIASED_FAKE_UPDATE === "2") {
+      stagedUpdate = { path: "/dev/null/fake", version: info.version };
+      send("update:staged", { version: info.version });
+    }
+    return info;
+  }
   // Unpackaged runs have no .app to replace — never offer an update in dev.
   if (!app.isPackaged) return null;
   try {
@@ -540,35 +567,52 @@ async function installUpdate(info: UpdateInfo): Promise<{ ok: boolean; error?: s
     }
 
     const target = appBundlePath();
-    // Stage beside the target, then swap. Deleting the installed app first
-    // means a failure here (full disk, permissions) leaves the user with no
-    // app at all — which is exactly what the shell installer did once.
-    // ditto (not cp -R) preserves the code signature; a broken seal would
-    // make macOS refuse to launch the updated app.
-    const staged = `${target}.incoming`;
+    // Stage beside the target and STOP. The swap happens in applyUpdate(),
+    // when the user chooses to relaunch. ditto (not cp -R) preserves the
+    // code signature; a broken seal would make macOS refuse to launch it.
+    const staged = stagedPathFor(target);
     rmSync(staged, { recursive: true, force: true });
     execFileSync("ditto", [join(mounted, srcApp), staged]);
-    try {
-      rmSync(target, { recursive: true, force: true });
-      execFileSync("mv", [staged, target]);
-    } catch (swapErr) {
-      rmSync(staged, { recursive: true, force: true });
-      throw swapErr;
-    }
+    cleanup();
+
+    stagedUpdate = { path: staged, version: info.version };
+    updateInstalling = false;
+    send("update:staged", { version: info.version });
+    return { ok: true };
+  } catch (err) {
+    cleanup();
+    updateInstalling = false;
+    const message = err instanceof Error ? err.message : String(err);
+    send("update:error", { message });
+    return { ok: false, error: message };
+  }
+}
+
+/** Swap the staged bundle in and restart. Only reached once a download has
+ *  been verified and staged, so the window where the app is missing is a
+ *  single `mv` — not a 190MB copy. */
+function applyUpdate(): { ok: boolean; error?: string } {
+  if (!stagedUpdate || !existsSync(stagedUpdate.path)) {
+    // The staged copy vanished (manual cleanup, disk tools). Fall back to
+    // offering the download again rather than pretending we can relaunch.
+    stagedUpdate = null;
+    const message = "the downloaded update is no longer available — download it again";
+    send("update:error", { message });
+    return { ok: false, error: message };
+  }
+  const target = appBundlePath();
+  try {
+    rmSync(target, { recursive: true, force: true });
+    execFileSync("mv", [stagedUpdate.path, target]);
     try {
       execFileSync("xattr", ["-dr", "com.apple.quarantine", target]);
     } catch {
       /* nothing to strip */
     }
-    cleanup();
-
-    send("update:progress", { phase: "relaunching", percent: 100 });
     app.relaunch();
     app.quit();
     return { ok: true };
   } catch (err) {
-    cleanup();
-    updateInstalling = false;
     const message = err instanceof Error ? err.message : String(err);
     send("update:error", { message });
     return { ok: false, error: message };
@@ -1139,11 +1183,15 @@ app.whenReady().then(async () => {
   // credentials-file label if we wrote one; env keys are opaque.
   // ── Update IPC ──────────────────────────────────────────────────────
   ipcMain.handle("update:check", async () => (await checkForUpdate()) ?? { none: true });
-  ipcMain.handle("update:pending", () => pendingUpdate);
-  ipcMain.handle("update:install", async () => {
+  ipcMain.handle("update:pending", () => ({
+    update: pendingUpdate,
+    staged: stagedUpdate ? { version: stagedUpdate.version } : null,
+  }));
+  ipcMain.handle("update:download", async () => {
     if (!pendingUpdate) return { ok: false, error: "no update available" };
     return installUpdate(pendingUpdate);
   });
+  ipcMain.handle("update:apply", () => applyUpdate());
 
   ipcMain.handle("auth:status", () => {
     const stored = readStoredKey();
