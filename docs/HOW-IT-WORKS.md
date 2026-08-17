@@ -1,4 +1,4 @@
-# How Unbiased works
+# How Unbiased App works
 
 A high-level tour of what happens between typing a message and a file
 appearing on disk. Read this before changing anything that crosses a layer
