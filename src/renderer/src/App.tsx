@@ -191,6 +191,9 @@ type SidebarData = {
   running?: string[];
 };
 
+type UpdateInfo = { version: string; dmgUrl: string; sumsUrl: string | null };
+type UpdatePhase = "downloading" | "verifying" | "installing" | "relaunching";
+
 type WhoamiResult =
   | {
       ok: true;
@@ -219,6 +222,12 @@ declare global {
     unbiased: {
       getEngineStatus: () => Promise<EngineStatus>;
       onEngineStatus: (cb: (status: EngineStatus) => void) => () => void;
+      checkUpdate: () => Promise<UpdateInfo | { none: true }>;
+      pendingUpdate: () => Promise<UpdateInfo | null>;
+      installUpdate: () => Promise<{ ok: boolean; error?: string }>;
+      onUpdateAvailable: (cb: (p: UpdateInfo) => void) => () => void;
+      onUpdateProgress: (cb: (p: { phase: UpdatePhase; percent: number }) => void) => () => void;
+      onUpdateError: (cb: (p: { message: string }) => void) => () => void;
       authStatus: () => Promise<{ hasKey: boolean; source: "env" | "file" | null }>;
       authValidate: (key?: string) => Promise<WhoamiResult>;
       authLogin: (key?: string) => Promise<WhoamiResult>;
@@ -502,6 +511,27 @@ export function App() {
   // the app. A remembered session (prior successful login) with a stored key
   // signs in automatically; otherwise the login screen prompts.
   const [authed, setAuthed] = useState<"checking" | "in" | "out">("checking");
+  // A newer release exists on the public releases repo. Surfaced as a
+  // sidebar banner; clicking it downloads, swaps the bundle, and relaunches.
+  const [update, setUpdate] = useState<UpdateInfo | null>(null);
+  const [updateProgress, setUpdateProgress] = useState<{ phase: UpdatePhase; percent: number } | null>(null);
+  const [updateError, setUpdateError] = useState<string | null>(null);
+
+  useEffect(() => {
+    void window.unbiased.pendingUpdate().then((u) => u && setUpdate(u));
+    const offs = [
+      window.unbiased.onUpdateAvailable((u) => setUpdate(u)),
+      window.unbiased.onUpdateProgress((p) => {
+        setUpdateProgress(p);
+        setUpdateError(null);
+      }),
+      window.unbiased.onUpdateError((e) => {
+        setUpdateProgress(null);
+        setUpdateError(e.message);
+      }),
+    ];
+    return () => offs.forEach((off) => off());
+  }, []);
 
   useEffect(() => {
     let alive = true;
@@ -1715,6 +1745,14 @@ export function App() {
             />
           ))}
         </div>
+        {update && (
+          <UpdateBanner
+            version={update.version}
+            progress={updateProgress}
+            error={updateError}
+            onInstall={() => void window.unbiased.installUpdate()}
+          />
+        )}
         <div style={{ padding: "4px 14px 2px", flexShrink: 0 }}>
           <SidebarAction onClick={() => setShowSettings(true)} disabled={false} icon={<GearIcon />}>
             Settings
@@ -6650,6 +6688,95 @@ const pillButtonStyle: React.CSSProperties = {
   whiteSpace: "nowrap",
 };
 
+/** Sidebar card offering the newer release. Click = download, verify, swap
+ *  the app bundle, relaunch. Progress replaces the label in place so the
+ *  card never changes size mid-update. */
+function UpdateBanner({
+  version,
+  progress,
+  error,
+  onInstall,
+}: {
+  version: string;
+  progress: { phase: UpdatePhase; percent: number } | null;
+  error: string | null;
+  onInstall: () => void;
+}) {
+  const busy = progress !== null;
+  const label = error
+    ? "Update failed — retry"
+    : progress?.phase === "downloading"
+      ? `Downloading… ${progress.percent}%`
+      : progress?.phase === "verifying"
+        ? "Verifying…"
+        : progress?.phase === "installing"
+          ? "Installing…"
+          : progress?.phase === "relaunching"
+            ? "Relaunching…"
+            : "Relaunch to update";
+  return (
+    <div style={{ padding: "6px 14px 2px", flexShrink: 0 }}>
+      <button
+        onClick={() => !busy && onInstall()}
+        disabled={busy}
+        title={error ?? `Version ${version} is available`}
+        style={{
+          position: "relative",
+          overflow: "hidden",
+          display: "flex",
+          alignItems: "center",
+          gap: 11,
+          width: "100%",
+          background: "var(--chip)",
+          border: `1px solid ${error ? colors.err : colors.border}`,
+          borderRadius: 12,
+          padding: "10px 12px",
+          cursor: busy ? "default" : "pointer",
+          fontFamily: "inherit",
+          textAlign: "left",
+        }}
+      >
+        {/* Download progress fills the card behind the text. */}
+        {progress?.phase === "downloading" && (
+          <span
+            style={{
+              position: "absolute",
+              inset: 0,
+              width: `${progress.percent}%`,
+              background: colors.accent,
+              opacity: 0.16,
+              transition: "width 200ms",
+            }}
+          />
+        )}
+        <span style={{ display: "flex", flexShrink: 0, color: error ? colors.err : colors.accent, zIndex: 1 }}>
+          <UpdateIcon />
+        </span>
+        <span style={{ flex: 1, minWidth: 0, zIndex: 1 }}>
+          <span
+            style={{
+              display: "block",
+              fontSize: 13.5,
+              color: colors.fg,
+              whiteSpace: "nowrap",
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+            }}
+          >
+            {label}
+          </span>
+          <span style={{ display: "block", fontSize: 12, color: colors.dim, marginTop: 1 }}>v{version}</span>
+        </span>
+        {!busy && (
+          <span style={{ color: colors.dim, display: "flex", flexShrink: 0, zIndex: 1 }}>
+            <ArrowRightIcon />
+          </span>
+        )}
+      </button>
+    </div>
+  );
+}
+
 /** Shown for the brief moment while we check for a remembered session. */
 function AuthSplash() {
   return (
@@ -7782,6 +7909,26 @@ function EnvIcon() {
       <path d="M4 12.5l1.5 1.5L8 11.5" />
       <path d="M4 19l1.5 1.5L8 18" />
       <path d="M11.5 6.5H20M11.5 13H20M11.5 19.5H20" />
+    </svg>
+  );
+}
+
+/** Downward arrow into a tray — an available update. */
+function UpdateIcon() {
+  return (
+    <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M12 3v11" />
+      <path d="M7.5 9.5 12 14l4.5-4.5" />
+      <path d="M4 17.5v1.5a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-1.5" />
+    </svg>
+  );
+}
+
+function ArrowRightIcon() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M4 12h15" />
+      <path d="m13 6 6 6-6 6" />
     </svg>
   );
 }

@@ -14,6 +14,13 @@ contextBridge.exposeInMainWorld("unbiased", {
   getEngineStatus: () => ipcRenderer.invoke("engine:status"),
   onEngineStatus: (cb: (status: unknown) => void) => subscribe("engine:status", cb),
 
+  checkUpdate: () => ipcRenderer.invoke("update:check"),
+  pendingUpdate: () => ipcRenderer.invoke("update:pending"),
+  installUpdate: () => ipcRenderer.invoke("update:install"),
+  onUpdateAvailable: (cb: (p: unknown) => void) => subscribe("update:available", cb),
+  onUpdateProgress: (cb: (p: unknown) => void) => subscribe("update:progress", cb),
+  onUpdateError: (cb: (p: unknown) => void) => subscribe("update:error", cb),
+
   authStatus: () => ipcRenderer.invoke("auth:status"),
   authValidate: (key?: string) => ipcRenderer.invoke("auth:validate", key),
   authLogin: (key?: string) => ipcRenderer.invoke("auth:login", { key }),

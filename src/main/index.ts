@@ -14,8 +14,19 @@ import type { MenuItemConstructorOptions } from "electron";
 import type { NativeImage } from "electron";
 import { isAbsolute, join, relative } from "node:path";
 import { homedir } from "node:os";
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { execFile } from "node:child_process";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { createHash } from "node:crypto";
+import { execFile, execFileSync } from "node:child_process";
 import { EngineClient, engineVersionFromUserAgent, type EngineStatus } from "./engine";
 import { spawn as ptySpawn, type IPty } from "@lydell/node-pty";
 
@@ -380,6 +391,163 @@ async function whoamiValidate(key: string): Promise<WhoamiResult> {
     return { ok: false, error: aborted ? "Validation timed out — check your connection." : "Couldn't reach the platform.", code: "network" };
   } finally {
     clearTimeout(timer);
+  }
+}
+
+// ── Self-update ──────────────────────────────────────────────────────
+// We install updates OURSELVES rather than using electron-updater, because
+// Squirrel.Mac refuses to update a bundle that isn't Developer ID signed —
+// and ours is ad-hoc signed (see build/adhoc-sign.cjs). Swapping the .app
+// ourselves is exactly what scripts/install.sh already does by hand, so the
+// same steps work here: download → verify SHA-256 → mount → replace → relaunch.
+const UPDATE_REPO = "circuitandchisel/unbiased-app-releases";
+const UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1000;
+
+type UpdateInfo = { version: string; dmgUrl: string; sumsUrl: string | null };
+let pendingUpdate: UpdateInfo | null = null;
+let updateInstalling = false;
+
+/** Numeric-segment compare: "1.10.0" > "1.9.9". Returns >0 if a is newer. */
+function compareVersions(a: string, b: string): number {
+  const pa = a.replace(/^v/, "").split(/[.-]/);
+  const pb = b.replace(/^v/, "").split(/[.-]/);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const na = parseInt(pa[i] ?? "0", 10);
+    const nb = parseInt(pb[i] ?? "0", 10);
+    if (Number.isNaN(na) || Number.isNaN(nb)) continue; // pre-release tails
+    if (na !== nb) return na - nb;
+  }
+  return 0;
+}
+
+/** Ask the public releases repo what the latest version is. */
+async function checkForUpdate(): Promise<UpdateInfo | null> {
+  // Unpackaged runs have no .app to replace — never offer an update in dev.
+  if (!app.isPackaged) return null;
+  try {
+    const res = await fetch(`https://api.github.com/repos/${UPDATE_REPO}/releases/latest`, {
+      headers: { Accept: "application/vnd.github+json" },
+    });
+    if (!res.ok) return null;
+    const body = (await res.json()) as {
+      tag_name?: string;
+      assets?: { name: string; browser_download_url: string }[];
+    };
+    const tag = body.tag_name;
+    if (!tag || compareVersions(tag, app.getVersion()) <= 0) return null;
+    const assets = body.assets ?? [];
+    const dmg = assets.find((a) => a.name.endsWith(".dmg"));
+    if (!dmg) return null;
+    const info: UpdateInfo = {
+      version: tag.replace(/^v/, ""),
+      dmgUrl: dmg.browser_download_url,
+      sumsUrl: assets.find((a) => a.name === "SHA256SUMS")?.browser_download_url ?? null,
+    };
+    pendingUpdate = info;
+    send("update:available", info);
+    return info;
+  } catch {
+    return null; // offline, rate-limited — silent; we retry on the next tick
+  }
+}
+
+/** The running app's bundle: .../Unbiased.app/Contents/MacOS/Unbiased → the .app. */
+function appBundlePath(): string {
+  return join(app.getPath("exe"), "..", "..", "..");
+}
+
+async function installUpdate(info: UpdateInfo): Promise<{ ok: boolean; error?: string }> {
+  if (!app.isPackaged) return { ok: false, error: "updates only apply to the installed app" };
+  if (updateInstalling) return { ok: false, error: "an update is already installing" };
+  updateInstalling = true;
+  const tmp = mkdtempSync(join(tmpdir(), "unbiased-update-"));
+  const dmgPath = join(tmp, "update.dmg");
+  let mounted: string | null = null;
+  const cleanup = () => {
+    if (mounted) {
+      try {
+        execFileSync("hdiutil", ["detach", mounted, "-quiet"]);
+      } catch {
+        /* already gone */
+      }
+    }
+    try {
+      rmSync(tmp, { recursive: true, force: true });
+    } catch {
+      /* best effort */
+    }
+  };
+  try {
+    // ── download with progress ──
+    send("update:progress", { phase: "downloading", percent: 0 });
+    const res = await fetch(info.dmgUrl);
+    if (!res.ok || !res.body) throw new Error(`download failed (HTTP ${res.status})`);
+    const total = Number(res.headers.get("content-length") ?? 0);
+    const chunks: Buffer[] = [];
+    let received = 0;
+    let lastSent = 0;
+    for await (const chunk of res.body as unknown as AsyncIterable<Uint8Array>) {
+      const buf = Buffer.from(chunk);
+      chunks.push(buf);
+      received += buf.length;
+      const percent = total ? Math.round((received / total) * 100) : 0;
+      // Throttle: a 190MB download would otherwise flood the renderer.
+      if (percent !== lastSent && percent % 2 === 0) {
+        lastSent = percent;
+        send("update:progress", { phase: "downloading", percent });
+      }
+    }
+    const data = Buffer.concat(chunks);
+    writeFileSync(dmgPath, data);
+
+    // ── verify ──
+    // A corrupted 190MB download must never replace a working app.
+    if (info.sumsUrl) {
+      send("update:progress", { phase: "verifying", percent: 100 });
+      const sums = await (await fetch(info.sumsUrl)).text();
+      const name = info.dmgUrl.split("/").pop() ?? "";
+      const expected = sums
+        .split("\n")
+        .map((l) => l.trim().split(/\s+/))
+        .find((p) => p[1]?.replace(/^\*/, "") === name)?.[0];
+      if (expected) {
+        const actual = createHash("sha256").update(data).digest("hex");
+        if (actual !== expected) throw new Error("checksum mismatch — update refused");
+      }
+    }
+
+    // ── swap the bundle ──
+    send("update:progress", { phase: "installing", percent: 100 });
+    const out = execFileSync("hdiutil", [
+      "attach", dmgPath, "-nobrowse", "-quiet", "-mountrandom", tmpdir(),
+    ]).toString();
+    mounted = out.trim().split(/\s+/).pop() ?? null;
+    if (!mounted) throw new Error("could not mount the disk image");
+    const srcApp = readdirSync(mounted).find((n) => n.endsWith(".app"));
+    if (!srcApp) throw new Error("no .app inside the disk image");
+
+    const target = appBundlePath();
+    // ditto (not cp -R) preserves the code signature; a broken seal would
+    // make macOS refuse to launch the updated app.
+    rmSync(target, { recursive: true, force: true });
+    execFileSync("ditto", [join(mounted, srcApp), target]);
+    try {
+      execFileSync("xattr", ["-dr", "com.apple.quarantine", target]);
+    } catch {
+      /* nothing to strip */
+    }
+    cleanup();
+
+    send("update:progress", { phase: "relaunching", percent: 100 });
+    app.relaunch();
+    app.quit();
+    return { ok: true };
+  } catch (err) {
+    cleanup();
+    updateInstalling = false;
+    const message = err instanceof Error ? err.message : String(err);
+    send("update:error", { message });
+    return { ok: false, error: message };
   }
 }
 
@@ -945,6 +1113,14 @@ app.whenReady().then(async () => {
   // ── Auth IPC ────────────────────────────────────────────────────────
   // Presence + source of the stored key (no network). keyName is the
   // credentials-file label if we wrote one; env keys are opaque.
+  // ── Update IPC ──────────────────────────────────────────────────────
+  ipcMain.handle("update:check", async () => (await checkForUpdate()) ?? { none: true });
+  ipcMain.handle("update:pending", () => pendingUpdate);
+  ipcMain.handle("update:install", async () => {
+    if (!pendingUpdate) return { ok: false, error: "no update available" };
+    return installUpdate(pendingUpdate);
+  });
+
   ipcMain.handle("auth:status", () => {
     const stored = readStoredKey();
     return { hasKey: !!stored, source: stored?.source ?? null };
@@ -1919,6 +2095,10 @@ app.whenReady().then(async () => {
   });
 
   createWindow();
+  // Check for updates shortly after launch (let the window settle first),
+  // then on a slow timer — a desktop app can stay open for days.
+  setTimeout(() => void checkForUpdate(), 8000);
+  setInterval(() => void checkForUpdate(), UPDATE_INTERVAL_MS);
   // The engine no longer auto-starts: the renderer's login gate decides
   // whether to sign in (a stored key + remembered session) or prompt first,
   // then calls auth:login, which validates and starts the engine.
