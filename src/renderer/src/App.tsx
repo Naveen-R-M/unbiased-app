@@ -62,7 +62,8 @@ type Entry =
     };
 
 type ApprovalDecision = "accept" | "acceptForSession" | "decline";
-type PaneId = "main" | "side";
+// "main" or a dynamic side-chat pane ("side:<n>").
+type PaneId = string;
 type ThreadSummary = { id: string; title: string; createdAt?: string };
 // A transcript excerpt staged for the next send, with an optional comment.
 // The live Range (when still valid) keeps the excerpt tinted in the DOM.
@@ -367,7 +368,7 @@ declare global {
       }>;
       detachThread: (cwd?: string) => Promise<{ ok: boolean }>;
       deleteThread: (id: string) => Promise<{ ok: boolean }>;
-      resetSideChat: () => Promise<{ ok: boolean }>;
+      resetSideChat: (paneId?: string) => Promise<{ ok: boolean }>;
       subagentsList: (parent: string) => Promise<{ agents: SubAgent[] }>;
       subagentTranscript: (id: string) => Promise<{
         entries: Entry[];
@@ -1140,8 +1141,11 @@ export function App() {
   // drag the side chat along with it. Neither restores across launches —
   // the app always starts with the panel closed.
   const [sideOpen, setSideOpen] = useState(false);
-  const [sideChatEnabled, setSideChatEnabledState] = useState(false);
-  const [sideContext, setSideContext] = useState<string | null>(null);
+  // Side-chat tabs: each entry is an engine pane id ("side:<n>"), each tab
+  // its own ephemeral fork of the main conversation. Context chips are per
+  // tab. sideNonce remounts them all when the main conversation changes.
+  const [sideChats, setSideChats] = useState<string[]>([]);
+  const [sideContexts, setSideContexts] = useState<Record<string, string | null>>({});
   const [sideNonce, setSideNonce] = useState(0);
   // Text handed to the MAIN composer from outside it — the embedded
   // browser's "Add … to chat" context-menu items land here and are
@@ -1209,9 +1213,6 @@ export function App() {
     setSideOpen(open);
   }
 
-  function setSideChatEnabled(v: boolean) {
-    setSideChatEnabledState(v);
-  }
   const [navOpen, setNavOpen] = useState(() => localStorage.getItem("navOpen") !== "false");
   // Nav width is user-draggable within [180, 400]px, persisted.
   const NAV_MIN = 180;
@@ -1342,7 +1343,7 @@ export function App() {
     const hasTabs =
       snap.openAgents.length > 0 || snap.openFiles.length > 0 || snap.filesTabs.length > 0 || snap.reviewOpen;
     if (!hasTabs) return false;
-    setSideContext(null);
+    setSideContexts({});
     setSideNonce((n) => n + 1);
     setSubAgentsList([]); // openThread refetches the live roster
     setTerminalTabs([]);
@@ -1359,7 +1360,7 @@ export function App() {
   }
 
   function resetSideView() {
-    setSideContext(null);
+    setSideContexts({});
     setSideNonce((n) => n + 1);
     setOpenFiles([]);
     setOpenAgents([]); // the agents belonged to the previous conversation
@@ -1369,8 +1370,14 @@ export function App() {
     setTerminalTabs([]); // the shells ran in the previous conversation's cwd
     setReviewOpen(false); // the diff reviewed the previous conversation's cwd
     // The browser isn't cwd-bound — the page you're reading survives.
-    setPanelMode(browserTabs.length > 0 ? `browser:${browserTabs[browserTabs.length - 1]}` : "chat");
-    if (!sideChatEnabled && browserTabs.length === 0) setSideOpenPersisted(false);
+    setPanelMode(
+      browserTabs.length > 0
+        ? `browser:${browserTabs[browserTabs.length - 1]}`
+        : sideChats.length > 0
+          ? sideChats[sideChats.length - 1]
+          : "launcher",
+    );
+    if (sideChats.length === 0 && browserTabs.length === 0) setSideOpenPersisted(false);
   }
 
   // Switching away from a running conversation is fine — its turn keeps
@@ -1496,7 +1503,7 @@ export function App() {
   // Static keys ("chat", "review", "browser", "launcher") name singleton
   // surfaces; dynamic keys ("agent:<threadId>", "terminal:<id>",
   // "files:<id>", "file:<id>") name multi-instance tabs.
-  const [panelMode, setPanelMode] = useState<string>("chat");
+  const [panelMode, setPanelMode] = useState<string>("launcher");
   const [reviewOpen, setReviewOpen] = useState(false);
   const [filesTabs, setFilesTabs] = useState<number[]>([]);
   const [treeFiles, setTreeFiles] = useState<Record<number, OpenFileInfo | null>>({});
@@ -1519,7 +1526,7 @@ export function App() {
   // each forgot a tab (closing Files with only Browser left used to kill
   // the whole panel).
   const tabKeys: string[] = [
-    ...(sideChatEnabled ? ["chat"] : []),
+    ...sideChats,
     ...openFiles.map((f) => `file:${f.id}`),
     ...filesTabs.map((id) => `files:${id}`),
     ...(reviewOpen ? ["review"] : []),
@@ -1546,11 +1553,11 @@ export function App() {
     if (tabOrder.length > 0) setPanelMode(tabOrder[tabOrder.length - 1]);
     else setSideOpenPersisted(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sideOpen, panelMode, sideChatEnabled, openFiles, filesTabs, reviewOpen, browserTabs, terminalTabs, openAgents]);
+  }, [sideOpen, panelMode, sideChats, openFiles, filesTabs, reviewOpen, browserTabs, terminalTabs, openAgents]);
 
   /** Close any tab by its key — one dispatcher instead of per-kind closers. */
   function closeTab(key: string): void {
-    if (key === "chat") closeSideChat();
+    if (key.startsWith("side:")) closeSideChat(key);
     else if (key === "review") setReviewOpen(false);
     else if (key.startsWith("browser:")) closeBrowserTab(Number(key.slice(8)));
     else if (key.startsWith("agent:")) setOpenAgents((as) => as.filter((a) => `agent:${a.threadId}` !== key));
@@ -1711,8 +1718,15 @@ export function App() {
 
   function openSideChatTab() {
     setSidePlusOpen(false);
-    setSideChatEnabled(true);
-    setPanelMode("chat");
+    if (sideChats.length >= MAX_TABS_PER_KIND) {
+      setPanelMode(sideChats[sideChats.length - 1]);
+      setSideOpenPersisted(true);
+      return;
+    }
+    const id = `side:${tabIdRef.current++}`;
+    setSideChats((cs) => [...cs, id]);
+    setPanelMode(id);
+    setSideOpenPersisted(true);
   }
 
   function openBrowserTab() {
@@ -1807,10 +1821,20 @@ export function App() {
     setSideOpenPersisted(true);
   }
 
+  // Selection → side chat: lands on the focused side-chat tab, else the
+  // most recent one, else a fresh tab.
   function askInSideChat(text: string) {
-    setSideContext(text);
-    setSideChatEnabled(true);
-    setPanelMode("chat");
+    let id: string;
+    if (panelMode.startsWith("side:") && sideChats.includes(panelMode)) {
+      id = panelMode;
+    } else if (sideChats.length > 0) {
+      id = sideChats[sideChats.length - 1];
+    } else {
+      id = `side:${tabIdRef.current++}`;
+      setSideChats((cs) => [...cs, id]);
+    }
+    setSideContexts((m) => ({ ...m, [id]: text }));
+    setPanelMode(id);
     setSideOpenPersisted(true);
   }
 
@@ -1871,11 +1895,17 @@ export function App() {
     setTreeFiles((m) => ({ ...m, [tabId]: info }));
   }
 
-  // Closing HIDES the side chat — its conversation survives and reopening
-  // restores it; only a main-conversation switch resets the thread.
-  // An open file preview keeps the panel itself alive.
-  function closeSideChat() {
-    setSideChatEnabled(false);
+  // Closing a side-chat tab discards its conversation — the engine drops
+  // the ephemeral pane (matching every other tab kind, and freeing the
+  // slot under the cap).
+  function closeSideChat(id: string) {
+    setSideChats((cs) => cs.filter((x) => x !== id));
+    setSideContexts((m) => {
+      const rest = { ...m };
+      delete rest[id];
+      return rest;
+    });
+    void window.unbiased.resetSideChat(id);
   }
 
   const connected = status.state === "connected";
@@ -3036,8 +3066,13 @@ export function App() {
                 : undefined;
               const termIdx = t.startsWith("terminal:") ? terminalTabs.indexOf(Number(t.slice(9))) : -1;
               const cfg: { icon: React.ReactNode; label: string; close: () => void; aria: string; title?: string } =
-                t === "chat"
-                  ? { icon: <ChatPlusIcon />, label: "Side chat", close: closeSideChat, aria: "Close side chat" }
+                t.startsWith("side:")
+                  ? {
+                      icon: <ChatPlusIcon />,
+                      label: sideChats.length > 1 ? `Side chat ${sideChats.indexOf(t) + 1}` : "Side chat",
+                      close: () => closeTab(t),
+                      aria: "Close side chat",
+                    }
                   : fileTab
                     ? {
                         icon: null,
@@ -3307,21 +3342,23 @@ export function App() {
               <BrowserPane browserId={id} />
             </div>
           ))}
+          {sideChats.map((id) => (
           <div
+            key={id}
             style={{
               flex: 1,
               minHeight: 0,
-              display: panelMode === "chat" ? "flex" : "none",
+              display: panelMode === id ? "flex" : "none",
               flexDirection: "column",
             }}
           >
           <ChatPane
             key={sideNonce}
-            paneId="side"
+            paneId={id}
             connected={connected}
             reset={{ entries: [], nonce: 0 }}
-            contextChip={sideContext}
-            onContextClear={() => setSideContext(null)}
+            contextChip={sideContexts[id] ?? null}
+            onContextClear={() => setSideContexts((m) => ({ ...m, [id]: null }))}
             onPreviewImage={(a) => void openImagePreview(a)}
             onOpenLink={openInBrowser}
             accessMode={accessMode}
@@ -3342,6 +3379,7 @@ export function App() {
             }
           />
           </div>
+          ))}
         </div>
       {branchSwitch && (
         <div

@@ -34,19 +34,32 @@ const engine = new EngineClient();
 let win: BrowserWindow | null = null;
 let lastStatus: EngineStatus = { state: "starting" };
 
-// Two conversation panes share one engine. "main" is the persistent,
-// sidebar-listed conversation; "side" is a scratch pane on an ephemeral
-// thread (in-memory only — codex discards it when the engine exits).
-// Notifications carry threadId, so each pane's traffic routes cleanly.
-type PaneId = "main" | "side";
-const panes: Record<PaneId, { threadId: string | null; turnId: string | null }> = {
+// Conversation panes share one engine. "main" is the persistent,
+// sidebar-listed conversation; "side:<n>" panes are scratch tabs on
+// ephemeral threads (in-memory only — codex discards them at exit),
+// created on demand by the renderer's side-chat tabs. Notifications carry
+// threadId, so each pane's traffic routes cleanly.
+type PaneId = string;
+const panes: Record<string, { threadId: string | null; turnId: string | null }> = {
   main: { threadId: null, turnId: null },
-  side: { threadId: null, turnId: null },
 };
 
+function ensurePane(paneId: string): { threadId: string | null; turnId: string | null } {
+  return (panes[paneId] ??= { threadId: null, turnId: null });
+}
+
+/** Drop every scratch pane — their ephemeral threads die with the context
+ *  that spawned them (conversation switch, delete, engine restart). */
+function resetSidePanes(): void {
+  for (const k of Object.keys(panes)) {
+    if (k !== "main") delete panes[k];
+  }
+}
+
 function paneForThread(threadId: unknown): PaneId | null {
-  if (panes.main.threadId === threadId) return "main";
-  if (panes.side.threadId === threadId) return "side";
+  for (const [id, p] of Object.entries(panes)) {
+    if (p.threadId === threadId) return id;
+  }
   return null;
 }
 
@@ -1878,11 +1891,11 @@ app.whenReady().then(async () => {
     attachments?: { name: string; path: string; kind?: "image" }[];
   }) => {
     const { paneId, text, attachments } = payload;
-    const pane = panes[paneId];
+    const pane = ensurePane(paneId);
     let created = false;
     if (!pane.threadId) {
       let started: { thread: { id: string } };
-      if (paneId === "side" && panes.main.threadId) {
+      if (paneId.startsWith("side") && panes.main.threadId) {
         // The Codex semantics, confirmed from its own client: a side chat is
         // an ephemeral FORK of the parent conversation — full context copied
         // into a temporary thread the engine forgets at exit. (Codex also
@@ -1894,7 +1907,7 @@ app.whenReady().then(async () => {
           ephemeral: true,
           ...threadPolicy(),
         })) as { thread: { id: string } };
-      } else if (paneId === "side") {
+      } else if (paneId.startsWith("side")) {
         // No parent conversation yet: a plain scratch thread.
         started = (await engine.request("thread/start", {
           ...threadPolicy(),
@@ -2164,7 +2177,7 @@ app.whenReady().then(async () => {
   });
 
   ipcMain.handle("chat:interrupt", async (_e, paneId: PaneId) => {
-    const pane = panes[paneId];
+    const pane = ensurePane(paneId);
     // The per-thread record covers a conversation reopened mid-turn,
     // where the pane's own turnId may not have been set by turn/started.
     const turnId = pane.turnId ?? (pane.threadId ? runningTurns.get(pane.threadId) : null);
@@ -2193,7 +2206,7 @@ app.whenReady().then(async () => {
   // the gateway's cascade. Emits a contextCompaction item on completion,
   // which the renderer already renders as a divider.
   ipcMain.handle("chat:compact", async (_e, paneId: PaneId) => {
-    const pane = panes[paneId];
+    const pane = ensurePane(paneId);
     if (!pane.threadId) return { ok: false, error: "no conversation" };
     try {
       await engine.request("thread/compact/start", { threadId: pane.threadId });
@@ -2279,8 +2292,7 @@ app.whenReady().then(async () => {
       if (panes.main.threadId === t.id) {
         panes.main.threadId = null;
         panes.main.turnId = null;
-        panes.side.threadId = null;
-        panes.side.turnId = null;
+        resetSidePanes();
       }
     }
     return { archived: targets.length };
@@ -2368,8 +2380,7 @@ app.whenReady().then(async () => {
       mainCwd = primary;
       panes.main.threadId = null;
       panes.main.turnId = null;
-      panes.side.threadId = null;
-      panes.side.turnId = null;
+      resetSidePanes();
       return { path: primary, name };
     },
   );
@@ -2398,8 +2409,7 @@ app.whenReady().then(async () => {
     mainCwd = path;
     panes.main.threadId = null;
     panes.main.turnId = null;
-    panes.side.threadId = null;
-    panes.side.turnId = null;
+    resetSidePanes();
     return { path, name: path.split("/").filter(Boolean).pop() ?? path };
   });
 
@@ -2422,8 +2432,7 @@ app.whenReady().then(async () => {
     panes.main.turnId = runningTurns.get(id) ?? null;
     // The side chat (if any) was forked from the previous conversation;
     // it resets alongside every main-context switch.
-    panes.side.threadId = null;
-    panes.side.turnId = null;
+    resetSidePanes();
     // Everything that happened while this thread was backgrounded: the
     // partial assistant stream, approval requests the agent is blocked
     // on, and a turn failure nobody saw. Held items are consumed here.
@@ -2446,8 +2455,7 @@ app.whenReady().then(async () => {
     // Fresh main-chat view: the next send creates a new thread, in `cwd` if given.
     panes.main.threadId = null;
     panes.main.turnId = null;
-    panes.side.threadId = null;
-    panes.side.turnId = null;
+    resetSidePanes();
     pendingCwd = cwd ?? null;
     mainCwd = cwd ?? null;
     return { ok: true };
@@ -2523,11 +2531,11 @@ app.whenReady().then(async () => {
     }
   });
 
-  ipcMain.handle("side:reset", () => {
+  ipcMain.handle("side:reset", (_e, paneId?: string) => {
     // Side chats are disposable: dropping the reference is the whole
     // cleanup — the ephemeral thread evaporates with the engine.
-    panes.side.threadId = null;
-    panes.side.turnId = null;
+    if (paneId) delete panes[paneId];
+    else resetSidePanes();
     return { ok: true };
   });
 
@@ -3044,8 +3052,7 @@ app.whenReady().then(async () => {
     if (panes.main.threadId === id) {
       panes.main.threadId = null;
       panes.main.turnId = null;
-      panes.side.threadId = null;
-      panes.side.turnId = null;
+      resetSidePanes();
     }
     return { ok: true };
   });
