@@ -208,6 +208,32 @@ function browserWallHint(out: string): string {
   );
 }
 
+// The host app's own instructions for every thread it starts (codex's
+// developer_instructions channel; sub-agents inherit it). Kept short — it
+// rides every request. Its one job is to stop the model asking for
+// permission in prose when the APP is the thing that asks: without this the
+// model reliably stalls on private-data requests ("go over my email") with a
+// "shall I?" instead of calling the tool that triggers the real prompt.
+// The engine home pins model_reasoning_effort = "none" (inherited from the
+// CLI's Pareto-only config). That is measurably too low for agentic work:
+// with the browser tools registered and a "go over my email" request, the
+// model called the tool 1/3 of the time at none, 2/3 at low and 3/3 at
+// medium — otherwise it narrated its intent and ended the turn, which is what
+// made approval cards look like they never appeared. Asked for per thread so
+// the engine default (and the CLI's shape) stays untouched, and so this can
+// become a user-facing picker later.
+const APP_REASONING_EFFORT = "medium";
+
+const APP_DEVELOPER_INSTRUCTIONS = [
+  "Permission in this app is handled by the app, not by you. When a tool needs the user's consent —",
+  "network access, or a signed-in browser session — calling it shows the user a permission card they",
+  "approve or deny. So call the tool directly and never ask the user in chat for permission first,",
+  "never wait for a yes, and never re-describe what you are about to do instead of doing it. This",
+  "applies to private data too (their email, messages, dashboards): the card covers it. The one case",
+  "to stop and ask is when a tool result says the browser profile is new and not signed in yet — then",
+  "tell the user to sign in in the window that opened, and never ask them for a password yourself.",
+].join(" ");
+
 const AGENT_BROWSER_TOOLS = [
   {
     type: "function",
@@ -301,7 +327,7 @@ const AGENT_BROWSER_TOOLS = [
     type: "function",
     name: "browser_connect",
     description:
-      "Get a signed-in browser session. Use this when the task needs the user's OWN accounts — their email, their X timeline, a dashboard or admin panel, anything behind a login — where no public page can answer. Always asks the user for approval first; on approval the app opens a browser window itself (no terminal steps for the user) and attaches to it. The first time, that window is not signed in yet: say so and ask the user to sign in there, then carry on. Prefer browser_search for anything public. While attached, browser_close leaves the browser open.",
+      "Get a signed-in browser session, for tasks that need the user's OWN accounts: their email, their X timeline, a dashboard or admin panel — anything behind a login that no public page can answer. CALL THIS DIRECTLY as your first step for such a task. Do NOT ask the user in chat whether you may proceed and do not wait for their reply — that includes private data like their email, messages or bank pages: the app shows them its OWN permission prompt, which they approve or deny, and that prompt IS the consent step, so asking again in chat only wastes a round trip. On approval the app opens and attaches a browser window by itself. Example: a request like 'go over my email and find the message from X' means call browser_connect straight away. There is nothing for the user to run. If the result says the profile is new and not signed in yet, tell the user to sign in in that window and stop; otherwise keep browsing as them. Prefer browser_search for anything public. While attached, browser_close leaves the browser open.",
     inputSchema: {
       type: "object",
       properties: { port: { type: "string", description: "CDP port or ws:// URL (default 9222)" } },
@@ -2516,6 +2542,8 @@ app.whenReady().then(async () => {
           ephemeral: true,
           experimentalRawEvents: true,
           dynamicTools: agentBrowserTools(),
+          developerInstructions: APP_DEVELOPER_INSTRUCTIONS,
+          reasoningEffort: APP_REASONING_EFFORT,
         })) as { thread: { id: string } };
       } else {
         // Explicit default when no project is chosen — left implicit, the
@@ -2539,6 +2567,8 @@ app.whenReady().then(async () => {
           // Model-driven browser automation (agent-browser CLI), when
           // installed — the calls come back as item/tool/call requests.
           dynamicTools: agentBrowserTools(),
+          developerInstructions: APP_DEVELOPER_INSTRUCTIONS,
+          reasoningEffort: APP_REASONING_EFFORT,
           // Raw response items feed the sub-agent viewer (task text + spawn
           // instructions). Sub-threads inherit this from their parent.
           experimentalRawEvents: true,
