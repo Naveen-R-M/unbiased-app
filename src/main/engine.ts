@@ -75,6 +75,10 @@ export class EngineClient extends EventEmitter {
   async handshake(appVersion: string): Promise<{ userAgent: string; codexHome: string }> {
     const result = (await this.request("initialize", {
       clientInfo: { name: "unbiased_app", title: "Unbiased", version: appVersion },
+      // experimentalApi unlocks thread/start.experimentalRawEvents — the raw
+      // item stream is the only client-visible copy of what a spawned
+      // sub-agent was told (its task text never appears as a thread item).
+      capabilities: { experimentalApi: true },
     })) as { userAgent: string; codexHome: string };
     this.notify("initialized");
     return result;

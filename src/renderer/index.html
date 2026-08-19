@@ -27,6 +27,11 @@
       @keyframes unbiased-spin {
         to { transform: rotate(360deg); }
       }
+      /* "is working" shimmer on sub-agent rows (Codex-style). */
+      @keyframes unbiased-shimmer {
+        0% { background-position: 200% 0; }
+        100% { background-position: -200% 0; }
+      }
     </style>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>

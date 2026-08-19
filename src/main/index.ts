@@ -66,6 +66,209 @@ const heldApprovals = new Map<string, Record<string, unknown>[]>();
 // so without this a failure while away would vanish entirely.
 const heldErrors = new Map<string, string>();
 
+// Sub-agents (multi-agent v2): the engine runs them as separate threads and
+// the PARENT's transcript only carries subAgentActivity markers. This map —
+// subThreadId → parent + path + live status — is what lets the app group a
+// sub-agent's traffic under its parent conversation, route its approval
+// requests somewhere visible, and open its transcript on demand. In-memory
+// only, matching the engine's own lifetime: spawned agents do not survive an
+// engine restart. Note thread/list defaults to interactive sources, so sub
+// threads never reach the sidebar in the first place.
+type SubAgentInfo = {
+  parent: string;
+  path: string; // engine agent path, e.g. /root/haiku_writer
+  name: string; // last path segment — the model-chosen task name
+  status: "running" | "idle" | "failed" | "interrupted";
+  // "Closed an agent" has fired for the current task (reset when the parent
+  // messages it again) — sub turns also end between queued mails, and those
+  // are not closures.
+  closedAnnounced?: boolean;
+};
+const subAgents = new Map<string, SubAgentInfo>();
+
+// Inter-agent mail TO a sub-agent, captured from rawResponseItem/completed
+// notifications (the engine emits one for every recorded item — the only
+// place the task text a sub-agent was given is visible to a client). Keyed
+// by the sub-agent's thread id; merged into its transcript by time.
+// preDelivered marks a copy captured from the SENDER's raw call while the
+// engine still holds the mail queued; the drain-time copy consumes the flag
+// instead of duplicating, and a genuinely repeated identical message keeps
+// both entries.
+type MailEntry = { at: number; author: string; text: string; preDelivered?: boolean };
+const subAgentMail = new Map<string, MailEntry[]>();
+const MAIL_CAP = 200;
+
+// Spawn instructions captured from the parent's raw collaboration
+// function_call, keyed by "parentThreadId:taskName" until the matching
+// subAgentActivity names the sub thread.
+const pendingSpawnPrompts = new Map<string, string>();
+
+// Spawn call_id → parent thread, so the raw function_call_output (which
+// carries the engine-assigned nickname) can be matched back. Raw items and
+// subAgentActivity arrive in either order, so the nickname is stashed by
+// "parentThreadId:taskName" when the sub isn't registered yet, and applied
+// as a rename when it is.
+const pendingSpawnCalls = new Map<string, string>();
+const pendingNicknames = new Map<string, string>();
+
+// send_message/followup_task text, keyed like the spawn prompts — feeds the
+// "Messaged an agent" row's instructions AND the immediate mailbox delivery
+// (the engine queues the mail until the sub's loop drains it, so nothing is
+// recorded on the sub thread until then; the pane shouldn't wait).
+const pendingMessagePrompts = new Map<string, string>();
+
+/** Every in-memory sub-agent structure is scoped to one engine process:
+ *  thread ids, queued approvals, and RPC ids all die with it. Called on
+ *  every engine (re)start so a stale roster can't outlive its engine. */
+function resetSubAgentState(): void {
+  subAgents.clear();
+  subAgentMail.clear();
+  pendingSpawnPrompts.clear();
+  pendingSpawnCalls.clear();
+  pendingNicknames.clear();
+  pendingMessagePrompts.clear();
+  heldApprovals.clear();
+  pendingApprovals.clear();
+}
+
+/** Strip the engine's inter-agent envelope ("Message Type: …\nTask name: …\n
+ *  Sender: …\nPayload:\n<text>") down to the payload. */
+function interAgentPayload(text: string): { author: string | null; payload: string } {
+  const m = /^Message Type: [^\n]*\nTask name: [^\n]*\nSender: ([^\n]*)\nPayload:\n([\s\S]*)$/.exec(text);
+  return m ? { author: m[1], payload: m[2] } : { author: null, payload: text };
+}
+
+/** Locate a thread's rollout file under the engine home's sessions dir.
+ *  Cached per thread — the filename embeds the thread id and never moves. */
+const rolloutPathCache = new Map<string, string>();
+// Misses are cached briefly too: before the engine's first flush (exactly
+// when activity is densest) every lookup would otherwise walk the entire
+// sessions tree, up to 4×/second from the debounced viewer refetch.
+const rolloutMissAt = new Map<string, number>();
+function findRolloutFile(threadId: string): string | null {
+  const cached = rolloutPathCache.get(threadId);
+  if (cached && existsSync(cached)) return cached;
+  const missAt = rolloutMissAt.get(threadId);
+  if (missAt !== undefined && Date.now() - missAt < 2000) return null;
+  const engineHome =
+    lastStatus.state === "connected"
+      ? lastStatus.codexHome
+      : join(app.getPath("home"), ".unbiased", "app-engine", "home");
+  const walk = (dir: string): string | null => {
+    let names: string[];
+    try {
+      names = readdirSync(dir);
+    } catch {
+      return null;
+    }
+    for (const n of names) {
+      const p = join(dir, n);
+      let st;
+      try {
+        st = statSync(p);
+      } catch {
+        continue;
+      }
+      if (st.isDirectory()) {
+        const hit = walk(p);
+        if (hit) return hit;
+      } else if (n.startsWith("rollout-") && n.endsWith(`${threadId}.jsonl`)) {
+        return p;
+      }
+    }
+    return null;
+  };
+  const found = walk(join(engineHome, "sessions"));
+  if (found) {
+    rolloutPathCache.set(threadId, found);
+    rolloutMissAt.delete(threadId);
+  } else {
+    rolloutMissAt.set(threadId, Date.now());
+  }
+  return found;
+}
+
+/** Inter-agent mail addressed to a sub-agent, read from its rollout on disk.
+ *  This is the restart-proof source: live raw notifications only flow for
+ *  threads STARTED with experimentalRawEvents (resume/fork hardcode it off
+ *  at 0.147.0), but the engine persists every agent_message to the rollout
+ *  before emitting anything. */
+const rolloutMailCache = new Map<string, { mtimeMs: number; size: number; mail: MailEntry[] }>();
+function rolloutMail(threadId: string, path: string | null): MailEntry[] {
+  const file = findRolloutFile(threadId);
+  if (!file) return [];
+  let st;
+  try {
+    st = statSync(file);
+  } catch {
+    return [];
+  }
+  if (st.size > 4_000_000) return []; // sub-agent rollouts are small; huge = not worth parsing
+  // The viewer refetches on every completed item; only re-parse when the
+  // file actually changed.
+  const cacheKey = `${file}::${path ?? ""}`;
+  const cached = rolloutMailCache.get(cacheKey);
+  if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size) return cached.mail.slice();
+  let raw: string;
+  try {
+    raw = readFileSync(file, "utf8");
+  } catch {
+    return [];
+  }
+  const all: { at: number; author: string; recipient: string; text: string; newTask: boolean }[] = [];
+  for (const line of raw.split("\n")) {
+    if (!line.includes('"agent_message"')) continue;
+    try {
+      const parsed = JSON.parse(line) as {
+        timestamp?: string;
+        type?: string;
+        payload?: { type?: string; author?: string; recipient?: string; content?: { type?: string; text?: string }[] };
+      };
+      const pl = parsed.payload;
+      if (parsed.type !== "response_item" || pl?.type !== "agent_message") continue;
+      const text = (pl.content ?? [])
+        .filter((c) => c?.type === "input_text" && typeof c.text === "string")
+        .map((c) => c.text as string)
+        .join("\n");
+      if (!text) continue;
+      const { author, payload } = interAgentPayload(text);
+      all.push({
+        at: parsed.timestamp ? Date.parse(parsed.timestamp) / 1000 : 0,
+        author: author ?? pl.author ?? "",
+        recipient: pl.recipient ?? "",
+        text: payload,
+        newTask: text.startsWith("Message Type: NEW_TASK"),
+      });
+    } catch {
+      // unparseable line — skip
+    }
+  }
+  // Only mail TO this agent. After an app restart the registry is empty and
+  // no path is known — but the spawn's NEW_TASK is addressed to this agent,
+  // so its recipient recovers the path (without it, the agent's own
+  // outbound reports would render as inbound bubbles).
+  const recipient = path ?? all.find((m) => m.newTask)?.recipient ?? null;
+  const mail: MailEntry[] = all
+    .filter((m) => !recipient || m.recipient === recipient)
+    .map(({ at, author, text }) => ({ at, author, text }));
+  // Keep the NEWEST entries, matching the live mailbox's retention.
+  const out = mail.slice(-MAIL_CAP);
+  rolloutMailCache.set(cacheKey, { mtimeMs: st.mtimeMs, size: st.size, mail: out });
+  return out.slice();
+}
+
+function subAgentsForParent(parent: string): { threadId: string; name: string; path: string; status: string }[] {
+  return [...subAgents.entries()]
+    .filter(([, a]) => a.parent === parent)
+    .map(([threadId, a]) => ({ threadId, name: a.name, path: a.path, status: a.status }));
+}
+
+/** Push the parent's sub-agent roster to whichever pane owns it (if any). */
+function pushSubAgents(parent: string): void {
+  const paneId = paneForThread(parent);
+  if (paneId) send("chat:subagents", { paneId, agents: subAgentsForParent(parent) });
+}
+
 // The active main conversation's working directory — file references in
 // chat resolve against it. Kept in sync with thread starts/resumes.
 let mainCwd: string | null = null;
@@ -216,6 +419,9 @@ type WireItem = {
   status?: string;
   exitCode?: number;
   aggregatedOutput?: string;
+  kind?: string;
+  agentThreadId?: string;
+  agentPath?: string;
 };
 type WireThread = {
   id: string;
@@ -223,7 +429,7 @@ type WireThread = {
   preview?: string;
   createdAt?: string;
   cwd?: string;
-  turns?: { items?: WireItem[] }[];
+  turns?: { items?: WireItem[]; startedAt?: number }[];
 };
 
 // Projects the user has explicitly opened. Persisted so a project appears
@@ -233,20 +439,77 @@ function projectsFile(): string {
   return join(app.getPath("userData"), "projects.json");
 }
 
-function loadProjects(): string[] {
+// App-side thread → project assignment. The engine pins a thread's cwd at
+// creation, so "moving" a Recents chat into a project is a GROUPING override
+// the app owns, not an engine mutation.
+function threadProjectsFile(): string {
+  return join(app.getPath("userData"), "thread-projects.json");
+}
+
+function loadThreadProjects(): Record<string, string> {
+  try {
+    const parsed = JSON.parse(readFileSync(threadProjectsFile(), "utf8"));
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+// A project is a display name + one or more source folders (chats whose cwd
+// falls in ANY of them group under it), a primary folder (the cwd new chats
+// start in), and an icon/color identity. Legacy projects.json was a bare
+// path array — migrated on load.
+type ProjectRecord = {
+  name: string;
+  folders: string[];
+  primary: string;
+  icon: string;
+  color: string | null;
+};
+
+function recordFromPath(path: string): ProjectRecord {
+  return {
+    name: path.split("/").filter(Boolean).pop() ?? path,
+    folders: [path],
+    primary: path,
+    icon: "folder",
+    color: null,
+  };
+}
+
+function loadProjects(): ProjectRecord[] {
   try {
     const parsed = JSON.parse(readFileSync(projectsFile(), "utf8"));
-    return Array.isArray(parsed) ? parsed.filter((p) => typeof p === "string") : [];
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .map((p) => {
+        if (typeof p === "string") return recordFromPath(p); // legacy entry
+        if (p && typeof p === "object" && Array.isArray(p.folders) && p.folders.length > 0) {
+          return {
+            name: typeof p.name === "string" && p.name ? p.name : recordFromPath(p.folders[0]).name,
+            folders: p.folders.filter((f: unknown) => typeof f === "string"),
+            primary: typeof p.primary === "string" && p.folders.includes(p.primary) ? p.primary : p.folders[0],
+            icon: typeof p.icon === "string" ? p.icon : "folder",
+            color: typeof p.color === "string" ? p.color : null,
+          } as ProjectRecord;
+        }
+        return null;
+      })
+      .filter((p): p is ProjectRecord => p !== null && p.folders.length > 0);
   } catch {
     return [];
   }
 }
 
+function saveProjects(projects: ProjectRecord[]): void {
+  writeFileSync(projectsFile(), JSON.stringify(projects, null, 2) + "\n");
+}
+
 function rememberProject(path: string): void {
   const projects = loadProjects();
-  if (!projects.includes(path)) {
-    projects.unshift(path);
-    writeFileSync(projectsFile(), JSON.stringify(projects, null, 2) + "\n");
+  if (!projects.some((p) => p.folders.includes(path))) {
+    projects.unshift(recordFromPath(path));
+    saveProjects(projects);
   }
 }
 
@@ -296,6 +559,17 @@ function threadToEntries(thread: WireThread): unknown[] {
         case "plan":
           entries.push({ kind: "assistant", text: item.text ?? "" });
           break;
+        case "subAgentActivity": {
+          const sub = item as { kind?: string; agentThreadId?: string; agentPath?: string };
+          entries.push({
+            kind: "agent",
+            event: sub.kind ?? "started",
+            name: (sub.agentPath ?? "").split("/").filter(Boolean).pop() ?? "agent",
+            path: sub.agentPath ?? "",
+            agentThreadId: sub.agentThreadId ?? "",
+          });
+          break;
+        }
       }
     }
   }
@@ -843,8 +1117,11 @@ function createWindow(): void {
 }
 
 // Server-initiated approval requests awaiting a human decision, keyed by a
-// string handle the renderer can safely round-trip.
-const pendingApprovals = new Map<string, number | string>();
+// string handle the renderer can safely round-trip. The owning thread is
+// kept so the card can be retired when that thread's turn dies (interrupt,
+// failure) — the engine drops the request server-side and would never
+// answer a late decision.
+const pendingApprovals = new Map<string, { rpcId: number | string; threadId: string | null }>();
 
 // Live PTYs for the integrated terminal, keyed by handle.
 const ptys = new Map<string, IPty>();
@@ -1031,12 +1308,154 @@ function wireNotifications(): void {
     const paneId = paneForThread(params.threadId);
     const threadId = typeof params.threadId === "string" ? params.threadId : null;
     switch (msg.method) {
+      case "rawResponseItem/completed": {
+        const raw = params.item as {
+          type?: string;
+          name?: string;
+          namespace?: string;
+          arguments?: string;
+          author?: string;
+          recipient?: string;
+          content?: { type?: string; text?: string }[];
+        } | undefined;
+        if (!raw || !threadId) break;
+        // The parent's spawn call carries the instructions the sub-agent
+        // will be given — the only client-visible copy.
+        if (
+          raw.type === "function_call" &&
+          raw.namespace === "collaboration" &&
+          raw.name === "spawn_agent" &&
+          typeof raw.arguments === "string"
+        ) {
+          try {
+            const args = JSON.parse(raw.arguments) as { task_name?: string; message?: string };
+            // task_name can arrive path-formed ("/root/x") — key by the last
+            // segment, which is what registration looks up.
+            const task = args.task_name?.split("/").filter(Boolean).pop();
+            if (task && args.message) {
+              pendingSpawnPrompts.set(`${threadId}:${task}`, args.message);
+            }
+          } catch {
+            // unparseable args — no prompt preview
+          }
+          const callId = (params.item as { call_id?: string }).call_id;
+          if (typeof callId === "string") pendingSpawnCalls.set(callId, threadId);
+        }
+        // Corrections/follow-ups: capture the text for the lifecycle row and
+        // deliver it to the target's mailbox NOW — the engine holds queued
+        // mail invisible until the sub's turn drains it.
+        if (
+          raw.type === "function_call" &&
+          raw.namespace === "collaboration" &&
+          (raw.name === "send_message" || raw.name === "followup_task") &&
+          typeof raw.arguments === "string"
+        ) {
+          try {
+            const args = JSON.parse(raw.arguments) as { target?: string; message?: string };
+            const task = args.target?.split("/").filter(Boolean).pop();
+            if (task && args.message) {
+              pendingMessagePrompts.set(`${threadId}:${task}`, args.message);
+              // The engine frees a closed agent's path for reuse, so the
+              // same name can refer to a dead thread AND a live successor —
+              // the LAST matching registration is the live one.
+              let target: string | null = null;
+              for (const [subId, info] of subAgents) {
+                if (info.parent === threadId && (info.name === task || info.path.endsWith(`/${task}`))) {
+                  target = subId;
+                }
+              }
+              if (target) {
+                const box = subAgentMail.get(target) ?? [];
+                box.push({ at: Date.now() / 1000, author: "", text: args.message, preDelivered: true });
+                if (box.length > MAIL_CAP) box.shift();
+                subAgentMail.set(target, box);
+                send("chat:subagent-activity", { threadId: target });
+              }
+            }
+          } catch {
+            // unparseable args
+          }
+        }
+        // The spawn OUTPUT carries the engine-assigned nickname
+        // ({"task_name": "...", "nickname": "Ramanujan"}). Rename the
+        // registry entry and let the renderer retitle its rows.
+        if (raw.type === "function_call_output") {
+          const out = params.item as { call_id?: string; output?: unknown };
+          const parent = typeof out.call_id === "string" ? pendingSpawnCalls.get(out.call_id) : undefined;
+          if (parent && typeof out.output === "string") {
+            pendingSpawnCalls.delete(out.call_id as string);
+            try {
+              const parsed = JSON.parse(out.output) as { task_name?: string; nickname?: string };
+              const task = parsed.task_name?.split("/").filter(Boolean).pop();
+              if (parsed.nickname && task) {
+                // Path reuse: prefer the newest registration with this name.
+                let match: [string, SubAgentInfo] | null = null;
+                for (const entry of subAgents) {
+                  if (entry[1].parent === parent && entry[1].name === task) match = entry;
+                }
+                const renamed = match !== null;
+                if (match) {
+                  const [subId, info] = match;
+                  info.name = parsed.nickname;
+                  pushSubAgents(parent);
+                  const pane = paneForThread(parent);
+                  if (pane) {
+                    send("chat:subagent-event", {
+                      paneId: pane,
+                      event: "renamed",
+                      name: parsed.nickname,
+                      path: info.path,
+                      agentThreadId: subId,
+                    });
+                  }
+                }
+                // Raws can precede subAgentActivity — stash for registration.
+                if (!renamed) pendingNicknames.set(`${parent}:${task}`, parsed.nickname);
+              }
+            } catch {
+              // not a spawn ack — ignore
+            }
+          }
+        }
+        // Mail addressed to a sub-agent thread: the task/message text.
+        if (raw.type === "agent_message" && Array.isArray(raw.content)) {
+          const text = raw.content
+            .filter((c) => c?.type === "input_text" && typeof c.text === "string")
+            .map((c) => c.text as string)
+            .join("\n");
+          if (text) {
+            const { author, payload } = interAgentPayload(text);
+            const box = subAgentMail.get(threadId) ?? [];
+            // Corrections are pre-delivered from the sender's raw call while
+            // the engine still has them queued: the drain-time copy CONSUMES
+            // that flag rather than duplicating — and a repeated identical
+            // message (two flags) correctly keeps both entries.
+            const pending = box.find((m) => m.preDelivered && m.text === payload);
+            if (pending) {
+              delete pending.preDelivered;
+              if (author ?? raw.author) pending.author = author ?? raw.author ?? pending.author;
+            } else {
+              box.push({ at: Date.now() / 1000, author: author ?? raw.author ?? "", text: payload });
+              if (box.length > MAIL_CAP) box.shift();
+              subAgentMail.set(threadId, box);
+              send("chat:subagent-activity", { threadId });
+            }
+          }
+        }
+        break;
+      }
       case "turn/started": {
         const turn = params.turn as { id?: string } | undefined;
         if (threadId && turn?.id) {
           runningTurns.set(threadId, turn.id);
           bgStream.delete(threadId);
           send("chat:thread-activity", { threadId, running: true });
+          const sub = subAgents.get(threadId);
+          if (sub) {
+            sub.status = "running";
+            pushSubAgents(sub.parent);
+            send("chat:subagent-activity", { threadId });
+          }
         }
         if (!paneId) break;
         if (turn?.id) panes[paneId].turnId = turn.id;
@@ -1049,6 +1468,8 @@ function wireNotifications(): void {
         // backgrounded conversation is reopened mid-stream.
         if (threadId) bgStream.set(threadId, (bgStream.get(threadId) ?? "") + delta);
         if (paneId) send("chat:delta", { paneId, delta });
+        // A sub-agent's reply streams to its viewer pane (if open).
+        if (threadId && subAgents.has(threadId)) send("chat:subagent-delta", { threadId, delta });
         break;
       }
       case "item/started":
@@ -1061,6 +1482,77 @@ function wireNotifications(): void {
         // partial-stream buffer for it is no longer needed.
         if (item?.type === "agentMessage" && phase === "completed" && threadId) {
           bgStream.delete(threadId);
+          // Message boundary: the next delta belongs to a NEW assistant
+          // message. Multi-agent turns emit several messages per turn, and
+          // without this they concatenate into one run-on paragraph.
+          if (paneId) send("chat:message-boundary", { paneId });
+        }
+        // Sub-agent registry: the parent thread emits a subAgentActivity
+        // marker per spawn/interaction. Runs even when the parent is
+        // backgrounded — the roster must be current when it reopens.
+        if (item?.type === "subAgentActivity" && phase === "completed" && threadId) {
+          const p = params.item as { kind?: string; agentThreadId?: string; agentPath?: string };
+          if (p.agentThreadId && p.agentPath) {
+            const existing = subAgents.get(p.agentThreadId);
+            const taskName = p.agentPath.split("/").filter(Boolean).pop() ?? p.agentThreadId;
+            const promptKey = `${threadId}:${taskName}`;
+            // started rows carry the spawn instructions; interacted rows the
+            // send_message/followup text.
+            const prompt =
+              p.kind === "interacted"
+                ? pendingMessagePrompts.get(promptKey)
+                : pendingSpawnPrompts.get(promptKey);
+            if (p.kind === "interacted") pendingMessagePrompts.delete(promptKey);
+            else pendingSpawnPrompts.delete(promptKey);
+            // The spawn-output raw (nickname) usually precedes registration.
+            const stashedNickname = pendingNicknames.get(promptKey);
+            if (stashedNickname !== undefined) pendingNicknames.delete(promptKey);
+            const name = existing?.name && existing.name !== taskName ? existing.name : (stashedNickname ?? taskName);
+            subAgents.set(p.agentThreadId, {
+              parent: threadId,
+              path: p.agentPath,
+              name,
+              status: p.kind === "interrupted" ? "interrupted" : (existing?.status ?? "running"),
+              // A fresh task re-arms the closed-row announcement.
+              closedAnnounced: p.kind === "interacted" ? false : existing?.closedAnnounced,
+            });
+            pushSubAgents(threadId);
+            // An approval that raced ahead of this registration was held
+            // under the sub's own id, which no pane ever opens — re-route it
+            // to the parent now or the spawn hangs on it forever.
+            const stranded = heldApprovals.get(p.agentThreadId);
+            if (stranded) {
+              heldApprovals.delete(p.agentThreadId);
+              const parentPane = paneForThread(threadId);
+              for (const payload of stranded) {
+                const tagged = { ...payload, agentName: name };
+                if (parentPane) {
+                  send("chat:approval-request", { paneId: parentPane, ...tagged });
+                } else {
+                  const held = heldApprovals.get(threadId) ?? [];
+                  held.push(tagged);
+                  heldApprovals.set(threadId, held);
+                }
+              }
+            }
+            // Lifecycle row in the parent's transcript, Codex-style
+            // ("Created an agent" / "Messaged an agent" / …) — with the
+            // spawn instructions when the raw call carried them.
+            if (paneId) {
+              send("chat:subagent-event", {
+                paneId,
+                event: p.kind ?? "started",
+                name,
+                path: p.agentPath,
+                agentThreadId: p.agentThreadId,
+                prompt: prompt ?? null,
+              });
+            }
+          }
+        }
+        // A sub-agent's own items (replies, commands) refresh its viewer.
+        if (threadId && subAgents.has(threadId) && phase === "completed") {
+          send("chat:subagent-activity", { threadId });
         }
         if (!paneId) break; // history holds these for a backgrounded thread
         if (item?.type === "commandExecution") {
@@ -1128,6 +1620,51 @@ function wireNotifications(): void {
         if (threadId) {
           runningTurns.delete(threadId);
           bgStream.delete(threadId);
+          // A turn can't end while the engine still waits on an approval —
+          // it dropped the request (interrupt/failure). Retire the card so
+          // dead Allow/Deny buttons don't linger in the transcript.
+          const droppedApprovals: string[] = [];
+          for (const [reqId, info] of pendingApprovals) {
+            if (info.threadId !== threadId) continue;
+            pendingApprovals.delete(reqId);
+            droppedApprovals.push(reqId);
+            const owner = subAgents.get(threadId)?.parent ?? threadId;
+            const ownerPane = paneForThread(owner);
+            if (ownerPane) send("chat:approval-canceled", { paneId: ownerPane, requestId: reqId });
+          }
+          if (droppedApprovals.length) {
+            for (const [tid, arr] of heldApprovals) {
+              const kept = arr.filter((a) => !droppedApprovals.includes(a.requestId as string));
+              if (kept.length !== arr.length) {
+                if (kept.length) heldApprovals.set(tid, kept);
+                else heldApprovals.delete(tid);
+              }
+            }
+          }
+          const sub = subAgents.get(threadId);
+          if (sub) {
+            sub.status =
+              turn?.status === "failed" ? "failed" : turn?.status === "interrupted" ? "interrupted" : "idle";
+            pushSubAgents(sub.parent);
+            send("chat:subagent-activity", { threadId });
+            // Closure/failure rows fire once per task — sub turns also end
+            // between queued mails, and an interrupted turn already tells
+            // its own story via the interrupt marker.
+            const isFailure = turn?.status === "failed";
+            if ((isFailure || turn?.status === "completed") && !sub.closedAnnounced) {
+              sub.closedAnnounced = true;
+              const parentPane = paneForThread(sub.parent);
+              if (parentPane) {
+                send("chat:subagent-event", {
+                  paneId: parentPane,
+                  event: isFailure ? "failed" : "completed",
+                  name: sub.name,
+                  path: sub.path,
+                  agentThreadId: threadId,
+                });
+              }
+            }
+          }
           if (!paneId && turn?.status === "failed") {
             heldErrors.set(
               threadId,
@@ -1162,20 +1699,27 @@ function wireNotifications(): void {
       // the conversation is reopened. Auto-declining here would silently
       // reject work the user asked for.
       function deliverApproval(payload: Record<string, unknown>): void {
-        const paneId = paneForThread(params.threadId);
+        // A sub-agent's approval must surface in its PARENT's pane — the sub
+        // thread never owns a pane, so without this reroute the request
+        // would sit in heldApprovals forever and the spawn would hang.
+        const sub = typeof params.threadId === "string" ? subAgents.get(params.threadId) : undefined;
+        const targetThread = sub ? sub.parent : params.threadId;
+        const tagged = sub ? { ...payload, agentName: sub.name } : payload;
+        const paneId = paneForThread(targetThread);
         if (paneId) {
-          send("chat:approval-request", { paneId, ...payload });
-        } else if (typeof params.threadId === "string") {
-          const held = heldApprovals.get(params.threadId) ?? [];
-          held.push(payload);
-          heldApprovals.set(params.threadId, held);
+          send("chat:approval-request", { paneId, ...tagged });
+        } else if (typeof targetThread === "string") {
+          const held = heldApprovals.get(targetThread) ?? [];
+          held.push(tagged);
+          heldApprovals.set(targetThread, held);
         } else {
-          send("chat:approval-request", { paneId: "main", ...payload });
+          send("chat:approval-request", { paneId: "main", ...tagged });
         }
       }
+      const approvalThread = typeof params.threadId === "string" ? params.threadId : null;
       if (msg.method === "item/commandExecution/requestApproval") {
         const requestId = `apr_${msg.id}`;
-        pendingApprovals.set(requestId, msg.id);
+        pendingApprovals.set(requestId, { rpcId: msg.id, threadId: approvalThread });
         deliverApproval({
           requestId,
           kind: "command",
@@ -1190,7 +1734,7 @@ function wireNotifications(): void {
       }
       if (msg.method === "item/fileChange/requestApproval") {
         const requestId = `apr_${msg.id}`;
-        pendingApprovals.set(requestId, msg.id);
+        pendingApprovals.set(requestId, { rpcId: msg.id, threadId: approvalThread });
         deliverApproval({
           requestId,
           kind: "fileChange",
@@ -1240,6 +1784,7 @@ async function startEngine(): Promise<void> {
     engineWired = true;
   }
   engine.stop();
+  resetSubAgentState();
   engine.start(bin, { UNBIASED_API_KEY: stored.key });
 
   const result = await engine.handshake(app.getVersion());
@@ -1307,14 +1852,18 @@ app.whenReady().then(async () => {
 
   // Sign out: stop the engine and remove the stored credentials file. An
   // env-provided key can't be removed by us — report that so the UI can say so.
-  ipcMain.handle("auth:logout", () => {
+  ipcMain.handle("auth:logout", (_e, opts?: { removeKey?: boolean }) => {
     engine.stop();
     pushStatus({ state: "exited", code: null, detail: "signed out" });
     const envKey = !!process.env.UNBIASED_API_KEY?.trim();
-    try {
-      rmSync(credentialsPath(), { force: true });
-    } catch {
-      // nothing to remove
+    // Removing the stored key is now the user's choice (Settings → Account):
+    // keeping it makes the next sign-in a one-click "Continue".
+    if (opts?.removeKey !== false) {
+      try {
+        rmSync(credentialsPath(), { force: true });
+      } catch {
+        // nothing to remove
+      }
     }
     resetKnownSecrets();
     return { ok: true, envKeyRemains: envKey };
@@ -1347,6 +1896,7 @@ app.whenReady().then(async () => {
         started = (await engine.request("thread/start", {
           ...threadPolicy(),
           ephemeral: true,
+          experimentalRawEvents: true,
         })) as { thread: { id: string } };
       } else {
         // Explicit home when no project is chosen — left implicit, the
@@ -1367,6 +1917,9 @@ app.whenReady().then(async () => {
         started = (await engine.request("thread/start", {
           ...threadPolicy(),
           cwd,
+          // Raw response items feed the sub-agent viewer (task text + spawn
+          // instructions). Sub-threads inherit this from their parent.
+          experimentalRawEvents: true,
         })) as { thread: { id: string }; cwd?: string };
         mainCwd = (started as { cwd?: string }).cwd ?? cwd;
       }
@@ -1548,6 +2101,40 @@ app.whenReady().then(async () => {
     return { ok: true };
   });
 
+  // Delete a conversation worktree: git removes it from the parent repo's
+  // bookkeeping (force — agent work in it is disposable by definition once
+  // the user deletes it), falling back to a plain rm if the repo is gone.
+  ipcMain.handle("worktrees:remove", async (_e, dir: string) => {
+    const map = loadWorktrees();
+    const info = map[dir];
+    if (info) {
+      const removed = await new Promise<boolean>((resolve) => {
+        execFile(
+          "git",
+          ["-C", info.project, "worktree", "remove", "--force", dir],
+          { timeout: 30000 },
+          (error) => resolve(!error),
+        );
+      });
+      if (!removed) {
+        try {
+          rmSync(dir, { recursive: true, force: true });
+        } catch (err) {
+          return { ok: false, error: String(err) };
+        }
+      }
+      delete map[dir];
+      writeFileSync(worktreesFile(), JSON.stringify(map, null, 2) + "\n");
+    } else {
+      try {
+        rmSync(dir, { recursive: true, force: true });
+      } catch (err) {
+        return { ok: false, error: String(err) };
+      }
+    }
+    return { ok: true };
+  });
+
   // Worktrees previously created for a project (and still on disk).
   ipcMain.handle("worktrees:list", (_e, project: string) => {
     const map = loadWorktrees();
@@ -1580,6 +2167,20 @@ app.whenReady().then(async () => {
     const turnId = pane.turnId ?? (pane.threadId ? runningTurns.get(pane.threadId) : null);
     if (!pane.threadId || !turnId) return { interrupted: false };
     await engine.request("turn/interrupt", { threadId: pane.threadId, turnId });
+    // Stop means stop: sub-agents run in their own sessions, so without a
+    // cascade they keep working (and a sub blocked on an approval would
+    // wait forever). Queued corrections still reach them — the engine
+    // starts a fresh turn for pending mail after an interrupt.
+    for (const [subId, info] of subAgents) {
+      if (info.parent !== pane.threadId) continue;
+      const subTurn = runningTurns.get(subId);
+      if (!subTurn) continue;
+      try {
+        await engine.request("turn/interrupt", { threadId: subId, turnId: subTurn });
+      } catch {
+        // sub turn may have just ended on its own
+      }
+    }
     return { interrupted: true };
   });
 
@@ -1603,10 +2204,10 @@ app.whenReady().then(async () => {
     requestId: string;
     decision: "accept" | "acceptForSession" | "decline";
   }) => {
-    const engineRequestId = pendingApprovals.get(payload.requestId);
-    if (engineRequestId === undefined) return { ok: false };
+    const pending = pendingApprovals.get(payload.requestId);
+    if (pending === undefined) return { ok: false };
     pendingApprovals.delete(payload.requestId);
-    engine.respond(engineRequestId, { decision: payload.decision });
+    engine.respond(pending.rpcId, { decision: payload.decision });
     return { ok: true };
   });
 
@@ -1619,23 +2220,35 @@ app.whenReady().then(async () => {
     // chats of removed projects, lists under Recents. Keyed by full path
     // so two folders sharing a basename stay distinct; explicitly opened
     // projects render even with zero conversations.
+    const records = loadProjects();
     const projectMap = new Map<string, ThreadSummary[]>();
-    for (const path of loadProjects()) projectMap.set(path, []);
+    const folderToPrimary = new Map<string, string>();
+    for (const r of records) {
+      projectMap.set(r.primary, []);
+      for (const f of r.folders) folderToPrimary.set(f, r.primary);
+    }
     const worktrees = loadWorktrees();
+    const threadProjectOverrides = loadThreadProjects();
     const recents: ThreadSummary[] = [];
     for (const t of result.data ?? []) {
       const summary: ThreadSummary = { id: t.id, title: threadTitle(t), createdAt: t.createdAt };
-      // Worktree conversations group under their parent project.
-      const effectiveCwd = t.cwd && worktrees[t.cwd] ? worktrees[t.cwd].project : t.cwd;
-      const group = effectiveCwd && effectiveCwd !== home ? projectMap.get(effectiveCwd) : undefined;
+      // Explicit assignment wins, then worktree conversations group under
+      // their parent project, then the thread's own cwd.
+      const effectiveCwd =
+        threadProjectOverrides[t.id] ?? (t.cwd && worktrees[t.cwd] ? worktrees[t.cwd].project : t.cwd);
+      const primary = effectiveCwd && effectiveCwd !== home ? folderToPrimary.get(effectiveCwd) : undefined;
+      const group = primary ? projectMap.get(primary) : undefined;
       if (group) group.push(summary);
       else recents.push(summary);
     }
     return {
-      projects: [...projectMap].map(([path, threads]) => ({
-        path,
-        name: path.split("/").filter(Boolean).pop() ?? path,
-        threads,
+      projects: records.map((r) => ({
+        path: r.primary,
+        name: r.name,
+        icon: r.icon,
+        color: r.color,
+        folders: r.folders,
+        threads: projectMap.get(r.primary) ?? [],
       })),
       recents,
       // Threads with a live turn — seeds the sidebar activity indicators.
@@ -1647,7 +2260,17 @@ app.whenReady().then(async () => {
   // drop out of thread/list but survive for a future archived view).
   ipcMain.handle("project:archive-chats", async (_e, path: string) => {
     const result = (await engine.request("thread/list", { limit: 100 })) as { data?: WireThread[] };
-    const targets = (result.data ?? []).filter((t) => t.cwd === path);
+    const record = loadProjects().find((r) => r.primary === path);
+    const folders = record?.folders ?? [path];
+    // Match the sidebar's grouping exactly (threads:list): explicit
+    // assignment wins, then worktree→project mapping, then the thread's own
+    // cwd — so this archives precisely the chats listed under the project.
+    const worktrees = loadWorktrees();
+    const overrides = loadThreadProjects();
+    const targets = (result.data ?? []).filter((t) => {
+      const effective = overrides[t.id] ?? (t.cwd && worktrees[t.cwd] ? worktrees[t.cwd].project : t.cwd);
+      return !!effective && (effective === path || folders.includes(effective));
+    });
     for (const t of targets) {
       await engine.request("thread/archive", { threadId: t.id });
       if (panes.main.threadId === t.id) {
@@ -1663,14 +2286,82 @@ app.whenReady().then(async () => {
   // Remove = forget the project in the app. Files and chats survive;
   // its chats regroup under Recents (see threads:list).
   ipcMain.handle("project:remove", (_e, path: string) => {
-    const projects = loadProjects().filter((p) => p !== path);
-    writeFileSync(projectsFile(), JSON.stringify(projects, null, 2) + "\n");
+    saveProjects(loadProjects().filter((p) => p.primary !== path));
     return { ok: true };
+  });
+
+  // Edit-project save: name, icon, color, folders, primary — matched by the
+  // project's previous primary path.
+  ipcMain.handle("project:update", (_e, p: { path: string; record: ProjectRecord }) => {
+    const projects = loadProjects();
+    const idx = projects.findIndex((r) => r.primary === p.path);
+    if (idx === -1) return { ok: false, error: "Project not found" };
+    const rec = p.record;
+    if (!rec.folders.length) return { ok: false, error: "A project needs at least one folder" };
+    projects[idx] = {
+      name: rec.name.trim() || projects[idx].name,
+      folders: rec.folders,
+      primary: rec.folders.includes(rec.primary) ? rec.primary : rec.folders[0],
+      icon: rec.icon,
+      color: rec.color,
+    };
+    saveProjects(projects);
+    return { ok: true, record: projects[idx] };
   });
 
   ipcMain.handle("project:reveal", (_e, path: string) => {
     void shell.openPath(path);
     return { ok: true };
+  });
+
+  // Rename lives in the ENGINE (thread/name/set) so the sidebar title —
+  // which comes from thread/list — updates everywhere, including resumes.
+  ipcMain.handle("threads:rename", async (_e, p: { threadId: string; name: string }) => {
+    try {
+      await engine.request("thread/name/set", { threadId: p.threadId, name: p.name });
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: String(err) };
+    }
+  });
+
+  ipcMain.handle("threads:assign-project", (_e, p: { threadId: string; projectPath: string }) => {
+    const map = loadThreadProjects();
+    map[p.threadId] = p.projectPath;
+    writeFileSync(threadProjectsFile(), JSON.stringify(map, null, 2) + "\n");
+    rememberProject(p.projectPath);
+    return { ok: true };
+  });
+
+  // Create = make the folder and remember it; an empty project is just a
+  // fresh directory with no chats yet.
+  ipcMain.handle("project:create", (_e, p: { name: string; parent?: string }) => {
+    const safe = p.name.trim().replace(/[/\\]/g, "-");
+    if (!safe) return { path: null, name: null, error: "Project name is required" };
+    const dir = join(p.parent ?? app.getPath("home"), safe);
+    try {
+      mkdirSync(dir, { recursive: true });
+    } catch (err) {
+      return { path: null, name: null, error: `Couldn't create ${dir}: ${String(err)}` };
+    }
+    rememberProject(dir);
+    pendingCwd = dir;
+    mainCwd = dir;
+    panes.main.threadId = null;
+    panes.main.turnId = null;
+    panes.side.threadId = null;
+    panes.side.turnId = null;
+    return { path: dir, name: safe };
+  });
+
+  ipcMain.handle("project:pick-location", async () => {
+    if (!win) return { path: null };
+    const result = await dialog.showOpenDialog(win, {
+      properties: ["openDirectory", "createDirectory"],
+      title: "Choose where the project folder is created",
+      buttonLabel: "Use this location",
+    });
+    return { path: result.canceled || result.filePaths.length === 0 ? null : result.filePaths[0] };
   });
 
   ipcMain.handle("project:choose", async () => {
@@ -1742,6 +2433,76 @@ app.whenReady().then(async () => {
     return { ok: true };
   });
 
+  // Sub-agent roster for a (re)opened conversation — the live pushes only
+  // reach a pane that already owns the thread.
+  ipcMain.handle("subagents:list", (_e, parent: string) => ({ agents: subAgentsForParent(parent) }));
+
+  // A sub-agent's transcript on demand: thread/read leaves its running turn
+  // undisturbed, and the bgStream tail covers text still streaming.
+  ipcMain.handle("subagents:transcript", async (_e, id: string) => {
+    const info = subAgents.get(id);
+    try {
+      const result = (await engine.request("thread/read", { threadId: id, includeTurns: true })) as {
+        thread: WireThread;
+      };
+      // The task/messages the agent was GIVEN aren't thread items — they
+      // ride the inter-agent channel we capture from raw notifications.
+      // Merge mail (as user bubbles) with the turns by time so the pane
+      // reads as the two-sided conversation it actually is.
+      // Rollout is the authoritative mail source (survives resume/restart);
+      // live raw captures fill the gap before the rollout flushes.
+      const mail = rolloutMail(id, info?.path ?? null);
+      // Live captures fill the gap before the rollout flushes. Dedupe by
+      // COUNT per text, not mere presence: the same text can legitimately be
+      // sent twice, and each rollout copy accounts for one live capture.
+      const rolloutCopies = new Map<string, number>();
+      for (const r of mail) rolloutCopies.set(r.text, (rolloutCopies.get(r.text) ?? 0) + 1);
+      for (const m of subAgentMail.get(id) ?? []) {
+        const left = rolloutCopies.get(m.text) ?? 0;
+        if (left > 0) rolloutCopies.set(m.text, left - 1);
+        else mail.push(m);
+      }
+      // The sub-agent's thread FORKS the parent's visible history (user
+      // prompts and the root's own replies), and thread/read returns those
+      // turns as if they were the agent's. The agent-to-agent view starts at
+      // the spawn — and the spawn moment IS the first mail's timestamp, so
+      // anything earlier is forked parent history and dropped. The user
+      // filter stays as a fallback for the no-mail case.
+      // Only stamped mail anchors the spawn moment — a timestamp-less
+      // rollout line would set spawnAt to 0 and disable the filter.
+      const stamped = mail.filter((m) => m.at > 0);
+      const spawnAt = stamped.length > 0 ? Math.min(...stamped.map((m) => Math.floor(m.at))) : null;
+      const timeline: { t: number; mail: boolean; entries: unknown[] }[] = [];
+      for (const turn of result.thread.turns ?? []) {
+        const t = turn.startedAt ?? 0;
+        // A turn without startedAt can't be classified — keep it rather
+        // than silently dropping the agent's replies.
+        if (spawnAt !== null && turn.startedAt != null && t < spawnAt) continue; // forked parent history
+        const entries = threadToEntries({ ...result.thread, turns: [turn] }).filter(
+          (e) => (e as { kind?: string }).kind !== "user",
+        );
+        if (entries.length === 0) continue;
+        timeline.push({ t, mail: false, entries });
+      }
+      for (const m of mail) {
+        // Floor to seconds to match turn.startedAt's resolution — mail is
+        // recorded milliseconds INTO the second its turn starts.
+        timeline.push({ t: Math.floor(m.at), mail: true, entries: [{ kind: "user", text: m.text }] });
+      }
+      // Mail always PRECEDES the turn it triggers, so ties break mail-first.
+      timeline.sort((a, b) => a.t - b.t || (a.mail === b.mail ? 0 : a.mail ? -1 : 1));
+      return redactSecrets({
+        entries: timeline.flatMap((x) => x.entries),
+        running: runningTurns.has(id),
+        streamText: bgStream.get(id) ?? "",
+        name: info?.name ?? null,
+        path: info?.path ?? null,
+      });
+    } catch (err) {
+      return { entries: [], running: false, streamText: "", name: info?.name ?? null, path: info?.path ?? null, error: String(err) };
+    }
+  });
+
   ipcMain.handle("side:reset", () => {
     // Side chats are disposable: dropping the reference is the whole
     // cleanup — the ephemeral thread evaporates with the engine.
@@ -1765,6 +2526,18 @@ app.whenReady().then(async () => {
       return { fullPath, relPath: rel.startsWith("..") ? fullPath : rel, content };
     } catch {
       return { error: `Could not open ${rawPath}`, fullPath };
+    }
+  });
+
+  // Existence probe for inline file chips: same resolution as file:read,
+  // so a chip only renders as a link when clicking it would actually work.
+  ipcMain.handle("file:exists", (_e, rawPath: string) => {
+    const base = mainCwd ?? pendingCwd ?? app.getPath("home");
+    const fullPath = isAbsolute(rawPath) ? rawPath : join(base, rawPath);
+    try {
+      return { exists: statSync(fullPath).isFile() };
+    } catch {
+      return { exists: false };
     }
   });
 
@@ -2217,6 +2990,25 @@ app.whenReady().then(async () => {
       } catch {
         // the delete below is the outcome that matters
       }
+    }
+    // Sub-agents run in their own sessions: stop and forget them with
+    // their parent, or they keep executing (and raising approvals) against
+    // a deleted conversation.
+    for (const [subId, info] of [...subAgents]) {
+      if (info.parent !== id) continue;
+      const subTurn = runningTurns.get(subId);
+      if (subTurn) {
+        try {
+          await engine.request("turn/interrupt", { threadId: subId, turnId: subTurn });
+        } catch {
+          // best-effort — the sub may have just finished
+        }
+      }
+      runningTurns.delete(subId);
+      subAgents.delete(subId);
+      subAgentMail.delete(subId);
+      heldApprovals.delete(subId);
+      bgStream.delete(subId);
     }
     runningTurns.delete(id);
     bgStream.delete(id);
