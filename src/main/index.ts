@@ -77,6 +77,203 @@ function defaultChatDir(): string {
   }
 }
 
+// ── Agent browser: model-driven browsing via dynamic tools ─────────────
+// Wraps the `agent-browser` CLI (vercel-labs): each tool call shells out
+// to one command, and the CLI keeps a background daemon holding the page
+// session, so refs from browser_snapshot stay valid across calls. The
+// tools ride thread/start's experimental dynamicTools and reach the
+// gateway as plain function tools (which it supports). Registered only
+// when the binary is installed (npm/brew/cargo).
+let agentBrowserBinCache: string | null | undefined;
+function agentBrowserBin(): string | null {
+  if (agentBrowserBinCache !== undefined) return agentBrowserBinCache;
+  const home = app.getPath("home");
+  const candidates = [
+    ...(process.env.PATH ?? "").split(":").filter(Boolean).map((d) => join(d, "agent-browser")),
+    "/opt/homebrew/bin/agent-browser",
+    "/usr/local/bin/agent-browser",
+    join(home, ".local", "bin", "agent-browser"),
+    join(home, ".npm-global", "bin", "agent-browser"),
+    join(home, ".cargo", "bin", "agent-browser"),
+  ];
+  agentBrowserBinCache = candidates.find((p) => existsSync(p)) ?? null;
+  return agentBrowserBinCache;
+}
+
+const AGENT_BROWSER_TOOLS = [
+  {
+    type: "function",
+    name: "browser_open",
+    description: "Open a URL in your browser and wait for it to load. Returns the page title.",
+    inputSchema: { type: "object", properties: { url: { type: "string" } }, required: ["url"] },
+  },
+  {
+    type: "function",
+    name: "browser_snapshot",
+    description:
+      "Accessibility-tree snapshot of the current page with stable element refs (e.g. [ref=e7]). Call this after navigation to see the page; pass a ref like 'e7' to browser_click/browser_fill/browser_type.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    type: "function",
+    name: "browser_read",
+    description: "The current page as agent-readable text (markdown-ish). Good for articles; use browser_snapshot when you need to interact.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    type: "function",
+    name: "browser_click",
+    description: "Click an element by its snapshot ref.",
+    inputSchema: { type: "object", properties: { ref: { type: "string", description: "Element ref from browser_snapshot, e.g. 'e7'" } }, required: ["ref"] },
+  },
+  {
+    type: "function",
+    name: "browser_fill",
+    description: "Clear an input and fill it with text, by snapshot ref.",
+    inputSchema: {
+      type: "object",
+      properties: { ref: { type: "string" }, text: { type: "string" } },
+      required: ["ref", "text"],
+    },
+  },
+  {
+    type: "function",
+    name: "browser_type",
+    description: "Type text into an element (no clearing), by snapshot ref.",
+    inputSchema: {
+      type: "object",
+      properties: { ref: { type: "string" }, text: { type: "string" } },
+      required: ["ref", "text"],
+    },
+  },
+  {
+    type: "function",
+    name: "browser_press",
+    description: "Press a key or chord, e.g. 'Enter', 'Tab', 'Control+a'.",
+    inputSchema: { type: "object", properties: { key: { type: "string" } }, required: ["key"] },
+  },
+  {
+    type: "function",
+    name: "browser_scroll",
+    description: "Scroll the page.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        direction: { type: "string", enum: ["up", "down", "left", "right"] },
+        pixels: { type: "number" },
+      },
+      required: ["direction"],
+    },
+  },
+  {
+    type: "function",
+    name: "browser_screenshot",
+    description: "Screenshot the current page (returned to you as an image).",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    type: "function",
+    name: "browser_back",
+    description: "Go back in browser history.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    type: "function",
+    name: "browser_close",
+    description: "Close the browser when you are done with it.",
+    inputSchema: { type: "object", properties: {} },
+  },
+];
+
+function agentBrowserTools(): typeof AGENT_BROWSER_TOOLS | undefined {
+  return agentBrowserBin() ? AGENT_BROWSER_TOOLS : undefined;
+}
+
+function runAgentBrowser(args: string[], timeoutMs = 60_000): Promise<{ ok: boolean; out: string }> {
+  const bin = agentBrowserBin();
+  if (!bin) return Promise.resolve({ ok: false, out: "agent-browser is not installed" });
+  return new Promise((resolve) =>
+    execFile(bin, args, { timeout: timeoutMs, maxBuffer: 4_000_000 }, (err, stdout, stderr) =>
+      resolve({
+        ok: !err,
+        out: [stdout, stderr].map((x) => String(x).trim()).filter(Boolean).join("\n") || (err ? String(err) : ""),
+      }),
+    ),
+  );
+}
+
+const AGENT_BROWSER_OUTPUT_CAP = 30_000;
+type DynamicToolResponse = {
+  contentItems: ({ type: "inputText"; text: string } | { type: "inputImage"; imageUrl: string })[];
+  success: boolean;
+};
+async function handleAgentBrowserCall(tool: string, rawArgs: unknown): Promise<DynamicToolResponse> {
+  const a = (rawArgs && typeof rawArgs === "object" ? rawArgs : {}) as Record<string, unknown>;
+  const str = (k: string) => (typeof a[k] === "string" ? (a[k] as string) : "");
+  const ref = () => (str("ref").startsWith("@") ? str("ref") : `@${str("ref")}`);
+  const text = (t: string, ok: boolean): DynamicToolResponse => ({
+    contentItems: [{ type: "inputText", text: t.slice(0, AGENT_BROWSER_OUTPUT_CAP) || (ok ? "ok" : "failed") }],
+    success: ok,
+  });
+  switch (tool) {
+    case "browser_open": {
+      const r = await runAgentBrowser(["open", str("url")], 90_000);
+      return text(r.out, r.ok);
+    }
+    case "browser_snapshot": {
+      const r = await runAgentBrowser(["snapshot"]);
+      return text(r.out, r.ok);
+    }
+    case "browser_read": {
+      const r = await runAgentBrowser(["read"]);
+      return text(r.out, r.ok);
+    }
+    case "browser_click": {
+      const r = await runAgentBrowser(["click", ref()]);
+      return text(r.out, r.ok);
+    }
+    case "browser_fill": {
+      const r = await runAgentBrowser(["fill", ref(), str("text")]);
+      return text(r.out, r.ok);
+    }
+    case "browser_type": {
+      const r = await runAgentBrowser(["type", ref(), str("text")]);
+      return text(r.out, r.ok);
+    }
+    case "browser_press": {
+      const r = await runAgentBrowser(["press", str("key")]);
+      return text(r.out, r.ok);
+    }
+    case "browser_scroll": {
+      const px = typeof a.pixels === "number" && a.pixels > 0 ? [String(Math.round(a.pixels))] : [];
+      const r = await runAgentBrowser(["scroll", str("direction") || "down", ...px]);
+      return text(r.out, r.ok);
+    }
+    case "browser_back": {
+      const r = await runAgentBrowser(["back"]);
+      return text(r.out, r.ok);
+    }
+    case "browser_close": {
+      const r = await runAgentBrowser(["close"]);
+      return text(r.out, r.ok);
+    }
+    case "browser_screenshot": {
+      const file = join(app.getPath("temp"), `unbiased-shot-${Date.now()}.png`);
+      const r = await runAgentBrowser(["screenshot", file], 90_000);
+      if (!r.ok) return text(r.out, false);
+      try {
+        const b64 = readFileSync(file).toString("base64");
+        rmSync(file, { force: true });
+        return { contentItems: [{ type: "inputImage", imageUrl: `data:image/png;base64,${b64}` }], success: true };
+      } catch (err) {
+        return text(`screenshot unreadable: ${String(err)}`, false);
+      }
+    }
+    default:
+      return text(`unknown tool: ${tool}`, false);
+  }
+}
+
 function paneForThread(threadId: unknown): PaneId | null {
   for (const [id, p] of Object.entries(panes)) {
     if (p.threadId === threadId) return id;
@@ -587,6 +784,18 @@ function threadToEntries(thread: WireThread): unknown[] {
             output: item.aggregatedOutput,
           });
           break;
+        case "dynamicToolCall": {
+          const d = item as { id?: string; tool?: string; arguments?: unknown; status?: string; success?: boolean };
+          const args = d.arguments && typeof d.arguments === "object" ? d.arguments : {};
+          const argsText = Object.keys(args).length ? ` ${JSON.stringify(args)}` : "";
+          entries.push({
+            kind: "command",
+            itemId: d.id ?? "unknown",
+            command: `${d.tool ?? "tool"}${argsText}`.slice(0, 400),
+            status: d.success === false ? "failed" : (d.status ?? "completed"),
+          });
+          break;
+        }
         case "contextCompaction":
           entries.push({ kind: "compaction" });
           break;
@@ -1594,6 +1803,20 @@ function wireNotifications(): void {
         if (!paneId) break; // history holds these for a backgrounded thread
         if (item?.type === "commandExecution") {
           send("chat:command", { paneId, phase, item });
+        } else if (item?.type === "dynamicToolCall") {
+          // Browser-tool calls render as command-style cards.
+          const d = item as { id?: string; tool?: string; arguments?: unknown; status?: string; success?: boolean };
+          const args = d.arguments && typeof d.arguments === "object" ? d.arguments : {};
+          const argsText = Object.keys(args).length ? ` ${JSON.stringify(args)}` : "";
+          send("chat:command", {
+            paneId,
+            phase,
+            item: {
+              id: d.id,
+              command: `${d.tool ?? "tool"}${argsText}`.slice(0, 400),
+              status: d.success === false ? "failed" : (d.status ?? "completed"),
+            },
+          });
         } else if (item?.type === "plan") {
           if (phase === "completed") {
             const planItem = params.item as { text?: string };
@@ -1786,6 +2009,19 @@ function wireNotifications(): void {
         });
         return;
       }
+      // Dynamic tool calls (the agent browser): run the CLI and answer
+      // with its output. Errors return success:false so the model can
+      // adapt instead of the turn dying.
+      if (msg.method === "item/tool/call") {
+        const tool = String((params as { tool?: unknown }).tool ?? "");
+        void handleAgentBrowserCall(tool, (params as { arguments?: unknown }).arguments)
+          .catch((err) => ({
+            contentItems: [{ type: "inputText" as const, text: `tool crashed: ${String(err)}` }],
+            success: false,
+          }))
+          .then((response) => engine.respond(msg.id, response));
+        return;
+      }
       // Anything we don't render yet (user-input tools, permissions):
       // declining beats hanging the turn on a question nobody can see.
       console.warn("[app] declining unhandled server request:", msg.method);
@@ -1934,6 +2170,7 @@ app.whenReady().then(async () => {
           ...threadPolicy(),
           ephemeral: true,
           experimentalRawEvents: true,
+          dynamicTools: agentBrowserTools(),
         })) as { thread: { id: string } };
       } else {
         // Explicit default when no project is chosen — left implicit, the
@@ -1954,6 +2191,9 @@ app.whenReady().then(async () => {
         started = (await engine.request("thread/start", {
           ...threadPolicy(),
           cwd,
+          // Model-driven browser automation (agent-browser CLI), when
+          // installed — the calls come back as item/tool/call requests.
+          dynamicTools: agentBrowserTools(),
           // Raw response items feed the sub-agent viewer (task text + spawn
           // instructions). Sub-threads inherit this from their parent.
           experimentalRawEvents: true,
@@ -3125,5 +3365,8 @@ app.on("window-all-closed", () => {
   for (const pty of ptys.values()) pty.kill();
   ptys.clear();
   engine.stop();
+  // The agent browser's daemon outlives us otherwise — close every session.
+  const bin = agentBrowserBinCache;
+  if (bin) execFile(bin, ["close", "--all"], () => {});
   app.quit();
 });
