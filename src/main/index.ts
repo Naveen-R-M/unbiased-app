@@ -84,6 +84,15 @@ function defaultChatDir(): string {
 // tools ride thread/start's experimental dynamicTools and reach the
 // gateway as plain function tools (which it supports). Registered only
 // when the binary is installed (npm/brew/cargo).
+// Consent state, keyed by the ROOT conversation. Plain browsing is gated
+// only in "ask" mode (auto and full already permit network work); attaching
+// to the user's own Chrome is gated in EVERY mode, because it hands the
+// agent their signed-in sessions rather than public pages.
+const browserNetGrants = new Set<string>();
+const browserConnectGrants = new Set<string>();
+// True while driving the user's Chrome: close must not take their tabs down.
+let browserAttached = false;
+
 let agentBrowserBinCache: string | null | undefined;
 function agentBrowserBin(): string | null {
   if (agentBrowserBinCache !== undefined) return agentBrowserBinCache;
@@ -100,11 +109,41 @@ function agentBrowserBin(): string | null {
   return agentBrowserBinCache;
 }
 
+// Gated sites (X, LinkedIn, Instagram, Reddit at times) return a SHORT page
+// dominated by sign-in or verification copy. Detecting that and saying what
+// to do next beats letting the model retry the same wall.
+// Sign-in copy, bot checks, AND outright refusals: sites increasingly answer
+// an automated browser with an HTTP error rather than a wall (x.com does),
+// which is exactly when the model most needs to be told not to retry.
+const BROWSER_WALL_SIGNALS =
+  /(sign in|log in|log into|sign up|create account|join today|verify you are human|are you a robot|unusual traffic|captcha|complete the following challenge|enable javascript|access denied|403 forbidden|rate limit|too many requests|navigation failed|net::err_|http error)/i;
+function browserWallHint(out: string): string {
+  if (out.length > 2500 || !BROWSER_WALL_SIGNALS.test(out)) return "";
+  return (
+    "\n\n[note] This looks like a logged-out wall or a bot check rather than the real content. " +
+    "Do not retry the same URL. Either use browser_search to find public sources that do not need an " +
+    "account (Wikipedia, news coverage, the site's own about/help pages), or tell the user you need " +
+    "their signed-in browser and ask whether to attach to it with browser_connect."
+  );
+}
+
 const AGENT_BROWSER_TOOLS = [
   {
     type: "function",
+    name: "browser_search",
+    description:
+      "Search the web and get back ranked results (title, URL, snippet). Use this FIRST for research questions instead of guessing URLs, and whenever a site blocks logged-out visitors — public sources (Wikipedia, news, official about/help pages) usually work when the site's own app does not. Follow up with browser_open on a result URL, or browser_snapshot the results page to click through. Prefer two or three independent sources over one.",
+    inputSchema: {
+      type: "object",
+      properties: { query: { type: "string", description: "What to search for" } },
+      required: ["query"],
+    },
+  },
+  {
+    type: "function",
     name: "browser_open",
-    description: "Open a URL in your browser and wait for it to load. Returns the page title.",
+    description:
+      "Open a URL in your browser and wait for it to load. Returns the page title. Note: many sites show an automated browser only a signup wall or a bot check — if what comes back looks like a login gate instead of content, do not retry it; search for public sources with browser_search, or ask the user about browser_connect.",
     inputSchema: { type: "object", properties: { url: { type: "string" } }, required: ["url"] },
   },
   {
@@ -179,8 +218,18 @@ const AGENT_BROWSER_TOOLS = [
   },
   {
     type: "function",
+    name: "browser_connect",
+    description:
+      "Attach to the user's OWN Chrome so you can use pages they are already signed into (their X timeline, mail, dashboards). This always needs the user's explicit approval, and their Chrome must be running with remote debugging enabled — the tool explains how if it is not. Only reach for this when the task genuinely needs their account; prefer browser_search and public pages. While attached, browser_close leaves their browser open.",
+    inputSchema: {
+      type: "object",
+      properties: { port: { type: "string", description: "CDP port or ws:// URL (default 9222)" } },
+    },
+  },
+  {
+    type: "function",
     name: "browser_close",
-    description: "Close the browser when you are done with it.",
+    description: "Close the automation browser when you are done. Never closes the user's own Chrome, even while attached to it.",
     inputSchema: { type: "object", properties: {} },
   },
 ];
@@ -202,12 +251,84 @@ function runAgentBrowser(args: string[], timeoutMs = 60_000): Promise<{ ok: bool
   );
 }
 
+// Bing is the one major engine that serves an automated Chrome real results
+// (Google, Brave, Ecosia and DuckDuckGo's no-JS endpoints all answer with a
+// bot challenge, which we neither solve nor work around). Result titles come
+// from textContent — innerText reads empty in this context — and Bing's
+// redirect wrappers are decoded back to the real destination so the model
+// gets URLs it can actually open.
+const BROWSER_SEARCH_EXTRACT = `(() => {
+  const real = (href) => { try {
+    const u = new URL(href).searchParams.get("u");
+    if (!u) return href;
+    const b = u.replace(/^a1/, "").replace(/-/g, "+").replace(/_/g, "/");
+    const s = atob(b + "=".repeat((4 - (b.length % 4)) % 4));
+    return /^https?:/.test(s) ? s : href;
+  } catch { return href; } };
+  const txt = (el, sel) => (el.querySelector(sel)?.textContent || "").replace(/\\s+/g, " ").trim();
+  const rows = Array.from(document.querySelectorAll("li.b_algo")).slice(0, 8).map((li) => {
+    const a = li.querySelector("h2 a[href]") || li.querySelector("a[href]");
+    return {
+      title: txt(li, "h2") || txt(li, "a"),
+      url: a ? real(a.href) : txt(li, "cite"),
+      snippet: txt(li, ".b_caption p") || txt(li, "p"),
+    };
+  }).filter((r) => r.title || r.url);
+  return JSON.stringify(rows);
+})()`;
+
+/** agent-browser prints eval results JSON-encoded, so a string return arrives
+ *  double-encoded; unwrap until it parses to an array. */
+function parseEvalJson(out: string): { title?: string; url?: string; snippet?: string }[] {
+  let value: unknown = out.trim();
+  for (let i = 0; i < 3; i++) {
+    if (typeof value !== "string") break;
+    try {
+      value = JSON.parse(value);
+    } catch {
+      return [];
+    }
+  }
+  return Array.isArray(value) ? (value as { title?: string }[]) : [];
+}
+
+/** Consent gate. Returns null when the call may proceed, else the refusal to
+ *  hand back to the model. */
+async function ensureBrowserAllowed(tool: string, threadId: string | null, detail: string): Promise<string | null> {
+  if (tool === "browser_close") return null; // cleanup only, no network
+  const root = rootThreadOf(threadId);
+  const attaching = tool === "browser_connect";
+  if (attaching) {
+    if (browserConnectGrants.has(root)) return null;
+  } else if (accessMode !== "ask" || browserNetGrants.has(root)) {
+    return null;
+  }
+  const decision = await requestLocalApproval(
+    threadId,
+    attaching ? `Attach to your Chrome browser (${detail})` : `Browse the web — ${detail}`,
+    attaching
+      ? "The agent wants to drive your own Chrome, including everything you are signed into (mail, X, dashboards, internal tools). Allow only if you want it acting with those accounts."
+      : "The agent wants to use the browser, which reaches the network. This conversation is in Ask-for-approval mode, so nothing goes out until you allow it.",
+  );
+  if (decision === "decline") {
+    return attaching
+      ? "The user declined access to their Chrome browser. Continue with public pages via browser_search instead."
+      : "The user declined browser/network access for this conversation.";
+  }
+  if (decision === "acceptForSession") (attaching ? browserConnectGrants : browserNetGrants).add(root);
+  return null;
+}
+
 const AGENT_BROWSER_OUTPUT_CAP = 30_000;
 type DynamicToolResponse = {
   contentItems: ({ type: "inputText"; text: string } | { type: "inputImage"; imageUrl: string })[];
   success: boolean;
 };
-async function handleAgentBrowserCall(tool: string, rawArgs: unknown): Promise<DynamicToolResponse> {
+async function handleAgentBrowserCall(
+  tool: string,
+  rawArgs: unknown,
+  threadId: string | null,
+): Promise<DynamicToolResponse> {
   const a = (rawArgs && typeof rawArgs === "object" ? rawArgs : {}) as Record<string, unknown>;
   const str = (k: string) => (typeof a[k] === "string" ? (a[k] as string) : "");
   const ref = () => (str("ref").startsWith("@") ? str("ref") : `@${str("ref")}`);
@@ -215,18 +336,75 @@ async function handleAgentBrowserCall(tool: string, rawArgs: unknown): Promise<D
     contentItems: [{ type: "inputText", text: t.slice(0, AGENT_BROWSER_OUTPUT_CAP) || (ok ? "ok" : "failed") }],
     success: ok,
   });
+  const gateDetail =
+    tool === "browser_open"
+      ? str("url")
+      : tool === "browser_search"
+        ? `search: ${str("query")}`
+        : tool === "browser_connect"
+          ? str("port") || "port 9222"
+          : tool.replace(/^browser_/, "");
+  const refusal = await ensureBrowserAllowed(tool, threadId, gateDetail);
+  if (refusal) return text(refusal, false);
   switch (tool) {
     case "browser_open": {
       const r = await runAgentBrowser(["open", str("url")], 90_000);
-      return text(r.out, r.ok);
+      return text(r.out + browserWallHint(r.out), r.ok);
     }
     case "browser_snapshot": {
       const r = await runAgentBrowser(["snapshot"]);
-      return text(r.out, r.ok);
+      return text(r.out + browserWallHint(r.out), r.ok);
     }
     case "browser_read": {
       const r = await runAgentBrowser(["read"]);
-      return text(r.out, r.ok);
+      return text(r.out + browserWallHint(r.out), r.ok);
+    }
+    case "browser_search": {
+      const query = str("query");
+      if (!query) return text("query is required", false);
+      const opened = await runAgentBrowser(
+        ["open", `https://www.bing.com/search?q=${encodeURIComponent(query)}`],
+        90_000,
+      );
+      if (!opened.ok) return text(opened.out, false);
+      await runAgentBrowser(["wait", "1200"], 20_000);
+      const evaluated = await runAgentBrowser(["eval", BROWSER_SEARCH_EXTRACT]);
+      const rows = parseEvalJson(evaluated.out);
+      if (rows.length === 0) {
+        // Empty means a challenge page or a query with no hits — show the
+        // model what is actually on screen so it can adapt.
+        const page = await runAgentBrowser(["read"]);
+        const seen = page.out.slice(0, 1200);
+        return text(
+          `No results could be extracted for ${JSON.stringify(query)}.\n\nWhat the page shows:\n${seen}` +
+            (browserWallHint(seen) || "\n\n[note] Try a differently worded query, or open a known source directly."),
+          false,
+        );
+      }
+      const list = rows
+        .map((r, i) => `${i + 1}. ${r.title ?? "(untitled)"}\n   ${r.url ?? ""}\n   ${r.snippet ?? ""}`.trimEnd())
+        .join("\n\n");
+      return text(
+        `Results for ${JSON.stringify(query)}:\n\n${list}\n\n[next] browser_open one of these URLs to read it, ` +
+          "or browser_snapshot this results page to click a link. Cross-check anything important against a second source.",
+        true,
+      );
+    }
+    case "browser_connect": {
+      const target = str("port") || "9222";
+      const r = await runAgentBrowser(["connect", target], 30_000);
+      // `connect` exits 0 even when discovery fails, so read the output.
+      if (r.ok && !/✗|failed|refused|error/i.test(r.out)) {
+        browserAttached = true;
+        return text(`${r.out || "connected"}\n\n[note] You are now driving the user's own Chrome.`, true);
+      }
+      return text(
+        `Could not attach to a debuggable Chrome on ${target}. Chrome does not expose remote debugging by ` +
+          "default, and it will not enable it for a profile that is already open. Ask the user to quit Chrome " +
+          'completely and relaunch it with:\n\n  open -na "Google Chrome" --args --remote-debugging-port=9222\n\n' +
+          "then call browser_connect again. Until then, use browser_search and public pages.",
+        false,
+      );
     }
     case "browser_click": {
       const r = await runAgentBrowser(["click", ref()]);
@@ -254,6 +432,9 @@ async function handleAgentBrowserCall(tool: string, rawArgs: unknown): Promise<D
       return text(r.out, r.ok);
     }
     case "browser_close": {
+      if (browserAttached) {
+        return text("Attached to the user's own Chrome — leaving it open. Nothing to close.", true);
+      }
       const r = await runAgentBrowser(["close"]);
       return text(r.out, r.ok);
     }
@@ -359,7 +540,13 @@ function resetSubAgentState(): void {
   pendingNicknames.clear();
   pendingMessagePrompts.clear();
   heldApprovals.clear();
+  for (const pending of pendingApprovals.values()) {
+    if (pending.kind === "local") pending.settle("decline");
+  }
   pendingApprovals.clear();
+  browserNetGrants.clear();
+  browserConnectGrants.clear();
+  browserAttached = false;
 }
 
 /** Strip the engine's inter-agent envelope ("Message Type: …\nTask name: …\n
@@ -1364,7 +1551,59 @@ function createWindow(): void {
 // kept so the card can be retired when that thread's turn dies (interrupt,
 // failure) — the engine drops the request server-side and would never
 // answer a late decision.
-const pendingApprovals = new Map<string, { rpcId: number | string; threadId: string | null }>();
+type ApprovalDecision = "accept" | "acceptForSession" | "decline";
+type PendingApproval = { threadId: string | null } & (
+  | { kind: "engine"; rpcId: number | string }
+  // Client-executed tools (the agent browser) need the same card, but the
+  // decision resolves a promise here instead of answering an engine RPC.
+  | { kind: "local"; settle: (decision: ApprovalDecision) => void }
+);
+const pendingApprovals = new Map<string, PendingApproval>();
+let nextLocalApproval = 1;
+
+/** Raise a Permissions card for work this process is about to do itself, and
+ *  wait for the human. Routed exactly like an engine approval: a sub-agent's
+ *  request surfaces in its PARENT's pane, and a backgrounded conversation
+ *  holds it until reopened. */
+function requestLocalApproval(threadId: string | null, command: string, reason: string): Promise<ApprovalDecision> {
+  const requestId = `apr_local_${nextLocalApproval++}`;
+  return new Promise((resolve) => {
+    pendingApprovals.set(requestId, { kind: "local", threadId, settle: resolve });
+    const sub = threadId ? subAgents.get(threadId) : undefined;
+    const target = sub ? sub.parent : threadId;
+    const payload: Record<string, unknown> = {
+      requestId,
+      kind: "command",
+      itemId: requestId,
+      command,
+      cwd: null,
+      reason,
+      ...(sub ? { agentName: sub.name } : {}),
+    };
+    const paneId = target ? paneForThread(target) : null;
+    if (paneId) {
+      send("chat:approval-request", { paneId, ...payload });
+    } else if (target) {
+      const held = heldApprovals.get(target) ?? [];
+      held.push(payload);
+      heldApprovals.set(target, held);
+    } else {
+      send("chat:approval-request", { paneId: "main", ...payload });
+    }
+  });
+}
+
+/** The conversation a thread belongs to — sub-agent grants follow the root,
+ *  so one approval covers the agent and everything it spawns. */
+function rootThreadOf(threadId: string | null): string {
+  let id = threadId ?? "main";
+  for (let hops = 0; hops < 8; hops++) {
+    const sub = subAgents.get(id);
+    if (!sub) break;
+    id = sub.parent;
+  }
+  return id;
+}
 
 // Live PTYs for the integrated terminal, keyed by handle.
 const ptys = new Map<string, IPty>();
@@ -1887,6 +2126,8 @@ function wireNotifications(): void {
           for (const [reqId, info] of pendingApprovals) {
             if (info.threadId !== threadId) continue;
             pendingApprovals.delete(reqId);
+            // A local waiter would hang forever otherwise.
+            if (info.kind === "local") info.settle("decline");
             droppedApprovals.push(reqId);
             const owner = subAgents.get(threadId)?.parent ?? threadId;
             const ownerPane = paneForThread(owner);
@@ -1979,7 +2220,7 @@ function wireNotifications(): void {
       const approvalThread = typeof params.threadId === "string" ? params.threadId : null;
       if (msg.method === "item/commandExecution/requestApproval") {
         const requestId = `apr_${msg.id}`;
-        pendingApprovals.set(requestId, { rpcId: msg.id, threadId: approvalThread });
+        pendingApprovals.set(requestId, { kind: "engine", rpcId: msg.id, threadId: approvalThread });
         deliverApproval({
           requestId,
           kind: "command",
@@ -1994,7 +2235,7 @@ function wireNotifications(): void {
       }
       if (msg.method === "item/fileChange/requestApproval") {
         const requestId = `apr_${msg.id}`;
-        pendingApprovals.set(requestId, { rpcId: msg.id, threadId: approvalThread });
+        pendingApprovals.set(requestId, { kind: "engine", rpcId: msg.id, threadId: approvalThread });
         deliverApproval({
           requestId,
           kind: "fileChange",
@@ -2014,7 +2255,7 @@ function wireNotifications(): void {
       // adapt instead of the turn dying.
       if (msg.method === "item/tool/call") {
         const tool = String((params as { tool?: unknown }).tool ?? "");
-        void handleAgentBrowserCall(tool, (params as { arguments?: unknown }).arguments)
+        void handleAgentBrowserCall(tool, (params as { arguments?: unknown }).arguments, approvalThread)
           .catch((err) => ({
             contentItems: [{ type: "inputText" as const, text: `tool crashed: ${String(err)}` }],
             success: false,
@@ -2517,7 +2758,8 @@ app.whenReady().then(async () => {
     const pending = pendingApprovals.get(payload.requestId);
     if (pending === undefined) return { ok: false };
     pendingApprovals.delete(payload.requestId);
-    engine.respond(pending.rpcId, { decision: payload.decision });
+    if (pending.kind === "engine") engine.respond(pending.rpcId, { decision: payload.decision });
+    else pending.settle(payload.decision);
     return { ok: true };
   });
 
@@ -3367,6 +3609,6 @@ app.on("window-all-closed", () => {
   engine.stop();
   // The agent browser's daemon outlives us otherwise — close every session.
   const bin = agentBrowserBinCache;
-  if (bin) execFile(bin, ["close", "--all"], () => {});
+  if (bin && !browserAttached) execFile(bin, ["close", "--all"], () => {});
   app.quit();
 });
