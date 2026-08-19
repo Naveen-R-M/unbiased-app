@@ -555,12 +555,6 @@ const REMARK_PLUGINS = [remarkGfm];
 // Scripts can't run regardless — the CSP has no unsafe-inline.
 const REHYPE_PLUGINS = [rehypeRaw];
 
-/** "12.3s" under a minute, "2m 20s" beyond. */
-function formatElapsed(seconds: number): string {
-  if (seconds < 60) return `${seconds.toFixed(1)}s`;
-  return `${Math.floor(seconds / 60)}m ${Math.floor(seconds % 60)}s`;
-}
-
 /** Deterministic glyph per sub-agent (Codex assigns each agent a colorful
  *  icon). Hashed off the thread id so every surface shows the same one. */
 const AGENT_EMOJI = ["🌸", "🌿", "🍀", "🌺", "🪷", "🌻", "🍁", "🌵", "🌼", "🍄", "🌷", "🌴", "⭐️", "🔮", "💠", "🪸"];
@@ -1335,9 +1329,14 @@ export function App() {
     void refreshThreads(); // the project shows in the sidebar immediately
   }
 
+  const openSeqRef = useRef(0);
   async function openThread(id: string) {
     if (id === activeThreadId) return;
+    // Two quick clicks race their awaits — only the latest open may commit.
+    const seq = ++openSeqRef.current;
+    const stale = () => openSeqRef.current !== seq;
     const res = await window.unbiased.openThread(id);
+    if (stale()) return;
     const history = res.entries;
     // The engine's history omits renderer-only content (failed-turn
     // errors, annotation cards). Prefer the cached transcript when it
@@ -1345,6 +1344,7 @@ export function App() {
     // CONTENTS, since folding makes the cache shorter than raw history
     // without losing anything.
     const cached = await window.unbiased.loadTranscript(id);
+    if (stale()) return;
     const cachedRichness = (cached.entries ?? []).reduce(
       (n, e) => n + (e.kind === "work" ? Math.max(e.entries.length, 1) : 1),
       0,
@@ -1375,7 +1375,10 @@ export function App() {
     resetSideView();
     // The engine may still be running spawns for this thread — pick up the
     // roster the live pushes accumulated while it was backgrounded.
-    void window.unbiased.subagentsList(id).then((r) => setSubAgentsList(r.agents));
+    fileExistsCache.clear(); // chip probes resolve against the new thread's cwd
+    void window.unbiased.subagentsList(id).then((r) => {
+      if (!stale()) setSubAgentsList(r.agents);
+    });
   }
 
   async function deleteThread(id: string) {
@@ -5436,7 +5439,10 @@ function SubAgentPane({ threadId, name, status }: { threadId: string; name: stri
       setEntries(r.entries);
       setPath(r.path);
       setError(r.error ?? null);
-      setTail(r.streamText);
+      // A delta can land between the engine snapshot and this resolve —
+      // never let the older snapshot truncate newer streamed text. An empty
+      // snapshot always wins: the turn ended and the entries now carry it.
+      setTail((t) => (r.streamText && t.startsWith(r.streamText) ? t : r.streamText));
     };
     void fetchTranscript();
     // Debounced refetch on this thread's item completions; deltas append
@@ -6552,6 +6558,17 @@ function ChatPane({
   // retrying THIS chat won't help — a fresh chat will.
   const emptyStreakRef = useRef(0);
 
+  /** Update command entries wherever they live — top level or folded inside
+   *  a work group (turn completion moves entries there, and approval cards
+   *  can still be live inside the fold). */
+  function mapCommandsDeep(es: Entry[], f: (e: CommandEntry) => Entry): Entry[] {
+    return es.map((e) => {
+      if (e.kind === "command") return f(e as CommandEntry);
+      if (e.kind === "work") return { ...e, entries: mapCommandsDeep(e.entries, f) };
+      return e;
+    });
+  }
+
   // Attach an approval request to its command card (or make one). Shared
   // by the live event and the replay of requests held while backgrounded.
   function applyApproval(p: HeldApproval): void {
@@ -6559,6 +6576,12 @@ function ChatPane({
       const cleaned = withoutTrailingPlaceholder(es);
       const approval = { requestId: p.requestId, reason: p.reason, kind: p.kind, grantRoot: p.grantRoot };
       const idx = cleaned.findIndex((e) => e.kind === "command" && e.itemId === p.itemId);
+      // A resumed conversation's approval attaches to a card INSIDE history,
+      // below the turn scope — widen the scope so the waiting… status sees
+      // it. Idempotent (min), so StrictMode's double-invoke is harmless.
+      if (idx !== -1 && turnStartIndexRef.current !== null && idx < turnStartIndexRef.current) {
+        turnStartIndexRef.current = idx;
+      }
       if (idx !== -1) {
         const cmd = cleaned[idx] as CommandEntry;
         const updated: Entry = { ...cmd, status: "awaitingApproval", approval };
@@ -6747,11 +6770,8 @@ function ChatPane({
       window.unbiased.onApprovalCanceled((p) => {
         if (p.paneId !== paneId) return;
         setEntries((es) =>
-          es.map((e) =>
-            e.kind === "command" &&
-            e.status === "awaitingApproval" &&
-            e.approval?.requestId === p.requestId &&
-            !e.approval.decision
+          mapCommandsDeep(es, (e) =>
+            e.status === "awaitingApproval" && e.approval?.requestId === p.requestId && !e.approval.decision
               ? { ...e, status: "canceled" }
               : e,
           ),
@@ -6811,29 +6831,33 @@ function ChatPane({
         setEntries((es) => {
           const cleaned = withoutTrailingPlaceholder(es);
           const itemId = item.id ?? "unknown";
-          const idx = cleaned.findIndex((e) => e.kind === "command" && e.itemId === itemId);
-          if (idx === -1) {
-            return [
-              ...cleaned,
-              {
-                kind: "command",
-                itemId,
-                command: item.command ?? "(command)",
-                status: item.status ?? (p.phase === "started" ? "inProgress" : "completed"),
-                exitCode: item.exitCode,
-                output: item.aggregatedOutput ?? item.output,
-              },
-            ];
-          }
-          const existing = cleaned[idx] as CommandEntry;
-          const updated: Entry = {
-            ...existing,
-            command: item.command ?? existing.command,
-            status: item.status ?? existing.status,
-            exitCode: item.exitCode ?? existing.exitCode,
-            output: item.aggregatedOutput ?? item.output ?? existing.output,
-          };
-          return [...cleaned.slice(0, idx), updated, ...cleaned.slice(idx + 1)];
+          // The card may have been folded into a work group by the time a
+          // late item event lands — update it in place wherever it lives
+          // instead of appending a duplicate.
+          let found = false;
+          const mapped = mapCommandsDeep(cleaned, (existing) => {
+            if (existing.itemId !== itemId) return existing;
+            found = true;
+            return {
+              ...existing,
+              command: item.command ?? existing.command,
+              status: item.status ?? existing.status,
+              exitCode: item.exitCode ?? existing.exitCode,
+              output: item.aggregatedOutput ?? item.output ?? existing.output,
+            };
+          });
+          if (found) return mapped;
+          return [
+            ...cleaned,
+            {
+              kind: "command",
+              itemId,
+              command: item.command ?? "(command)",
+              status: item.status ?? (p.phase === "started" ? "inProgress" : "completed"),
+              exitCode: item.exitCode,
+              output: item.aggregatedOutput ?? item.output,
+            },
+          ];
         });
       }),
     ];
@@ -6953,8 +6977,8 @@ function ChatPane({
 
   async function decide(itemId: string, requestId: string, decision: ApprovalDecision) {
     setEntries((es) =>
-      es.map((e) =>
-        e.kind === "command" && e.itemId === itemId && e.approval
+      mapCommandsDeep(es, (e) =>
+        e.itemId === itemId && e.approval
           ? {
               ...e,
               approval: { ...e.approval, decision },
@@ -8078,6 +8102,19 @@ function ChatPane({
  *  a file mentioned before the agent creates it stays plain until the
  *  message re-renders (rare, and honest either way). The open handler rides
  *  a ref so the markdown component map stays referentially stable. */
+// One probe per unique path text — chips remount en masse when a turn
+// folds, and every probe is an IPC + stat. Cleared on thread switch (the
+// resolution base changes with the conversation's cwd).
+const fileExistsCache = new Map<string, Promise<boolean>>();
+function probeFileExists(text: string): Promise<boolean> {
+  let p = fileExistsCache.get(text);
+  if (!p) {
+    p = window.unbiased.fileExists(text).then((r) => r.exists);
+    fileExistsCache.set(text, p);
+  }
+  return p;
+}
+
 function InlineCodeChip({
   text,
   children,
@@ -8090,10 +8127,13 @@ function InlineCodeChip({
   const candidate = Boolean(openRef.current) && looksLikeFilePath(text);
   const [exists, setExists] = useState(false);
   useEffect(() => {
+    // The text can mutate under a streaming re-render — drop the previous
+    // path's verdict so an unverified chip is never momentarily clickable.
+    setExists(false);
     if (!candidate) return;
     let alive = true;
-    void window.unbiased.fileExists(text).then((r) => {
-      if (alive) setExists(r.exists);
+    void probeFileExists(text).then((ok) => {
+      if (alive) setExists(ok);
     });
     return () => {
       alive = false;
@@ -8203,7 +8243,12 @@ function CodeBlock({ children }: { children?: React.ReactNode }) {
   // Syntax colors (prism-tomorrow, already themed for the file viewer).
   const prismLang = FENCE_TO_PRISM[lang];
   const grammar = prismLang ? Prism.languages[prismLang] : undefined;
-  const highlighted = grammar ? Prism.highlight(text, grammar, prismLang) : null;
+  // Every streaming delta re-renders the whole Markdown tree — only
+  // re-tokenize when this block's text actually changed.
+  const highlighted = useMemo(
+    () => (grammar ? Prism.highlight(text, grammar, prismLang) : null),
+    [text, grammar, prismLang],
+  );
 
   return (
     <div
@@ -9743,7 +9788,7 @@ type ChangelogRelease = {
 };
 const CHANGELOG: ChangelogRelease[] = [
   {
-    version: "1.0.7",
+    version: "1.1.0",
     date: "August 18, 2026",
     sections: [
       {

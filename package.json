@@ -1,7 +1,7 @@
 {
   "name": "unbiased-app",
-  "version": "1.0.7",
-  "description": "Unbiased desktop — Pareto-powered coding agent",
+  "version": "1.1.0",
+  "description": "Unbiased desktop \u2014 Pareto-powered coding agent",
   "main": "out/main/index.js",
   "scripts": {
     "dev": "electron-vite dev",

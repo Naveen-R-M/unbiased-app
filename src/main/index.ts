@@ -79,6 +79,10 @@ type SubAgentInfo = {
   path: string; // engine agent path, e.g. /root/haiku_writer
   name: string; // last path segment — the model-chosen task name
   status: "running" | "idle" | "failed" | "interrupted";
+  // "Closed an agent" has fired for the current task (reset when the parent
+  // messages it again) — sub turns also end between queued mails, and those
+  // are not closures.
+  closedAnnounced?: boolean;
 };
 const subAgents = new Map<string, SubAgentInfo>();
 
@@ -86,7 +90,12 @@ const subAgents = new Map<string, SubAgentInfo>();
 // notifications (the engine emits one for every recorded item — the only
 // place the task text a sub-agent was given is visible to a client). Keyed
 // by the sub-agent's thread id; merged into its transcript by time.
-const subAgentMail = new Map<string, { at: number; author: string; text: string }[]>();
+// preDelivered marks a copy captured from the SENDER's raw call while the
+// engine still holds the mail queued; the drain-time copy consumes the flag
+// instead of duplicating, and a genuinely repeated identical message keeps
+// both entries.
+type MailEntry = { at: number; author: string; text: string; preDelivered?: boolean };
+const subAgentMail = new Map<string, MailEntry[]>();
 const MAIL_CAP = 200;
 
 // Spawn instructions captured from the parent's raw collaboration
@@ -108,6 +117,20 @@ const pendingNicknames = new Map<string, string>();
 // recorded on the sub thread until then; the pane shouldn't wait).
 const pendingMessagePrompts = new Map<string, string>();
 
+/** Every in-memory sub-agent structure is scoped to one engine process:
+ *  thread ids, queued approvals, and RPC ids all die with it. Called on
+ *  every engine (re)start so a stale roster can't outlive its engine. */
+function resetSubAgentState(): void {
+  subAgents.clear();
+  subAgentMail.clear();
+  pendingSpawnPrompts.clear();
+  pendingSpawnCalls.clear();
+  pendingNicknames.clear();
+  pendingMessagePrompts.clear();
+  heldApprovals.clear();
+  pendingApprovals.clear();
+}
+
 /** Strip the engine's inter-agent envelope ("Message Type: …\nTask name: …\n
  *  Sender: …\nPayload:\n<text>") down to the payload. */
 function interAgentPayload(text: string): { author: string | null; payload: string } {
@@ -118,9 +141,15 @@ function interAgentPayload(text: string): { author: string | null; payload: stri
 /** Locate a thread's rollout file under the engine home's sessions dir.
  *  Cached per thread — the filename embeds the thread id and never moves. */
 const rolloutPathCache = new Map<string, string>();
+// Misses are cached briefly too: before the engine's first flush (exactly
+// when activity is densest) every lookup would otherwise walk the entire
+// sessions tree, up to 4×/second from the debounced viewer refetch.
+const rolloutMissAt = new Map<string, number>();
 function findRolloutFile(threadId: string): string | null {
   const cached = rolloutPathCache.get(threadId);
   if (cached && existsSync(cached)) return cached;
+  const missAt = rolloutMissAt.get(threadId);
+  if (missAt !== undefined && Date.now() - missAt < 2000) return null;
   const engineHome =
     lastStatus.state === "connected"
       ? lastStatus.codexHome
@@ -150,7 +179,12 @@ function findRolloutFile(threadId: string): string | null {
     return null;
   };
   const found = walk(join(engineHome, "sessions"));
-  if (found) rolloutPathCache.set(threadId, found);
+  if (found) {
+    rolloutPathCache.set(threadId, found);
+    rolloutMissAt.delete(threadId);
+  } else {
+    rolloutMissAt.set(threadId, Date.now());
+  }
   return found;
 }
 
@@ -159,17 +193,29 @@ function findRolloutFile(threadId: string): string | null {
  *  threads STARTED with experimentalRawEvents (resume/fork hardcode it off
  *  at 0.147.0), but the engine persists every agent_message to the rollout
  *  before emitting anything. */
-function rolloutMail(threadId: string, path: string | null): { at: number; author: string; text: string }[] {
+const rolloutMailCache = new Map<string, { mtimeMs: number; size: number; mail: MailEntry[] }>();
+function rolloutMail(threadId: string, path: string | null): MailEntry[] {
   const file = findRolloutFile(threadId);
   if (!file) return [];
+  let st;
+  try {
+    st = statSync(file);
+  } catch {
+    return [];
+  }
+  if (st.size > 4_000_000) return []; // sub-agent rollouts are small; huge = not worth parsing
+  // The viewer refetches on every completed item; only re-parse when the
+  // file actually changed.
+  const cacheKey = `${file}::${path ?? ""}`;
+  const cached = rolloutMailCache.get(cacheKey);
+  if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size) return cached.mail.slice();
   let raw: string;
   try {
-    if (statSync(file).size > 4_000_000) return []; // sub-agent rollouts are small; huge = not worth parsing
     raw = readFileSync(file, "utf8");
   } catch {
     return [];
   }
-  const mail: { at: number; author: string; text: string }[] = [];
+  const all: { at: number; author: string; recipient: string; text: string; newTask: boolean }[] = [];
   for (const line of raw.split("\n")) {
     if (!line.includes('"agent_message"')) continue;
     try {
@@ -180,23 +226,35 @@ function rolloutMail(threadId: string, path: string | null): { at: number; autho
       };
       const pl = parsed.payload;
       if (parsed.type !== "response_item" || pl?.type !== "agent_message") continue;
-      if (path && pl.recipient !== path) continue; // only mail TO this agent
       const text = (pl.content ?? [])
         .filter((c) => c?.type === "input_text" && typeof c.text === "string")
         .map((c) => c.text as string)
         .join("\n");
       if (!text) continue;
       const { author, payload } = interAgentPayload(text);
-      mail.push({
+      all.push({
         at: parsed.timestamp ? Date.parse(parsed.timestamp) / 1000 : 0,
         author: author ?? pl.author ?? "",
+        recipient: pl.recipient ?? "",
         text: payload,
+        newTask: text.startsWith("Message Type: NEW_TASK"),
       });
     } catch {
       // unparseable line — skip
     }
   }
-  return mail.slice(0, MAIL_CAP);
+  // Only mail TO this agent. After an app restart the registry is empty and
+  // no path is known — but the spawn's NEW_TASK is addressed to this agent,
+  // so its recipient recovers the path (without it, the agent's own
+  // outbound reports would render as inbound bubbles).
+  const recipient = path ?? all.find((m) => m.newTask)?.recipient ?? null;
+  const mail: MailEntry[] = all
+    .filter((m) => !recipient || m.recipient === recipient)
+    .map(({ at, author, text }) => ({ at, author, text }));
+  // Keep the NEWEST entries, matching the live mailbox's retention.
+  const out = mail.slice(-MAIL_CAP);
+  rolloutMailCache.set(cacheKey, { mtimeMs: st.mtimeMs, size: st.size, mail: out });
+  return out.slice();
 }
 
 function subAgentsForParent(parent: string): { threadId: string; name: string; path: string; status: string }[] {
@@ -1271,8 +1329,11 @@ function wireNotifications(): void {
         ) {
           try {
             const args = JSON.parse(raw.arguments) as { task_name?: string; message?: string };
-            if (args.task_name && args.message) {
-              pendingSpawnPrompts.set(`${threadId}:${args.task_name}`, args.message);
+            // task_name can arrive path-formed ("/root/x") — key by the last
+            // segment, which is what registration looks up.
+            const task = args.task_name?.split("/").filter(Boolean).pop();
+            if (task && args.message) {
+              pendingSpawnPrompts.set(`${threadId}:${task}`, args.message);
             }
           } catch {
             // unparseable args — no prompt preview
@@ -1294,17 +1355,21 @@ function wireNotifications(): void {
             const task = args.target?.split("/").filter(Boolean).pop();
             if (task && args.message) {
               pendingMessagePrompts.set(`${threadId}:${task}`, args.message);
+              // The engine frees a closed agent's path for reuse, so the
+              // same name can refer to a dead thread AND a live successor —
+              // the LAST matching registration is the live one.
+              let target: string | null = null;
               for (const [subId, info] of subAgents) {
                 if (info.parent === threadId && (info.name === task || info.path.endsWith(`/${task}`))) {
-                  const box = subAgentMail.get(subId) ?? [];
-                  if (!box.some((m) => m.text === args.message)) {
-                    box.push({ at: Date.now() / 1000, author: "", text: args.message });
-                    if (box.length > MAIL_CAP) box.shift();
-                    subAgentMail.set(subId, box);
-                    send("chat:subagent-activity", { threadId: subId });
-                  }
-                  break;
+                  target = subId;
                 }
+              }
+              if (target) {
+                const box = subAgentMail.get(target) ?? [];
+                box.push({ at: Date.now() / 1000, author: "", text: args.message, preDelivered: true });
+                if (box.length > MAIL_CAP) box.shift();
+                subAgentMail.set(target, box);
+                send("chat:subagent-activity", { threadId: target });
               }
             }
           } catch {
@@ -1323,23 +1388,25 @@ function wireNotifications(): void {
               const parsed = JSON.parse(out.output) as { task_name?: string; nickname?: string };
               const task = parsed.task_name?.split("/").filter(Boolean).pop();
               if (parsed.nickname && task) {
-                let renamed = false;
-                for (const [subId, info] of subAgents) {
-                  if (info.parent === parent && info.name === task) {
-                    info.name = parsed.nickname;
-                    renamed = true;
-                    pushSubAgents(parent);
-                    const pane = paneForThread(parent);
-                    if (pane) {
-                      send("chat:subagent-event", {
-                        paneId: pane,
-                        event: "renamed",
-                        name: parsed.nickname,
-                        path: info.path,
-                        agentThreadId: subId,
-                      });
-                    }
-                    break;
+                // Path reuse: prefer the newest registration with this name.
+                let match: [string, SubAgentInfo] | null = null;
+                for (const entry of subAgents) {
+                  if (entry[1].parent === parent && entry[1].name === task) match = entry;
+                }
+                const renamed = match !== null;
+                if (match) {
+                  const [subId, info] = match;
+                  info.name = parsed.nickname;
+                  pushSubAgents(parent);
+                  const pane = paneForThread(parent);
+                  if (pane) {
+                    send("chat:subagent-event", {
+                      paneId: pane,
+                      event: "renamed",
+                      name: parsed.nickname,
+                      path: info.path,
+                      agentThreadId: subId,
+                    });
                   }
                 }
                 // Raws can precede subAgentActivity — stash for registration.
@@ -1360,8 +1427,14 @@ function wireNotifications(): void {
             const { author, payload } = interAgentPayload(text);
             const box = subAgentMail.get(threadId) ?? [];
             // Corrections are pre-delivered from the sender's raw call while
-            // the engine still has them queued — don't add a second copy.
-            if (!box.some((m) => m.text === payload)) {
+            // the engine still has them queued: the drain-time copy CONSUMES
+            // that flag rather than duplicating — and a repeated identical
+            // message (two flags) correctly keeps both entries.
+            const pending = box.find((m) => m.preDelivered && m.text === payload);
+            if (pending) {
+              delete pending.preDelivered;
+              if (author ?? raw.author) pending.author = author ?? raw.author ?? pending.author;
+            } else {
               box.push({ at: Date.now() / 1000, author: author ?? raw.author ?? "", text: payload });
               if (box.length > MAIL_CAP) box.shift();
               subAgentMail.set(threadId, box);
@@ -1440,8 +1513,28 @@ function wireNotifications(): void {
               path: p.agentPath,
               name,
               status: p.kind === "interrupted" ? "interrupted" : (existing?.status ?? "running"),
+              // A fresh task re-arms the closed-row announcement.
+              closedAnnounced: p.kind === "interacted" ? false : existing?.closedAnnounced,
             });
             pushSubAgents(threadId);
+            // An approval that raced ahead of this registration was held
+            // under the sub's own id, which no pane ever opens — re-route it
+            // to the parent now or the spawn hangs on it forever.
+            const stranded = heldApprovals.get(p.agentThreadId);
+            if (stranded) {
+              heldApprovals.delete(p.agentThreadId);
+              const parentPane = paneForThread(threadId);
+              for (const payload of stranded) {
+                const tagged = { ...payload, agentName: name };
+                if (parentPane) {
+                  send("chat:approval-request", { paneId: parentPane, ...tagged });
+                } else {
+                  const held = heldApprovals.get(threadId) ?? [];
+                  held.push(tagged);
+                  heldApprovals.set(threadId, held);
+                }
+              }
+            }
             // Lifecycle row in the parent's transcript, Codex-style
             // ("Created an agent" / "Messaged an agent" / …) — with the
             // spawn instructions when the raw call carried them.
@@ -1550,18 +1643,26 @@ function wireNotifications(): void {
           }
           const sub = subAgents.get(threadId);
           if (sub) {
-            sub.status = turn?.status === "failed" ? "failed" : "idle";
+            sub.status =
+              turn?.status === "failed" ? "failed" : turn?.status === "interrupted" ? "interrupted" : "idle";
             pushSubAgents(sub.parent);
             send("chat:subagent-activity", { threadId });
-            const parentPane = paneForThread(sub.parent);
-            if (parentPane) {
-              send("chat:subagent-event", {
-                paneId: parentPane,
-                event: turn?.status === "failed" ? "failed" : "completed",
-                name: sub.name,
-                path: sub.path,
-                agentThreadId: threadId,
-              });
+            // Closure/failure rows fire once per task — sub turns also end
+            // between queued mails, and an interrupted turn already tells
+            // its own story via the interrupt marker.
+            const isFailure = turn?.status === "failed";
+            if ((isFailure || turn?.status === "completed") && !sub.closedAnnounced) {
+              sub.closedAnnounced = true;
+              const parentPane = paneForThread(sub.parent);
+              if (parentPane) {
+                send("chat:subagent-event", {
+                  paneId: parentPane,
+                  event: isFailure ? "failed" : "completed",
+                  name: sub.name,
+                  path: sub.path,
+                  agentThreadId: threadId,
+                });
+              }
             }
           }
           if (!paneId && turn?.status === "failed") {
@@ -1683,6 +1784,7 @@ async function startEngine(): Promise<void> {
     engineWired = true;
   }
   engine.stop();
+  resetSubAgentState();
   engine.start(bin, { UNBIASED_API_KEY: stored.key });
 
   const result = await engine.handshake(app.getVersion());
@@ -2160,7 +2262,15 @@ app.whenReady().then(async () => {
     const result = (await engine.request("thread/list", { limit: 100 })) as { data?: WireThread[] };
     const record = loadProjects().find((r) => r.primary === path);
     const folders = record?.folders ?? [path];
-    const targets = (result.data ?? []).filter((t) => t.cwd && folders.includes(t.cwd));
+    // Match the sidebar's grouping exactly (threads:list): explicit
+    // assignment wins, then worktree→project mapping, then the thread's own
+    // cwd — so this archives precisely the chats listed under the project.
+    const worktrees = loadWorktrees();
+    const overrides = loadThreadProjects();
+    const targets = (result.data ?? []).filter((t) => {
+      const effective = overrides[t.id] ?? (t.cwd && worktrees[t.cwd] ? worktrees[t.cwd].project : t.cwd);
+      return !!effective && (effective === path || folders.includes(effective));
+    });
     for (const t of targets) {
       await engine.request("thread/archive", { threadId: t.id });
       if (panes.main.threadId === t.id) {
@@ -2342,8 +2452,15 @@ app.whenReady().then(async () => {
       // Rollout is the authoritative mail source (survives resume/restart);
       // live raw captures fill the gap before the rollout flushes.
       const mail = rolloutMail(id, info?.path ?? null);
+      // Live captures fill the gap before the rollout flushes. Dedupe by
+      // COUNT per text, not mere presence: the same text can legitimately be
+      // sent twice, and each rollout copy accounts for one live capture.
+      const rolloutCopies = new Map<string, number>();
+      for (const r of mail) rolloutCopies.set(r.text, (rolloutCopies.get(r.text) ?? 0) + 1);
       for (const m of subAgentMail.get(id) ?? []) {
-        if (!mail.some((r) => r.text === m.text)) mail.push(m);
+        const left = rolloutCopies.get(m.text) ?? 0;
+        if (left > 0) rolloutCopies.set(m.text, left - 1);
+        else mail.push(m);
       }
       // The sub-agent's thread FORKS the parent's visible history (user
       // prompts and the root's own replies), and thread/read returns those
@@ -2351,11 +2468,16 @@ app.whenReady().then(async () => {
       // the spawn — and the spawn moment IS the first mail's timestamp, so
       // anything earlier is forked parent history and dropped. The user
       // filter stays as a fallback for the no-mail case.
-      const spawnAt = mail.length > 0 ? Math.min(...mail.map((m) => Math.floor(m.at))) : null;
+      // Only stamped mail anchors the spawn moment — a timestamp-less
+      // rollout line would set spawnAt to 0 and disable the filter.
+      const stamped = mail.filter((m) => m.at > 0);
+      const spawnAt = stamped.length > 0 ? Math.min(...stamped.map((m) => Math.floor(m.at))) : null;
       const timeline: { t: number; mail: boolean; entries: unknown[] }[] = [];
       for (const turn of result.thread.turns ?? []) {
         const t = turn.startedAt ?? 0;
-        if (spawnAt !== null && t < spawnAt) continue; // forked parent history
+        // A turn without startedAt can't be classified — keep it rather
+        // than silently dropping the agent's replies.
+        if (spawnAt !== null && turn.startedAt != null && t < spawnAt) continue; // forked parent history
         const entries = threadToEntries({ ...result.thread, turns: [turn] }).filter(
           (e) => (e as { kind?: string }).kind !== "user",
         );
@@ -2868,6 +2990,25 @@ app.whenReady().then(async () => {
       } catch {
         // the delete below is the outcome that matters
       }
+    }
+    // Sub-agents run in their own sessions: stop and forget them with
+    // their parent, or they keep executing (and raising approvals) against
+    // a deleted conversation.
+    for (const [subId, info] of [...subAgents]) {
+      if (info.parent !== id) continue;
+      const subTurn = runningTurns.get(subId);
+      if (subTurn) {
+        try {
+          await engine.request("turn/interrupt", { threadId: subId, turnId: subTurn });
+        } catch {
+          // best-effort — the sub may have just finished
+        }
+      }
+      runningTurns.delete(subId);
+      subAgents.delete(subId);
+      subAgentMail.delete(subId);
+      heldApprovals.delete(subId);
+      bgStream.delete(subId);
     }
     runningTurns.delete(id);
     bgStream.delete(id);
