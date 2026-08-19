@@ -649,6 +649,11 @@ function toDisplayBlocks(entries: Entry[]): DisplayBlock[] {
 export function App() {
   const [theme, setTheme] = useState<ThemeConfig>(loadTheme);
   const [showSettings, setShowSettings] = useState(false);
+  const [showChangelog, setShowChangelog] = useState(false);
+  // Unread until the user has opened the log at its current top version.
+  const [changelogUnread, setChangelogUnread] = useState(
+    () => localStorage.getItem("changelogSeen") !== CHANGELOG[0].version,
+  );
   const [status, setStatus] = useState<EngineStatus>({ state: "starting" });
   // Sign-in gate: "checking" until we know, then either the login screen or
   // the app. A remembered session (prior successful login) with a stored key
@@ -1579,6 +1584,7 @@ export function App() {
         !sidePlusOpen &&
         !envOpen &&
         !showSettings &&
+        !showChangelog &&
         !confirmDialog &&
         !fullAccessPrompt &&
         !branchSwitch &&
@@ -1588,7 +1594,7 @@ export function App() {
         !moveDialog &&
         !editProj,
     );
-  }, [browserOpen, sideOpen, panelMode, sidePlusOpen, envOpen, showSettings, confirmDialog, fullAccessPrompt, branchSwitch, branchCreate, createProj, renameDialog, moveDialog, editProj]);
+  }, [browserOpen, sideOpen, panelMode, sidePlusOpen, envOpen, showSettings, showChangelog, confirmDialog, fullAccessPrompt, branchSwitch, branchCreate, createProj, renameDialog, moveDialog, editProj]);
 
   function openSideChatTab() {
     setSidePlusOpen(false);
@@ -2092,10 +2098,50 @@ export function App() {
             }
           />
         )}
-        <div style={{ padding: "4px 14px 2px", flexShrink: 0 }}>
-          <SidebarAction onClick={() => setShowSettings(true)} disabled={false} icon={<GearIcon />}>
-            Settings
-          </SidebarAction>
+        <div style={{ padding: "4px 14px 2px", flexShrink: 0, display: "flex", alignItems: "center", gap: 2 }}>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <SidebarAction onClick={() => setShowSettings(true)} disabled={false} icon={<GearIcon />}>
+              Settings
+            </SidebarAction>
+          </div>
+          <button
+            onClick={() => {
+              localStorage.setItem("changelogSeen", CHANGELOG[0].version);
+              setChangelogUnread(false);
+              setShowChangelog(true);
+            }}
+            title="What's new"
+            style={{
+              position: "relative",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              width: 30,
+              height: 30,
+              flexShrink: 0,
+              background: "transparent",
+              border: "none",
+              borderRadius: 8,
+              color: "var(--fg-soft)",
+              cursor: "pointer",
+            }}
+          >
+            <BellIcon />
+            {changelogUnread && (
+              <span
+                style={{
+                  position: "absolute",
+                  top: 5,
+                  right: 5,
+                  width: 7,
+                  height: 7,
+                  borderRadius: "50%",
+                  background: colors.accent,
+                  border: `1.5px solid ${colors.bg}`,
+                }}
+              />
+            )}
+          </button>
         </div>
         <ChatFooter status={status} busy={mainBusy} />
       </nav>
@@ -3799,6 +3845,7 @@ export function App() {
           </div>
         </div>
       )}
+      {showChangelog && <ChangelogModal onClose={() => setShowChangelog(false)} />}
       {createProj && (
         <div
           onMouseDown={(e) => {
@@ -9683,6 +9730,197 @@ function ShieldAlertIcon() {
       <path d="M12 8v4" />
       <path d="M12 16h.01" />
     </svg>
+  );
+}
+
+/** Release notes shown in the What's-new modal. Newest first; the top
+ *  entry's version doubles as the unread marker (localStorage
+ *  "changelogSeen"), so add new releases at the head. */
+type ChangelogRelease = {
+  version: string;
+  date: string;
+  sections: { title: string; items: string[] }[];
+};
+const CHANGELOG: ChangelogRelease[] = [
+  {
+    version: "1.0.7",
+    date: "August 18, 2026",
+    sections: [
+      {
+        title: "New",
+        items: [
+          "Sub-agents: the assistant can spawn parallel agents to split up a task. Each gets a nickname, shows up in the environment popover, and leaves lifecycle rows in the chat (“Created an agent”, “Messaged an agent”, “Closed an agent”).",
+          "Click a sub-agent’s name to open the agent-to-agent conversation in the side panel, rendered with the same formatting as the main chat.",
+          "A turn’s intermediate work now folds under a “Worked for …” header when it finishes, Codex-style.",
+          "Projects: create one from the + button in the sidebar, give it an icon and a color, and attach multiple folders with a primary.",
+          "Rename conversations, move them into projects, and delete conversations and worktrees from Settings → Resources.",
+          "The composer rotates through fresh placeholder prompts in existing chats.",
+          "New setting to keep the stored API key when signing out.",
+        ],
+      },
+      {
+        title: "Fixed",
+        items: [
+          "Code blocks are syntax-highlighted, and every copy button flashes a tick to confirm the copy.",
+          "Thinking and waiting status shimmer, and durations read as whole seconds.",
+          "A sub-agent’s permission request lands in the main chat naming the agent, and interrupting a chat now also stops its sub-agents and retires stale Allow/Deny cards.",
+          "Corrections sent to a busy sub-agent appear in its conversation immediately instead of after it finishes.",
+          "Long commands wrap inside their cards instead of stretching the chat.",
+          "Message timestamps appear when hovering the actions row.",
+        ],
+      },
+    ],
+  },
+  {
+    version: "1.0.6",
+    date: "August 17, 2026",
+    sections: [
+      {
+        title: "New",
+        items: ["The usage popover shows real credits and spend from your account."],
+      },
+      {
+        title: "Fixed",
+        items: ["New releases are noticed right away instead of waiting for the six-hour check."],
+      },
+    ],
+  },
+  {
+    version: "1.0.1 – 1.0.5",
+    date: "August 17, 2026",
+    sections: [
+      {
+        title: "New",
+        items: [
+          "In-app update banner with self-installing updates — downloads in the background, relaunches on demand.",
+          "The mascot joined the update banner.",
+        ],
+      },
+      {
+        title: "Fixed",
+        items: ["Installer reliability: staged installs and a macOS mount-point fix."],
+      },
+    ],
+  },
+  {
+    version: "1.0.0",
+    date: "August 17, 2026",
+    sections: [
+      {
+        title: "New",
+        items: [
+          "Initial release: chat with Pareto, worktrees, plan mode, the Review pane, an integrated terminal, an embedded browser with annotations, a real file viewer, and themes.",
+        ],
+      },
+    ],
+  },
+];
+
+function BellIcon() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9" />
+      <path d="M13.73 21a2 2 0 0 1-3.46 0" />
+    </svg>
+  );
+}
+
+function ChangelogModal({ onClose }: { onClose: () => void }) {
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        onClose();
+      }
+    }
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  return (
+    <div
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+      style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)", display: "grid", placeItems: "center", zIndex: 100 }}
+    >
+      <div
+        style={{
+          width: 620,
+          maxWidth: "calc(100vw - 48px)",
+          maxHeight: "min(720px, calc(100vh - 96px))",
+          display: "flex",
+          flexDirection: "column",
+          background: colors.panel,
+          border: `1px solid ${colors.border}`,
+          borderRadius: 16,
+          boxShadow: "0 16px 48px rgba(0,0,0,0.55)",
+          overflow: "hidden",
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "center", padding: "20px 24px 6px", flexShrink: 0 }}>
+          <div style={{ fontSize: 20, fontWeight: 650, color: colors.fg }}>What’s new</div>
+          <span style={{ flex: 1 }} />
+          <button
+            onClick={onClose}
+            title="Close"
+            style={{
+              width: 30,
+              height: 30,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              background: "transparent",
+              border: `1px solid ${colors.border}`,
+              borderRadius: 9,
+              color: colors.dim,
+              cursor: "pointer",
+              fontSize: 14,
+            }}
+          >
+            ×
+          </button>
+        </div>
+        <div style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: "6px 24px 22px" }}>
+          {CHANGELOG.map((rel, i) => (
+            <div key={rel.version}>
+              {i > 0 && <div style={{ height: 1, background: colors.border, margin: "22px 0" }} />}
+              <div style={{ display: "flex", alignItems: "center", margin: "10px 0 2px" }}>
+                <div style={{ fontSize: 16.5, fontWeight: 600, color: colors.fg }}>{rel.date}</div>
+                <span style={{ flex: 1 }} />
+                <span
+                  style={{
+                    fontFamily: "var(--font-code)",
+                    fontSize: 12,
+                    color: colors.dim,
+                    background: "var(--panel-2)",
+                    border: `1px solid ${colors.border}`,
+                    borderRadius: 7,
+                    padding: "2px 8px",
+                  }}
+                >
+                  {rel.version}
+                </span>
+              </div>
+              {rel.sections.map((sec) => (
+                <div key={sec.title}>
+                  <div style={{ color: colors.dim, fontSize: 11.5, letterSpacing: 1.1, textTransform: "uppercase", margin: "16px 0 2px" }}>
+                    {sec.title}
+                  </div>
+                  <ul style={{ margin: "6px 0 0", paddingLeft: 22 }}>
+                    {sec.items.map((it, j) => (
+                      <li key={j} style={{ margin: "8px 0", fontSize: 13.5, lineHeight: 1.55, color: "var(--fg-msg)" }}>
+                        {it}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ))}
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
   );
 }
 
