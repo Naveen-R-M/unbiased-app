@@ -19,7 +19,6 @@ import "prismjs/components/prism-yaml";
 import "prismjs/components/prism-sql";
 import "prismjs/components/prism-markdown";
 import "prismjs/themes/prism-tomorrow.css";
-import { DogMark } from "./DogMark";
 
 type EngineStatus =
   | { state: "starting" }
@@ -8539,20 +8538,6 @@ function UpdateBanner({
               : `Update to v${version}`;
   return (
     <div style={{ padding: "6px 14px 2px", flexShrink: 0 }}>
-      {/* The dog sits above the card; its resting paws overlap the top edge
-          so the card reads as the sign it's holding up. */}
-      <div
-        style={{
-          display: "flex",
-          justifyContent: "center",
-          marginBottom: -18,
-          pointerEvents: "none",
-          color: "var(--fg-soft)",
-        }}
-      >
-        {/* Tongue out once the update is downloaded and only a relaunch away. */}
-        <DogMark size={96} happy={staged && !error} />
-      </div>
       <button
         onClick={() => !busy && onAct()}
         disabled={busy}
@@ -8586,7 +8571,11 @@ function UpdateBanner({
             }}
           />
         )}
-        {/* No icon here — the pup above the card is the visual. */}
+        {/* Sad while an update is pending; happy once it's staged and a
+            relaunch away. */}
+        <span style={{ fontSize: 22, lineHeight: 1, flexShrink: 0, zIndex: 1 }} aria-hidden="true">
+          {staged && !error ? "😄" : "😞"}
+        </span>
         <span style={{ flex: 1, minWidth: 0, zIndex: 1 }}>
           <span
             style={{
