@@ -5288,12 +5288,98 @@ function AgentIcon() {
  *  the agent was GIVEN is not a thread item (it rides the engine's internal
  *  inter-agent channel), so the view shows the agent's side: its replies
  *  and the commands it runs. */
+/** Markdown component set shared by the main chat and the sub-agent pane —
+ *  same code blocks, file chips, links, and typography everywhere. */
+function buildMdComponents(
+  openFileRef: React.MutableRefObject<((path: string) => void) | undefined>,
+  openLink?: (url: string) => void,
+) {
+  return {
+    code: (props: { className?: string; children?: React.ReactNode }) => {
+      if (props.className) {
+        // Block code: the surrounding <pre> (CodeBlock) owns the chrome.
+        return <code style={{ fontFamily: "inherit", fontSize: "inherit" }}>{props.children}</code>;
+      }
+      const text = extractText(props.children);
+      // Only file references that ACTUALLY resolve are interactive — the
+      // chip verifies existence before dressing itself as a link.
+      return (
+        <InlineCodeChip text={text} openRef={openFileRef}>
+          {props.children}
+        </InlineCodeChip>
+      );
+    },
+    pre: (props: { children?: React.ReactNode }) => <CodeBlock>{props.children}</CodeBlock>,
+    a: (props: { href?: string; children?: React.ReactNode }) => (
+      <a
+        href={props.href}
+        onClick={(e) => {
+          e.preventDefault();
+          const href = props.href ?? "";
+          if (/^https?:/.test(href)) openLink?.(href);
+        }}
+        style={{ color: "var(--accent)", cursor: "pointer" }}
+        title="Open in browser tab"
+      >
+        {props.children}
+      </a>
+    ),
+    blockquote: (props: { children?: React.ReactNode }) => (
+      <blockquote
+        style={{
+          margin: "10px 0",
+          padding: "2px 12px",
+          borderLeft: `3px solid ${colors.accent}`,
+          // Same surface as the composer box; sized to its content.
+          background: colors.panel,
+          borderRadius: "0 8px 8px 0",
+          color: "var(--fg-msg)",
+          width: "fit-content",
+          maxWidth: "100%",
+        }}
+      >
+        {props.children}
+      </blockquote>
+    ),
+    p: (props: { children?: React.ReactNode }) => <p style={{ margin: "12px 0" }}>{props.children}</p>,
+    h1: (props: { children?: React.ReactNode }) => (
+      <h1 style={{ fontSize: "1.5em", fontWeight: 650, margin: "28px 0 12px", color: "var(--fg)" }}>
+        {props.children}
+      </h1>
+    ),
+    h2: (props: { children?: React.ReactNode }) => (
+      <h2 style={{ fontSize: "1.35em", fontWeight: 650, margin: "26px 0 12px", color: "var(--fg)" }}>
+        {props.children}
+      </h2>
+    ),
+    h3: (props: { children?: React.ReactNode }) => (
+      <h3 style={{ fontSize: "1.15em", fontWeight: 600, margin: "22px 0 10px", color: "var(--fg)" }}>
+        {props.children}
+      </h3>
+    ),
+    ul: (props: { children?: React.ReactNode }) => (
+      <ul style={{ margin: "10px 0", paddingLeft: 24 }}>{props.children}</ul>
+    ),
+    ol: (props: { children?: React.ReactNode }) => (
+      <ol style={{ margin: "10px 0", paddingLeft: 24 }}>{props.children}</ol>
+    ),
+    li: (props: { children?: React.ReactNode }) => <li style={{ margin: "7px 0" }}>{props.children}</li>,
+  };
+}
+
 function SubAgentPane({ threadId, name, status }: { threadId: string; name: string; status: string }) {
   const [entries, setEntries] = useState<Entry[]>([]);
   const [path, setPath] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [tail, setTail] = useState("");
   const scrollRef = useRef<HTMLDivElement>(null);
+  // No file viewer owns this pane, so chips stay non-interactive; links
+  // open in the system browser.
+  const noOpenFile = useRef<((path: string) => void) | undefined>(undefined);
+  const mdComponents = useMemo(
+    () => buildMdComponents(noOpenFile, (href) => void window.unbiased.openExternal(href)),
+    [],
+  );
 
   useEffect(() => {
     let alive = true;
@@ -5367,7 +5453,7 @@ function SubAgentPane({ threadId, name, status }: { threadId: string; name: stri
           if (e.kind === "assistant") {
             return (
               <div key={i} style={{ margin: "12px 0", lineHeight: 1.65, fontSize: 14, color: "var(--fg-msg)" }}>
-                <Markdown remarkPlugins={REMARK_PLUGINS}>{e.text}</Markdown>
+                <Markdown remarkPlugins={REMARK_PLUGINS} components={mdComponents}>{e.text}</Markdown>
               </div>
             );
           }
@@ -5422,7 +5508,7 @@ function SubAgentPane({ threadId, name, status }: { threadId: string; name: stri
         })}
         {tail !== "" && (
           <div style={{ margin: "12px 0", lineHeight: 1.65, fontSize: 14, color: "var(--fg-msg)" }}>
-            <Markdown remarkPlugins={REMARK_PLUGINS}>{tail}</Markdown>
+            <Markdown remarkPlugins={REMARK_PLUGINS} components={mdComponents}>{tail}</Markdown>
           </div>
         )}
         {status === "running" && (
@@ -6973,77 +7059,7 @@ function ChatPane({
   }, [selection]);
 
   const mdComponents = useMemo(
-    () => ({
-      code: (props: { className?: string; children?: React.ReactNode }) => {
-        if (props.className) {
-          // Block code: the surrounding <pre> (CodeBlock) owns the chrome.
-          return <code style={{ fontFamily: "inherit", fontSize: "inherit" }}>{props.children}</code>;
-        }
-        const text = extractText(props.children);
-        // Only file references that ACTUALLY resolve are interactive — the
-        // chip verifies existence before dressing itself as a link.
-        return (
-          <InlineCodeChip text={text} openRef={onOpenFileRef}>
-            {props.children}
-          </InlineCodeChip>
-        );
-      },
-      pre: (props: { children?: React.ReactNode }) => <CodeBlock>{props.children}</CodeBlock>,
-      a: (props: { href?: string; children?: React.ReactNode }) => (
-        <a
-          href={props.href}
-          onClick={(e) => {
-            e.preventDefault();
-            const href = props.href ?? "";
-            if (/^https?:/.test(href)) onOpenLinkRef.current?.(href);
-          }}
-          style={{ color: "var(--accent)", cursor: "pointer" }}
-          title="Open in browser tab"
-        >
-          {props.children}
-        </a>
-      ),
-      blockquote: (props: { children?: React.ReactNode }) => (
-        <blockquote
-          style={{
-            margin: "10px 0",
-            padding: "2px 12px",
-            borderLeft: `3px solid ${colors.accent}`,
-            // Same surface as the composer box; sized to its content.
-            background: colors.panel,
-            borderRadius: "0 8px 8px 0",
-            color: "var(--fg-msg)",
-            width: "fit-content",
-            maxWidth: "100%",
-          }}
-        >
-          {props.children}
-        </blockquote>
-      ),
-      p: (props: { children?: React.ReactNode }) => <p style={{ margin: "12px 0" }}>{props.children}</p>,
-      h1: (props: { children?: React.ReactNode }) => (
-        <h1 style={{ fontSize: "1.5em", fontWeight: 650, margin: "28px 0 12px", color: "var(--fg)" }}>
-          {props.children}
-        </h1>
-      ),
-      h2: (props: { children?: React.ReactNode }) => (
-        <h2 style={{ fontSize: "1.35em", fontWeight: 650, margin: "26px 0 12px", color: "var(--fg)" }}>
-          {props.children}
-        </h2>
-      ),
-      h3: (props: { children?: React.ReactNode }) => (
-        <h3 style={{ fontSize: "1.15em", fontWeight: 600, margin: "22px 0 10px", color: "var(--fg)" }}>
-          {props.children}
-        </h3>
-      ),
-      ul: (props: { children?: React.ReactNode }) => (
-        <ul style={{ margin: "10px 0", paddingLeft: 24 }}>{props.children}</ul>
-      ),
-      ol: (props: { children?: React.ReactNode }) => (
-        <ol style={{ margin: "10px 0", paddingLeft: 24 }}>{props.children}</ol>
-      ),
-      li: (props: { children?: React.ReactNode }) => <li style={{ margin: "7px 0" }}>{props.children}</li>,
-    }),
+    () => buildMdComponents(onOpenFileRef, (href) => onOpenLinkRef.current?.(href)),
     [],
   );
 
