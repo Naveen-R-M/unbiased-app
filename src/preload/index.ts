@@ -75,7 +75,7 @@ contextBridge.exposeInMainWorld("unbiased", {
   onSubAgentEvent: (cb: (p: unknown) => void) => subscribe("chat:subagent-event", cb),
   onMessageBoundary: (cb: (p: unknown) => void) => subscribe("chat:message-boundary", cb),
   chooseProject: () => ipcRenderer.invoke("project:choose"),
-  createProject: (name: string, parent?: string) => ipcRenderer.invoke("project:create", { name, parent }),
+  createProject: (record: unknown) => ipcRenderer.invoke("project:create", record),
   pickProjectLocation: () => ipcRenderer.invoke("project:pick-location"),
   renameThread: (threadId: string, name: string) => ipcRenderer.invoke("threads:rename", { threadId, name }),
   assignThreadProject: (threadId: string, projectPath: string) =>

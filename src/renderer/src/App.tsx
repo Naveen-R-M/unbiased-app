@@ -392,7 +392,13 @@ declare global {
       ) => () => void;
       onMessageBoundary: (cb: (p: { paneId: PaneId }) => void) => () => void;
       chooseProject: () => Promise<{ path: string | null; name: string | null }>;
-      createProject: (name: string, parent?: string) => Promise<{ path: string | null; name: string | null; error?: string }>;
+      createProject: (record: {
+        name: string;
+        folders: string[];
+        primary: string;
+        icon: string;
+        color: string | null;
+      }) => Promise<{ path: string | null; name: string | null; error?: string }>;
       pickProjectLocation: () => Promise<{ path: string | null }>;
       renameThread: (threadId: string, name: string) => Promise<{ ok: boolean; error?: string }>;
       assignThreadProject: (threadId: string, projectPath: string) => Promise<{ ok: boolean }>;
@@ -758,11 +764,12 @@ export function App() {
   } | null>(null);
 
   // Create-project modal (the + beside the Projects section header).
-  const [createProj, setCreateProj] = useState<{ name: string; parent: string | null; error: string | null } | null>(null);
-  // Edit-project modal (Codex-style): name, icon+color picker, source
-  // folders with a primary, remove.
+  // Create/edit-project modal (Codex-style): name, icon+color picker,
+  // source folders with a primary, remove. Create and edit share the one
+  // surface; create just starts blank and lands on project:create.
   const [editProj, setEditProj] = useState<{
-    path: string; // the record's primary at open time — the update key
+    mode: "create" | "edit";
+    path: string; // edit: the record's primary at open time — the update key
     name: string;
     folders: string[];
     primary: string;
@@ -798,10 +805,9 @@ export function App() {
   }, [threadMenu]);
 
   useEffect(() => {
-    if (!createProj && !renameDialog && !moveDialog && !editProj) return;
+    if (!renameDialog && !moveDialog && !editProj) return;
     function onKey(e: KeyboardEvent) {
       if (e.key === "Escape") {
-        setCreateProj(null);
         setRenameDialog(null);
         setMoveDialog(null);
         setEditProj((cur) => (cur?.pickerOpen ? { ...cur, pickerOpen: false } : null));
@@ -809,10 +815,32 @@ export function App() {
     }
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
-  }, [createProj, renameDialog, moveDialog, editProj]);
+  }, [renameDialog, moveDialog, editProj]);
 
   async function doSaveProject() {
     if (!editProj) return;
+    if (editProj.mode === "create") {
+      if (!editProj.name.trim()) return;
+      const r = await window.unbiased.createProject({
+        name: editProj.name.trim(),
+        folders: editProj.folders,
+        primary: editProj.primary,
+        icon: editProj.icon,
+        color: editProj.color,
+      });
+      if (!r.path || !r.name) {
+        setEditProj((e) => (e ? { ...e, error: r.error ?? "Couldn't create the project" } : e));
+        return;
+      }
+      setEditProj(null);
+      setActiveProject({ name: r.name, path: r.path });
+      setActiveThreadId(null);
+      setMainStarted(false);
+      setMainReset((r2) => ({ entries: [], nonce: r2.nonce + 1 }));
+      resetSideView();
+      void refreshThreads();
+      return;
+    }
     const r = await window.unbiased.updateProject(editProj.path, {
       name: editProj.name,
       folders: editProj.folders,
@@ -828,22 +856,6 @@ export function App() {
       setActiveProject({ name: editProj.name.trim() || activeProject.name, path: editProj.primary });
     }
     setEditProj(null);
-    void refreshThreads();
-  }
-
-  async function doCreateProject() {
-    if (!createProj || !createProj.name.trim()) return;
-    const r = await window.unbiased.createProject(createProj.name.trim(), createProj.parent ?? undefined);
-    if (!r.path || !r.name) {
-      setCreateProj((c) => (c ? { ...c, error: r.error ?? "Couldn't create the project" } : c));
-      return;
-    }
-    setCreateProj(null);
-    setActiveProject({ name: r.name, path: r.path });
-    setActiveThreadId(null);
-    setMainStarted(false);
-    setMainReset((r2) => ({ entries: [], nonce: r2.nonce + 1 }));
-    resetSideView();
     void refreshThreads();
   }
 
@@ -1592,12 +1604,11 @@ export function App() {
         !fullAccessPrompt &&
         !branchSwitch &&
         !branchCreate &&
-        !createProj &&
         !renameDialog &&
         !moveDialog &&
         !editProj,
     );
-  }, [browserOpen, sideOpen, panelMode, sidePlusOpen, envOpen, showSettings, showChangelog, confirmDialog, fullAccessPrompt, branchSwitch, branchCreate, createProj, renameDialog, moveDialog, editProj]);
+  }, [browserOpen, sideOpen, panelMode, sidePlusOpen, envOpen, showSettings, showChangelog, confirmDialog, fullAccessPrompt, branchSwitch, branchCreate, renameDialog, moveDialog, editProj]);
 
   function openSideChatTab() {
     setSidePlusOpen(false);
@@ -1894,7 +1905,19 @@ export function App() {
               </SectionLabel>
             </div>
             <button
-              onClick={() => setCreateProj({ name: "", parent: null, error: null })}
+              onClick={() =>
+                setEditProj({
+                  mode: "create",
+                  path: "",
+                  name: "",
+                  folders: [],
+                  primary: "",
+                  icon: "folder",
+                  color: null,
+                  pickerOpen: false,
+                  error: null,
+                })
+              }
               title="Create project"
               aria-label="Create project"
               style={{
@@ -2006,6 +2029,7 @@ export function App() {
                           onClick={() => {
                             setProjMenu(null);
                             setEditProj({
+                              mode: "edit",
                               path: p.path,
                               name: p.name,
                               folders: p.folders ?? [p.path],
@@ -3614,7 +3638,9 @@ export function App() {
             >
               <CloseIcon />
             </button>
-            <div style={{ fontSize: 18, fontWeight: 600, color: colors.fg }}>Edit project</div>
+            <div style={{ fontSize: 18, fontWeight: 600, color: colors.fg }}>
+              {editProj.mode === "create" ? "Create project" : "Edit project"}
+            </div>
             {/* Name row: icon button (opens the identity picker) + name input */}
             <div
               style={{
@@ -3648,8 +3674,12 @@ export function App() {
                 <ProjectIcon icon={editProj.icon} color={editProj.color} size={18} />
               </button>
               <input
+                autoFocus={editProj.mode === "create"}
                 value={editProj.name}
                 onChange={(e) => setEditProj({ ...editProj, name: e.target.value, error: null })}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && editProj.name.trim()) void doSaveProject();
+                }}
                 placeholder="Project name"
                 spellCheck={false}
                 style={{
@@ -3767,20 +3797,23 @@ export function App() {
                   )}
                   <button
                     onClick={() => {
-                      if (editProj.folders.length === 1) return;
+                      // An existing project keeps at least one folder; a new
+                      // one may go back to empty (fresh folder on create).
+                      const locked = editProj.mode === "edit" && editProj.folders.length === 1;
+                      if (locked) return;
                       const folders = editProj.folders.filter((x) => x !== f);
                       setEditProj({
                         ...editProj,
                         folders,
-                        primary: editProj.primary === f ? folders[0] : editProj.primary,
+                        primary: editProj.primary === f ? (folders[0] ?? "") : editProj.primary,
                       });
                     }}
                     aria-label={`Remove ${f}`}
                     style={{
                       background: "transparent",
                       border: "none",
-                      color: editProj.folders.length === 1 ? "var(--gutter)" : colors.dim,
-                      cursor: editProj.folders.length === 1 ? "default" : "pointer",
+                      color: editProj.mode === "edit" && editProj.folders.length === 1 ? "var(--gutter)" : colors.dim,
+                      cursor: editProj.mode === "edit" && editProj.folders.length === 1 ? "default" : "pointer",
                       padding: 2,
                       display: "flex",
                       flexShrink: 0,
@@ -3790,11 +3823,20 @@ export function App() {
                   </button>
                 </div>
               ))}
+              {editProj.mode === "create" && editProj.folders.length === 0 && (
+                <div style={{ padding: "11px 14px", fontSize: 12.5, color: colors.dim }}>
+                  No folders yet — a new folder named after the project is created in your home directory.
+                </div>
+              )}
               <button
                 onClick={() =>
                   void window.unbiased.pickProjectLocation().then((r) => {
                     if (r.path && !editProj.folders.includes(r.path)) {
-                      setEditProj((e) => (e ? { ...e, folders: [...e.folders, r.path!] } : e));
+                      setEditProj((e) =>
+                        e
+                          ? { ...e, folders: [...e.folders, r.path!], primary: e.primary || r.path! }
+                          : e,
+                      );
                     }
                   })
                 }
@@ -3820,17 +3862,19 @@ export function App() {
             </div>
             {editProj.error && <div style={{ color: colors.err, fontSize: 13, marginTop: 10 }}>{editProj.error}</div>}
             <div style={{ display: "flex", alignItems: "center", gap: 12, marginTop: 20 }}>
-              <button
-                onClick={() => {
-                  const path = editProj.path;
-                  const name = editProj.name;
-                  setEditProj(null);
-                  setConfirmDialog({ kind: "remove", path, name, count: 0 });
-                }}
-                style={{ background: "rgba(240, 149, 149, 0.14)", border: "none", borderRadius: 10, color: colors.err, fontSize: 13.5, cursor: "pointer", fontFamily: "inherit", padding: "9px 16px" }}
-              >
-                Remove local project
-              </button>
+              {editProj.mode === "edit" && (
+                <button
+                  onClick={() => {
+                    const path = editProj.path;
+                    const name = editProj.name;
+                    setEditProj(null);
+                    setConfirmDialog({ kind: "remove", path, name, count: 0 });
+                  }}
+                  style={{ background: "rgba(240, 149, 149, 0.14)", border: "none", borderRadius: 10, color: colors.err, fontSize: 13.5, cursor: "pointer", fontFamily: "inherit", padding: "9px 16px" }}
+                >
+                  Remove local project
+                </button>
+              )}
               <span style={{ flex: 1 }} />
               <button
                 onClick={() => setEditProj(null)}
@@ -3840,123 +3884,26 @@ export function App() {
               </button>
               <button
                 onClick={() => void doSaveProject()}
-                style={{ background: colors.fg, border: "none", borderRadius: 999, color: "var(--bg)", fontSize: 14, fontWeight: 500, cursor: "pointer", fontFamily: "inherit", padding: "9px 20px" }}
+                disabled={!editProj.name.trim()}
+                style={{
+                  background: editProj.name.trim() ? colors.fg : "var(--panel-2)",
+                  border: "none",
+                  borderRadius: 999,
+                  color: editProj.name.trim() ? "var(--bg)" : colors.dim,
+                  fontSize: 14,
+                  fontWeight: 500,
+                  cursor: editProj.name.trim() ? "pointer" : "default",
+                  fontFamily: "inherit",
+                  padding: "9px 20px",
+                }}
               >
-                Save
+                {editProj.mode === "create" ? "Create project" : "Save"}
               </button>
             </div>
           </div>
         </div>
       )}
       {showChangelog && <ChangelogModal onClose={() => setShowChangelog(false)} />}
-      {createProj && (
-        <div
-          onMouseDown={(e) => {
-            if (e.target === e.currentTarget) setCreateProj(null);
-          }}
-          style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)", display: "grid", placeItems: "center", zIndex: 100 }}
-        >
-          <div
-            style={{
-              width: 480,
-              maxWidth: "calc(100vw - 48px)",
-              background: colors.panel,
-              border: `1px solid ${colors.border}`,
-              borderRadius: 16,
-              padding: "22px 24px 20px",
-              boxShadow: "0 16px 48px rgba(0,0,0,0.55)",
-            }}
-          >
-            <div style={{ fontSize: 18, fontWeight: 600, color: colors.fg }}>Create project</div>
-            <div style={{ color: colors.dim, fontSize: 13.5, margin: "16px 0 8px" }}>Project name</div>
-            <input
-              autoFocus
-              value={createProj.name}
-              onChange={(e) => setCreateProj({ ...createProj, name: e.target.value, error: null })}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && createProj.name.trim()) void doCreateProject();
-              }}
-              placeholder="my-new-project"
-              spellCheck={false}
-              style={{
-                width: "100%",
-                boxSizing: "border-box",
-                background: "var(--panel-2)",
-                border: `1px solid ${colors.border}`,
-                borderRadius: 10,
-                padding: "10px 12px",
-                color: colors.fg,
-                fontSize: 14,
-                outline: "none",
-                fontFamily: "var(--font-code)",
-              }}
-            />
-            <div style={{ color: colors.dim, fontSize: 13.5, margin: "14px 0 6px" }}>Location</div>
-            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-              <span
-                style={{
-                  flex: 1,
-                  minWidth: 0,
-                  fontFamily: "var(--font-code)",
-                  fontSize: 12.5,
-                  color: colors.dim,
-                  whiteSpace: "nowrap",
-                  overflow: "hidden",
-                  textOverflow: "ellipsis",
-                }}
-              >
-                {(createProj.parent ?? "~") + "/" + (createProj.name.trim() || "…")}
-              </span>
-              <button
-                onClick={() =>
-                  void window.unbiased.pickProjectLocation().then((r) => {
-                    if (r.path) setCreateProj((c) => (c ? { ...c, parent: r.path } : c));
-                  })
-                }
-                style={{
-                  background: "transparent",
-                  border: `1px solid ${colors.border}`,
-                  color: colors.fg,
-                  borderRadius: 8,
-                  padding: "5px 12px",
-                  fontSize: 12.5,
-                  cursor: "pointer",
-                  fontFamily: "inherit",
-                  flexShrink: 0,
-                }}
-              >
-                Choose…
-              </button>
-            </div>
-            {createProj.error && <div style={{ color: colors.err, fontSize: 13, marginTop: 10 }}>{createProj.error}</div>}
-            <div style={{ display: "flex", justifyContent: "flex-end", gap: 12, marginTop: 20 }}>
-              <button
-                onClick={() => setCreateProj(null)}
-                style={{ background: "var(--chip)", border: "none", borderRadius: 999, color: colors.fg, fontSize: 14, cursor: "pointer", fontFamily: "inherit", padding: "9px 18px" }}
-              >
-                Cancel
-              </button>
-              <button
-                onClick={() => void doCreateProject()}
-                disabled={!createProj.name.trim()}
-                style={{
-                  background: createProj.name.trim() ? colors.fg : "var(--panel-2)",
-                  border: "none",
-                  borderRadius: 999,
-                  color: createProj.name.trim() ? "var(--bg)" : colors.dim,
-                  fontSize: 14,
-                  fontWeight: 500,
-                  cursor: createProj.name.trim() ? "pointer" : "default",
-                  fontFamily: "inherit",
-                  padding: "9px 18px",
-                }}
-              >
-                Create project
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
       {renameDialog && (
         <div
           onMouseDown={(e) => {
