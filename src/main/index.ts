@@ -29,7 +29,9 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
-import { execFile, execFileSync } from "node:child_process";
+import { execFile, execFileSync, spawn as spawnProcess } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
+import { get as httpGet } from "node:http";
 import { EngineClient, engineVersionFromUserAgent, type EngineStatus } from "./engine";
 import { spawn as ptySpawn, type IPty } from "@lydell/node-pty";
 
@@ -90,6 +92,85 @@ function defaultChatDir(): string {
 // agent their signed-in sessions rather than public pages.
 const browserNetGrants = new Set<string>();
 const browserConnectGrants = new Set<string>();
+// Unbiased's own Chrome, launched on demand once the user approves session
+// access. It CANNOT be their everyday profile: since Chrome 136 the browser
+// refuses remote debugging on the default user-data-dir, so we keep a
+// persistent profile of our own — signed into once, reused forever after.
+const AGENT_CHROME_PORT = 9222;
+function agentChromeProfile(): string {
+  return join(app.getPath("home"), ".unbiased", "chrome-profile");
+}
+const CHROME_BINARIES = [
+  "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+  "/Applications/Chromium.app/Contents/MacOS/Chromium",
+  "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+  "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+];
+let managedChrome: ChildProcess | null = null;
+
+/** Is something speaking the DevTools protocol on this port? */
+function cdpAlive(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const req = httpGet({ host: "127.0.0.1", port, path: "/json/version", timeout: 1200 }, (res) => {
+      res.resume();
+      resolve((res.statusCode ?? 500) < 400);
+    });
+    req.on("timeout", () => {
+      req.destroy();
+      resolve(false);
+    });
+    req.on("error", () => resolve(false));
+  });
+}
+
+const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** Attach target for browser_connect: an already-debuggable browser if one is
+ *  listening (including one the user started themselves), otherwise our own
+ *  Chrome, launched here so the user never has to run a terminal command. */
+async function ensureAgentChrome(
+  port: number,
+): Promise<{ ok: boolean; launched: boolean; firstRun: boolean; error?: string }> {
+  if (await cdpAlive(port)) return { ok: true, launched: false, firstRun: false };
+  const bin = CHROME_BINARIES.find((b) => existsSync(b));
+  if (!bin) {
+    return {
+      ok: false,
+      launched: false,
+      firstRun: false,
+      error: "No Chrome/Chromium install found in /Applications.",
+    };
+  }
+  const profile = agentChromeProfile();
+  const firstRun = !existsSync(profile);
+  try {
+    mkdirSync(profile, { recursive: true });
+  } catch (err) {
+    return { ok: false, launched: false, firstRun, error: `Could not create ${profile}: ${String(err)}` };
+  }
+  // Visible on purpose: the user signs in here and watches the agent work.
+  managedChrome = spawnProcess(
+    bin,
+    [
+      `--remote-debugging-port=${port}`,
+      `--user-data-dir=${profile}`,
+      "--no-first-run",
+      "--no-default-browser-check",
+      "about:blank",
+    ],
+    { stdio: "ignore" },
+  );
+  managedChrome.on("exit", () => {
+    managedChrome = null;
+    browserAttached = false;
+  });
+  for (let tries = 0; tries < 24; tries++) {
+    await wait(500);
+    if (await cdpAlive(port)) return { ok: true, launched: true, firstRun };
+  }
+  return { ok: false, launched: true, firstRun, error: `Chrome started but never opened port ${port}.` };
+}
+
 // True while driving the user's Chrome: close must not take their tabs down.
 let browserAttached = false;
 
@@ -220,7 +301,7 @@ const AGENT_BROWSER_TOOLS = [
     type: "function",
     name: "browser_connect",
     description:
-      "Attach to the user's OWN Chrome so you can use pages they are already signed into (their X timeline, mail, dashboards). This always needs the user's explicit approval, and their Chrome must be running with remote debugging enabled — the tool explains how if it is not. Only reach for this when the task genuinely needs their account; prefer browser_search and public pages. While attached, browser_close leaves their browser open.",
+      "Get a signed-in browser session. Use this when the task needs the user's OWN accounts — their email, their X timeline, a dashboard or admin panel, anything behind a login — where no public page can answer. Always asks the user for approval first; on approval the app opens a browser window itself (no terminal steps for the user) and attaches to it. The first time, that window is not signed in yet: say so and ask the user to sign in there, then carry on. Prefer browser_search for anything public. While attached, browser_close leaves the browser open.",
     inputSchema: {
       type: "object",
       properties: { port: { type: "string", description: "CDP port or ws:// URL (default 9222)" } },
@@ -305,9 +386,9 @@ async function ensureBrowserAllowed(tool: string, threadId: string | null, detai
   }
   const decision = await requestLocalApproval(
     threadId,
-    attaching ? `Attach to your Chrome browser (${detail})` : `Browse the web — ${detail}`,
+    attaching ? "Use a signed-in browser session" : `Browse the web — ${detail}`,
     attaching
-      ? "The agent wants to drive your own Chrome, including everything you are signed into (mail, X, dashboards, internal tools). Allow only if you want it acting with those accounts."
+      ? "The agent wants a browser it can use as you — reading pages you are signed into (mail, X, dashboards, internal tools). Approving opens an Unbiased-managed Chrome window; anything you sign into there stays available to the agent. Allow only if you want it acting with those accounts."
       : "The agent wants to use the browser, which reaches the network. This conversation is in Ask-for-approval mode, so nothing goes out until you allow it.",
   );
   if (decision === "decline") {
@@ -391,19 +472,42 @@ async function handleAgentBrowserCall(
       );
     }
     case "browser_connect": {
-      const target = str("port") || "9222";
-      const r = await runAgentBrowser(["connect", target], 30_000);
+      const port = Number(str("port")) || AGENT_CHROME_PORT;
+      // Approved above — now make a debuggable browser exist. Nothing for the
+      // user to run: an already-listening browser is reused, otherwise we
+      // start Unbiased's own Chrome and wait for its port.
+      const ready = await ensureAgentChrome(port);
+      if (!ready.ok) {
+        return text(
+          `Could not start a browser session: ${ready.error ?? "unknown error"}. ` +
+            "Use browser_search and public pages instead.",
+          false,
+        );
+      }
+      const r = await runAgentBrowser(["connect", String(port)], 30_000);
       // `connect` exits 0 even when discovery fails, so read the output.
-      if (r.ok && !/✗|failed|refused|error/i.test(r.out)) {
-        browserAttached = true;
-        return text(`${r.out || "connected"}\n\n[note] You are now driving the user's own Chrome.`, true);
+      if (!r.ok || /✗|failed|refused/i.test(r.out)) {
+        return text(`Attach failed on port ${port}: ${r.out || "no detail"}`, false);
+      }
+      browserAttached = true;
+      if (ready.launched && ready.firstRun) {
+        return text(
+          "Attached to a freshly created Unbiased Chrome profile — a browser window is now open on the " +
+            "user's screen, but it is NOT signed into anything yet (Chrome refuses remote debugging on their " +
+            "everyday profile, so this is a separate profile that persists for next time). Tell the user to " +
+            "sign in to the site you need in that new window, then continue. Do not guess credentials or ask " +
+            "them to type any password to you.",
+          true,
+        );
       }
       return text(
-        `Could not attach to a debuggable Chrome on ${target}. Chrome does not expose remote debugging by ` +
-          "default, and it will not enable it for a profile that is already open. Ask the user to quit Chrome " +
-          'completely and relaunch it with:\n\n  open -na "Google Chrome" --args --remote-debugging-port=9222\n\n' +
-          "then call browser_connect again. Until then, use browser_search and public pages.",
-        false,
+        (ready.launched
+          ? "Attached to Unbiased's Chrome (a window is open on the user's screen). Sessions signed in " +
+            "there previously are available."
+          : "Attached to the browser already listening on this port.") +
+          " If a page comes back signed out, ask the user to sign in in that window rather than looking for " +
+          "another way around it.",
+        true,
       );
     }
     case "browser_click": {
@@ -3610,5 +3714,7 @@ app.on("window-all-closed", () => {
   // The agent browser's daemon outlives us otherwise — close every session.
   const bin = agentBrowserBinCache;
   if (bin && !browserAttached) execFile(bin, ["close", "--all"], () => {});
+  // Our own Chrome goes with us; its profile (and logins) persist on disk.
+  managedChrome?.kill();
   app.quit();
 });
