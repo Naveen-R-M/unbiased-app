@@ -1202,8 +1202,8 @@ const ANNOTATE_PICKER = `
 
 /** Run the picker in the browser page; forward a completed pick to the
  *  renderer as a main-composer annotation carrying page provenance. */
-async function startAnnotatePicker(): Promise<void> {
-  const wc = browserView?.webContents;
+async function startAnnotatePicker(id: number): Promise<void> {
+  const wc = browserViews.get(id)?.webContents;
   if (!wc || wc.isDestroyed()) return;
   try {
     const result = (await wc.executeJavaScript(ANNOTATE_PICKER, true)) as {
@@ -1234,20 +1234,23 @@ async function startAnnotatePicker(): Promise<void> {
   }
 }
 
-// The embedded browser: a sandboxed WebContentsView layered over the side
-// panel. The renderer owns the toolbar and reports the placeholder's
-// bounds; this side owns navigation and pushes state back.
-let browserView: WebContentsView | null = null;
+// The embedded browser: sandboxed WebContentsViews layered over the side
+// panel, one per renderer browser tab, keyed by the tab's id. The renderer
+// owns the toolbars and reports each placeholder's bounds; this side owns
+// navigation and pushes state back tagged with the id.
+const browserViews = new Map<number, WebContentsView>();
 
-function ensureBrowserView(): WebContentsView {
-  if (browserView) return browserView;
+function ensureBrowserView(id: number): WebContentsView {
+  const existing = browserViews.get(id);
+  if (existing) return existing;
   const view = new WebContentsView({ webPreferences: { sandbox: true } });
-  browserView = view;
+  browserViews.set(id, view);
   win?.contentView.addChildView(view);
   const wc = view.webContents;
   const pushState = () => {
     if (wc.isDestroyed()) return;
     send("browser:state", {
+      id,
       url: wc.getURL(),
       title: wc.getTitle(),
       canGoBack: wc.navigationHistory.canGoBack(),
@@ -1260,7 +1263,7 @@ function ensureBrowserView(): WebContentsView {
   wc.on("page-title-updated", pushState);
   wc.on("did-start-loading", pushState);
   wc.on("did-stop-loading", pushState);
-  // Popups/new-tab links load in the same pane — there is one pane.
+  // Popups/new-tab links load in the same view — tabs are renderer-owned.
   wc.setWindowOpenHandler(({ url }) => {
     if (/^https?:/.test(url)) void wc.loadURL(url);
     return { action: "deny" };
@@ -1277,7 +1280,7 @@ function ensureBrowserView(): WebContentsView {
         : link
           ? { label: "Quick annotate", click: () => send("browser:annotate", { text: link, tag: "link" }) }
           : null,
-      { label: "Annotate", click: () => void startAnnotatePicker() },
+      { label: "Annotate", click: () => void startAnnotatePicker(id) },
       { type: "separator" },
       link ? { label: "Open link", click: () => void wc.loadURL(link) } : null,
       link ? { label: "Open in external browser", click: () => void shell.openExternal(link) } : null,
@@ -2587,31 +2590,31 @@ app.whenReady().then(async () => {
     };
   });
 
-  ipcMain.handle("browser:open", (_e, url?: string) => {
-    const view = ensureBrowserView();
-    if (url) void view.webContents.loadURL(url);
+  ipcMain.handle("browser:open", (_e, p: { id: number; url?: string }) => {
+    const view = ensureBrowserView(p.id);
+    if (p.url) void view.webContents.loadURL(p.url);
     return { ok: true };
   });
 
-  ipcMain.handle("browser:bounds", (_e, b: { x: number; y: number; width: number; height: number }) => {
+  ipcMain.handle("browser:bounds", (_e, p: { id: number; x: number; y: number; width: number; height: number }) => {
     // The renderer measures in its own CSS pixels; setBounds wants window
     // DIPs. They differ by the page zoom factor (Cmd+= / Cmd+-), so an
     // unzoomed conversion strands the view at the wrong spot and size.
     const z = win?.webContents.getZoomFactor() ?? 1;
-    ensureBrowserView().setBounds({
-      x: Math.round(b.x * z),
-      y: Math.round(b.y * z),
-      width: Math.max(0, Math.round(b.width * z)),
-      height: Math.max(0, Math.round(b.height * z)),
+    ensureBrowserView(p.id).setBounds({
+      x: Math.round(p.x * z),
+      y: Math.round(p.y * z),
+      width: Math.max(0, Math.round(p.width * z)),
+      height: Math.max(0, Math.round(p.height * z)),
     });
   });
 
-  ipcMain.handle("browser:visible", (_e, visible: boolean) => {
-    browserView?.setVisible(visible);
+  ipcMain.handle("browser:visible", (_e, p: { id: number; visible: boolean }) => {
+    browserViews.get(p.id)?.setVisible(p.visible);
   });
 
-  ipcMain.handle("browser:navigate", (_e, p: { url?: string; action?: "back" | "forward" | "reload" }) => {
-    const wc = browserView?.webContents;
+  ipcMain.handle("browser:navigate", (_e, p: { id: number; url?: string; action?: "back" | "forward" | "reload" }) => {
+    const wc = browserViews.get(p.id)?.webContents;
     if (!wc) return;
     if (p.url) {
       const url = /^[a-z][a-z0-9+.-]*:/i.test(p.url) ? p.url : `https://${p.url}`;
@@ -2625,16 +2628,17 @@ app.whenReady().then(async () => {
     }
   });
 
-  ipcMain.handle("browser:annotate-mode", () => {
-    void startAnnotatePicker();
+  ipcMain.handle("browser:annotate-mode", (_e, id: number) => {
+    void startAnnotatePicker(id);
     return { ok: true };
   });
 
-  ipcMain.handle("browser:close", () => {
-    if (browserView) {
-      win?.contentView.removeChildView(browserView);
-      browserView.webContents.close();
-      browserView = null;
+  ipcMain.handle("browser:close", (_e, id: number) => {
+    const view = browserViews.get(id);
+    if (view) {
+      browserViews.delete(id);
+      win?.contentView.removeChildView(view);
+      view.webContents.close();
     }
   });
 
