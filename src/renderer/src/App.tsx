@@ -1303,6 +1303,61 @@ export function App() {
   // The side chat is attached to the main conversation (it forks from it),
   // so every main-context switch discards the side pane's transcript too —
   // and any open file, which resolved against the previous conversation.
+  // The side panel's composition belongs to the conversation it was built
+  // for — leaving and returning should find the same tabs. Snapshots are
+  // keyed by thread id; terminals are excluded (their PTYs die on unmount,
+  // and a silently respawned shell is worse than a closed tab).
+  const sidePanelSnapshots = useRef(
+    new Map<
+      string,
+      {
+        openAgents: { threadId: string; name: string }[];
+        openFiles: { id: number; info: OpenFileInfo }[];
+        filesTabs: number[];
+        treeFiles: Record<number, OpenFileInfo | null>;
+        reviewOpen: boolean;
+        panelMode: string;
+        sideOpen: boolean;
+      }
+    >(),
+  );
+
+  function snapshotSideView(): void {
+    if (!activeThreadId) return;
+    sidePanelSnapshots.current.set(activeThreadId, {
+      openAgents,
+      openFiles,
+      filesTabs,
+      treeFiles,
+      reviewOpen,
+      panelMode,
+      sideOpen,
+    });
+  }
+
+  /** Restore a conversation's saved side panel; false = nothing to restore. */
+  function restoreSideView(id: string): boolean {
+    const snap = sidePanelSnapshots.current.get(id);
+    if (!snap) return false;
+    const hasTabs =
+      snap.openAgents.length > 0 || snap.openFiles.length > 0 || snap.filesTabs.length > 0 || snap.reviewOpen;
+    if (!hasTabs) return false;
+    setSideContext(null);
+    setSideNonce((n) => n + 1);
+    setSubAgentsList([]); // openThread refetches the live roster
+    setTerminalTabs([]);
+    setOpenAgents(snap.openAgents);
+    setOpenFiles(snap.openFiles);
+    setFilesTabs(snap.filesTabs);
+    setTreeFiles(snap.treeFiles);
+    setReviewOpen(snap.reviewOpen);
+    // A stale active key (e.g. a dropped terminal) falls back to the most
+    // recent surviving tab via the strip's own effect.
+    setPanelMode(snap.panelMode);
+    setSideOpenPersisted(snap.sideOpen);
+    return true;
+  }
+
   function resetSideView() {
     setSideContext(null);
     setSideNonce((n) => n + 1);
@@ -1322,6 +1377,7 @@ export function App() {
   // going in the engine and the sidebar shows it as active. Only genuinely
   // destructive actions still wait.
   async function newChat(project?: { name: string; path: string }) {
+    snapshotSideView();
     await window.unbiased.detachThread(project?.path);
     setActiveProject(project ?? null);
     setActiveThreadId(null);
@@ -1333,6 +1389,7 @@ export function App() {
   async function openProjectDialog() {
     const { path, name } = await window.unbiased.chooseProject();
     if (!path || !name) return; // cancelled
+    snapshotSideView();
     setActiveProject({ name, path });
     setActiveThreadId(null);
     setMainStarted(false);
@@ -1344,6 +1401,7 @@ export function App() {
   const openSeqRef = useRef(0);
   async function openThread(id: string) {
     if (id === activeThreadId) return;
+    snapshotSideView();
     // Two quick clicks race their awaits — only the latest open may commit.
     const seq = ++openSeqRef.current;
     const stale = () => openSeqRef.current !== seq;
@@ -1384,7 +1442,7 @@ export function App() {
       nonce: r.nonce + 1,
       resume: res.running ? { running: true, approvals: res.approvals } : null,
     }));
-    resetSideView();
+    if (!restoreSideView(id)) resetSideView();
     // The engine may still be running spawns for this thread — pick up the
     // roster the live pushes accumulated while it was backgrounded.
     fileExistsCache.clear(); // chip probes resolve against the new thread's cwd
@@ -1394,6 +1452,7 @@ export function App() {
   }
 
   async function deleteThread(id: string) {
+    sidePanelSnapshots.current.delete(id);
     await window.unbiased.deleteThread(id);
     if (id === activeThreadId) {
       setActiveThreadId(null);
@@ -5360,11 +5419,14 @@ function buildMdComponents(
 ) {
   return {
     code: (props: { className?: string; children?: React.ReactNode }) => {
-      if (props.className) {
-        // Block code: the surrounding <pre> (CodeBlock) owns the chrome.
+      const text = extractText(props.children);
+      // Block code: the surrounding <pre> (CodeBlock) owns the chrome. A
+      // fence WITHOUT a language has no className, so multiline content is
+      // the real block/inline discriminator — chip-styling an untagged
+      // ASCII diagram paints every line with the inline background.
+      if (props.className || text.includes("\n")) {
         return <code style={{ fontFamily: "inherit", fontSize: "inherit" }}>{props.children}</code>;
       }
-      const text = extractText(props.children);
       // Only file references that ACTUALLY resolve are interactive — the
       // chip verifies existence before dressing itself as a link.
       return (
