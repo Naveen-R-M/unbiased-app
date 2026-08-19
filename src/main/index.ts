@@ -15,11 +15,14 @@ import type { NativeImage } from "electron";
 import { isAbsolute, join, relative } from "node:path";
 import { homedir } from "node:os";
 import {
+  closeSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readdirSync,
   readFileSync,
+  readSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -2051,8 +2054,40 @@ app.whenReady().then(async () => {
       lastStatus.state === "connected"
         ? lastStatus.codexHome
         : join(app.getPath("home"), ".unbiased", "app-engine", "home");
-    const threads: Record<string, { rolloutBytes: number; transcriptBytes: number; mtime: number }> = {};
+    const threads: Record<
+      string,
+      {
+        rolloutBytes: number;
+        transcriptBytes: number;
+        mtime: number;
+        agent?: { nickname: string | null; task: string; parent: string | null };
+      }
+    > = {};
     const entry = (id: string) => (threads[id] ??= { rolloutBytes: 0, transcriptBytes: 0, mtime: 0 });
+    // A sub-agent's rollout opens with a session_meta line naming its
+    // nickname, agent path, and parent thread — enough to label the row
+    // like a conversation instead of a bare thread id.
+    const agentMeta = (file: string): { nickname: string | null; task: string; parent: string | null } | null => {
+      try {
+        const fd = openSync(file, "r");
+        const buf = Buffer.alloc(65536);
+        const n = readSync(fd, buf, 0, buf.length, 0);
+        closeSync(fd);
+        const firstLine = buf.toString("utf8", 0, n).split("\n")[0];
+        const meta = JSON.parse(firstLine) as {
+          payload?: { agent_path?: string; agent_nickname?: string; parent_thread_id?: string };
+        };
+        const path = meta.payload?.agent_path;
+        if (!path) return null;
+        return {
+          nickname: meta.payload?.agent_nickname ?? null,
+          task: path.split("/").filter(Boolean).pop() ?? path,
+          parent: meta.payload?.parent_thread_id ?? null,
+        };
+      } catch {
+        return null; // meta line longer than the probe, or not a sub-agent
+      }
+    };
     const walkSessions = (dir: string): void => {
       let names: string[];
       try {
@@ -2075,6 +2110,7 @@ app.whenReady().then(async () => {
             const e = entry(m[1]);
             e.rolloutBytes += st.size;
             e.mtime = Math.max(e.mtime, st.mtimeMs);
+            if (!e.agent) e.agent = agentMeta(p) ?? undefined;
           }
         }
       }
