@@ -66,6 +66,143 @@ const heldApprovals = new Map<string, Record<string, unknown>[]>();
 // so without this a failure while away would vanish entirely.
 const heldErrors = new Map<string, string>();
 
+// Sub-agents (multi-agent v2): the engine runs them as separate threads and
+// the PARENT's transcript only carries subAgentActivity markers. This map —
+// subThreadId → parent + path + live status — is what lets the app group a
+// sub-agent's traffic under its parent conversation, route its approval
+// requests somewhere visible, and open its transcript on demand. In-memory
+// only, matching the engine's own lifetime: spawned agents do not survive an
+// engine restart. Note thread/list defaults to interactive sources, so sub
+// threads never reach the sidebar in the first place.
+type SubAgentInfo = {
+  parent: string;
+  path: string; // engine agent path, e.g. /root/haiku_writer
+  name: string; // last path segment — the model-chosen task name
+  status: "running" | "idle" | "failed" | "interrupted";
+};
+const subAgents = new Map<string, SubAgentInfo>();
+
+// Inter-agent mail TO a sub-agent, captured from rawResponseItem/completed
+// notifications (the engine emits one for every recorded item — the only
+// place the task text a sub-agent was given is visible to a client). Keyed
+// by the sub-agent's thread id; merged into its transcript by time.
+const subAgentMail = new Map<string, { at: number; author: string; text: string }[]>();
+const MAIL_CAP = 200;
+
+// Spawn instructions captured from the parent's raw collaboration
+// function_call, keyed by "parentThreadId:taskName" until the matching
+// subAgentActivity names the sub thread.
+const pendingSpawnPrompts = new Map<string, string>();
+
+// Spawn call_id → parent thread, so the raw function_call_output (which
+// carries the engine-assigned nickname when the engine exposes it) can be
+// matched back. The output lands moments AFTER subAgentActivity, so the
+// nickname arrives as a rename.
+const pendingSpawnCalls = new Map<string, string>();
+
+/** Strip the engine's inter-agent envelope ("Message Type: …\nTask name: …\n
+ *  Sender: …\nPayload:\n<text>") down to the payload. */
+function interAgentPayload(text: string): { author: string | null; payload: string } {
+  const m = /^Message Type: [^\n]*\nTask name: [^\n]*\nSender: ([^\n]*)\nPayload:\n([\s\S]*)$/.exec(text);
+  return m ? { author: m[1], payload: m[2] } : { author: null, payload: text };
+}
+
+/** Locate a thread's rollout file under the engine home's sessions dir.
+ *  Cached per thread — the filename embeds the thread id and never moves. */
+const rolloutPathCache = new Map<string, string>();
+function findRolloutFile(threadId: string): string | null {
+  const cached = rolloutPathCache.get(threadId);
+  if (cached && existsSync(cached)) return cached;
+  const engineHome =
+    lastStatus.state === "connected"
+      ? lastStatus.codexHome
+      : join(app.getPath("home"), ".unbiased", "app-engine", "home");
+  const walk = (dir: string): string | null => {
+    let names: string[];
+    try {
+      names = readdirSync(dir);
+    } catch {
+      return null;
+    }
+    for (const n of names) {
+      const p = join(dir, n);
+      let st;
+      try {
+        st = statSync(p);
+      } catch {
+        continue;
+      }
+      if (st.isDirectory()) {
+        const hit = walk(p);
+        if (hit) return hit;
+      } else if (n.startsWith("rollout-") && n.endsWith(`${threadId}.jsonl`)) {
+        return p;
+      }
+    }
+    return null;
+  };
+  const found = walk(join(engineHome, "sessions"));
+  if (found) rolloutPathCache.set(threadId, found);
+  return found;
+}
+
+/** Inter-agent mail addressed to a sub-agent, read from its rollout on disk.
+ *  This is the restart-proof source: live raw notifications only flow for
+ *  threads STARTED with experimentalRawEvents (resume/fork hardcode it off
+ *  at 0.147.0), but the engine persists every agent_message to the rollout
+ *  before emitting anything. */
+function rolloutMail(threadId: string, path: string | null): { at: number; author: string; text: string }[] {
+  const file = findRolloutFile(threadId);
+  if (!file) return [];
+  let raw: string;
+  try {
+    if (statSync(file).size > 4_000_000) return []; // sub-agent rollouts are small; huge = not worth parsing
+    raw = readFileSync(file, "utf8");
+  } catch {
+    return [];
+  }
+  const mail: { at: number; author: string; text: string }[] = [];
+  for (const line of raw.split("\n")) {
+    if (!line.includes('"agent_message"')) continue;
+    try {
+      const parsed = JSON.parse(line) as {
+        timestamp?: string;
+        type?: string;
+        payload?: { type?: string; author?: string; recipient?: string; content?: { type?: string; text?: string }[] };
+      };
+      const pl = parsed.payload;
+      if (parsed.type !== "response_item" || pl?.type !== "agent_message") continue;
+      if (path && pl.recipient !== path) continue; // only mail TO this agent
+      const text = (pl.content ?? [])
+        .filter((c) => c?.type === "input_text" && typeof c.text === "string")
+        .map((c) => c.text as string)
+        .join("\n");
+      if (!text) continue;
+      const { author, payload } = interAgentPayload(text);
+      mail.push({
+        at: parsed.timestamp ? Date.parse(parsed.timestamp) / 1000 : 0,
+        author: author ?? pl.author ?? "",
+        text: payload,
+      });
+    } catch {
+      // unparseable line — skip
+    }
+  }
+  return mail.slice(0, MAIL_CAP);
+}
+
+function subAgentsForParent(parent: string): { threadId: string; name: string; path: string; status: string }[] {
+  return [...subAgents.entries()]
+    .filter(([, a]) => a.parent === parent)
+    .map(([threadId, a]) => ({ threadId, name: a.name, path: a.path, status: a.status }));
+}
+
+/** Push the parent's sub-agent roster to whichever pane owns it (if any). */
+function pushSubAgents(parent: string): void {
+  const paneId = paneForThread(parent);
+  if (paneId) send("chat:subagents", { paneId, agents: subAgentsForParent(parent) });
+}
+
 // The active main conversation's working directory — file references in
 // chat resolve against it. Kept in sync with thread starts/resumes.
 let mainCwd: string | null = null;
@@ -216,6 +353,9 @@ type WireItem = {
   status?: string;
   exitCode?: number;
   aggregatedOutput?: string;
+  kind?: string;
+  agentThreadId?: string;
+  agentPath?: string;
 };
 type WireThread = {
   id: string;
@@ -223,7 +363,7 @@ type WireThread = {
   preview?: string;
   createdAt?: string;
   cwd?: string;
-  turns?: { items?: WireItem[] }[];
+  turns?: { items?: WireItem[]; startedAt?: number }[];
 };
 
 // Projects the user has explicitly opened. Persisted so a project appears
@@ -233,20 +373,77 @@ function projectsFile(): string {
   return join(app.getPath("userData"), "projects.json");
 }
 
-function loadProjects(): string[] {
+// App-side thread → project assignment. The engine pins a thread's cwd at
+// creation, so "moving" a Recents chat into a project is a GROUPING override
+// the app owns, not an engine mutation.
+function threadProjectsFile(): string {
+  return join(app.getPath("userData"), "thread-projects.json");
+}
+
+function loadThreadProjects(): Record<string, string> {
+  try {
+    const parsed = JSON.parse(readFileSync(threadProjectsFile(), "utf8"));
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+// A project is a display name + one or more source folders (chats whose cwd
+// falls in ANY of them group under it), a primary folder (the cwd new chats
+// start in), and an icon/color identity. Legacy projects.json was a bare
+// path array — migrated on load.
+type ProjectRecord = {
+  name: string;
+  folders: string[];
+  primary: string;
+  icon: string;
+  color: string | null;
+};
+
+function recordFromPath(path: string): ProjectRecord {
+  return {
+    name: path.split("/").filter(Boolean).pop() ?? path,
+    folders: [path],
+    primary: path,
+    icon: "folder",
+    color: null,
+  };
+}
+
+function loadProjects(): ProjectRecord[] {
   try {
     const parsed = JSON.parse(readFileSync(projectsFile(), "utf8"));
-    return Array.isArray(parsed) ? parsed.filter((p) => typeof p === "string") : [];
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .map((p) => {
+        if (typeof p === "string") return recordFromPath(p); // legacy entry
+        if (p && typeof p === "object" && Array.isArray(p.folders) && p.folders.length > 0) {
+          return {
+            name: typeof p.name === "string" && p.name ? p.name : recordFromPath(p.folders[0]).name,
+            folders: p.folders.filter((f: unknown) => typeof f === "string"),
+            primary: typeof p.primary === "string" && p.folders.includes(p.primary) ? p.primary : p.folders[0],
+            icon: typeof p.icon === "string" ? p.icon : "folder",
+            color: typeof p.color === "string" ? p.color : null,
+          } as ProjectRecord;
+        }
+        return null;
+      })
+      .filter((p): p is ProjectRecord => p !== null && p.folders.length > 0);
   } catch {
     return [];
   }
 }
 
+function saveProjects(projects: ProjectRecord[]): void {
+  writeFileSync(projectsFile(), JSON.stringify(projects, null, 2) + "\n");
+}
+
 function rememberProject(path: string): void {
   const projects = loadProjects();
-  if (!projects.includes(path)) {
-    projects.unshift(path);
-    writeFileSync(projectsFile(), JSON.stringify(projects, null, 2) + "\n");
+  if (!projects.some((p) => p.folders.includes(path))) {
+    projects.unshift(recordFromPath(path));
+    saveProjects(projects);
   }
 }
 
@@ -296,6 +493,17 @@ function threadToEntries(thread: WireThread): unknown[] {
         case "plan":
           entries.push({ kind: "assistant", text: item.text ?? "" });
           break;
+        case "subAgentActivity": {
+          const sub = item as { kind?: string; agentThreadId?: string; agentPath?: string };
+          entries.push({
+            kind: "agent",
+            event: sub.kind ?? "started",
+            name: (sub.agentPath ?? "").split("/").filter(Boolean).pop() ?? "agent",
+            path: sub.agentPath ?? "",
+            agentThreadId: sub.agentThreadId ?? "",
+          });
+          break;
+        }
       }
     }
   }
@@ -1031,12 +1239,100 @@ function wireNotifications(): void {
     const paneId = paneForThread(params.threadId);
     const threadId = typeof params.threadId === "string" ? params.threadId : null;
     switch (msg.method) {
+      case "rawResponseItem/completed": {
+        const raw = params.item as {
+          type?: string;
+          name?: string;
+          namespace?: string;
+          arguments?: string;
+          author?: string;
+          recipient?: string;
+          content?: { type?: string; text?: string }[];
+        } | undefined;
+        if (!raw || !threadId) break;
+        // The parent's spawn call carries the instructions the sub-agent
+        // will be given — the only client-visible copy.
+        if (
+          raw.type === "function_call" &&
+          raw.namespace === "collaboration" &&
+          raw.name === "spawn_agent" &&
+          typeof raw.arguments === "string"
+        ) {
+          try {
+            const args = JSON.parse(raw.arguments) as { task_name?: string; message?: string };
+            if (args.task_name && args.message) {
+              pendingSpawnPrompts.set(`${threadId}:${args.task_name}`, args.message);
+            }
+          } catch {
+            // unparseable args — no prompt preview
+          }
+          const callId = (params.item as { call_id?: string }).call_id;
+          if (typeof callId === "string") pendingSpawnCalls.set(callId, threadId);
+        }
+        // The spawn OUTPUT carries the engine-assigned nickname
+        // ({"task_name": "...", "nickname": "Ramanujan"}). Rename the
+        // registry entry and let the renderer retitle its rows.
+        if (raw.type === "function_call_output") {
+          const out = params.item as { call_id?: string; output?: unknown };
+          const parent = typeof out.call_id === "string" ? pendingSpawnCalls.get(out.call_id) : undefined;
+          if (parent && typeof out.output === "string") {
+            pendingSpawnCalls.delete(out.call_id as string);
+            try {
+              const parsed = JSON.parse(out.output) as { task_name?: string; nickname?: string };
+              const task = parsed.task_name?.split("/").filter(Boolean).pop();
+              if (parsed.nickname && task) {
+                for (const [subId, info] of subAgents) {
+                  if (info.parent === parent && info.name === task) {
+                    info.name = parsed.nickname;
+                    pushSubAgents(parent);
+                    const pane = paneForThread(parent);
+                    if (pane) {
+                      send("chat:subagent-event", {
+                        paneId: pane,
+                        event: "renamed",
+                        name: parsed.nickname,
+                        path: info.path,
+                        agentThreadId: subId,
+                      });
+                    }
+                    break;
+                  }
+                }
+              }
+            } catch {
+              // not a spawn ack — ignore
+            }
+          }
+        }
+        // Mail addressed to a sub-agent thread: the task/message text.
+        if (raw.type === "agent_message" && Array.isArray(raw.content)) {
+          const text = raw.content
+            .filter((c) => c?.type === "input_text" && typeof c.text === "string")
+            .map((c) => c.text as string)
+            .join("\n");
+          if (text) {
+            const { author, payload } = interAgentPayload(text);
+            const box = subAgentMail.get(threadId) ?? [];
+            box.push({ at: Date.now() / 1000, author: author ?? raw.author ?? "", text: payload });
+            if (box.length > MAIL_CAP) box.shift();
+            subAgentMail.set(threadId, box);
+            send("chat:subagent-activity", { threadId });
+          }
+        }
+        break;
+      }
       case "turn/started": {
         const turn = params.turn as { id?: string } | undefined;
         if (threadId && turn?.id) {
           runningTurns.set(threadId, turn.id);
           bgStream.delete(threadId);
           send("chat:thread-activity", { threadId, running: true });
+          const sub = subAgents.get(threadId);
+          if (sub) {
+            sub.status = "running";
+            pushSubAgents(sub.parent);
+            send("chat:subagent-activity", { threadId });
+          }
         }
         if (!paneId) break;
         if (turn?.id) panes[paneId].turnId = turn.id;
@@ -1049,6 +1345,8 @@ function wireNotifications(): void {
         // backgrounded conversation is reopened mid-stream.
         if (threadId) bgStream.set(threadId, (bgStream.get(threadId) ?? "") + delta);
         if (paneId) send("chat:delta", { paneId, delta });
+        // A sub-agent's reply streams to its viewer pane (if open).
+        if (threadId && subAgents.has(threadId)) send("chat:subagent-delta", { threadId, delta });
         break;
       }
       case "item/started":
@@ -1061,6 +1359,47 @@ function wireNotifications(): void {
         // partial-stream buffer for it is no longer needed.
         if (item?.type === "agentMessage" && phase === "completed" && threadId) {
           bgStream.delete(threadId);
+          // Message boundary: the next delta belongs to a NEW assistant
+          // message. Multi-agent turns emit several messages per turn, and
+          // without this they concatenate into one run-on paragraph.
+          if (paneId) send("chat:message-boundary", { paneId });
+        }
+        // Sub-agent registry: the parent thread emits a subAgentActivity
+        // marker per spawn/interaction. Runs even when the parent is
+        // backgrounded — the roster must be current when it reopens.
+        if (item?.type === "subAgentActivity" && phase === "completed" && threadId) {
+          const p = params.item as { kind?: string; agentThreadId?: string; agentPath?: string };
+          if (p.agentThreadId && p.agentPath) {
+            const existing = subAgents.get(p.agentThreadId);
+            const name = p.agentPath.split("/").filter(Boolean).pop() ?? p.agentThreadId;
+            const promptKey = `${threadId}:${name}`;
+            const prompt = pendingSpawnPrompts.get(promptKey);
+            if (prompt !== undefined) pendingSpawnPrompts.delete(promptKey);
+            subAgents.set(p.agentThreadId, {
+              parent: threadId,
+              path: p.agentPath,
+              name,
+              status: p.kind === "interrupted" ? "interrupted" : (existing?.status ?? "running"),
+            });
+            pushSubAgents(threadId);
+            // Lifecycle row in the parent's transcript, Codex-style
+            // ("Created an agent" / "Messaged an agent" / …) — with the
+            // spawn instructions when the raw call carried them.
+            if (paneId) {
+              send("chat:subagent-event", {
+                paneId,
+                event: p.kind ?? "started",
+                name,
+                path: p.agentPath,
+                agentThreadId: p.agentThreadId,
+                prompt: prompt ?? null,
+              });
+            }
+          }
+        }
+        // A sub-agent's own items (replies, commands) refresh its viewer.
+        if (threadId && subAgents.has(threadId) && phase === "completed") {
+          send("chat:subagent-activity", { threadId });
         }
         if (!paneId) break; // history holds these for a backgrounded thread
         if (item?.type === "commandExecution") {
@@ -1128,6 +1467,22 @@ function wireNotifications(): void {
         if (threadId) {
           runningTurns.delete(threadId);
           bgStream.delete(threadId);
+          const sub = subAgents.get(threadId);
+          if (sub) {
+            sub.status = turn?.status === "failed" ? "failed" : "idle";
+            pushSubAgents(sub.parent);
+            send("chat:subagent-activity", { threadId });
+            const parentPane = paneForThread(sub.parent);
+            if (parentPane) {
+              send("chat:subagent-event", {
+                paneId: parentPane,
+                event: turn?.status === "failed" ? "failed" : "completed",
+                name: sub.name,
+                path: sub.path,
+                agentThreadId: threadId,
+              });
+            }
+          }
           if (!paneId && turn?.status === "failed") {
             heldErrors.set(
               threadId,
@@ -1162,15 +1517,21 @@ function wireNotifications(): void {
       // the conversation is reopened. Auto-declining here would silently
       // reject work the user asked for.
       function deliverApproval(payload: Record<string, unknown>): void {
-        const paneId = paneForThread(params.threadId);
+        // A sub-agent's approval must surface in its PARENT's pane — the sub
+        // thread never owns a pane, so without this reroute the request
+        // would sit in heldApprovals forever and the spawn would hang.
+        const sub = typeof params.threadId === "string" ? subAgents.get(params.threadId) : undefined;
+        const targetThread = sub ? sub.parent : params.threadId;
+        const tagged = sub ? { ...payload, agentName: sub.name } : payload;
+        const paneId = paneForThread(targetThread);
         if (paneId) {
-          send("chat:approval-request", { paneId, ...payload });
-        } else if (typeof params.threadId === "string") {
-          const held = heldApprovals.get(params.threadId) ?? [];
-          held.push(payload);
-          heldApprovals.set(params.threadId, held);
+          send("chat:approval-request", { paneId, ...tagged });
+        } else if (typeof targetThread === "string") {
+          const held = heldApprovals.get(targetThread) ?? [];
+          held.push(tagged);
+          heldApprovals.set(targetThread, held);
         } else {
-          send("chat:approval-request", { paneId: "main", ...payload });
+          send("chat:approval-request", { paneId: "main", ...tagged });
         }
       }
       if (msg.method === "item/commandExecution/requestApproval") {
@@ -1347,6 +1708,7 @@ app.whenReady().then(async () => {
         started = (await engine.request("thread/start", {
           ...threadPolicy(),
           ephemeral: true,
+          experimentalRawEvents: true,
         })) as { thread: { id: string } };
       } else {
         // Explicit home when no project is chosen — left implicit, the
@@ -1367,6 +1729,9 @@ app.whenReady().then(async () => {
         started = (await engine.request("thread/start", {
           ...threadPolicy(),
           cwd,
+          // Raw response items feed the sub-agent viewer (task text + spawn
+          // instructions). Sub-threads inherit this from their parent.
+          experimentalRawEvents: true,
         })) as { thread: { id: string }; cwd?: string };
         mainCwd = (started as { cwd?: string }).cwd ?? cwd;
       }
@@ -1619,23 +1984,35 @@ app.whenReady().then(async () => {
     // chats of removed projects, lists under Recents. Keyed by full path
     // so two folders sharing a basename stay distinct; explicitly opened
     // projects render even with zero conversations.
+    const records = loadProjects();
     const projectMap = new Map<string, ThreadSummary[]>();
-    for (const path of loadProjects()) projectMap.set(path, []);
+    const folderToPrimary = new Map<string, string>();
+    for (const r of records) {
+      projectMap.set(r.primary, []);
+      for (const f of r.folders) folderToPrimary.set(f, r.primary);
+    }
     const worktrees = loadWorktrees();
+    const threadProjectOverrides = loadThreadProjects();
     const recents: ThreadSummary[] = [];
     for (const t of result.data ?? []) {
       const summary: ThreadSummary = { id: t.id, title: threadTitle(t), createdAt: t.createdAt };
-      // Worktree conversations group under their parent project.
-      const effectiveCwd = t.cwd && worktrees[t.cwd] ? worktrees[t.cwd].project : t.cwd;
-      const group = effectiveCwd && effectiveCwd !== home ? projectMap.get(effectiveCwd) : undefined;
+      // Explicit assignment wins, then worktree conversations group under
+      // their parent project, then the thread's own cwd.
+      const effectiveCwd =
+        threadProjectOverrides[t.id] ?? (t.cwd && worktrees[t.cwd] ? worktrees[t.cwd].project : t.cwd);
+      const primary = effectiveCwd && effectiveCwd !== home ? folderToPrimary.get(effectiveCwd) : undefined;
+      const group = primary ? projectMap.get(primary) : undefined;
       if (group) group.push(summary);
       else recents.push(summary);
     }
     return {
-      projects: [...projectMap].map(([path, threads]) => ({
-        path,
-        name: path.split("/").filter(Boolean).pop() ?? path,
-        threads,
+      projects: records.map((r) => ({
+        path: r.primary,
+        name: r.name,
+        icon: r.icon,
+        color: r.color,
+        folders: r.folders,
+        threads: projectMap.get(r.primary) ?? [],
       })),
       recents,
       // Threads with a live turn — seeds the sidebar activity indicators.
@@ -1647,7 +2024,9 @@ app.whenReady().then(async () => {
   // drop out of thread/list but survive for a future archived view).
   ipcMain.handle("project:archive-chats", async (_e, path: string) => {
     const result = (await engine.request("thread/list", { limit: 100 })) as { data?: WireThread[] };
-    const targets = (result.data ?? []).filter((t) => t.cwd === path);
+    const record = loadProjects().find((r) => r.primary === path);
+    const folders = record?.folders ?? [path];
+    const targets = (result.data ?? []).filter((t) => t.cwd && folders.includes(t.cwd));
     for (const t of targets) {
       await engine.request("thread/archive", { threadId: t.id });
       if (panes.main.threadId === t.id) {
@@ -1663,14 +2042,82 @@ app.whenReady().then(async () => {
   // Remove = forget the project in the app. Files and chats survive;
   // its chats regroup under Recents (see threads:list).
   ipcMain.handle("project:remove", (_e, path: string) => {
-    const projects = loadProjects().filter((p) => p !== path);
-    writeFileSync(projectsFile(), JSON.stringify(projects, null, 2) + "\n");
+    saveProjects(loadProjects().filter((p) => p.primary !== path));
     return { ok: true };
+  });
+
+  // Edit-project save: name, icon, color, folders, primary — matched by the
+  // project's previous primary path.
+  ipcMain.handle("project:update", (_e, p: { path: string; record: ProjectRecord }) => {
+    const projects = loadProjects();
+    const idx = projects.findIndex((r) => r.primary === p.path);
+    if (idx === -1) return { ok: false, error: "Project not found" };
+    const rec = p.record;
+    if (!rec.folders.length) return { ok: false, error: "A project needs at least one folder" };
+    projects[idx] = {
+      name: rec.name.trim() || projects[idx].name,
+      folders: rec.folders,
+      primary: rec.folders.includes(rec.primary) ? rec.primary : rec.folders[0],
+      icon: rec.icon,
+      color: rec.color,
+    };
+    saveProjects(projects);
+    return { ok: true, record: projects[idx] };
   });
 
   ipcMain.handle("project:reveal", (_e, path: string) => {
     void shell.openPath(path);
     return { ok: true };
+  });
+
+  // Rename lives in the ENGINE (thread/name/set) so the sidebar title —
+  // which comes from thread/list — updates everywhere, including resumes.
+  ipcMain.handle("threads:rename", async (_e, p: { threadId: string; name: string }) => {
+    try {
+      await engine.request("thread/name/set", { threadId: p.threadId, name: p.name });
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: String(err) };
+    }
+  });
+
+  ipcMain.handle("threads:assign-project", (_e, p: { threadId: string; projectPath: string }) => {
+    const map = loadThreadProjects();
+    map[p.threadId] = p.projectPath;
+    writeFileSync(threadProjectsFile(), JSON.stringify(map, null, 2) + "\n");
+    rememberProject(p.projectPath);
+    return { ok: true };
+  });
+
+  // Create = make the folder and remember it; an empty project is just a
+  // fresh directory with no chats yet.
+  ipcMain.handle("project:create", (_e, p: { name: string; parent?: string }) => {
+    const safe = p.name.trim().replace(/[/\\]/g, "-");
+    if (!safe) return { path: null, name: null, error: "Project name is required" };
+    const dir = join(p.parent ?? app.getPath("home"), safe);
+    try {
+      mkdirSync(dir, { recursive: true });
+    } catch (err) {
+      return { path: null, name: null, error: `Couldn't create ${dir}: ${String(err)}` };
+    }
+    rememberProject(dir);
+    pendingCwd = dir;
+    mainCwd = dir;
+    panes.main.threadId = null;
+    panes.main.turnId = null;
+    panes.side.threadId = null;
+    panes.side.turnId = null;
+    return { path: dir, name: safe };
+  });
+
+  ipcMain.handle("project:pick-location", async () => {
+    if (!win) return { path: null };
+    const result = await dialog.showOpenDialog(win, {
+      properties: ["openDirectory", "createDirectory"],
+      title: "Choose where the project folder is created",
+      buttonLabel: "Use this location",
+    });
+    return { path: result.canceled || result.filePaths.length === 0 ? null : result.filePaths[0] };
   });
 
   ipcMain.handle("project:choose", async () => {
@@ -1740,6 +2187,64 @@ app.whenReady().then(async () => {
     pendingCwd = cwd ?? null;
     mainCwd = cwd ?? null;
     return { ok: true };
+  });
+
+  // Sub-agent roster for a (re)opened conversation — the live pushes only
+  // reach a pane that already owns the thread.
+  ipcMain.handle("subagents:list", (_e, parent: string) => ({ agents: subAgentsForParent(parent) }));
+
+  // A sub-agent's transcript on demand: thread/read leaves its running turn
+  // undisturbed, and the bgStream tail covers text still streaming.
+  ipcMain.handle("subagents:transcript", async (_e, id: string) => {
+    const info = subAgents.get(id);
+    try {
+      const result = (await engine.request("thread/read", { threadId: id, includeTurns: true })) as {
+        thread: WireThread;
+      };
+      // The task/messages the agent was GIVEN aren't thread items — they
+      // ride the inter-agent channel we capture from raw notifications.
+      // Merge mail (as user bubbles) with the turns by time so the pane
+      // reads as the two-sided conversation it actually is.
+      // Rollout is the authoritative mail source (survives resume/restart);
+      // live raw captures fill the gap before the rollout flushes.
+      const mail = rolloutMail(id, info?.path ?? null);
+      for (const m of subAgentMail.get(id) ?? []) {
+        if (!mail.some((r) => r.text === m.text)) mail.push(m);
+      }
+      // The sub-agent's thread FORKS the parent's visible history (user
+      // prompts and the root's own replies), and thread/read returns those
+      // turns as if they were the agent's. The agent-to-agent view starts at
+      // the spawn — and the spawn moment IS the first mail's timestamp, so
+      // anything earlier is forked parent history and dropped. The user
+      // filter stays as a fallback for the no-mail case.
+      const spawnAt = mail.length > 0 ? Math.min(...mail.map((m) => Math.floor(m.at))) : null;
+      const timeline: { t: number; mail: boolean; entries: unknown[] }[] = [];
+      for (const turn of result.thread.turns ?? []) {
+        const t = turn.startedAt ?? 0;
+        if (spawnAt !== null && t < spawnAt) continue; // forked parent history
+        const entries = threadToEntries({ ...result.thread, turns: [turn] }).filter(
+          (e) => (e as { kind?: string }).kind !== "user",
+        );
+        if (entries.length === 0) continue;
+        timeline.push({ t, mail: false, entries });
+      }
+      for (const m of mail) {
+        // Floor to seconds to match turn.startedAt's resolution — mail is
+        // recorded milliseconds INTO the second its turn starts.
+        timeline.push({ t: Math.floor(m.at), mail: true, entries: [{ kind: "user", text: m.text }] });
+      }
+      // Mail always PRECEDES the turn it triggers, so ties break mail-first.
+      timeline.sort((a, b) => a.t - b.t || (a.mail === b.mail ? 0 : a.mail ? -1 : 1));
+      return redactSecrets({
+        entries: timeline.flatMap((x) => x.entries),
+        running: runningTurns.has(id),
+        streamText: bgStream.get(id) ?? "",
+        name: info?.name ?? null,
+        path: info?.path ?? null,
+      });
+    } catch (err) {
+      return { entries: [], running: false, streamText: "", name: info?.name ?? null, path: info?.path ?? null, error: String(err) };
+    }
   });
 
   ipcMain.handle("side:reset", () => {

@@ -38,7 +38,13 @@ type CommandItem = {
 type Entry =
   | { kind: "user"; text: string; annotations?: SentAnnotation[] }
   | { kind: "compaction" }
-  | { kind: "assistant"; text: string; interrupted?: boolean }
+  | { kind: "assistant"; text: string; interrupted?: boolean; at?: number }
+  // Sub-agent lifecycle row in the transcript flow (Codex-style
+  // "Created an agent" / "Closed an agent" markers).
+  | { kind: "agent"; event: string; name: string; path?: string; agentThreadId?: string; prompt?: string | null }
+  // A completed turn's work — everything before its final message —
+  // collapsed under a "Worked for Ns" header, Codex-style.
+  | { kind: "work"; duration: number | null; entries: Entry[] }
   | {
       kind: "command";
       itemId: string;
@@ -168,11 +174,60 @@ function looksLikeFilePath(text: string): boolean {
   if (t.includes("/") && /^[./~]?[\w.@/-]+\.[A-Za-z0-9]{1,8}$/.test(t)) return true;
   return /^[\w.-]+\.(ts|tsx|js|jsx|mjs|cjs|json|go|rs|py|sh|bash|zsh|toml|yaml|yml|css|scss|html|md|sql|txt|lock)$/.test(t);
 }
+type ProjectInfo = {
+  name: string;
+  path: string;
+  icon?: string;
+  color?: string | null;
+  folders?: string[];
+  threads: ThreadSummary[];
+};
 type SidebarData = {
-  projects: { name: string; path: string; threads: ThreadSummary[] }[];
+  projects: ProjectInfo[];
   recents: ThreadSummary[];
   running?: string[];
 };
+
+// Project identity: 8 colors + a compact icon set (Codex-style customizer).
+const PROJECT_COLORS = ["#E8E8E8", "#FF6B5E", "#FF9F43", "#FFD54F", "#66BB6A", "#42A5F5", "#AB7BF7", "#FF8AC2"];
+const PROJECT_ICON_PATHS: Record<string, React.ReactNode> = {
+  folder: <path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.7-.9L9.2 3.9A2 2 0 0 0 7.5 3H4a2 2 0 0 0-2 2v13c0 1.1.9 2 2 2Z" />,
+  code: <><path d="m8 8-4 4 4 4" /><path d="m16 8 4 4-4 4" /></>,
+  terminal: <><path d="m4 17 6-5-6-5" /><path d="M12 19h8" /></>,
+  book: <><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20" /><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2Z" /></>,
+  pencil: <><path d="M17 3a2.8 2.8 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z" /></>,
+  music: <><path d="M9 18V5l12-2v13" /><circle cx="6" cy="18" r="3" /><circle cx="18" cy="16" r="3" /></>,
+  palette: <><circle cx="13.5" cy="6.5" r=".5" /><circle cx="17.5" cy="10.5" r=".5" /><circle cx="8.5" cy="7.5" r=".5" /><circle cx="6.5" cy="12.5" r=".5" /><path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c.9 0 1.7-.7 1.7-1.7 0-.4-.2-.8-.4-1.1-.3-.3-.4-.6-.4-1.1a1.7 1.7 0 0 1 1.7-1.7H17a5 5 0 0 0 5-5c0-4.6-4.5-8.4-10-8.4Z" /></>,
+  flask: <><path d="M10 2v7.5L4.7 19a2 2 0 0 0 1.8 3h11a2 2 0 0 0 1.8-3L14 9.5V2" /><path d="M8.5 2h7" /><path d="M7 16h10" /></>,
+  globe: <><circle cx="12" cy="12" r="10" /><path d="M2 12h20" /><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10Z" /></>,
+  plane: <><path d="M17.8 19.2 16 11l3.5-3.5C21 6 21.5 4 21 3c-1-.5-3 0-4.5 1.5L13 8 4.8 6.2c-.5-.1-.9.1-1.1.5l-.3.5c-.2.5-.1 1 .3 1.3L9 12l-2 3H4l-1 1 3 2 2 3 1-1v-3l3-2 3.5 5.3c.3.4.8.5 1.3.3l.5-.2c.4-.3.6-.7.5-1.2Z" /></>,
+  briefcase: <><rect x="2" y="7" width="20" height="14" rx="2" /><path d="M16 7V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v2" /></>,
+  chart: <><path d="M3 3v16a2 2 0 0 0 2 2h16" /><path d="M7 16v-5" /><path d="M12 16V8" /><path d="M17 16v-3" /></>,
+  heart: <path d="M19 14c1.5-1.5 3-3.2 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.8 0-3 .5-4.5 2C10.5 3.5 9.3 3 7.5 3A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4 3 5.5l7 7Z" />,
+  star: <path d="m12 2 3.1 6.3 6.9 1-5 4.9 1.2 6.8L12 17.8 5.8 21l1.2-6.8-5-4.9 6.9-1Z" />,
+  wrench: <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z" />,
+  paw: <><circle cx="11" cy="4" r="2" /><circle cx="18" cy="8" r="2" /><circle cx="4" cy="8" r="2" /><path d="M11 12a5 5 0 0 0-5 5c0 1.7 1.3 3 3 3 1 0 1.6-.5 2-1 .4.5 1 1 2 1 1.7 0 3-1.3 3-3a5 5 0 0 0-5-5Z" /></>,
+  brain: <><path d="M9.5 2A2.5 2.5 0 0 1 12 4.5v15a2.5 2.5 0 0 1-4.96.44A2.5 2.5 0 0 1 4 17.5v-11A2.5 2.5 0 0 1 6.5 4 2.5 2.5 0 0 1 9.5 2Z" /><path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 4.96.44A2.5 2.5 0 0 0 20 17.5v-11A2.5 2.5 0 0 0 17.5 4 2.5 2.5 0 0 0 14.5 2Z" /></>,
+  leaf: <><path d="M11 20A7 7 0 0 1 9.8 6.1C15.5 5 17 4.5 19 2c1 2 2 4.2 2 8 0 5.5-4.8 10-10 10Z" /><path d="M2 21c0-3 1.9-5.5 3.5-7" /></>,
+};
+function ProjectIcon({ icon, color, size = 16 }: { icon?: string; color?: string | null; size?: number }) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke={color ?? "currentColor"}
+      strokeWidth="1.8"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+      style={{ flexShrink: 0 }}
+    >
+      {PROJECT_ICON_PATHS[icon ?? "folder"] ?? PROJECT_ICON_PATHS.folder}
+    </svg>
+  );
+}
 
 type BillingResult =
   | {
@@ -214,7 +269,14 @@ type HeldApproval = {
   cwd: string | null;
   reason: string | null;
   grantRoot?: string | null;
+  // Present when the request came from a sub-agent's thread (multi-agent) —
+  // the card renders in the parent's pane, tagged with the agent's name.
+  agentName?: string;
 };
+
+// A spawned sub-agent (multi-agent v2): its own engine thread, grouped
+// under the parent conversation. name = the model-chosen task name.
+type SubAgent = { threadId: string; name: string; path: string; status: string };
 
 declare global {
   interface Window {
@@ -304,9 +366,40 @@ declare global {
       detachThread: (cwd?: string) => Promise<{ ok: boolean }>;
       deleteThread: (id: string) => Promise<{ ok: boolean }>;
       resetSideChat: () => Promise<{ ok: boolean }>;
+      subagentsList: (parent: string) => Promise<{ agents: SubAgent[] }>;
+      subagentTranscript: (id: string) => Promise<{
+        entries: Entry[];
+        running: boolean;
+        streamText: string;
+        name: string | null;
+        path: string | null;
+        error?: string;
+      }>;
+      onSubAgents: (cb: (p: { paneId: PaneId; agents: SubAgent[] }) => void) => () => void;
+      onSubAgentDelta: (cb: (p: { threadId: string; delta: string }) => void) => () => void;
+      onSubAgentActivity: (cb: (p: { threadId: string }) => void) => () => void;
+      onSubAgentEvent: (
+        cb: (p: {
+          paneId: PaneId;
+          event: string;
+          name: string;
+          path: string;
+          agentThreadId: string;
+          prompt?: string | null;
+        }) => void,
+      ) => () => void;
+      onMessageBoundary: (cb: (p: { paneId: PaneId }) => void) => () => void;
       chooseProject: () => Promise<{ path: string | null; name: string | null }>;
+      createProject: (name: string, parent?: string) => Promise<{ path: string | null; name: string | null; error?: string }>;
+      pickProjectLocation: () => Promise<{ path: string | null }>;
+      renameThread: (threadId: string, name: string) => Promise<{ ok: boolean; error?: string }>;
+      assignThreadProject: (threadId: string, projectPath: string) => Promise<{ ok: boolean }>;
       archiveProjectChats: (path: string) => Promise<{ archived: number }>;
       removeProject: (path: string) => Promise<{ ok: boolean }>;
+      updateProject: (
+        path: string,
+        record: { name: string; folders: string[]; primary: string; icon: string; color: string | null },
+      ) => Promise<{ ok: boolean; error?: string }>;
       revealProject: (path: string) => Promise<{ ok: boolean }>;
       readFile: (path: string) => Promise<{ fullPath: string; relPath?: string; content?: string; error?: string }>;
       readImage: (path: string) => Promise<{ dataUrl?: string; error?: string }>;
@@ -465,12 +558,61 @@ function formatElapsed(seconds: number): string {
   return `${Math.floor(seconds / 60)}m ${Math.floor(seconds % 60)}s`;
 }
 
+/** Deterministic glyph per sub-agent (Codex assigns each agent a colorful
+ *  icon). Hashed off the thread id so every surface shows the same one. */
+const AGENT_EMOJI = ["🌸", "🌿", "🍀", "🌺", "🪷", "🌻", "🍁", "🌵", "🌼", "🍄", "🌷", "🌴", "⭐️", "🔮", "💠", "🪸"];
+function agentEmoji(seed: string): string {
+  let h = 0;
+  for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) >>> 0;
+  return AGENT_EMOJI[h % AGENT_EMOJI.length];
+}
+
+/** Shimmering "is working" text (gradient sweep, Codex-style). */
+function WorkingShimmer() {
+  return (
+    <span
+      style={{
+        fontSize: 12.5,
+        background: `linear-gradient(90deg, var(--dim) 30%, var(--fg) 50%, var(--dim) 70%)`,
+        backgroundSize: "200% 100%",
+        WebkitBackgroundClip: "text",
+        backgroundClip: "text",
+        color: "transparent",
+        animation: "unbiased-shimmer 2s linear infinite",
+      }}
+    >
+      is working
+    </span>
+  );
+}
+
+/** Whole-unit variant for settled durations: "5s", "2m 20s". */
+function formatDuration(seconds: number): string {
+  if (seconds < 60) return `${Math.max(1, Math.round(seconds))}s`;
+  return `${Math.floor(seconds / 60)}m ${Math.floor(seconds % 60)}s`;
+}
+
 /** Drop a trailing empty assistant placeholder. */
 function withoutTrailingPlaceholder(es: Entry[]): Entry[] {
   const last = es[es.length - 1];
   if (last?.kind === "assistant" && last.text === "" && !last.interrupted) return es.slice(0, -1);
   return es;
 }
+
+// Composer placeholders for a conversation that already has history — a
+// fresh one is drawn every time a chat opens.
+const CHAT_PLACEHOLDERS = [
+  "Start typing, we'll keep up",
+  "What are we doing today",
+  "Say the thing",
+  "Begin anywhere",
+  "Out with it",
+  "Ask something hard",
+  "Where were we",
+  "Put us to work",
+  "Go on",
+  "Try something",
+];
 
 type CommandEntry = Extract<Entry, { kind: "command" }>;
 type DisplayBlock =
@@ -606,6 +748,114 @@ export function App() {
     name: string;
     count: number;
   } | null>(null);
+
+  // Create-project modal (the + beside the Projects section header).
+  const [createProj, setCreateProj] = useState<{ name: string; parent: string | null; error: string | null } | null>(null);
+  // Edit-project modal (Codex-style): name, icon+color picker, source
+  // folders with a primary, remove.
+  const [editProj, setEditProj] = useState<{
+    path: string; // the record's primary at open time — the update key
+    name: string;
+    folders: string[];
+    primary: string;
+    icon: string;
+    color: string | null;
+    pickerOpen: boolean;
+    error: string | null;
+  } | null>(null);
+  // Per-thread ⋯ menu (fixed-positioned like the project menu) and its dialogs.
+  const [threadMenu, setThreadMenu] = useState<{ id: string; title: string; inProject: boolean; x: number; y: number } | null>(null);
+  const [renameDialog, setRenameDialog] = useState<{ id: string; name: string; error: string | null } | null>(null);
+  const [moveDialog, setMoveDialog] = useState<{ id: string; title: string } | null>(null);
+
+  useEffect(() => {
+    if (!threadMenu) return;
+    function onDown(e: MouseEvent) {
+      if (!(e.target as HTMLElement).closest("[data-threadmenu]")) setThreadMenu(null);
+    }
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") setThreadMenu(null);
+    }
+    function onScroll() {
+      setThreadMenu(null);
+    }
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    document.addEventListener("scroll", onScroll, true);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+      document.removeEventListener("scroll", onScroll, true);
+    };
+  }, [threadMenu]);
+
+  useEffect(() => {
+    if (!createProj && !renameDialog && !moveDialog && !editProj) return;
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") {
+        setCreateProj(null);
+        setRenameDialog(null);
+        setMoveDialog(null);
+        setEditProj((cur) => (cur?.pickerOpen ? { ...cur, pickerOpen: false } : null));
+      }
+    }
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [createProj, renameDialog, moveDialog, editProj]);
+
+  async function doSaveProject() {
+    if (!editProj) return;
+    const r = await window.unbiased.updateProject(editProj.path, {
+      name: editProj.name,
+      folders: editProj.folders,
+      primary: editProj.primary,
+      icon: editProj.icon,
+      color: editProj.color,
+    });
+    if (!r.ok) {
+      setEditProj((e) => (e ? { ...e, error: r.error ?? "Save failed" } : e));
+      return;
+    }
+    if (activeProject?.path === editProj.path) {
+      setActiveProject({ name: editProj.name.trim() || activeProject.name, path: editProj.primary });
+    }
+    setEditProj(null);
+    void refreshThreads();
+  }
+
+  async function doCreateProject() {
+    if (!createProj || !createProj.name.trim()) return;
+    const r = await window.unbiased.createProject(createProj.name.trim(), createProj.parent ?? undefined);
+    if (!r.path || !r.name) {
+      setCreateProj((c) => (c ? { ...c, error: r.error ?? "Couldn't create the project" } : c));
+      return;
+    }
+    setCreateProj(null);
+    setActiveProject({ name: r.name, path: r.path });
+    setActiveThreadId(null);
+    setMainStarted(false);
+    setMainReset((r2) => ({ entries: [], nonce: r2.nonce + 1 }));
+    resetSideView();
+    void refreshThreads();
+  }
+
+  async function doRenameThread() {
+    if (!renameDialog || !renameDialog.name.trim()) return;
+    const r = await window.unbiased.renameThread(renameDialog.id, renameDialog.name.trim());
+    if (!r.ok) {
+      setRenameDialog((d) => (d ? { ...d, error: r.error ?? "Rename failed" } : d));
+      return;
+    }
+    setRenameDialog(null);
+    void refreshThreads();
+  }
+
+  async function doMoveThread(projectPath: string) {
+    if (!moveDialog) return;
+    await window.unbiased.assignThreadProject(moveDialog.id, projectPath);
+    setMoveDialog(null);
+    void refreshThreads();
+  }
 
   useEffect(() => {
     if (!projMenu) return;
@@ -1037,6 +1287,8 @@ export function App() {
     setSideContext(null);
     setSideNonce((n) => n + 1);
     setOpenFile(null);
+    setOpenAgent(null); // the agent belonged to the previous conversation
+    setSubAgentsList([]);
     setFilesOpen(false); // the tree browsed the previous conversation's cwd
     setTreeFile(null);
     setTerminalOpen(false); // the shell ran in the previous conversation's cwd
@@ -1075,10 +1327,15 @@ export function App() {
     const history = res.entries;
     // The engine's history omits renderer-only content (failed-turn
     // errors, annotation cards). Prefer the cached transcript when it
-    // holds at least as much.
+    // holds at least as much — counting a "Worked for" fold as its
+    // CONTENTS, since folding makes the cache shorter than raw history
+    // without losing anything.
     const cached = await window.unbiased.loadTranscript(id);
-    let entries =
-      cached.entries && cached.entries.length >= history.length ? cached.entries : history;
+    const cachedRichness = (cached.entries ?? []).reduce(
+      (n, e) => n + (e.kind === "work" ? Math.max(e.entries.length, 1) : 1),
+      0,
+    );
+    let entries = cached.entries && cachedRichness >= history.length ? cached.entries : history;
     if (res.running && res.streamText) {
       // The reply is still streaming. Main accumulated the full partial
       // text; a shorter prefix of it may already sit in the cached
@@ -1102,6 +1359,9 @@ export function App() {
       resume: res.running ? { running: true, approvals: res.approvals } : null,
     }));
     resetSideView();
+    // The engine may still be running spawns for this thread — pick up the
+    // roster the live pushes accumulated while it was backgrounded.
+    void window.unbiased.subagentsList(id).then((r) => setSubAgentsList(r.agents));
   }
 
   async function deleteThread(id: string) {
@@ -1116,10 +1376,28 @@ export function App() {
   }
 
   const [openFile, setOpenFile] = useState<OpenFileInfo | null>(null);
+  // Sub-agents of the ACTIVE main conversation (multi-agent v2). The main
+  // process pushes roster changes; a (re)opened thread fetches its own.
+  const [subAgentsList, setSubAgentsList] = useState<SubAgent[]>([]);
+  // The sub-agent whose conversation the side panel is showing.
+  const [openAgent, setOpenAgent] = useState<{ threadId: string; name: string } | null>(null);
+
+  useEffect(() => {
+    return window.unbiased.onSubAgents((p) => {
+      if (p.paneId === "main") setSubAgentsList(p.agents);
+    });
+  }, []);
+
+  function openAgentTab(agent: { threadId: string; name: string }) {
+    setOpenAgent({ threadId: agent.threadId, name: agent.name });
+    setPanelMode("agent");
+    setSideOpenPersisted(true);
+  }
+
   // "launcher" = the panel is open with nothing selected yet — it shows
   // big rows asking which surface to open (Codex's empty side panel).
   const [panelMode, setPanelMode] = useState<
-    "chat" | "file" | "files" | "launcher" | "terminal" | "browser" | "review"
+    "chat" | "file" | "files" | "launcher" | "terminal" | "browser" | "review" | "agent"
   >("chat");
   const [reviewOpen, setReviewOpen] = useState(false);
   const [filesOpen, setFilesOpen] = useState(false);
@@ -1132,7 +1410,7 @@ export function App() {
   // most-recent tab — one rule, instead of six hand-rolled chains that
   // each forgot a tab (closing Files with only Browser left used to kill
   // the whole panel).
-  type PanelTab = "chat" | "file" | "files" | "review" | "browser" | "terminal";
+  type PanelTab = "chat" | "file" | "files" | "review" | "browser" | "terminal" | "agent";
   const TAB_FLAGS: Record<PanelTab, boolean> = {
     chat: sideChatEnabled,
     file: !!openFile,
@@ -1140,6 +1418,7 @@ export function App() {
     review: reviewOpen,
     browser: browserOpen,
     terminal: terminalOpen,
+    agent: !!openAgent,
   };
   // Seq numbers survive re-renders; assigning during render is idempotent.
   const tabSeqRef = useRef<Map<PanelTab, number>>(new Map());
@@ -1160,7 +1439,7 @@ export function App() {
     if (tabOrder.length > 0) setPanelMode(tabOrder[tabOrder.length - 1]);
     else setSideOpenPersisted(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sideOpen, panelMode, sideChatEnabled, openFile, filesOpen, reviewOpen, browserOpen, terminalOpen]);
+  }, [sideOpen, panelMode, sideChatEnabled, openFile, filesOpen, reviewOpen, browserOpen, terminalOpen, openAgent]);
   // The Files view's tree column can collapse, leaving the viewer full
   // width — Codex's folders toggle. Persisted.
   const [treeVisible, setTreeVisible] = useState(() => localStorage.getItem("filesTreeVisible") !== "false");
@@ -1294,9 +1573,13 @@ export function App() {
         !confirmDialog &&
         !fullAccessPrompt &&
         !branchSwitch &&
-        !branchCreate,
+        !branchCreate &&
+        !createProj &&
+        !renameDialog &&
+        !moveDialog &&
+        !editProj,
     );
-  }, [browserOpen, sideOpen, panelMode, sidePlusOpen, envOpen, showSettings, confirmDialog, fullAccessPrompt, branchSwitch, branchCreate]);
+  }, [browserOpen, sideOpen, panelMode, sidePlusOpen, envOpen, showSettings, confirmDialog, fullAccessPrompt, branchSwitch, branchCreate, createProj, renameDialog, moveDialog, editProj]);
 
   function openSideChatTab() {
     setSidePlusOpen(false);
@@ -1586,11 +1869,32 @@ export function App() {
             <div style={{ color: colors.dim, fontSize: 12, padding: "8px 8px" }}>No conversations yet</div>
           )}
 
-          {sidebar.projects.length > 0 && (
-            <SectionLabel collapsed={projectsCollapsed} onToggle={toggleProjectsSection}>
-              Projects
-            </SectionLabel>
-          )}
+          <div style={{ display: "flex", alignItems: "stretch" }}>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <SectionLabel collapsed={projectsCollapsed} onToggle={toggleProjectsSection}>
+                Projects
+              </SectionLabel>
+            </div>
+            <button
+              onClick={() => setCreateProj({ name: "", parent: null, error: null })}
+              title="Create project"
+              aria-label="Create project"
+              style={{
+                background: "transparent",
+                border: "none",
+                color: colors.dim,
+                cursor: "pointer",
+                // Mirror SectionLabel's padding box (14px top, 6px bottom)
+                // so the glyph sits on the label's text line.
+                padding: "14px 8px 6px",
+                display: "flex",
+                alignItems: "center",
+                flexShrink: 0,
+              }}
+            >
+              <PlusIcon />
+            </button>
+          </div>
           {!projectsCollapsed &&
           sidebar.projects.map((p) => (
             <div key={p.path} style={{ marginBottom: 12 }}>
@@ -1613,7 +1917,7 @@ export function App() {
                   boxSizing: "border-box",
                 }}
               >
-                <FolderIcon />
+                <ProjectIcon icon={p.icon} color={p.color} />
                 <span
                   style={{
                     flex: 1,
@@ -1679,6 +1983,23 @@ export function App() {
                         }}
                       >
                         <MenuItem
+                          icon={<PencilIcon />}
+                          label="Edit project…"
+                          onClick={() => {
+                            setProjMenu(null);
+                            setEditProj({
+                              path: p.path,
+                              name: p.name,
+                              folders: p.folders ?? [p.path],
+                              primary: p.path,
+                              icon: p.icon ?? "folder",
+                              color: p.color ?? null,
+                              pickerOpen: false,
+                              error: null,
+                            });
+                          }}
+                        />
+                        <MenuItem
                           icon={<FolderOutlineIcon size={15} />}
                           label="Reveal in Finder"
                           onClick={() => {
@@ -1724,7 +2045,8 @@ export function App() {
                   indent
                   onHover={setHoveredThreadId}
                   onOpen={openThread}
-                  onDelete={deleteThread}
+                  menuOpen={threadMenu?.id === t.id}
+                  onMenu={(x, y) => setThreadMenu((cur) => (cur?.id === t.id ? null : { id: t.id, title: t.title, inProject: true, x, y }))}
                 />
               ))}
             </div>
@@ -1745,7 +2067,8 @@ export function App() {
               running={runningThreads.has(t.id)}
               onHover={setHoveredThreadId}
               onOpen={openThread}
-              onDelete={deleteThread}
+              menuOpen={threadMenu?.id === t.id}
+              onMenu={(x, y) => setThreadMenu((cur) => (cur?.id === t.id ? null : { id: t.id, title: t.title, inProject: false, x, y }))}
             />
           ))}
         </div>
@@ -1822,7 +2145,7 @@ export function App() {
             {mainTitle}
           </span>
           <span style={{ flex: 1 }} />
-          {inProject && mainStarted && (
+          {mainStarted && (
             <span ref={envRef} style={{ position: "relative", display: "flex" }}>
               <IconButton title="Environment" onClick={() => (envOpen ? setEnvOpen(false) : void openEnvMenu())}>
                 <EnvIcon />
@@ -1842,48 +2165,201 @@ export function App() {
                     boxShadow: "0 8px 24px rgba(0,0,0,0.45)",
                   }}
                 >
-                  <div style={{ color: colors.dim, fontSize: 12.5, padding: "4px 10px 8px" }}>Environment</div>
-                  <EnvRow
-                    icon={<ChangesIcon />}
-                    label="Changes"
-                    right={
-                      envDiff ? (
-                        <span style={{ fontVariantNumeric: "tabular-nums" }}>
-                          <span style={{ color: colors.ok }}>+{envDiff.plus}</span>{" "}
-                          <span style={{ color: colors.err }}>-{envDiff.minus}</span>
-                        </span>
-                      ) : (
-                        <span style={{ color: colors.dim }}>…</span>
-                      )
-                    }
-                    onClick={() => {
-                      openReviewTab();
-                      setEnvOpen(false);
-                    }}
-                  />
-                  <EnvRow
-                    icon={convCwd ? <SteerIcon /> : <LaptopIcon />}
-                    label={convCwd ? "Worktree" : "Local"}
-                    right={<Chevron open={envSection === "workin"} />}
-                    onClick={() => setEnvSection((s) => (s === "workin" ? null : "workin"))}
-                  />
-                  {envSection === "workin" && (
-                    <div style={{ padding: "0 0 4px 12px" }}>
-                      {(
-                        [
-                          { sel: { mode: "local" } as const, key: "local", label: "Local", icon: <LaptopIcon /> },
-                          { sel: { mode: "worktree" } as const, key: "worktree", label: "New worktree", icon: <SteerIcon /> },
-                          ...existingWts.map((wt) => ({
-                            sel: { mode: "existing", dir: wt.dir, branch: wt.branch } as const,
-                            key: wt.dir,
-                            label: wt.branch,
-                            icon: <BranchIcon />,
-                          })),
-                        ]
-                      ).map((opt) => (
+                  {inProject && (
+                    <>
+                    <div style={{ color: colors.dim, fontSize: 12.5, padding: "4px 10px 8px" }}>Environment</div>
+                    <EnvRow
+                      icon={<ChangesIcon />}
+                      label="Changes"
+                      right={
+                        envDiff ? (
+                          <span style={{ fontVariantNumeric: "tabular-nums" }}>
+                            <span style={{ color: colors.ok }}>+{envDiff.plus}</span>{" "}
+                            <span style={{ color: colors.err }}>-{envDiff.minus}</span>
+                          </span>
+                        ) : (
+                          <span style={{ color: colors.dim }}>…</span>
+                        )
+                      }
+                      onClick={() => {
+                        openReviewTab();
+                        setEnvOpen(false);
+                      }}
+                    />
+                    <EnvRow
+                      icon={convCwd ? <SteerIcon /> : <LaptopIcon />}
+                      label={convCwd ? "Worktree" : "Local"}
+                      right={<Chevron open={envSection === "workin"} />}
+                      onClick={() => setEnvSection((s) => (s === "workin" ? null : "workin"))}
+                    />
+                    {envSection === "workin" && (
+                      <div style={{ padding: "0 0 4px 12px" }}>
+                        {(
+                          [
+                            { sel: { mode: "local" } as const, key: "local", label: "Local", icon: <LaptopIcon /> },
+                            { sel: { mode: "worktree" } as const, key: "worktree", label: "New worktree", icon: <SteerIcon /> },
+                            ...existingWts.map((wt) => ({
+                              sel: { mode: "existing", dir: wt.dir, branch: wt.branch } as const,
+                              key: wt.dir,
+                              label: wt.branch,
+                              icon: <BranchIcon />,
+                            })),
+                          ]
+                        ).map((opt) => (
+                          <button
+                            key={opt.key}
+                            onClick={() => changeWorkMode(opt.sel)}
+                            style={{
+                              display: "flex",
+                              alignItems: "center",
+                              gap: 10,
+                              width: "100%",
+                              background: "transparent",
+                              border: "none",
+                              borderRadius: 8,
+                              padding: "7px 10px",
+                              fontSize: 13,
+                              color: colors.fg,
+                              cursor: "pointer",
+                              textAlign: "left",
+                              fontFamily: "inherit",
+                            }}
+                          >
+                            <span style={{ color: colors.dim, display: "flex", flexShrink: 0 }}>{opt.icon}</span>
+                            <span style={{ flex: 1, minWidth: 0, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                              {opt.label}
+                            </span>
+                            {opt.sel.mode === "existing" && opt.sel.dir === convCwd && (
+                              <span
+                                style={{
+                                  color: colors.dim,
+                                  fontSize: 11,
+                                  border: `1px solid ${colors.border}`,
+                                  borderRadius: 5,
+                                  padding: "1px 6px",
+                                  flexShrink: 0,
+                                }}
+                              >
+                                current
+                              </span>
+                            )}
+                            {(workSel.mode === opt.sel.mode &&
+                              (opt.sel.mode !== "existing" ||
+                                (workSel.mode === "existing" && workSel.dir === opt.sel.dir))) && <CheckIcon />}
+                          </button>
+                        ))}
+                        <div style={{ color: colors.dim, fontSize: 11.5, padding: "4px 10px 2px", lineHeight: 1.4 }}>
+                          Applies to new chats in {activeProjectName ?? "this project"} — this conversation keeps its
+                          checkout.
+                        </div>
+                      </div>
+                    )}
+                    <EnvRow
+                      icon={<BranchIcon />}
+                      label={envBranches?.current ?? projectBranch ?? "…"}
+                      right={<Chevron open={envSection === "branch"} />}
+                      onClick={() => setEnvSection((s) => (s === "branch" ? null : "branch"))}
+                    />
+                    {envSection === "branch" && envBranches && (
+                      <div style={{ padding: "0 0 4px 12px" }}>
+                        <input
+                          value={envBranchSearch}
+                          onChange={(e) => setEnvBranchSearch(e.target.value)}
+                          placeholder="Find a branch…"
+                          spellCheck={false}
+                          style={{
+                            width: "100%",
+                            boxSizing: "border-box",
+                            background: "var(--panel-2)",
+                            color: colors.fg,
+                            border: `1px solid ${colors.border}`,
+                            borderRadius: 8,
+                            padding: "6px 10px",
+                            fontSize: 12.5,
+                            outline: "none",
+                            margin: "2px 0 4px",
+                            fontFamily: "inherit",
+                          }}
+                        />
+                        <div style={{ maxHeight: 180, overflowY: "auto" }}>
+                          {envBranches.branches
+                            .filter((b) => b.toLowerCase().includes(envBranchSearch.toLowerCase()))
+                            .slice(0, 30)
+                            .map((b) => (
+                              <button
+                                key={b}
+                                onClick={() => envPickBranch(b)}
+                                style={{
+                                  display: "flex",
+                                  alignItems: "center",
+                                  gap: 10,
+                                  width: "100%",
+                                  background: "transparent",
+                                  border: "none",
+                                  borderRadius: 8,
+                                  padding: "6px 10px",
+                                  fontSize: 13,
+                                  color: colors.fg,
+                                  cursor: "pointer",
+                                  textAlign: "left",
+                                  fontFamily: "var(--font-code)",
+                                }}
+                              >
+                                <span style={{ flex: 1, minWidth: 0, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                                  {b}
+                                </span>
+                                {b === envBranches.current && <CheckIcon />}
+                              </button>
+                            ))}
+                        </div>
                         <button
-                          key={opt.key}
-                          onClick={() => changeWorkMode(opt.sel)}
+                          onClick={() => {
+                            setBranchCreate(true);
+                            setEnvOpen(false);
+                          }}
+                          style={{
+                            display: "flex",
+                            alignItems: "center",
+                            gap: 10,
+                            width: "100%",
+                            background: "transparent",
+                            border: "none",
+                            borderRadius: 8,
+                            padding: "6px 10px",
+                            fontSize: 13,
+                            color: colors.fg,
+                            cursor: "pointer",
+                            textAlign: "left",
+                            fontFamily: "inherit",
+                          }}
+                        >
+                          <span style={{ color: colors.dim, display: "flex" }}>
+                            <PlusIcon />
+                          </span>
+                          Create new branch…
+                        </button>
+                      </div>
+                    )}
+                    <div style={{ borderTop: `1px solid ${colors.border}`, margin: "6px 4px" }} />
+                    <EnvRow icon={<CommitIcon />} label="Commit or push" onClick={() => void envCommitPush()} />
+                    <EnvRow icon={<PrIcon />} label="Create pull request" onClick={() => void envCreatePr()} />
+                    {envMsg && (
+                      <div style={{ color: colors.dim, fontSize: 12, padding: "6px 10px 2px" }}>{envMsg}</div>
+                    )}
+                    </>
+                  )}
+                  {subAgentsList.length > 0 && (
+                    <>
+                      {inProject && <div style={{ borderTop: `1px solid ${colors.border}`, margin: "6px 4px" }} />}
+                      <div style={{ color: colors.dim, fontSize: 12.5, padding: "4px 10px 8px" }}>Subagents</div>
+                      {subAgentsList.map((a) => (
+                        <button
+                          key={a.threadId}
+                          onClick={() => {
+                            setEnvOpen(false);
+                            openAgentTab(a);
+                          }}
+                          title={a.path}
                           style={{
                             display: "flex",
                             alignItems: "center",
@@ -1893,133 +2369,41 @@ export function App() {
                             border: "none",
                             borderRadius: 8,
                             padding: "7px 10px",
-                            fontSize: 13,
-                            color: colors.fg,
                             cursor: "pointer",
                             textAlign: "left",
                             fontFamily: "inherit",
                           }}
                         >
-                          <span style={{ color: colors.dim, display: "flex", flexShrink: 0 }}>{opt.icon}</span>
-                          <span style={{ flex: 1, minWidth: 0, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                            {opt.label}
+                          <span style={{ fontSize: 15, flexShrink: 0 }}>{agentEmoji(a.threadId)}</span>
+                          <span
+                            style={{
+                              flex: 1,
+                              minWidth: 0,
+                              fontSize: 13.5,
+                              fontWeight: 500,
+                              color: colors.fg,
+                              whiteSpace: "nowrap",
+                              overflow: "hidden",
+                              textOverflow: "ellipsis",
+                            }}
+                          >
+                            {a.name}
                           </span>
-                          {opt.sel.mode === "existing" && opt.sel.dir === convCwd && (
-                            <span
-                              style={{
-                                color: colors.dim,
-                                fontSize: 11,
-                                border: `1px solid ${colors.border}`,
-                                borderRadius: 5,
-                                padding: "1px 6px",
-                                flexShrink: 0,
-                              }}
-                            >
-                              current
+                          {a.status === "running" ? (
+                            <WorkingShimmer />
+                          ) : (
+                            <span style={{ color: a.status === "failed" ? colors.err : colors.dim, fontSize: 12.5 }}>
+                              {a.status === "failed" ? "failed" : "done"}
                             </span>
                           )}
-                          {(workSel.mode === opt.sel.mode &&
-                            (opt.sel.mode !== "existing" ||
-                              (workSel.mode === "existing" && workSel.dir === opt.sel.dir))) && <CheckIcon />}
                         </button>
                       ))}
-                      <div style={{ color: colors.dim, fontSize: 11.5, padding: "4px 10px 2px", lineHeight: 1.4 }}>
-                        Applies to new chats in {activeProjectName ?? "this project"} — this conversation keeps its
-                        checkout.
-                      </div>
-                    </div>
+                    </>
                   )}
-                  <EnvRow
-                    icon={<BranchIcon />}
-                    label={envBranches?.current ?? projectBranch ?? "…"}
-                    right={<Chevron open={envSection === "branch"} />}
-                    onClick={() => setEnvSection((s) => (s === "branch" ? null : "branch"))}
-                  />
-                  {envSection === "branch" && envBranches && (
-                    <div style={{ padding: "0 0 4px 12px" }}>
-                      <input
-                        value={envBranchSearch}
-                        onChange={(e) => setEnvBranchSearch(e.target.value)}
-                        placeholder="Find a branch…"
-                        spellCheck={false}
-                        style={{
-                          width: "100%",
-                          boxSizing: "border-box",
-                          background: "var(--panel-2)",
-                          color: colors.fg,
-                          border: `1px solid ${colors.border}`,
-                          borderRadius: 8,
-                          padding: "6px 10px",
-                          fontSize: 12.5,
-                          outline: "none",
-                          margin: "2px 0 4px",
-                          fontFamily: "inherit",
-                        }}
-                      />
-                      <div style={{ maxHeight: 180, overflowY: "auto" }}>
-                        {envBranches.branches
-                          .filter((b) => b.toLowerCase().includes(envBranchSearch.toLowerCase()))
-                          .slice(0, 30)
-                          .map((b) => (
-                            <button
-                              key={b}
-                              onClick={() => envPickBranch(b)}
-                              style={{
-                                display: "flex",
-                                alignItems: "center",
-                                gap: 10,
-                                width: "100%",
-                                background: "transparent",
-                                border: "none",
-                                borderRadius: 8,
-                                padding: "6px 10px",
-                                fontSize: 13,
-                                color: colors.fg,
-                                cursor: "pointer",
-                                textAlign: "left",
-                                fontFamily: "var(--font-code)",
-                              }}
-                            >
-                              <span style={{ flex: 1, minWidth: 0, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                                {b}
-                              </span>
-                              {b === envBranches.current && <CheckIcon />}
-                            </button>
-                          ))}
-                      </div>
-                      <button
-                        onClick={() => {
-                          setBranchCreate(true);
-                          setEnvOpen(false);
-                        }}
-                        style={{
-                          display: "flex",
-                          alignItems: "center",
-                          gap: 10,
-                          width: "100%",
-                          background: "transparent",
-                          border: "none",
-                          borderRadius: 8,
-                          padding: "6px 10px",
-                          fontSize: 13,
-                          color: colors.fg,
-                          cursor: "pointer",
-                          textAlign: "left",
-                          fontFamily: "inherit",
-                        }}
-                      >
-                        <span style={{ color: colors.dim, display: "flex" }}>
-                          <PlusIcon />
-                        </span>
-                        Create new branch…
-                      </button>
+                  {!inProject && subAgentsList.length === 0 && (
+                    <div style={{ color: colors.dim, fontSize: 12.5, padding: "4px 10px 8px", lineHeight: 1.4 }}>
+                      Sub-agents spawned in this chat will appear here.
                     </div>
-                  )}
-                  <div style={{ borderTop: `1px solid ${colors.border}`, margin: "6px 4px" }} />
-                  <EnvRow icon={<CommitIcon />} label="Commit or push" onClick={() => void envCommitPush()} />
-                  <EnvRow icon={<PrIcon />} label="Create pull request" onClick={() => void envCreatePr()} />
-                  {envMsg && (
-                    <div style={{ color: colors.dim, fontSize: 12, padding: "6px 10px 2px" }}>{envMsg}</div>
                   )}
                 </div>
               )}
@@ -2375,6 +2759,7 @@ export function App() {
               </div>
             ) : undefined
           }
+          onOpenAgent={openAgentTab}
           onBusyChange={(b) => {
             setMainBusy(b);
             if (b) setMainStarted(true);
@@ -2444,12 +2829,19 @@ export function App() {
                         ? { icon: <ReviewIcon />, label: "Review", close: closeReviewTab, aria: "Close review" }
                         : t === "browser"
                           ? { icon: <GlobeIcon size={13} />, label: "Browser", close: closeBrowserTab, aria: "Close browser" }
-                          : {
-                              icon: <TerminalIcon size={13} />,
-                              label: activeProjectName ?? "Terminal",
-                              close: closeTerminalTab,
-                              aria: "Close terminal",
-                            };
+                          : t === "agent"
+                            ? {
+                                icon: openAgent ? <span style={{ fontSize: 13 }}>{agentEmoji(openAgent.threadId)}</span> : <SteerIcon />,
+                                label: openAgent?.name ?? "Sub-agent",
+                                close: () => setOpenAgent(null),
+                                aria: "Close sub-agent",
+                              }
+                            : {
+                                icon: <TerminalIcon size={13} />,
+                                label: activeProjectName ?? "Terminal",
+                                close: closeTerminalTab,
+                                aria: "Close terminal",
+                              };
               return (
                 <button
                   key={t}
@@ -2515,6 +2907,25 @@ export function App() {
                   {mainStarted && (
                     <MenuItem icon={<ChatPlusIcon />} label="Side chat" onClick={openSideChatTab} />
                   )}
+                  {subAgentsList.length > 0 && (
+                    <>
+                      <div style={{ color: colors.dim, fontSize: 12.5, padding: "8px 10px 4px", borderTop: `1px solid ${colors.border}`, marginTop: 6 }}>
+                        Sub-agents
+                      </div>
+                      {subAgentsList.map((a) => (
+                        <MenuItem
+                          key={a.threadId}
+                          icon={<span style={{ fontSize: 14 }}>{agentEmoji(a.threadId)}</span>}
+                          label={a.name}
+                          desc={a.status === "running" ? "working…" : a.status}
+                          onClick={() => {
+                            setSidePlusOpen(false);
+                            openAgentTab(a);
+                          }}
+                        />
+                      ))}
+                    </>
+                  )}
                 </div>
               )}
             </span>
@@ -2573,6 +2984,14 @@ export function App() {
             />
           )}
           {reviewOpen && panelMode === "review" && <ReviewPane gitPath={gitPath} />}
+          {openAgent && panelMode === "agent" && (
+            <SubAgentPane
+              key={openAgent.threadId}
+              threadId={openAgent.threadId}
+              name={openAgent.name}
+              status={subAgentsList.find((a) => a.threadId === openAgent.threadId)?.status ?? "idle"}
+            />
+          )}
           {filesOpen && panelMode === "files" && (
             <div style={{ flex: 1, minHeight: 0, display: "flex" }}>
               <div
@@ -3059,6 +3478,543 @@ export function App() {
                 <ShieldAlertIcon />
                 Confirm
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {threadMenu && (
+        <div
+          data-threadmenu
+          style={{
+            position: "fixed",
+            top: threadMenu.y,
+            left: Math.max(8, Math.min(threadMenu.x - 210, window.innerWidth - 226)),
+            width: 210,
+            background: colors.panel,
+            border: `1px solid ${colors.border}`,
+            borderRadius: 12,
+            padding: 6,
+            zIndex: 60,
+            boxShadow: "0 8px 24px rgba(0,0,0,0.45)",
+          }}
+        >
+          <MenuItem
+            icon={<PencilIcon />}
+            label="Rename…"
+            onClick={() => {
+              setRenameDialog({ id: threadMenu.id, name: threadMenu.title, error: null });
+              setThreadMenu(null);
+            }}
+          />
+          {!threadMenu.inProject && (
+            <MenuItem
+              icon={<FolderOutlineIcon size={15} />}
+              label="Move to project…"
+              disabled={sidebar.projects.length === 0}
+              desc={sidebar.projects.length === 0 ? "No projects yet" : undefined}
+              onClick={() => {
+                setMoveDialog({ id: threadMenu.id, title: threadMenu.title });
+                setThreadMenu(null);
+              }}
+            />
+          )}
+          <MenuItem
+            icon={<TrashIcon />}
+            label="Delete"
+            onClick={() => {
+              const id = threadMenu.id;
+              setThreadMenu(null);
+              void deleteThread(id);
+            }}
+          />
+        </div>
+      )}
+      {editProj && (
+        <div
+          onMouseDown={(e) => {
+            if (e.target === e.currentTarget) setEditProj(null);
+          }}
+          style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)", display: "grid", placeItems: "center", zIndex: 100 }}
+        >
+          <div
+            style={{
+              width: 560,
+              maxWidth: "calc(100vw - 48px)",
+              background: colors.panel,
+              border: `1px solid ${colors.border}`,
+              borderRadius: 16,
+              padding: "22px 24px 20px",
+              boxShadow: "0 16px 48px rgba(0,0,0,0.55)",
+              position: "relative",
+            }}
+          >
+            <button
+              onClick={() => setEditProj(null)}
+              aria-label="Close"
+              style={{ position: "absolute", top: 16, right: 16, background: "transparent", border: "none", color: colors.dim, cursor: "pointer", padding: 4, display: "flex" }}
+            >
+              <CloseIcon />
+            </button>
+            <div style={{ fontSize: 18, fontWeight: 600, color: colors.fg }}>Edit project</div>
+            {/* Name row: icon button (opens the identity picker) + name input */}
+            <div
+              style={{
+                display: "flex",
+                alignItems: "stretch",
+                marginTop: 16,
+                border: `1px solid ${colors.border}`,
+                borderRadius: 12,
+                background: "var(--panel-2)",
+                overflow: "visible",
+                position: "relative",
+              }}
+            >
+              <button
+                onClick={() => setEditProj({ ...editProj, pickerOpen: !editProj.pickerOpen })}
+                title="Change icon and color"
+                aria-expanded={editProj.pickerOpen}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  width: 52,
+                  background: "var(--chip)",
+                  border: "none",
+                  borderRight: `1px solid ${colors.border}`,
+                  borderRadius: "12px 0 0 12px",
+                  cursor: "pointer",
+                  color: colors.fg,
+                }}
+              >
+                <ProjectIcon icon={editProj.icon} color={editProj.color} size={18} />
+              </button>
+              <input
+                value={editProj.name}
+                onChange={(e) => setEditProj({ ...editProj, name: e.target.value, error: null })}
+                placeholder="Project name"
+                spellCheck={false}
+                style={{
+                  flex: 1,
+                  background: "transparent",
+                  border: "none",
+                  outline: "none",
+                  color: colors.fg,
+                  fontSize: 15,
+                  padding: "12px 14px",
+                  fontFamily: "inherit",
+                }}
+              />
+              {editProj.pickerOpen && (
+                <div
+                  style={{
+                    position: "absolute",
+                    top: "calc(100% + 8px)",
+                    left: 0,
+                    width: 300,
+                    background: colors.panel,
+                    border: `1px solid ${colors.border}`,
+                    borderRadius: 14,
+                    padding: 14,
+                    zIndex: 40,
+                    boxShadow: "0 12px 32px rgba(0,0,0,0.55)",
+                  }}
+                >
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 10, paddingBottom: 12, borderBottom: `1px solid ${colors.border}` }}>
+                    {PROJECT_COLORS.map((c, i) => {
+                      const value = i === 0 ? null : c; // first swatch = default
+                      const selected = editProj.color === value;
+                      return (
+                        <button
+                          key={c}
+                          onClick={() => setEditProj({ ...editProj, color: value })}
+                          aria-label={`Color ${i + 1}`}
+                          style={{
+                            width: 26,
+                            height: 26,
+                            borderRadius: "50%",
+                            background: c,
+                            border: selected ? `2px solid ${colors.fg}` : "2px solid transparent",
+                            outline: selected ? `2px solid ${colors.bg}` : "none",
+                            outlineOffset: -4,
+                            cursor: "pointer",
+                            padding: 0,
+                          }}
+                        />
+                      );
+                    })}
+                  </div>
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(6, 1fr)", gap: 6, paddingTop: 12 }}>
+                    {Object.keys(PROJECT_ICON_PATHS).map((key) => (
+                      <button
+                        key={key}
+                        onClick={() => setEditProj({ ...editProj, icon: key })}
+                        aria-label={key}
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "center",
+                          padding: 7,
+                          background: editProj.icon === key ? "var(--chip)" : "transparent",
+                          border: "none",
+                          borderRadius: 8,
+                          color: colors.fg,
+                          cursor: "pointer",
+                        }}
+                      >
+                        <ProjectIcon icon={key} color={editProj.color} size={17} />
+                      </button>
+                    ))}
+                  </div>
+                  <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 10 }}>
+                    <button
+                      onClick={() => setEditProj({ ...editProj, pickerOpen: false })}
+                      style={{ background: "var(--chip)", border: "none", borderRadius: 10, color: colors.fg, fontSize: 13, cursor: "pointer", fontFamily: "inherit", padding: "7px 16px" }}
+                    >
+                      Done
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+            <div style={{ color: colors.fg, fontSize: 14.5, fontWeight: 500, margin: "18px 0 8px" }}>Source folders</div>
+            <div style={{ border: `1px solid ${colors.border}`, borderRadius: 12 }}>
+              {editProj.folders.map((f, i) => (
+                <div
+                  key={f}
+                  title={f}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 10,
+                    padding: "11px 14px",
+                    borderTop: i > 0 ? `1px solid ${colors.border}` : "none",
+                  }}
+                >
+                  <FolderOutlineIcon size={15} />
+                  <span style={{ flex: 1, minWidth: 0, fontSize: 13.5, color: colors.fg, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                    {f.split("/").filter(Boolean).pop()}
+                  </span>
+                  {f === editProj.primary ? (
+                    <span style={{ color: colors.dim, fontSize: 12, border: `1px solid ${colors.border}`, borderRadius: 999, padding: "2px 10px", flexShrink: 0 }}>
+                      Primary
+                    </span>
+                  ) : (
+                    <button
+                      onClick={() => setEditProj({ ...editProj, primary: f })}
+                      style={{ background: "transparent", border: "none", color: colors.dim, fontSize: 12, cursor: "pointer", fontFamily: "inherit", padding: "2px 6px", flexShrink: 0 }}
+                    >
+                      Make primary
+                    </button>
+                  )}
+                  <button
+                    onClick={() => {
+                      if (editProj.folders.length === 1) return;
+                      const folders = editProj.folders.filter((x) => x !== f);
+                      setEditProj({
+                        ...editProj,
+                        folders,
+                        primary: editProj.primary === f ? folders[0] : editProj.primary,
+                      });
+                    }}
+                    aria-label={`Remove ${f}`}
+                    style={{
+                      background: "transparent",
+                      border: "none",
+                      color: editProj.folders.length === 1 ? "var(--gutter)" : colors.dim,
+                      cursor: editProj.folders.length === 1 ? "default" : "pointer",
+                      padding: 2,
+                      display: "flex",
+                      flexShrink: 0,
+                    }}
+                  >
+                    <CloseIcon />
+                  </button>
+                </div>
+              ))}
+              <button
+                onClick={() =>
+                  void window.unbiased.pickProjectLocation().then((r) => {
+                    if (r.path && !editProj.folders.includes(r.path)) {
+                      setEditProj((e) => (e ? { ...e, folders: [...e.folders, r.path!] } : e));
+                    }
+                  })
+                }
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 10,
+                  width: "100%",
+                  background: "transparent",
+                  border: "none",
+                  borderTop: `1px solid ${colors.border}`,
+                  padding: "11px 14px",
+                  fontSize: 13.5,
+                  color: colors.fg,
+                  cursor: "pointer",
+                  textAlign: "left",
+                  fontFamily: "inherit",
+                }}
+              >
+                <FolderPlusIcon />
+                Add folder
+              </button>
+            </div>
+            {editProj.error && <div style={{ color: colors.err, fontSize: 13, marginTop: 10 }}>{editProj.error}</div>}
+            <div style={{ display: "flex", alignItems: "center", gap: 12, marginTop: 20 }}>
+              <button
+                onClick={() => {
+                  const path = editProj.path;
+                  const name = editProj.name;
+                  setEditProj(null);
+                  setConfirmDialog({ kind: "remove", path, name, count: 0 });
+                }}
+                style={{ background: "rgba(240, 149, 149, 0.14)", border: "none", borderRadius: 10, color: colors.err, fontSize: 13.5, cursor: "pointer", fontFamily: "inherit", padding: "9px 16px" }}
+              >
+                Remove local project
+              </button>
+              <span style={{ flex: 1 }} />
+              <button
+                onClick={() => setEditProj(null)}
+                style={{ background: "transparent", border: "none", color: colors.dim, fontSize: 14, cursor: "pointer", fontFamily: "inherit", padding: "9px 14px" }}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => void doSaveProject()}
+                style={{ background: colors.fg, border: "none", borderRadius: 999, color: "var(--bg)", fontSize: 14, fontWeight: 500, cursor: "pointer", fontFamily: "inherit", padding: "9px 20px" }}
+              >
+                Save
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {createProj && (
+        <div
+          onMouseDown={(e) => {
+            if (e.target === e.currentTarget) setCreateProj(null);
+          }}
+          style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)", display: "grid", placeItems: "center", zIndex: 100 }}
+        >
+          <div
+            style={{
+              width: 480,
+              maxWidth: "calc(100vw - 48px)",
+              background: colors.panel,
+              border: `1px solid ${colors.border}`,
+              borderRadius: 16,
+              padding: "22px 24px 20px",
+              boxShadow: "0 16px 48px rgba(0,0,0,0.55)",
+            }}
+          >
+            <div style={{ fontSize: 18, fontWeight: 600, color: colors.fg }}>Create project</div>
+            <div style={{ color: colors.dim, fontSize: 13.5, margin: "16px 0 8px" }}>Project name</div>
+            <input
+              autoFocus
+              value={createProj.name}
+              onChange={(e) => setCreateProj({ ...createProj, name: e.target.value, error: null })}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && createProj.name.trim()) void doCreateProject();
+              }}
+              placeholder="my-new-project"
+              spellCheck={false}
+              style={{
+                width: "100%",
+                boxSizing: "border-box",
+                background: "var(--panel-2)",
+                border: `1px solid ${colors.border}`,
+                borderRadius: 10,
+                padding: "10px 12px",
+                color: colors.fg,
+                fontSize: 14,
+                outline: "none",
+                fontFamily: "var(--font-code)",
+              }}
+            />
+            <div style={{ color: colors.dim, fontSize: 13.5, margin: "14px 0 6px" }}>Location</div>
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <span
+                style={{
+                  flex: 1,
+                  minWidth: 0,
+                  fontFamily: "var(--font-code)",
+                  fontSize: 12.5,
+                  color: colors.dim,
+                  whiteSpace: "nowrap",
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                }}
+              >
+                {(createProj.parent ?? "~") + "/" + (createProj.name.trim() || "…")}
+              </span>
+              <button
+                onClick={() =>
+                  void window.unbiased.pickProjectLocation().then((r) => {
+                    if (r.path) setCreateProj((c) => (c ? { ...c, parent: r.path } : c));
+                  })
+                }
+                style={{
+                  background: "transparent",
+                  border: `1px solid ${colors.border}`,
+                  color: colors.fg,
+                  borderRadius: 8,
+                  padding: "5px 12px",
+                  fontSize: 12.5,
+                  cursor: "pointer",
+                  fontFamily: "inherit",
+                  flexShrink: 0,
+                }}
+              >
+                Choose…
+              </button>
+            </div>
+            {createProj.error && <div style={{ color: colors.err, fontSize: 13, marginTop: 10 }}>{createProj.error}</div>}
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 12, marginTop: 20 }}>
+              <button
+                onClick={() => setCreateProj(null)}
+                style={{ background: "var(--chip)", border: "none", borderRadius: 999, color: colors.fg, fontSize: 14, cursor: "pointer", fontFamily: "inherit", padding: "9px 18px" }}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => void doCreateProject()}
+                disabled={!createProj.name.trim()}
+                style={{
+                  background: createProj.name.trim() ? colors.fg : "var(--panel-2)",
+                  border: "none",
+                  borderRadius: 999,
+                  color: createProj.name.trim() ? "var(--bg)" : colors.dim,
+                  fontSize: 14,
+                  fontWeight: 500,
+                  cursor: createProj.name.trim() ? "pointer" : "default",
+                  fontFamily: "inherit",
+                  padding: "9px 18px",
+                }}
+              >
+                Create project
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {renameDialog && (
+        <div
+          onMouseDown={(e) => {
+            if (e.target === e.currentTarget) setRenameDialog(null);
+          }}
+          style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)", display: "grid", placeItems: "center", zIndex: 100 }}
+        >
+          <div
+            style={{
+              width: 440,
+              maxWidth: "calc(100vw - 48px)",
+              background: colors.panel,
+              border: `1px solid ${colors.border}`,
+              borderRadius: 16,
+              padding: "22px 24px 20px",
+              boxShadow: "0 16px 48px rgba(0,0,0,0.55)",
+            }}
+          >
+            <div style={{ fontSize: 18, fontWeight: 600, color: colors.fg }}>Rename conversation</div>
+            <input
+              autoFocus
+              value={renameDialog.name}
+              onChange={(e) => setRenameDialog({ ...renameDialog, name: e.target.value, error: null })}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && renameDialog.name.trim()) void doRenameThread();
+              }}
+              spellCheck={false}
+              style={{
+                width: "100%",
+                boxSizing: "border-box",
+                background: "var(--panel-2)",
+                border: `1px solid ${colors.border}`,
+                borderRadius: 10,
+                padding: "10px 12px",
+                color: colors.fg,
+                fontSize: 14,
+                outline: "none",
+                fontFamily: "inherit",
+                marginTop: 16,
+              }}
+            />
+            {renameDialog.error && <div style={{ color: colors.err, fontSize: 13, marginTop: 8 }}>{renameDialog.error}</div>}
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 12, marginTop: 20 }}>
+              <button
+                onClick={() => setRenameDialog(null)}
+                style={{ background: "var(--chip)", border: "none", borderRadius: 999, color: colors.fg, fontSize: 14, cursor: "pointer", fontFamily: "inherit", padding: "9px 18px" }}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => void doRenameThread()}
+                disabled={!renameDialog.name.trim()}
+                style={{
+                  background: renameDialog.name.trim() ? colors.fg : "var(--panel-2)",
+                  border: "none",
+                  borderRadius: 999,
+                  color: renameDialog.name.trim() ? "var(--bg)" : colors.dim,
+                  fontSize: 14,
+                  fontWeight: 500,
+                  cursor: renameDialog.name.trim() ? "pointer" : "default",
+                  fontFamily: "inherit",
+                  padding: "9px 18px",
+                }}
+              >
+                Rename
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {moveDialog && (
+        <div
+          onMouseDown={(e) => {
+            if (e.target === e.currentTarget) setMoveDialog(null);
+          }}
+          style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)", display: "grid", placeItems: "center", zIndex: 100 }}
+        >
+          <div
+            style={{
+              width: 440,
+              maxWidth: "calc(100vw - 48px)",
+              background: colors.panel,
+              border: `1px solid ${colors.border}`,
+              borderRadius: 16,
+              padding: "22px 24px 20px",
+              boxShadow: "0 16px 48px rgba(0,0,0,0.55)",
+            }}
+          >
+            <div style={{ fontSize: 18, fontWeight: 600, color: colors.fg }}>Move to project</div>
+            <div style={{ color: colors.dim, fontSize: 13.5, marginTop: 8, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+              {moveDialog.title}
+            </div>
+            <div style={{ maxHeight: 260, overflowY: "auto", marginTop: 12 }}>
+              {sidebar.projects.map((pr) => (
+                <button
+                  key={pr.path}
+                  onClick={() => void doMoveThread(pr.path)}
+                  title={pr.path}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 10,
+                    width: "100%",
+                    background: "transparent",
+                    border: "none",
+                    borderRadius: 10,
+                    padding: "9px 10px",
+                    fontSize: 14,
+                    color: colors.fg,
+                    cursor: "pointer",
+                    textAlign: "left",
+                    fontFamily: "inherit",
+                  }}
+                >
+                  <FolderIcon />
+                  <span style={{ minWidth: 0, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{pr.name}</span>
+                </button>
+              ))}
             </div>
           </div>
         </div>
@@ -4148,6 +5104,333 @@ function BrowserPane() {
  *  the active conversation's root) in the main process. Mounted for as
  *  long as its tab exists — hiding the tab only hides this component, so
  *  the shell session survives tab switches. */
+/** A completed turn's work — narration, agent lifecycle rows, command
+ *  groups — collapsed under a dim "Worked for Ns" header, Codex-style.
+ *  The final message stays outside, always visible. */
+function WorkedGroup({ duration, children }: { duration: number | null; children: React.ReactNode }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div style={{ margin: "14px 0" }}>
+      <button
+        onClick={() => setOpen((o) => !o)}
+        aria-expanded={open}
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 6,
+          width: "100%",
+          background: "transparent",
+          border: "none",
+          padding: "0 0 6px",
+          color: colors.dim,
+          fontSize: 13.5,
+          cursor: "pointer",
+          fontFamily: "inherit",
+          borderBottom: `1px solid ${colors.border}`,
+        }}
+      >
+        {duration !== null ? `Worked for ${formatDuration(duration)}` : "Worked"}
+        <span
+          style={{
+            display: "inline-block",
+            transform: open ? "rotate(90deg)" : "none",
+            transition: "transform 120ms",
+            fontSize: 10,
+          }}
+        >
+          ›
+        </span>
+      </button>
+      {open && <div style={{ paddingTop: 2 }}>{children}</div>}
+    </div>
+  );
+}
+
+/** Codex-style sub-agent lifecycle marker in the transcript flow: a dim
+ *  icon row ("Created an agent ⌄") that expands to the agent's name and an
+ *  open-conversation link. The pinned engine's subAgentActivity items carry
+ *  kind + agent path only, so the detail line names the model-chosen task
+ *  name rather than the spawn instructions (which never reach the client). */
+function AgentLifecycleRow({
+  entry,
+  onOpen,
+}: {
+  entry: Extract<Entry, { kind: "agent" }>;
+  onOpen?: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  // Live spawns carry the instructions in the event; rows rebuilt from
+  // history (resumed conversations) fetch them lazily from the agent's
+  // transcript — the first inbound mail IS the task.
+  const [fetchedPrompt, setFetchedPrompt] = useState<string | null>(null);
+  useEffect(() => {
+    if (!open || entry.prompt || fetchedPrompt || !entry.agentThreadId) return;
+    let alive = true;
+    void window.unbiased.subagentTranscript(entry.agentThreadId).then((r) => {
+      if (!alive) return;
+      const task = r.entries.find((x) => x.kind === "user");
+      if (task && task.kind === "user") setFetchedPrompt(task.text);
+    });
+    return () => {
+      alive = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
+  const prompt = entry.prompt ?? fetchedPrompt;
+  const LABELS: Record<string, { row: string; detail: string }> = {
+    started: { row: "Created an agent", detail: "Created" },
+    interacted: { row: "Messaged an agent", detail: "Messaged" },
+    interrupted: { row: "Interrupted an agent", detail: "Interrupted" },
+    completed: { row: "Closed an agent", detail: "Closed" },
+    failed: { row: "An agent failed", detail: "Failed:" },
+  };
+  const label = LABELS[entry.event] ?? { row: `Agent ${entry.event}`, detail: entry.event };
+  return (
+    <div style={{ margin: "14px 0" }}>
+      <button
+        onClick={() => setOpen((o) => !o)}
+        aria-expanded={open}
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 8,
+          background: "transparent",
+          border: "none",
+          padding: 0,
+          color: entry.event === "failed" ? colors.err : colors.dim,
+          fontSize: 13.5,
+          cursor: "pointer",
+          fontFamily: "inherit",
+        }}
+      >
+        <AgentIcon />
+        {label.row}
+        <span
+          style={{
+            display: "inline-block",
+            transform: open ? "rotate(90deg)" : "none",
+            transition: "transform 120ms",
+            fontSize: 10,
+          }}
+        >
+          ›
+        </span>
+      </button>
+      {open && (
+        <div
+          style={{
+            color: colors.dim,
+            fontSize: 13,
+            padding: "6px 0 0 26px",
+            display: "flex",
+            alignItems: "center",
+            gap: 10,
+            minWidth: 0,
+          }}
+        >
+          <span style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+            {label.detail}{" "}
+            {onOpen ? (
+              <button
+                onClick={onOpen}
+                title="Open conversation"
+                style={{
+                  background: "transparent",
+                  border: "none",
+                  color: colors.accent,
+                  fontSize: "inherit",
+                  cursor: "pointer",
+                  fontFamily: "inherit",
+                  padding: 0,
+                }}
+              >
+                {entry.agentThreadId ? `${agentEmoji(entry.agentThreadId)} ` : ""}
+                {entry.name}
+              </button>
+            ) : (
+              <span style={{ color: "var(--fg-soft)" }}>{entry.name}</span>
+            )}
+            {prompt ? ` with the instructions: ${prompt}` : entry.path ? ` — ${entry.path}` : ""}
+          </span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function AgentIcon() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <rect x="5" y="8" width="14" height="10" rx="3" />
+      <path d="M12 8V5" />
+      <circle cx="12" cy="3.5" r="1.2" />
+      <path d="M9.5 12.5v1.2M14.5 12.5v1.2" />
+    </svg>
+  );
+}
+
+/** Read-only view of one sub-agent's conversation (multi-agent v2). The
+ *  transcript comes from the engine on open and refetches on that thread's
+ *  item completions; the in-flight reply streams live via deltas. The task
+ *  the agent was GIVEN is not a thread item (it rides the engine's internal
+ *  inter-agent channel), so the view shows the agent's side: its replies
+ *  and the commands it runs. */
+function SubAgentPane({ threadId, name, status }: { threadId: string; name: string; status: string }) {
+  const [entries, setEntries] = useState<Entry[]>([]);
+  const [path, setPath] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [tail, setTail] = useState("");
+  const scrollRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    let alive = true;
+    const fetchTranscript = async () => {
+      const r = await window.unbiased.subagentTranscript(threadId);
+      if (!alive) return;
+      setEntries(r.entries);
+      setPath(r.path);
+      setError(r.error ?? null);
+      setTail(r.streamText);
+    };
+    void fetchTranscript();
+    // Debounced refetch on this thread's item completions; deltas append
+    // between refetches so streaming text is visible immediately.
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const offs = [
+      window.unbiased.onSubAgentActivity((p) => {
+        if (p.threadId !== threadId) return;
+        if (timer) clearTimeout(timer);
+        timer = setTimeout(() => void fetchTranscript(), 250);
+      }),
+      window.unbiased.onSubAgentDelta((p) => {
+        if (p.threadId !== threadId) return;
+        setTail((t) => t + p.delta);
+      }),
+    ];
+    return () => {
+      alive = false;
+      if (timer) clearTimeout(timer);
+      offs.forEach((off) => off());
+    };
+  }, [threadId]);
+
+  useEffect(() => {
+    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
+  }, [entries, tail]);
+
+  return (
+    <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
+      <div
+        style={{
+          padding: "10px 16px",
+          borderBottom: `1px solid ${colors.border}`,
+          fontSize: 12.5,
+          color: colors.dim,
+          display: "flex",
+          alignItems: "center",
+          gap: 8,
+          flexShrink: 0,
+        }}
+        title={path ?? undefined}
+      >
+        <span style={{ fontSize: 14 }}>{agentEmoji(threadId)}</span>
+        <span style={{ color: colors.fg, fontWeight: 500 }}>{name}</span>
+        <span style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{path}</span>
+        <span style={{ flex: 1 }} />
+        <span style={{ color: status === "running" ? colors.amber : status === "failed" ? colors.err : colors.dim }}>
+          {status === "running" ? "working…" : status}
+        </span>
+      </div>
+      <div ref={scrollRef} style={{ flex: 1, overflowY: "auto", padding: "18px 20px" }}>
+        {error && <div style={{ color: colors.err, fontSize: 13 }}>{error}</div>}
+        {!error && entries.length === 0 && tail === "" && (
+          <div style={{ color: colors.dim, fontSize: 13 }}>
+            No replies yet — the agent is {status === "running" ? "working on its task." : "idle."}
+          </div>
+        )}
+        {entries.map((e, i) => {
+          if (e.kind === "assistant") {
+            return (
+              <div key={i} style={{ margin: "12px 0", lineHeight: 1.65, fontSize: 14, color: "var(--fg-msg)" }}>
+                <Markdown remarkPlugins={REMARK_PLUGINS}>{e.text}</Markdown>
+              </div>
+            );
+          }
+          if (e.kind === "user") {
+            return (
+              <div key={i} style={{ display: "flex", justifyContent: "flex-end", margin: "10px 0" }}>
+                <div
+                  style={{
+                    maxWidth: "85%",
+                    padding: "8px 12px",
+                    borderRadius: 12,
+                    background: colors.panel,
+                    whiteSpace: "pre-wrap",
+                    fontSize: 13,
+                  }}
+                >
+                  {e.text}
+                </div>
+              </div>
+            );
+          }
+          if (e.kind === "command") {
+            return (
+              <div
+                key={i}
+                style={{
+                  margin: "8px 0",
+                  padding: "8px 12px",
+                  borderRadius: 10,
+                  background: "var(--code-bg)",
+                  border: `1px solid ${colors.border}`,
+                  fontFamily: "var(--font-code)",
+                  fontSize: 12,
+                  color: colors.dim,
+                }}
+              >
+                <span style={{ color: e.status === "failed" ? colors.err : colors.ok }}>▸ </span>
+                <span style={{ color: colors.fg, whiteSpace: "pre-wrap", minWidth: 0, overflowWrap: "anywhere" }}>{e.command}</span>
+              </div>
+            );
+          }
+          if (e.kind === "compaction") {
+            return (
+              <div key={i} style={{ display: "flex", alignItems: "center", gap: 12, margin: "14px 0" }}>
+                <span style={{ flex: 1, height: 1, background: colors.border }} />
+                <span style={{ color: colors.dim, fontSize: 11 }}>context compacted</span>
+                <span style={{ flex: 1, height: 1, background: colors.border }} />
+              </div>
+            );
+          }
+          return null;
+        })}
+        {tail !== "" && (
+          <div style={{ margin: "12px 0", lineHeight: 1.65, fontSize: 14, color: "var(--fg-msg)" }}>
+            <Markdown remarkPlugins={REMARK_PLUGINS}>{tail}</Markdown>
+          </div>
+        )}
+        {status === "running" && (
+          <div style={{ display: "flex", margin: "10px 0" }}>
+            <div
+              style={{
+                padding: "8px 12px",
+                borderRadius: 12,
+                background: colors.panel,
+                border: `1px solid ${colors.border}`,
+                fontSize: 13,
+                color: colors.dim,
+              }}
+            >
+              working…
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function TerminalPane() {
   const hostRef = useRef<HTMLDivElement>(null);
 
@@ -4890,6 +6173,7 @@ function ChatPane({
   composerHeader,
   threadId,
   persistTranscript,
+  onOpenAgent,
 }: {
   paneId: PaneId;
   connected: boolean;
@@ -4920,6 +6204,8 @@ function ChatPane({
   // their id from the first send. Drives the transcript cache.
   threadId?: string | null;
   persistTranscript?: boolean;
+  // Opens a sub-agent's conversation in the side panel (lifecycle rows).
+  onOpenAgent?: (a: { threadId: string; name: string }) => void;
 }) {
   const [entries, setEntries] = useState<Entry[]>(reset.entries);
   const [draft, setDraft] = useState("");
@@ -5103,6 +6389,10 @@ function ChatPane({
   }
 
   const threadIdRef = useRef<string | null>(threadId ?? null);
+  // Set when an assistant message completes: the next delta starts a NEW
+  // assistant entry instead of appending to the finished one. Multi-agent
+  // turns emit several messages per turn; without this they run together.
+  const messageBoundaryRef = useRef(false);
   // Did the current turn emit anything visible (text, command, plan)? A
   // turn that completes having produced NOTHING — the gateway returned an
   // empty completion — otherwise leaves the chat looking frozen with no
@@ -5131,7 +6421,9 @@ function ChatPane({
         {
           kind: "command",
           itemId: p.itemId ?? p.requestId,
-          command: p.command,
+          // A sub-agent's request has no command card in THIS transcript —
+          // name the agent so the human knows who is asking.
+          command: p.agentName ? `[sub-agent ${p.agentName}] ${p.command}` : p.command,
           status: "awaitingApproval",
           approval,
         },
@@ -5141,10 +6433,13 @@ function ChatPane({
 
   useEffect(() => {
     threadIdRef.current = threadId ?? null;
+    messageBoundaryRef.current = false;
     setEntries(reset.entries);
     // A reopened conversation may still be mid-turn: restore its busy
     // state and any approval requests the agent is blocked on.
     setBusy(!!reset.resume?.running);
+    turnStartIndexRef.current = reset.resume?.running ? reset.entries.length : null;
+    turnStartedAtRef.current = null;
     for (const held of reset.resume?.approvals ?? []) applyApproval(held);
     // Staged annotations belong to the conversation they came from.
     setAnnotations([]);
@@ -5192,11 +6487,17 @@ function ChatPane({
       window.unbiased.onDelta((p) => {
         if (p.paneId !== paneId) return;
         producedRef.current = true;
+        const boundary = messageBoundaryRef.current;
+        messageBoundaryRef.current = false;
         setEntries((es) => {
           const last = es[es.length - 1];
-          if (!last || last.kind !== "assistant") return [...es, { kind: "assistant", text: p.delta }];
+          if (!last || last.kind !== "assistant" || boundary) return [...es, { kind: "assistant", text: p.delta }];
           return [...es.slice(0, -1), { ...last, text: last.text + p.delta }];
         });
+      }),
+      window.unbiased.onMessageBoundary((p) => {
+        if (p.paneId !== paneId) return;
+        messageBoundaryRef.current = true;
       }),
       window.unbiased.onTurnCompleted((p) => {
         if (p.paneId !== paneId) return;
@@ -5204,6 +6505,13 @@ function ChatPane({
         onTurnLanded?.();
         // A turn that produced anything breaks the empty streak.
         if (producedRef.current) emptyStreakRef.current = 0;
+        // Read-and-clear OUTSIDE the updater: React can invoke updaters
+        // more than once (StrictMode), and a consumed ref on the second
+        // pass would silently skip the work fold.
+        const workStart = turnStartIndexRef.current;
+        const workStartedAt = turnStartedAtRef.current;
+        turnStartIndexRef.current = null;
+        turnStartedAtRef.current = null;
         setEntries((es) => {
           let next = es;
           if (p.status === "interrupted") {
@@ -5213,6 +6521,29 @@ function ChatPane({
             }
           }
           next = withoutTrailingPlaceholder(next);
+          // Fold a completed turn's intermediate output — narration, agent
+          // lifecycle rows, command groups — under a "Worked for Ns" header,
+          // leaving the final message visible (Codex-style). Only turns that
+          // actually did agent/tool work get folded; failed and interrupted
+          // turns stay raw so nothing hides the evidence.
+          if (p.status === "completed") {
+            const start = workStart;
+            if (start !== null && start >= 0 && start < next.length) {
+              const turnEntries = next.slice(start);
+              const last = turnEntries[turnEntries.length - 1];
+              const finalMsg = last?.kind === "assistant" ? last : null;
+              const work = finalMsg ? turnEntries.slice(0, -1) : turnEntries;
+              const didWork = work.some((e) => e.kind === "agent" || e.kind === "command");
+              if (didWork && work.length > 0) {
+                const duration = workStartedAt !== null ? (Date.now() - workStartedAt) / 1000 : null;
+                next = [
+                  ...next.slice(0, start),
+                  { kind: "work", duration, entries: work },
+                  ...(finalMsg ? [finalMsg] : []),
+                ];
+              }
+            }
+          }
           // A failed turn with no visible cause looks like the app doing
           // nothing — always say why.
           if (p.status === "failed") {
@@ -5235,6 +6566,12 @@ function ChatPane({
               },
             ];
           }
+          // Stamp the settled final message — the hover timestamp beside
+          // its copy button.
+          const settled = next[next.length - 1];
+          if (settled?.kind === "assistant" && settled.at === undefined) {
+            next = [...next.slice(0, -1), { ...settled, at: Date.now() }];
+          }
           return next;
         });
         // One queued message per completed turn.
@@ -5256,6 +6593,26 @@ function ChatPane({
         if (p.paneId !== paneId) return;
         producedRef.current = true;
         setEntries((es) => [...withoutTrailingPlaceholder(es), { kind: "assistant", text: p.text }]);
+      }),
+      window.unbiased.onSubAgentEvent((p) => {
+        if (p.paneId !== paneId) return;
+        if (p.event === "renamed") {
+          // The engine-assigned nickname lands moments after the spawn —
+          // retitle every row (top-level or inside a work group).
+          const rename = (list: Entry[]): Entry[] =>
+            list.map((e) => {
+              if (e.kind === "agent" && e.agentThreadId === p.agentThreadId) return { ...e, name: p.name };
+              if (e.kind === "work") return { ...e, entries: rename(e.entries) };
+              return e;
+            });
+          setEntries(rename);
+          return;
+        }
+        producedRef.current = true;
+        setEntries((es) => [
+          ...withoutTrailingPlaceholder(es),
+          { kind: "agent", event: p.event, name: p.name, path: p.path, agentThreadId: p.agentThreadId, prompt: p.prompt },
+        ]);
       }),
       window.unbiased.onCompaction((p) => {
         if (p.paneId !== paneId) return;
@@ -5316,6 +6673,13 @@ function ChatPane({
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
   }, [entries]);
 
+  // Drawn anew every time this pane shows a (different) conversation.
+  const chatPlaceholder = useMemo(
+    () => CHAT_PLACEHOLDERS[Math.floor(Math.random() * CHAT_PLACEHOLDERS.length)],
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [reset.nonce, threadId],
+  );
+
   const lastEntry = entries[entries.length - 1];
   const showThinking = busy && !(lastEntry?.kind === "assistant" && lastEntry.text !== "");
   const canSend = connected && (draft.trim() !== "" || annotations.length > 0);
@@ -5329,11 +6693,21 @@ function ChatPane({
     entries.length > 0 &&
     lastEntry?.kind !== "compaction";
 
+  // Where the running turn's output starts in `entries`, and when it began —
+  // consumed on completion to fold the work into a "Worked for Ns" group.
+  const turnStartIndexRef = useRef<number | null>(null);
+  const turnStartedAtRef = useRef<number | null>(null);
+
   /** Send a prepared message right now (fresh sends and queue flushes). */
   async function sendNow(q: QueuedMsg) {
     setBusy(true);
     producedRef.current = false;
-    setEntries((es) => [...es, { kind: "user", text: q.text, annotations: q.annotations }]);
+    turnStartedAtRef.current = Date.now();
+    setEntries((es) => {
+      const next: Entry[] = [...es, { kind: "user", text: q.text, annotations: q.annotations }];
+      turnStartIndexRef.current = next.length;
+      return next;
+    });
     try {
       const res = await window.unbiased.sendMessage(paneId, q.wire, q.attachments);
       threadIdRef.current = res.threadId;
@@ -5612,6 +6986,23 @@ function ChatPane({
           {props.children}
         </a>
       ),
+      blockquote: (props: { children?: React.ReactNode }) => (
+        <blockquote
+          style={{
+            margin: "10px 0",
+            padding: "2px 12px",
+            borderLeft: `3px solid ${colors.accent}`,
+            // Same surface as the composer box; sized to its content.
+            background: colors.panel,
+            borderRadius: "0 8px 8px 0",
+            color: "var(--fg-msg)",
+            width: "fit-content",
+            maxWidth: "100%",
+          }}
+        >
+          {props.children}
+        </blockquote>
+      ),
       p: (props: { children?: React.ReactNode }) => <p style={{ margin: "12px 0" }}>{props.children}</p>,
       h1: (props: { children?: React.ReactNode }) => (
         <h1 style={{ fontSize: "1.5em", fontWeight: 650, margin: "28px 0 12px", color: "var(--fg)" }}>
@@ -5638,6 +7029,95 @@ function ChatPane({
     }),
     [],
   );
+
+  const renderBlock = (block: DisplayBlock, isLast = false): React.ReactNode => {
+    if (block.kind === "steps") {
+      return (
+        <StepsGroup key={`s${block.key}`} items={block.items} statusLabel={statusLabel} decide={decide} />
+      );
+    }
+    const e = block.entry;
+    if (e.kind === "user") {
+      return (
+        <div
+          key={block.key}
+          style={{
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "flex-end",
+            gap: 8,
+            margin: "10px 0",
+          }}
+        >
+          {e.annotations && e.annotations.length > 0 && <SentAnnotations items={e.annotations} />}
+          {e.text && (
+            <div
+              style={{
+                maxWidth: "85%",
+                padding: "10px 14px",
+                borderRadius: 12,
+                background: colors.panel,
+                whiteSpace: "pre-wrap",
+                lineHeight: 1.55,
+                fontSize: 14,
+              }}
+            >
+              {e.text}
+            </div>
+          )}
+          {e.text && <CopyButton text={e.text} />}
+        </div>
+      );
+    }
+    if (e.kind === "compaction") {
+      return (
+        <div
+          key={block.key}
+          style={{ display: "flex", alignItems: "center", gap: 12, margin: "18px 0" }}
+        >
+          <span style={{ flex: 1, height: 1, background: colors.border }} />
+          <span style={{ color: colors.dim, fontSize: 11.5, whiteSpace: "nowrap" }}>
+            context compacted — earlier turns summarized
+          </span>
+          <span style={{ flex: 1, height: 1, background: colors.border }} />
+        </div>
+      );
+    }
+    if (e.kind === "agent") {
+      return (
+        <AgentLifecycleRow
+          key={block.key}
+          entry={e}
+          onOpen={
+            onOpenAgent && e.agentThreadId
+              ? () => onOpenAgent({ threadId: e.agentThreadId!, name: e.name })
+              : undefined
+          }
+        />
+      );
+    }
+    if (e.kind === "assistant") {
+      return (
+        <div key={block.key} style={{ margin: "16px 0", lineHeight: 1.7, fontSize: 15.5, color: "var(--fg-msg)" }}>
+          <Markdown remarkPlugins={REMARK_PLUGINS} components={mdComponents}>
+            {e.text}
+          </Markdown>
+          {e.interrupted && <div style={{ color: colors.dim, fontSize: 12, marginTop: 4 }}>— stopped</div>}
+          {/* One action row, on the settled final response — intermediate
+              narration (and anything inside a work group) goes without. */}
+          {e.text && isLast && !busy && <AssistantActions text={e.text} at={e.at} />}
+        </div>
+      );
+    }
+    if (e.kind === "work") {
+      return (
+        <WorkedGroup key={`w${block.key}`} duration={e.duration}>
+          {toDisplayBlocks(e.entries).map((b) => renderBlock(b))}
+        </WorkedGroup>
+      );
+    }
+    return null;
+  };
 
   return (
     <div ref={paneRef} style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", position: "relative" }}>
@@ -5763,72 +7243,7 @@ function ChatPane({
               {b.n}
             </span>
           ))}
-          {toDisplayBlocks(entries).map((block) => {
-            if (block.kind === "steps") {
-              return (
-                <StepsGroup key={`s${block.key}`} items={block.items} statusLabel={statusLabel} decide={decide} />
-              );
-            }
-            const e = block.entry;
-            if (e.kind === "user") {
-              return (
-                <div
-                  key={block.key}
-                  style={{
-                    display: "flex",
-                    flexDirection: "column",
-                    alignItems: "flex-end",
-                    gap: 8,
-                    margin: "10px 0",
-                  }}
-                >
-                  {e.annotations && e.annotations.length > 0 && <SentAnnotations items={e.annotations} />}
-                  {e.text && (
-                    <div
-                      style={{
-                        maxWidth: "85%",
-                        padding: "10px 14px",
-                        borderRadius: 12,
-                        background: colors.panel,
-                        whiteSpace: "pre-wrap",
-                        lineHeight: 1.55,
-                        fontSize: 14,
-                      }}
-                    >
-                      {e.text}
-                    </div>
-                  )}
-                  {e.text && <CopyButton text={e.text} />}
-                </div>
-              );
-            }
-            if (e.kind === "compaction") {
-              return (
-                <div
-                  key={block.key}
-                  style={{ display: "flex", alignItems: "center", gap: 12, margin: "18px 0" }}
-                >
-                  <span style={{ flex: 1, height: 1, background: colors.border }} />
-                  <span style={{ color: colors.dim, fontSize: 11.5, whiteSpace: "nowrap" }}>
-                    context compacted — earlier turns summarized
-                  </span>
-                  <span style={{ flex: 1, height: 1, background: colors.border }} />
-                </div>
-              );
-            }
-            if (e.kind === "assistant") {
-              return (
-                <div key={block.key} style={{ margin: "16px 0", lineHeight: 1.7, fontSize: 15.5, color: "var(--fg-msg)" }}>
-                  <Markdown remarkPlugins={REMARK_PLUGINS} components={mdComponents}>
-                    {e.text}
-                  </Markdown>
-                  {e.interrupted && <div style={{ color: colors.dim, fontSize: 12, marginTop: 4 }}>— stopped</div>}
-                  {e.text && <CopyButton text={e.text} />}
-                </div>
-              );
-            }
-            return null;
-          })}
+          {toDisplayBlocks(entries).map((b, i, arr) => renderBlock(b, i === arr.length - 1))}
           {compacting && (
             <div style={{ display: "flex", justifyContent: "flex-start", margin: "10px 0" }}>
               <div
@@ -6217,7 +7632,7 @@ function ChatPane({
               e.preventDefault();
               void attachClipboardImage();
             }}
-            placeholder={connected ? "Do anything" : "Engine starting…"}
+            placeholder={!connected ? "Engine starting…" : entries.length > 0 ? chatPlaceholder : "Do anything"}
             disabled={!connected}
             rows={2}
             style={{
@@ -8119,6 +9534,34 @@ function IconButton({
   );
 }
 
+/** The final response's action row: copy, plus the settled time revealed
+ *  when the pointer is anywhere over the row (Codex behavior). */
+function AssistantActions({ text, at }: { text: string; at?: number }) {
+  const [hover, setHover] = useState(false);
+  return (
+    <span
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      style={{ display: "inline-flex", alignItems: "center", gap: 10 }}
+    >
+      <CopyButton text={text} />
+      {at !== undefined && (
+        <span
+          style={{
+            color: colors.dim,
+            fontSize: 12.5,
+            opacity: hover ? 1 : 0,
+            transition: "opacity 120ms",
+            fontVariantNumeric: "tabular-nums",
+          }}
+        >
+          {new Date(at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}
+        </span>
+      )}
+    </span>
+  );
+}
+
 function CopyButton({ text }: { text: string }) {
   const [copied, setCopied] = useState(false);
   return (
@@ -8547,7 +9990,8 @@ function ThreadRow({
   indent,
   onHover,
   onOpen,
-  onDelete,
+  menuOpen,
+  onMenu,
 }: {
   thread: ThreadSummary;
   active: boolean;
@@ -8556,7 +10000,8 @@ function ThreadRow({
   indent?: boolean;
   onHover: (id: string | null) => void;
   onOpen: (id: string) => Promise<void>;
-  onDelete: (id: string) => Promise<void>;
+  menuOpen?: boolean;
+  onMenu: (x: number, y: number) => void;
 }) {
   return (
     <div
@@ -8614,11 +10059,16 @@ function ThreadRow({
           />
         )}
       </button>
-      {hovered && (
+      {(hovered || menuOpen) && (
         <button
-          onClick={() => void onDelete(thread.id)}
-          title="Delete conversation"
-          aria-label="Delete conversation"
+          data-threadmenu
+          onClick={(e) => {
+            const r = (e.currentTarget as HTMLButtonElement).getBoundingClientRect();
+            onMenu(r.right, r.bottom + 6);
+          }}
+          title="Conversation options"
+          aria-label="Conversation options"
+          aria-expanded={menuOpen}
           style={{
             flexShrink: 0,
             display: "flex",
@@ -8630,10 +10080,8 @@ function ThreadRow({
             cursor: "pointer",
             lineHeight: 1,
           }}
-          onMouseEnter={(ev) => ((ev.currentTarget as HTMLButtonElement).style.color = colors.err)}
-          onMouseLeave={(ev) => ((ev.currentTarget as HTMLButtonElement).style.color = colors.dim)}
         >
-          <TrashIcon />
+          <EllipsisIcon />
         </button>
       )}
     </div>
@@ -9155,7 +10603,9 @@ function StepsGroup({
                   ▶
                 </span>
                 <span style={{ color: label.color, flexShrink: 0 }}>{label.text}</span>
-                <span style={{ whiteSpace: "pre-wrap", color: colors.fg }}>{e.command}</span>
+                <span style={{ whiteSpace: "pre-wrap", color: colors.fg, minWidth: 0, overflowWrap: "anywhere" }}>
+                  {e.command}
+                </span>
               </div>
               {e.status === "awaitingApproval" && e.approval && !e.approval.decision && (
                 <PermissionsPrompt
@@ -9169,6 +10619,7 @@ function StepsGroup({
                     margin: "8px 0 0",
                     color: colors.dim,
                     whiteSpace: "pre-wrap",
+                    overflowWrap: "anywhere",
                     maxHeight: 200,
                     overflowY: "auto",
                   }}
