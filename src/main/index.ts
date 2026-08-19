@@ -59,6 +59,24 @@ function resetSidePanes(): void {
   }
 }
 
+/** Where chats outside any project live. NOT the home directory: the
+ *  engine merges any `.codex/` config folder found at the cwd once the
+ *  thread is trusted — and full-access/workspace-write threads self-trust
+ *  their cwd at start. $HOME/.codex is the user's PERSONAL codex CLI
+ *  config; running chats in ~ imported its model override, MCP servers,
+ *  and freeform apply_patch tool, which the gateway rejects with
+ *  'only "function" and "namespace" tools are supported (got "custom")'.
+ *  A dedicated subfolder has no .codex anywhere on its cwd→root walk. */
+function defaultChatDir(): string {
+  const dir = join(app.getPath("home"), "Unbiased");
+  try {
+    mkdirSync(dir, { recursive: true });
+    return dir;
+  } catch {
+    return app.getPath("home");
+  }
+}
+
 function paneForThread(threadId: unknown): PaneId | null {
   for (const [id, p] of Object.entries(panes)) {
     if (p.threadId === threadId) return id;
@@ -1918,10 +1936,10 @@ app.whenReady().then(async () => {
           experimentalRawEvents: true,
         })) as { thread: { id: string } };
       } else {
-        // Explicit home when no project is chosen — left implicit, the
+        // Explicit default when no project is chosen — left implicit, the
         // engine falls back to its own process cwd (wherever the app
         // launched from) and the chat wrongly files under that project.
-        let cwd = pendingCwd ?? app.getPath("home");
+        let cwd = pendingCwd ?? defaultChatDir();
         if (pendingCwd && workMode === "worktree") {
           const wt = await createWorktree(pendingCwd);
           if (wt) cwd = wt;
