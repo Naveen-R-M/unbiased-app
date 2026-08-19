@@ -352,7 +352,15 @@ declare global {
       ) => Promise<{ usage: { used: number; window: number | null; percent: number | null } | null }>;
       resourceStats: () => Promise<{ procs: { pid: number; kind: string; memMB: number; cpu: number }[] }>;
       storageStats: () => Promise<{
-        threads: Record<string, { rolloutBytes: number; transcriptBytes: number; mtime: number }>;
+        threads: Record<
+          string,
+          {
+            rolloutBytes: number;
+            transcriptBytes: number;
+            mtime: number;
+            agent?: { nickname: string | null; task: string; parent: string | null };
+          }
+        >;
         worktrees: { dir: string; project: string; branch: string; kb: number }[];
         engineHomeKB: number;
       }>;
@@ -8945,7 +8953,15 @@ function ResourcesView() {
   const [procs, setProcs] = useState<{ pid: number; kind: string; memMB: number; cpu: number }[]>([]);
   const [hist, setHist] = useState<{ mem: number; cpu: number }[]>([]);
   const [storage, setStorage] = useState<{
-    threads: Record<string, { rolloutBytes: number; transcriptBytes: number; mtime: number }>;
+    threads: Record<
+      string,
+      {
+        rolloutBytes: number;
+        transcriptBytes: number;
+        mtime: number;
+        agent?: { nickname: string | null; task: string; parent: string | null };
+      }
+    >;
     worktrees: { dir: string; project: string; branch: string; kb: number }[];
     engineHomeKB: number;
   } | null>(null);
@@ -9028,11 +9044,21 @@ function ResourcesView() {
 
   const convRows = storage
     ? Object.entries(storage.threads)
-        .map(([id, t]) => ({
-          id,
-          title: titles.get(id) ?? `${id.slice(0, 13)}…`,
-          bytes: t.rolloutBytes + t.transcriptBytes,
-        }))
+        .map(([id, t]) => {
+          // Sub-agent threads never get sidebar titles — name them from
+          // their rollout meta (nickname · task) and point at the parent.
+          const parentTitle = t.agent?.parent ? titles.get(t.agent.parent) : undefined;
+          return {
+            id,
+            title:
+              titles.get(id) ??
+              (t.agent
+                ? `${agentEmoji(id)} ${t.agent.nickname ?? "Sub-agent"} · ${t.agent.task}`
+                : `${id.slice(0, 13)}…`),
+            sub: t.agent ? (parentTitle ? `in ${parentTitle}` : "sub-agent") : null,
+            bytes: t.rolloutBytes + t.transcriptBytes,
+          };
+        })
         .sort((a, b) => b.bytes - a.bytes)
     : [];
   const convTotal = convRows.reduce((n, r) => n + r.bytes, 0);
@@ -9137,6 +9163,9 @@ function ResourcesView() {
                 }}
               >
                 {r.title}
+                {r.sub && (
+                  <span style={{ color: colors.dim, marginLeft: 8, fontSize: 11.5 }}>{r.sub}</span>
+                )}
               </span>
               <span
                 style={{
