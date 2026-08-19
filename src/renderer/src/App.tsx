@@ -10051,6 +10051,19 @@ type ChangelogRelease = {
 };
 const CHANGELOG: ChangelogRelease[] = [
   {
+    version: "1.2.1",
+    date: "August 19, 2026",
+    sections: [
+      {
+        title: "Fixed",
+        items: [
+          "Security: text the assistant typed into a page could be misread as a command-line option by the browser tool, including one that changes which program it launches. Text is now entered directly into the page and never reaches that parser.",
+          "Browser steps in the transcript show as running while they are still going, instead of jumping straight to done.",
+        ],
+      },
+    ],
+  },
+  {
     version: "1.2.0",
     date: "August 19, 2026",
     sections: [
