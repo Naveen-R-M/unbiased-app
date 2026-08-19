@@ -721,7 +721,7 @@ export function App() {
   }
 
   async function signOut() {
-    const removeKey = localStorage.getItem("signoutKeepsKey") !== "true";
+    const removeKey = localStorage.getItem("signoutKeepsKey") === "false";
     await window.unbiased.authLogout(removeKey);
     localStorage.removeItem("unbiased.authed");
     setShowSettings(false);
@@ -9322,7 +9322,7 @@ function SettingsView({
   const [tab, setTab] = useState<"appearance" | "resources" | "account">("appearance");
   // Sign-out key handling: default removes the saved key; flipping this
   // keeps ~/.unbiased/credentials.json so the next sign-in is one click.
-  const [keepKey, setKeepKey] = useState(() => localStorage.getItem("signoutKeepsKey") === "true");
+  const [keepKey, setKeepKey] = useState(() => localStorage.getItem("signoutKeepsKey") !== "false");
 
   function toggleKeepKey() {
     setKeepKey((k) => {
