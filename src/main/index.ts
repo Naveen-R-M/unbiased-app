@@ -503,6 +503,40 @@ function cdpTargetOrNull(raw: string): { port: number } | { url: string } | null
   }
 }
 
+/** agent-browser parses its global flags positionally, and one of them is
+ *  `--executable-path` — so a model-controlled value starting with "-" in a
+ *  fill/type argument is a flag, not text. Verified: filling a field with
+ *  "--headed" relaunched the browser and destroyed the page. Text like that
+ *  is written into the field in-page instead, with the events a framework
+ *  listens for, so it can never reach the CLI's argument parser. */
+async function fillFieldSafely(
+  mode: "fill" | "type",
+  refArg: string,
+  value: string,
+): Promise<{ ok: boolean; out: string }> {
+  if (!value.startsWith("-")) return runAgentBrowser([mode, refArg, value]);
+  const focused = await runAgentBrowser(["focus", refArg]);
+  if (!focused.ok || /✗/.test(focused.out)) return focused;
+  const js = `(() => {
+  const el = document.activeElement;
+  if (!el || !("value" in el)) return "not-a-field";
+  const text = ${JSON.stringify(value)};
+  const next = ${mode === "fill" ? "text" : '(el.value || "") + text'};
+  const proto = el.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+  const desc = Object.getOwnPropertyDescriptor(proto, "value");
+  if (desc && desc.set) desc.set.call(el, next);
+  else el.value = next;
+  el.dispatchEvent(new Event("input", { bubbles: true }));
+  el.dispatchEvent(new Event("change", { bubbles: true }));
+  return "ok";
+})()`;
+  const r = await runAgentBrowser(["eval", js]);
+  if (!r.ok || !/ok/.test(r.out)) {
+    return { ok: false, out: `Could not enter text starting with "-": ${r.out || "no detail"}` };
+  }
+  return { ok: true, out: "✓ entered (value set in-page: text beginning with a dash cannot be typed via the CLI)" };
+}
+
 const AGENT_BROWSER_OUTPUT_CAP = 30_000;
 type DynamicToolResponse = {
   contentItems: ({ type: "inputText"; text: string } | { type: "inputImage"; imageUrl: string })[];
@@ -649,11 +683,11 @@ async function handleAgentBrowserCall(
       return text(r.out, r.ok);
     }
     case "browser_fill": {
-      const r = await runAgentBrowser(["fill", ref(), str("text")]);
+      const r = await fillFieldSafely("fill", ref(), str("text"));
       return text(r.out, r.ok);
     }
     case "browser_type": {
-      const r = await runAgentBrowser(["type", ref(), str("text")]);
+      const r = await fillFieldSafely("type", ref(), str("text"));
       return text(r.out, r.ok);
     }
     case "browser_press": {
@@ -2309,7 +2343,12 @@ function wireNotifications(): void {
             item: {
               id: d.id,
               command: `${d.tool ?? "tool"}${argsText}`.slice(0, 400),
-              status: d.success === false ? "failed" : (d.status ?? "completed"),
+              // A started call is in progress — defaulting to "completed"
+              // showed a green "done" for a page still loading.
+              status:
+                d.success === false
+                  ? "failed"
+                  : (d.status ?? (phase === "started" ? "inProgress" : "completed")),
             },
           });
         } else if (item?.type === "plan") {
