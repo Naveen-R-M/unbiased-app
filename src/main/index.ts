@@ -2880,8 +2880,22 @@ app.whenReady().then(async () => {
     const pending = pendingApprovals.get(payload.requestId);
     if (pending === undefined) return { ok: false };
     pendingApprovals.delete(payload.requestId);
-    if (pending.kind === "engine") engine.respond(pending.rpcId, { decision: payload.decision });
-    else pending.settle(payload.decision);
+    if (pending.kind === "engine") {
+      engine.respond(pending.rpcId, { decision: payload.decision });
+    } else {
+      pending.settle(payload.decision);
+      // No engine item stands behind a local approval card, so nothing would
+      // ever flip it off "running" — resolve it here.
+      const sub = pending.threadId ? subAgents.get(pending.threadId) : undefined;
+      const paneId = paneForThread(sub ? sub.parent : pending.threadId);
+      if (paneId) {
+        send("chat:command", {
+          paneId,
+          phase: "completed",
+          item: { id: payload.requestId, status: payload.decision === "decline" ? "declined" : "completed" },
+        });
+      }
+    }
     return { ok: true };
   });
 
