@@ -66,7 +66,7 @@ contextBridge.exposeInMainWorld("unbiased", {
   openThread: (id: string) => ipcRenderer.invoke("threads:open", id),
   detachThread: (cwd?: string) => ipcRenderer.invoke("threads:detach", cwd),
   deleteThread: (id: string) => ipcRenderer.invoke("threads:delete", id),
-  resetSideChat: () => ipcRenderer.invoke("side:reset"),
+  resetSideChat: (paneId?: string) => ipcRenderer.invoke("side:reset", paneId),
   subagentsList: (parent: string) => ipcRenderer.invoke("subagents:list", parent),
   subagentTranscript: (id: string) => ipcRenderer.invoke("subagents:transcript", id),
   onSubAgents: (cb: (p: unknown) => void) => subscribe("chat:subagents", cb),
