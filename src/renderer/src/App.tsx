@@ -1306,12 +1306,12 @@ export function App() {
   function resetSideView() {
     setSideContext(null);
     setSideNonce((n) => n + 1);
-    setOpenFile(null);
-    setOpenAgent(null); // the agent belonged to the previous conversation
+    setOpenFiles([]);
+    setOpenAgents([]); // the agents belonged to the previous conversation
     setSubAgentsList([]);
-    setFilesOpen(false); // the tree browsed the previous conversation's cwd
-    setTreeFile(null);
-    setTerminalOpen(false); // the shell ran in the previous conversation's cwd
+    setFilesTabs([]); // the trees browsed the previous conversation's cwd
+    setTreeFiles({});
+    setTerminalTabs([]); // the shells ran in the previous conversation's cwd
     setReviewOpen(false); // the diff reviewed the previous conversation's cwd
     // The browser isn't cwd-bound — the page you're reading survives.
     setPanelMode(browserOpen ? "browser" : "chat");
@@ -1404,12 +1404,16 @@ export function App() {
     void refreshThreads();
   }
 
-  const [openFile, setOpenFile] = useState<OpenFileInfo | null>(null);
+  // File-viewer tabs — one per opened file, capped.
+  const [openFiles, setOpenFiles] = useState<{ id: number; info: OpenFileInfo }[]>([]);
   // Sub-agents of the ACTIVE main conversation (multi-agent v2). The main
   // process pushes roster changes; a (re)opened thread fetches its own.
   const [subAgentsList, setSubAgentsList] = useState<SubAgent[]>([]);
   // The sub-agent whose conversation the side panel is showing.
-  const [openAgent, setOpenAgent] = useState<{ threadId: string; name: string } | null>(null);
+  // Each opened sub-agent gets its OWN tab (Codex-style), capped.
+  const [openAgents, setOpenAgents] = useState<{ threadId: string; name: string }[]>([]);
+  const MAX_TABS_PER_KIND = 5;
+  const tabIdRef = useRef(1);
 
   useEffect(() => {
     return window.unbiased.onSubAgents((p) => {
@@ -1418,19 +1422,26 @@ export function App() {
   }, []);
 
   function openAgentTab(agent: { threadId: string; name: string }) {
-    setOpenAgent({ threadId: agent.threadId, name: agent.name });
-    setPanelMode("agent");
+    setOpenAgents((as) => {
+      if (as.some((a) => a.threadId === agent.threadId)) return as;
+      const next = [...as, { threadId: agent.threadId, name: agent.name }];
+      // At the cap the oldest tab yields — the strip stays bounded.
+      return next.length > MAX_TABS_PER_KIND ? next.slice(next.length - MAX_TABS_PER_KIND) : next;
+    });
+    setPanelMode(`agent:${agent.threadId}`);
     setSideOpenPersisted(true);
   }
 
   // "launcher" = the panel is open with nothing selected yet — it shows
   // big rows asking which surface to open (Codex's empty side panel).
-  const [panelMode, setPanelMode] = useState<
-    "chat" | "file" | "files" | "launcher" | "terminal" | "browser" | "review" | "agent"
-  >("chat");
+  // Static keys ("chat", "review", "browser", "launcher") name singleton
+  // surfaces; dynamic keys ("agent:<threadId>", "terminal:<id>",
+  // "files:<id>", "file:<id>") name multi-instance tabs.
+  const [panelMode, setPanelMode] = useState<string>("chat");
   const [reviewOpen, setReviewOpen] = useState(false);
-  const [filesOpen, setFilesOpen] = useState(false);
-  const [terminalOpen, setTerminalOpen] = useState(false);
+  const [filesTabs, setFilesTabs] = useState<number[]>([]);
+  const [treeFiles, setTreeFiles] = useState<Record<number, OpenFileInfo | null>>({});
+  const [terminalTabs, setTerminalTabs] = useState<number[]>([]);
   const [browserOpen, setBrowserOpen] = useState(false);
 
   // ── Tab order + close fallback ──────────────────────────────────────
@@ -1439,36 +1450,54 @@ export function App() {
   // most-recent tab — one rule, instead of six hand-rolled chains that
   // each forgot a tab (closing Files with only Browser left used to kill
   // the whole panel).
-  type PanelTab = "chat" | "file" | "files" | "review" | "browser" | "terminal" | "agent";
-  const TAB_FLAGS: Record<PanelTab, boolean> = {
-    chat: sideChatEnabled,
-    file: !!openFile,
-    files: filesOpen,
-    review: reviewOpen,
-    browser: browserOpen,
-    terminal: terminalOpen,
-    agent: !!openAgent,
-  };
+  const tabKeys: string[] = [
+    ...(sideChatEnabled ? ["chat"] : []),
+    ...openFiles.map((f) => `file:${f.id}`),
+    ...filesTabs.map((id) => `files:${id}`),
+    ...(reviewOpen ? ["review"] : []),
+    ...(browserOpen ? ["browser"] : []),
+    ...terminalTabs.map((id) => `terminal:${id}`),
+    ...openAgents.map((a) => `agent:${a.threadId}`),
+  ];
   // Seq numbers survive re-renders; assigning during render is idempotent.
-  const tabSeqRef = useRef<Map<PanelTab, number>>(new Map());
+  const tabSeqRef = useRef<Map<string, number>>(new Map());
   const tabSeqCounter = useRef(0);
-  for (const t of Object.keys(TAB_FLAGS) as PanelTab[]) {
-    if (TAB_FLAGS[t] && !tabSeqRef.current.has(t)) tabSeqRef.current.set(t, ++tabSeqCounter.current);
-    if (!TAB_FLAGS[t]) tabSeqRef.current.delete(t);
+  for (const t of tabKeys) {
+    if (!tabSeqRef.current.has(t)) tabSeqRef.current.set(t, ++tabSeqCounter.current);
   }
-  const tabOrder = (Object.keys(TAB_FLAGS) as PanelTab[])
-    .filter((t) => TAB_FLAGS[t])
-    .sort((a, b) => tabSeqRef.current.get(a)! - tabSeqRef.current.get(b)!);
+  for (const t of [...tabSeqRef.current.keys()]) {
+    if (!tabKeys.includes(t)) tabSeqRef.current.delete(t);
+  }
+  const tabOrder = [...tabKeys].sort((a, b) => tabSeqRef.current.get(a)! - tabSeqRef.current.get(b)!);
 
-  // When the active tab's flag drops, activate the most recent survivor;
+  // When the active tab disappears, activate the most recent survivor;
   // only an empty strip closes the panel.
   useEffect(() => {
     if (!sideOpen || panelMode === "launcher") return;
-    if (TAB_FLAGS[panelMode as PanelTab] !== false) return;
+    if (tabKeys.includes(panelMode)) return;
     if (tabOrder.length > 0) setPanelMode(tabOrder[tabOrder.length - 1]);
     else setSideOpenPersisted(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sideOpen, panelMode, sideChatEnabled, openFile, filesOpen, reviewOpen, browserOpen, terminalOpen, openAgent]);
+  }, [sideOpen, panelMode, sideChatEnabled, openFiles, filesTabs, reviewOpen, browserOpen, terminalTabs, openAgents]);
+
+  /** Close any tab by its key — one dispatcher instead of per-kind closers. */
+  function closeTab(key: string): void {
+    if (key === "chat") closeSideChat();
+    else if (key === "review") setReviewOpen(false);
+    else if (key === "browser") closeBrowserTab();
+    else if (key.startsWith("agent:")) setOpenAgents((as) => as.filter((a) => `agent:${a.threadId}` !== key));
+    else if (key.startsWith("file:")) setOpenFiles((fs) => fs.filter((f) => `file:${f.id}` !== key));
+    else if (key.startsWith("terminal:")) setTerminalTabs((ts) => ts.filter((id) => `terminal:${id}` !== key));
+    else if (key.startsWith("files:")) {
+      const id = Number(key.slice(6));
+      setFilesTabs((ts) => ts.filter((x) => x !== id));
+      setTreeFiles((m) => {
+        const rest = { ...m };
+        delete rest[id];
+        return rest;
+      });
+    }
+  }
   // The Files view's tree column can collapse, leaving the viewer full
   // width — Codex's folders toggle. Persisted.
   const [treeVisible, setTreeVisible] = useState(() => localStorage.getItem("filesTreeVisible") !== "false");
@@ -1641,8 +1670,15 @@ export function App() {
 
   function openFilesTab() {
     setSidePlusOpen(false);
-    setFilesOpen(true);
-    setPanelMode("files");
+    if (filesTabs.length >= MAX_TABS_PER_KIND) {
+      setPanelMode(`files:${filesTabs[filesTabs.length - 1]}`);
+      setSideOpenPersisted(true);
+      return;
+    }
+    const id = tabIdRef.current++;
+    setFilesTabs((ts) => [...ts, id]);
+    setPanelMode(`files:${id}`);
+    setSideOpenPersisted(true);
   }
 
   // The header's panel toggle: open to whatever the panel last showed, or
@@ -1653,17 +1689,7 @@ export function App() {
       return;
     }
     setSideOpenPersisted(true);
-    if (sideChatEnabled) setPanelMode("chat");
-    else if (openFile) setPanelMode("file");
-    else if (filesOpen) setPanelMode("files");
-    else if (reviewOpen) setPanelMode("review");
-    else if (terminalOpen) setPanelMode("terminal");
-    else if (browserOpen) setPanelMode("browser");
-    else setPanelMode("launcher");
-  }
-
-  function closeFilesTab() {
-    setFilesOpen(false);
+    setPanelMode(tabOrder.length > 0 ? tabOrder[tabOrder.length - 1] : "launcher");
   }
 
   function openReviewTab() {
@@ -1677,17 +1703,19 @@ export function App() {
     setReviewOpen(false);
   }
 
+  // Closing a terminal tab KILLS its shell (unmount disposes the PTY) —
+  // unlike the side chat, a dead terminal has no transcript worth keeping.
   function openTerminalTab() {
     setSidePlusOpen(false);
-    setTerminalOpen(true);
-    setPanelMode("terminal");
+    if (terminalTabs.length >= MAX_TABS_PER_KIND) {
+      setPanelMode(`terminal:${terminalTabs[terminalTabs.length - 1]}`);
+      setSideOpenPersisted(true);
+      return;
+    }
+    const id = tabIdRef.current++;
+    setTerminalTabs((ts) => [...ts, id]);
+    setPanelMode(`terminal:${id}`);
     setSideOpenPersisted(true);
-  }
-
-  // Closing the tab KILLS the shell (unmount disposes the PTY) — unlike
-  // the side chat, a dead terminal has no transcript worth preserving.
-  function closeTerminalTab() {
-    setTerminalOpen(false);
   }
 
   function askInSideChat(text: string) {
@@ -1697,17 +1725,33 @@ export function App() {
     setSideOpenPersisted(true);
   }
 
+  /** Open (or focus) a file-viewer tab. Same file focuses its existing
+   *  tab with fresh content; at the cap the oldest tab yields. */
+  function addFileTab(info: OpenFileInfo): void {
+    const existing = openFiles.find((f) => f.info.fullPath === info.fullPath);
+    if (existing) {
+      setOpenFiles((fs) => fs.map((f) => (f.id === existing.id ? { ...f, info } : f)));
+      setPanelMode(`file:${existing.id}`);
+    } else {
+      const id = tabIdRef.current++;
+      setOpenFiles((fs) => {
+        const next = [...fs, { id, info }];
+        return next.length > MAX_TABS_PER_KIND ? next.slice(next.length - MAX_TABS_PER_KIND) : next;
+      });
+      setPanelMode(`file:${id}`);
+    }
+    setSideOpenPersisted(true);
+  }
+
   async function openImagePreview(a: { name: string; path: string }) {
     const result = await window.unbiased.readImage(a.path);
-    setOpenFile({
+    addFileTab({
       name: a.name,
       relPath: a.name,
       fullPath: a.path,
       imageSrc: result.dataUrl,
       error: result.error,
     });
-    setPanelMode("file");
-    setSideOpenPersisted(true);
   }
 
   /** Text files read through file:read; images route to the picture viewer. */
@@ -1729,17 +1773,13 @@ export function App() {
   }
 
   async function openFileInPanel(pathText: string, line?: number) {
-    setOpenFile(await loadFileInfo(pathText, line));
-    setPanelMode("file");
-    setSideOpenPersisted(true);
+    addFileTab(await loadFileInfo(pathText, line));
   }
 
-  // The Files view's own selection — shown beside the tree, so browsing
-  // never hides the tree the way the standalone file tab does.
-  const [treeFile, setTreeFile] = useState<OpenFileInfo | null>(null);
-
-  async function openFileInTree(pathText: string, line?: number) {
-    setTreeFile(await loadFileInfo(pathText, line));
+  // A Files tab's own selection — shown beside its tree, per tab.
+  async function openFileInTree(tabId: number, pathText: string, line?: number) {
+    const info = await loadFileInfo(pathText, line);
+    setTreeFiles((m) => ({ ...m, [tabId]: info }));
   }
 
   // Closing HIDES the side chat — its conversation survives and reopening
@@ -1803,7 +1843,11 @@ export function App() {
 
   // Whatever file the panel is currently showing, and whether it has a
   // rendered form worth offering.
-  const visibleFile = panelMode === "file" ? openFile : panelMode === "files" ? treeFile : null;
+  const visibleFile = panelMode.startsWith("file:")
+    ? (openFiles.find((f) => `file:${f.id}` === panelMode)?.info ?? null)
+    : panelMode.startsWith("files:")
+      ? (treeFiles[Number(panelMode.slice(6))] ?? null)
+      : null;
   const previewable =
     !!visibleFile &&
     !visibleFile.error &&
@@ -2895,34 +2939,45 @@ export function App() {
             }}
           >
             {tabOrder.map((t) => {
+              const agent = t.startsWith("agent:")
+                ? openAgents.find((a) => `agent:${a.threadId}` === t)
+                : undefined;
+              const fileTab = t.startsWith("file:")
+                ? openFiles.find((f) => `file:${f.id}` === t)
+                : undefined;
+              const termIdx = t.startsWith("terminal:") ? terminalTabs.indexOf(Number(t.slice(9))) : -1;
               const cfg: { icon: React.ReactNode; label: string; close: () => void; aria: string; title?: string } =
                 t === "chat"
                   ? { icon: <ChatPlusIcon />, label: "Side chat", close: closeSideChat, aria: "Close side chat" }
-                  : t === "file"
+                  : fileTab
                     ? {
                         icon: null,
-                        label: openFile?.name ?? "",
-                        close: () => setOpenFile(null),
+                        label: fileTab.info.name,
+                        close: () => closeTab(t),
                         aria: "Close file",
-                        title: openFile?.fullPath,
+                        title: fileTab.info.fullPath,
                       }
-                    : t === "files"
-                      ? { icon: <FolderOutlineIcon size={13} />, label: "Files", close: closeFilesTab, aria: "Close files" }
+                    : t.startsWith("files:")
+                      ? { icon: <FolderOutlineIcon size={13} />, label: "Files", close: () => closeTab(t), aria: "Close files" }
                       : t === "review"
                         ? { icon: <ReviewIcon />, label: "Review", close: closeReviewTab, aria: "Close review" }
                         : t === "browser"
                           ? { icon: <GlobeIcon size={13} />, label: "Browser", close: closeBrowserTab, aria: "Close browser" }
-                          : t === "agent"
+                          : agent
                             ? {
-                                icon: openAgent ? <span style={{ fontSize: 13 }}>{agentEmoji(openAgent.threadId)}</span> : <SteerIcon />,
-                                label: openAgent?.name ?? "Sub-agent",
-                                close: () => setOpenAgent(null),
+                                icon: <span style={{ fontSize: 13 }}>{agentEmoji(agent.threadId)}</span>,
+                                // Nicknames land after the spawn — prefer the roster's live name.
+                                label: subAgentsList.find((x) => x.threadId === agent.threadId)?.name ?? agent.name,
+                                close: () => closeTab(t),
                                 aria: "Close sub-agent",
                               }
                             : {
                                 icon: <TerminalIcon size={13} />,
-                                label: activeProjectName ?? "Terminal",
-                                close: closeTerminalTab,
+                                label:
+                                  terminalTabs.length > 1
+                                    ? `Terminal ${termIdx + 1}`
+                                    : (activeProjectName ?? "Terminal"),
+                                close: () => closeTab(t),
                                 aria: "Close terminal",
                               };
               return (
@@ -2943,7 +2998,7 @@ export function App() {
                     cursor: "pointer",
                     fontFamily: "inherit",
                     minWidth: 0,
-                    ...(t === "file" ? { maxWidth: 220 } : {}),
+                    ...(t.startsWith("file:") ? { maxWidth: 220 } : {}),
                   }}
                 >
                   {cfg.icon}
@@ -3032,7 +3087,7 @@ export function App() {
                 {previewOn ? "View raw" : "View preview"}
               </button>
             )}
-            {filesOpen && panelMode === "files" && (
+            {panelMode.startsWith("files:") && (
               <IconButton title={treeVisible ? "Hide file tree" : "Show file tree"} onClick={toggleTreeVisible}>
                 <FoldersIcon />
               </IconButton>
@@ -3058,25 +3113,35 @@ export function App() {
               {inProject && <LauncherRow icon={<ReviewIcon />} label="Review" onClick={openReviewTab} />}
             </div>
           )}
-          {openFile && panelMode === "file" && (
-            <FileViewer
-              file={openFile}
-              onOpenFile={(p, l) => void openFileInPanel(p, l)}
-              onOpenLink={openInBrowser}
-              preview={previewOn}
-            />
+          {openFiles.map(
+            (f) =>
+              panelMode === `file:${f.id}` && (
+                <FileViewer
+                  key={f.id}
+                  file={f.info}
+                  onOpenFile={(p, l) => void openFileInPanel(p, l)}
+                  onOpenLink={openInBrowser}
+                  preview={previewOn}
+                />
+              ),
           )}
           {reviewOpen && panelMode === "review" && <ReviewPane gitPath={gitPath} />}
-          {openAgent && panelMode === "agent" && (
-            <SubAgentPane
-              key={openAgent.threadId}
-              threadId={openAgent.threadId}
-              name={openAgent.name}
-              status={subAgentsList.find((a) => a.threadId === openAgent.threadId)?.status ?? "idle"}
-            />
+          {openAgents.map(
+            (a) =>
+              panelMode === `agent:${a.threadId}` && (
+                <SubAgentPane
+                  key={a.threadId}
+                  threadId={a.threadId}
+                  name={subAgentsList.find((x) => x.threadId === a.threadId)?.name ?? a.name}
+                  status={subAgentsList.find((x) => x.threadId === a.threadId)?.status ?? "idle"}
+                />
+              ),
           )}
-          {filesOpen && panelMode === "files" && (
-            <div style={{ flex: 1, minHeight: 0, display: "flex" }}>
+          {filesTabs.map((tabId) => {
+            if (panelMode !== `files:${tabId}`) return null;
+            const treeFile = treeFiles[tabId] ?? null;
+            return (
+            <div key={tabId} style={{ flex: 1, minHeight: 0, display: "flex" }}>
               <div
                 style={{
                   flex: 1,
@@ -3089,7 +3154,7 @@ export function App() {
                 {treeFile ? (
                   <FileViewer
                     file={treeFile}
-                    onOpenFile={(p, l) => void openFileInTree(p, l)}
+                    onOpenFile={(p, l) => void openFileInTree(tabId, p, l)}
                     onOpenLink={openInBrowser}
                     preview={previewOn}
                   />
@@ -3116,23 +3181,25 @@ export function App() {
                     flexDirection: "column",
                   }}
                 >
-                  <FileTreePane onOpenFile={(p) => void openFileInTree(p)} />
+                  <FileTreePane onOpenFile={(p) => void openFileInTree(tabId, p)} />
                 </div>
               )}
             </div>
-          )}
-          {terminalOpen && (
+            );
+          })}
+          {terminalTabs.map((id) => (
             <div
+              key={id}
               style={{
                 flex: 1,
                 minHeight: 0,
-                display: panelMode === "terminal" ? "flex" : "none",
+                display: panelMode === `terminal:${id}` ? "flex" : "none",
                 flexDirection: "column",
               }}
             >
               <TerminalPane />
             </div>
-          )}
+          ))}
           {browserOpen && (
             <div
               style={{
