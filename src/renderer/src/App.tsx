@@ -5174,6 +5174,9 @@ function AgentLifecycleRow({
   const [fetchedPrompt, setFetchedPrompt] = useState<string | null>(null);
   useEffect(() => {
     if (!open || entry.prompt || fetchedPrompt || !entry.agentThreadId) return;
+    // Only spawn rows: a "Messaged an agent" row's text is a later mail,
+    // not the first one, so falling back to it would show the wrong text.
+    if (entry.event !== "started") return;
     let alive = true;
     void window.unbiased.subagentTranscript(entry.agentThreadId).then((r) => {
       if (!alive) return;

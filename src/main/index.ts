@@ -95,10 +95,18 @@ const MAIL_CAP = 200;
 const pendingSpawnPrompts = new Map<string, string>();
 
 // Spawn call_id → parent thread, so the raw function_call_output (which
-// carries the engine-assigned nickname when the engine exposes it) can be
-// matched back. The output lands moments AFTER subAgentActivity, so the
-// nickname arrives as a rename.
+// carries the engine-assigned nickname) can be matched back. Raw items and
+// subAgentActivity arrive in either order, so the nickname is stashed by
+// "parentThreadId:taskName" when the sub isn't registered yet, and applied
+// as a rename when it is.
 const pendingSpawnCalls = new Map<string, string>();
+const pendingNicknames = new Map<string, string>();
+
+// send_message/followup_task text, keyed like the spawn prompts — feeds the
+// "Messaged an agent" row's instructions AND the immediate mailbox delivery
+// (the engine queues the mail until the sub's loop drains it, so nothing is
+// recorded on the sub thread until then; the pane shouldn't wait).
+const pendingMessagePrompts = new Map<string, string>();
 
 /** Strip the engine's inter-agent envelope ("Message Type: …\nTask name: …\n
  *  Sender: …\nPayload:\n<text>") down to the payload. */
@@ -1269,6 +1277,37 @@ function wireNotifications(): void {
           const callId = (params.item as { call_id?: string }).call_id;
           if (typeof callId === "string") pendingSpawnCalls.set(callId, threadId);
         }
+        // Corrections/follow-ups: capture the text for the lifecycle row and
+        // deliver it to the target's mailbox NOW — the engine holds queued
+        // mail invisible until the sub's turn drains it.
+        if (
+          raw.type === "function_call" &&
+          raw.namespace === "collaboration" &&
+          (raw.name === "send_message" || raw.name === "followup_task") &&
+          typeof raw.arguments === "string"
+        ) {
+          try {
+            const args = JSON.parse(raw.arguments) as { target?: string; message?: string };
+            const task = args.target?.split("/").filter(Boolean).pop();
+            if (task && args.message) {
+              pendingMessagePrompts.set(`${threadId}:${task}`, args.message);
+              for (const [subId, info] of subAgents) {
+                if (info.parent === threadId && (info.name === task || info.path.endsWith(`/${task}`))) {
+                  const box = subAgentMail.get(subId) ?? [];
+                  if (!box.some((m) => m.text === args.message)) {
+                    box.push({ at: Date.now() / 1000, author: "", text: args.message });
+                    if (box.length > MAIL_CAP) box.shift();
+                    subAgentMail.set(subId, box);
+                    send("chat:subagent-activity", { threadId: subId });
+                  }
+                  break;
+                }
+              }
+            }
+          } catch {
+            // unparseable args
+          }
+        }
         // The spawn OUTPUT carries the engine-assigned nickname
         // ({"task_name": "...", "nickname": "Ramanujan"}). Rename the
         // registry entry and let the renderer retitle its rows.
@@ -1281,9 +1320,11 @@ function wireNotifications(): void {
               const parsed = JSON.parse(out.output) as { task_name?: string; nickname?: string };
               const task = parsed.task_name?.split("/").filter(Boolean).pop();
               if (parsed.nickname && task) {
+                let renamed = false;
                 for (const [subId, info] of subAgents) {
                   if (info.parent === parent && info.name === task) {
                     info.name = parsed.nickname;
+                    renamed = true;
                     pushSubAgents(parent);
                     const pane = paneForThread(parent);
                     if (pane) {
@@ -1298,6 +1339,8 @@ function wireNotifications(): void {
                     break;
                   }
                 }
+                // Raws can precede subAgentActivity — stash for registration.
+                if (!renamed) pendingNicknames.set(`${parent}:${task}`, parsed.nickname);
               }
             } catch {
               // not a spawn ack — ignore
@@ -1313,10 +1356,14 @@ function wireNotifications(): void {
           if (text) {
             const { author, payload } = interAgentPayload(text);
             const box = subAgentMail.get(threadId) ?? [];
-            box.push({ at: Date.now() / 1000, author: author ?? raw.author ?? "", text: payload });
-            if (box.length > MAIL_CAP) box.shift();
-            subAgentMail.set(threadId, box);
-            send("chat:subagent-activity", { threadId });
+            // Corrections are pre-delivered from the sender's raw call while
+            // the engine still has them queued — don't add a second copy.
+            if (!box.some((m) => m.text === payload)) {
+              box.push({ at: Date.now() / 1000, author: author ?? raw.author ?? "", text: payload });
+              if (box.length > MAIL_CAP) box.shift();
+              subAgentMail.set(threadId, box);
+              send("chat:subagent-activity", { threadId });
+            }
           }
         }
         break;
@@ -1371,10 +1418,20 @@ function wireNotifications(): void {
           const p = params.item as { kind?: string; agentThreadId?: string; agentPath?: string };
           if (p.agentThreadId && p.agentPath) {
             const existing = subAgents.get(p.agentThreadId);
-            const name = p.agentPath.split("/").filter(Boolean).pop() ?? p.agentThreadId;
-            const promptKey = `${threadId}:${name}`;
-            const prompt = pendingSpawnPrompts.get(promptKey);
-            if (prompt !== undefined) pendingSpawnPrompts.delete(promptKey);
+            const taskName = p.agentPath.split("/").filter(Boolean).pop() ?? p.agentThreadId;
+            const promptKey = `${threadId}:${taskName}`;
+            // started rows carry the spawn instructions; interacted rows the
+            // send_message/followup text.
+            const prompt =
+              p.kind === "interacted"
+                ? pendingMessagePrompts.get(promptKey)
+                : pendingSpawnPrompts.get(promptKey);
+            if (p.kind === "interacted") pendingMessagePrompts.delete(promptKey);
+            else pendingSpawnPrompts.delete(promptKey);
+            // The spawn-output raw (nickname) usually precedes registration.
+            const stashedNickname = pendingNicknames.get(promptKey);
+            if (stashedNickname !== undefined) pendingNicknames.delete(promptKey);
+            const name = existing?.name && existing.name !== taskName ? existing.name : (stashedNickname ?? taskName);
             subAgents.set(p.agentThreadId, {
               parent: threadId,
               path: p.agentPath,
