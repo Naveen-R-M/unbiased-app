@@ -8951,6 +8951,20 @@ function ResourcesView() {
   } | null>(null);
   const [titles, setTitles] = useState<Map<string, string>>(new Map());
   const [showAllConvs, setShowAllConvs] = useState(false);
+  // Deletions here are irreversible (engine log, transcript cache, worktree
+  // folder) — always confirm first.
+  const [confirmDelete, setConfirmDelete] = useState<
+    { kind: "conversation"; id: string; label: string } | { kind: "worktree"; dir: string; label: string } | null
+  >(null);
+
+  useEffect(() => {
+    if (!confirmDelete) return;
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") setConfirmDelete(null);
+    }
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [confirmDelete]);
 
   useEffect(() => {
     let alive = true;
@@ -8981,13 +8995,11 @@ function ResourcesView() {
   // Deleting from here must not fight an in-flight sample — refetch after.
   const refreshStorage = () => void window.unbiased.storageStats().then(setStorage);
 
-  async function deleteConversation(id: string) {
-    await window.unbiased.deleteThread(id);
-    refreshStorage();
-  }
-
-  async function deleteWorktree(dir: string) {
-    await window.unbiased.removeWorktree(dir);
+  async function runConfirmedDelete() {
+    if (!confirmDelete) return;
+    if (confirmDelete.kind === "conversation") await window.unbiased.deleteThread(confirmDelete.id);
+    else await window.unbiased.removeWorktree(confirmDelete.dir);
+    setConfirmDelete(null);
     refreshStorage();
   }
 
@@ -9141,7 +9153,7 @@ function ResourcesView() {
               {fmtBytes(r.bytes)}
             </span>
             <button
-              onClick={() => void deleteConversation(r.id)}
+              onClick={() => setConfirmDelete({ kind: "conversation", id: r.id, label: r.title })}
               title="Delete conversation (engine log + transcript cache)"
               aria-label={`Delete ${r.title}`}
               style={{
@@ -9200,7 +9212,7 @@ function ResourcesView() {
                 </span>
                 <span style={{ fontVariantNumeric: "tabular-nums", flexShrink: 0 }}>{fmtBytes(w.kb * 1024)}</span>
                 <button
-                  onClick={() => void deleteWorktree(w.dir)}
+                  onClick={() => setConfirmDelete({ kind: "worktree", dir: w.dir, label: w.branch })}
                   title={`Delete worktree ${w.dir}`}
                   aria-label={`Delete worktree ${w.branch}`}
                   style={{
@@ -9221,6 +9233,76 @@ function ResourcesView() {
             ))}
           </div>
         </>
+      )}
+      {confirmDelete && (
+        <div
+          onMouseDown={(e) => {
+            if (e.target === e.currentTarget) setConfirmDelete(null);
+          }}
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0,0,0,0.55)",
+            display: "grid",
+            placeItems: "center",
+            zIndex: 100,
+          }}
+        >
+          <div
+            style={{
+              width: 480,
+              maxWidth: "calc(100vw - 48px)",
+              background: colors.panel,
+              border: `1px solid ${colors.border}`,
+              borderRadius: 16,
+              padding: "22px 24px 20px",
+              boxShadow: "0 16px 48px rgba(0,0,0,0.55)",
+            }}
+          >
+            <div style={{ fontSize: 18, fontWeight: 600, color: colors.fg, overflowWrap: "anywhere" }}>
+              {confirmDelete.kind === "conversation"
+                ? `Delete “${confirmDelete.label}”?`
+                : `Delete worktree ${confirmDelete.label}?`}
+            </div>
+            <div style={{ color: colors.dim, fontSize: 14, lineHeight: 1.55, marginTop: 10 }}>
+              {confirmDelete.kind === "conversation"
+                ? "This permanently deletes the conversation — its engine history and cached transcript. This can't be undone."
+                : "This deletes the worktree's folder from disk, including any uncommitted changes in it. The branch itself stays in the repository."}
+            </div>
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 12, marginTop: 22 }}>
+              <button
+                onClick={() => setConfirmDelete(null)}
+                style={{
+                  background: "transparent",
+                  border: "none",
+                  color: colors.dim,
+                  fontSize: 14.5,
+                  cursor: "pointer",
+                  fontFamily: "inherit",
+                  padding: "9px 14px",
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => void runConfirmedDelete()}
+                style={{
+                  background: "rgba(240, 149, 149, 0.14)",
+                  border: "none",
+                  borderRadius: 10,
+                  color: colors.err,
+                  fontSize: 14.5,
+                  fontWeight: 500,
+                  cursor: "pointer",
+                  fontFamily: "inherit",
+                  padding: "9px 18px",
+                }}
+              >
+                Delete
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );
