@@ -53,6 +53,7 @@ contextBridge.exposeInMainWorld("unbiased", {
   decideApproval: (requestId: string, decision: "accept" | "acceptForSession" | "decline") =>
     ipcRenderer.invoke("chat:approve", { requestId, decision }),
   onApprovalRequest: (cb: (p: unknown) => void) => subscribe("chat:approval-request", cb),
+  onApprovalCanceled: (cb: (p: unknown) => void) => subscribe("chat:approval-canceled", cb),
   onCommand: (cb: (p: unknown) => void) => subscribe("chat:command", cb),
   onCompaction: (cb: (p: unknown) => void) => subscribe("chat:compaction", cb),
   onTokenUsage: (cb: (p: unknown) => void) => subscribe("chat:token-usage", cb),

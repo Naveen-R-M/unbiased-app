@@ -1059,8 +1059,11 @@ function createWindow(): void {
 }
 
 // Server-initiated approval requests awaiting a human decision, keyed by a
-// string handle the renderer can safely round-trip.
-const pendingApprovals = new Map<string, number | string>();
+// string handle the renderer can safely round-trip. The owning thread is
+// kept so the card can be retired when that thread's turn dies (interrupt,
+// failure) — the engine drops the request server-side and would never
+// answer a late decision.
+const pendingApprovals = new Map<string, { rpcId: number | string; threadId: string | null }>();
 
 // Live PTYs for the integrated terminal, keyed by handle.
 const ptys = new Map<string, IPty>();
@@ -1524,6 +1527,27 @@ function wireNotifications(): void {
         if (threadId) {
           runningTurns.delete(threadId);
           bgStream.delete(threadId);
+          // A turn can't end while the engine still waits on an approval —
+          // it dropped the request (interrupt/failure). Retire the card so
+          // dead Allow/Deny buttons don't linger in the transcript.
+          const droppedApprovals: string[] = [];
+          for (const [reqId, info] of pendingApprovals) {
+            if (info.threadId !== threadId) continue;
+            pendingApprovals.delete(reqId);
+            droppedApprovals.push(reqId);
+            const owner = subAgents.get(threadId)?.parent ?? threadId;
+            const ownerPane = paneForThread(owner);
+            if (ownerPane) send("chat:approval-canceled", { paneId: ownerPane, requestId: reqId });
+          }
+          if (droppedApprovals.length) {
+            for (const [tid, arr] of heldApprovals) {
+              const kept = arr.filter((a) => !droppedApprovals.includes(a.requestId as string));
+              if (kept.length !== arr.length) {
+                if (kept.length) heldApprovals.set(tid, kept);
+                else heldApprovals.delete(tid);
+              }
+            }
+          }
           const sub = subAgents.get(threadId);
           if (sub) {
             sub.status = turn?.status === "failed" ? "failed" : "idle";
@@ -1591,9 +1615,10 @@ function wireNotifications(): void {
           send("chat:approval-request", { paneId: "main", ...tagged });
         }
       }
+      const approvalThread = typeof params.threadId === "string" ? params.threadId : null;
       if (msg.method === "item/commandExecution/requestApproval") {
         const requestId = `apr_${msg.id}`;
-        pendingApprovals.set(requestId, msg.id);
+        pendingApprovals.set(requestId, { rpcId: msg.id, threadId: approvalThread });
         deliverApproval({
           requestId,
           kind: "command",
@@ -1608,7 +1633,7 @@ function wireNotifications(): void {
       }
       if (msg.method === "item/fileChange/requestApproval") {
         const requestId = `apr_${msg.id}`;
-        pendingApprovals.set(requestId, msg.id);
+        pendingApprovals.set(requestId, { rpcId: msg.id, threadId: approvalThread });
         deliverApproval({
           requestId,
           kind: "fileChange",
@@ -2040,6 +2065,20 @@ app.whenReady().then(async () => {
     const turnId = pane.turnId ?? (pane.threadId ? runningTurns.get(pane.threadId) : null);
     if (!pane.threadId || !turnId) return { interrupted: false };
     await engine.request("turn/interrupt", { threadId: pane.threadId, turnId });
+    // Stop means stop: sub-agents run in their own sessions, so without a
+    // cascade they keep working (and a sub blocked on an approval would
+    // wait forever). Queued corrections still reach them — the engine
+    // starts a fresh turn for pending mail after an interrupt.
+    for (const [subId, info] of subAgents) {
+      if (info.parent !== pane.threadId) continue;
+      const subTurn = runningTurns.get(subId);
+      if (!subTurn) continue;
+      try {
+        await engine.request("turn/interrupt", { threadId: subId, turnId: subTurn });
+      } catch {
+        // sub turn may have just ended on its own
+      }
+    }
     return { interrupted: true };
   });
 
@@ -2063,10 +2102,10 @@ app.whenReady().then(async () => {
     requestId: string;
     decision: "accept" | "acceptForSession" | "decline";
   }) => {
-    const engineRequestId = pendingApprovals.get(payload.requestId);
-    if (engineRequestId === undefined) return { ok: false };
+    const pending = pendingApprovals.get(payload.requestId);
+    if (pending === undefined) return { ok: false };
     pendingApprovals.delete(payload.requestId);
-    engine.respond(engineRequestId, { decision: payload.decision });
+    engine.respond(pending.rpcId, { decision: payload.decision });
     return { ok: true };
   });
 

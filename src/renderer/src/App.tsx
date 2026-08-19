@@ -49,7 +49,7 @@ type Entry =
       kind: "command";
       itemId: string;
       command: string;
-      status: string; // inProgress | completed | failed | declined | awaitingApproval
+      status: string; // inProgress | completed | failed | declined | awaitingApproval | canceled
       exitCode?: number;
       output?: string;
       approval?: {
@@ -326,6 +326,7 @@ declare global {
         branch: string | null;
       }>;
       decideApproval: (requestId: string, decision: ApprovalDecision) => Promise<{ ok: boolean }>;
+      onApprovalCanceled: (cb: (p: { paneId: PaneId; requestId: string }) => void) => () => void;
       onApprovalRequest: (
         cb: (p: {
           paneId: PaneId;
@@ -6608,6 +6609,21 @@ function ChatPane({
         if (p.paneId !== paneId) return;
         applyApproval(p);
       }),
+      // The owning turn died (interrupt/failure) — the engine dropped the
+      // request, so live Allow/Deny buttons would decide into the void.
+      window.unbiased.onApprovalCanceled((p) => {
+        if (p.paneId !== paneId) return;
+        setEntries((es) =>
+          es.map((e) =>
+            e.kind === "command" &&
+            e.status === "awaitingApproval" &&
+            e.approval?.requestId === p.requestId &&
+            !e.approval.decision
+              ? { ...e, status: "canceled" }
+              : e,
+          ),
+        );
+      }),
       window.unbiased.onTokenUsage((p) => {
         if (p.paneId !== paneId) return;
         setCtxUsage({ used: p.used, window: p.window, percent: p.percent });
@@ -6819,6 +6835,7 @@ function ChatPane({
 
   const statusLabel = (e: CommandEntry) => {
     if (e.status === "awaitingApproval") return { text: "▸ needs approval", color: colors.dim };
+    if (e.status === "canceled") return { text: "▸ canceled", color: colors.dim };
     if (e.status === "inProgress") return { text: "▸ running", color: colors.amber };
     if (e.status === "declined") return { text: "▸ declined", color: colors.dim };
     if (e.status === "failed" || (e.exitCode ?? 0) !== 0)
