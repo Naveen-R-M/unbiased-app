@@ -85,7 +85,7 @@ type QueuedMsg = {
 // thumb is a small data-URL preview for the composer card.
 type Attachment = { name: string; path: string; kind?: "image" | "folder" | "file"; thumb?: string };
 type DirEntry = { name: string; dir: boolean };
-type BrowserState = { url: string; title: string; canGoBack: boolean; canGoForward: boolean; loading: boolean };
+type BrowserState = { id: number; url: string; title: string; canGoBack: boolean; canGoForward: boolean; loading: boolean };
 // How agent actions get approved — maps to engine approvalPolicy+sandbox
 // pairs in the main process.
 type AccessMode = "ask" | "auto" | "full";
@@ -426,16 +426,16 @@ declare global {
       reviewCommitPush: (path: string) => Promise<{ ok: boolean; error?: string }>;
       reviewCreatePr: (path: string) => Promise<{ ok: boolean; error?: string }>;
       openExternal: (url: string) => Promise<{ ok: boolean }>;
-      openBrowser: (url?: string) => Promise<{ ok: boolean }>;
-      setBrowserBounds: (b: { x: number; y: number; width: number; height: number }) => Promise<void>;
-      setBrowserVisible: (visible: boolean) => Promise<void>;
-      navigateBrowser: (p: { url?: string; action?: "back" | "forward" | "reload" }) => Promise<void>;
-      closeBrowser: () => Promise<void>;
+      openBrowser: (p: { id: number; url?: string }) => Promise<{ ok: boolean }>;
+      setBrowserBounds: (b: { id: number; x: number; y: number; width: number; height: number }) => Promise<void>;
+      setBrowserVisible: (p: { id: number; visible: boolean }) => Promise<void>;
+      navigateBrowser: (p: { id: number; url?: string; action?: "back" | "forward" | "reload" }) => Promise<void>;
+      closeBrowser: (id: number) => Promise<void>;
       onBrowserState: (cb: (p: BrowserState) => void) => () => void;
       onBrowserAnnotate: (
         cb: (p: { text: string; comment?: string; tag?: string; thumb?: string }) => void,
       ) => () => void;
-      startBrowserAnnotate: () => Promise<{ ok: boolean }>;
+      startBrowserAnnotate: (id: number) => Promise<{ ok: boolean }>;
       createTerminal: (cols: number, rows: number) => Promise<{ id: string; cwd: string; shell: string }>;
       writeTerminal: (id: string, data: string) => Promise<void>;
       resizeTerminal: (id: string, cols: number, rows: number) => Promise<void>;
@@ -1369,8 +1369,8 @@ export function App() {
     setTerminalTabs([]); // the shells ran in the previous conversation's cwd
     setReviewOpen(false); // the diff reviewed the previous conversation's cwd
     // The browser isn't cwd-bound — the page you're reading survives.
-    setPanelMode(browserOpen ? "browser" : "chat");
-    if (!sideChatEnabled && !browserOpen) setSideOpenPersisted(false);
+    setPanelMode(browserTabs.length > 0 ? `browser:${browserTabs[browserTabs.length - 1]}` : "chat");
+    if (!sideChatEnabled && browserTabs.length === 0) setSideOpenPersisted(false);
   }
 
   // Switching away from a running conversation is fine — its turn keeps
@@ -1501,7 +1501,16 @@ export function App() {
   const [filesTabs, setFilesTabs] = useState<number[]>([]);
   const [treeFiles, setTreeFiles] = useState<Record<number, OpenFileInfo | null>>({});
   const [terminalTabs, setTerminalTabs] = useState<number[]>([]);
-  const [browserOpen, setBrowserOpen] = useState(false);
+  const [browserTabs, setBrowserTabs] = useState<number[]>([]);
+  // Live page titles per browser tab (for the strip labels).
+  const [browserTitles, setBrowserTitles] = useState<Record<number, string>>({});
+  useEffect(
+    () =>
+      window.unbiased.onBrowserState((st) => {
+        setBrowserTitles((m) => (m[st.id] === st.title ? m : { ...m, [st.id]: st.title }));
+      }),
+    [],
+  );
 
   // ── Tab order + close fallback ──────────────────────────────────────
   // The strip renders tabs in the order they were OPENED (new ones append
@@ -1514,7 +1523,7 @@ export function App() {
     ...openFiles.map((f) => `file:${f.id}`),
     ...filesTabs.map((id) => `files:${id}`),
     ...(reviewOpen ? ["review"] : []),
-    ...(browserOpen ? ["browser"] : []),
+    ...browserTabs.map((id) => `browser:${id}`),
     ...terminalTabs.map((id) => `terminal:${id}`),
     ...openAgents.map((a) => `agent:${a.threadId}`),
   ];
@@ -1537,13 +1546,13 @@ export function App() {
     if (tabOrder.length > 0) setPanelMode(tabOrder[tabOrder.length - 1]);
     else setSideOpenPersisted(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sideOpen, panelMode, sideChatEnabled, openFiles, filesTabs, reviewOpen, browserOpen, terminalTabs, openAgents]);
+  }, [sideOpen, panelMode, sideChatEnabled, openFiles, filesTabs, reviewOpen, browserTabs, terminalTabs, openAgents]);
 
   /** Close any tab by its key — one dispatcher instead of per-kind closers. */
   function closeTab(key: string): void {
     if (key === "chat") closeSideChat();
     else if (key === "review") setReviewOpen(false);
-    else if (key === "browser") closeBrowserTab();
+    else if (key.startsWith("browser:")) closeBrowserTab(Number(key.slice(8)));
     else if (key.startsWith("agent:")) setOpenAgents((as) => as.filter((a) => `agent:${a.threadId}` !== key));
     else if (key.startsWith("file:")) setOpenFiles((fs) => fs.filter((f) => `file:${f.id}` !== key));
     else if (key.startsWith("terminal:")) setTerminalTabs((ts) => ts.filter((id) => `terminal:${id}` !== key));
@@ -1680,23 +1689,25 @@ export function App() {
   // whenever its spot isn't showing: other tab active, panel closed, the
   // + menu dropping over it, or the Settings view replacing the whole UI.
   useEffect(() => {
-    if (!browserOpen) return;
-    void window.unbiased.setBrowserVisible(
-      sideOpen &&
-        panelMode === "browser" &&
-        !sidePlusOpen &&
-        !envOpen &&
-        !showSettings &&
-        !showChangelog &&
-        !confirmDialog &&
-        !fullAccessPrompt &&
-        !branchSwitch &&
-        !branchCreate &&
-        !renameDialog &&
-        !moveDialog &&
-        !editProj,
-    );
-  }, [browserOpen, sideOpen, panelMode, sidePlusOpen, envOpen, showSettings, showChangelog, confirmDialog, fullAccessPrompt, branchSwitch, branchCreate, renameDialog, moveDialog, editProj]);
+    const clear =
+      !sidePlusOpen &&
+      !envOpen &&
+      !showSettings &&
+      !showChangelog &&
+      !confirmDialog &&
+      !fullAccessPrompt &&
+      !branchSwitch &&
+      !branchCreate &&
+      !renameDialog &&
+      !moveDialog &&
+      !editProj;
+    for (const id of browserTabs) {
+      void window.unbiased.setBrowserVisible({
+        id,
+        visible: sideOpen && panelMode === `browser:${id}` && clear,
+      });
+    }
+  }, [browserTabs, sideOpen, panelMode, sidePlusOpen, envOpen, showSettings, showChangelog, confirmDialog, fullAccessPrompt, branchSwitch, branchCreate, renameDialog, moveDialog, editProj]);
 
   function openSideChatTab() {
     setSidePlusOpen(false);
@@ -1706,24 +1717,43 @@ export function App() {
 
   function openBrowserTab() {
     setSidePlusOpen(false);
-    setBrowserOpen(true);
-    setPanelMode("browser");
+    if (browserTabs.length >= MAX_TABS_PER_KIND) {
+      setPanelMode(`browser:${browserTabs[browserTabs.length - 1]}`);
+      setSideOpenPersisted(true);
+      return;
+    }
+    const id = tabIdRef.current++;
+    setBrowserTabs((ts) => [...ts, id]);
+    setPanelMode(`browser:${id}`);
     setSideOpenPersisted(true);
   }
 
   // Any http(s) link anywhere in the app lands in the embedded browser:
-  // main-chat links open the side panel on the Browser tab; side-panel
-  // links just switch the tab.
+  // the active browser tab if one is focused, else the most recent one,
+  // else a fresh tab.
   function openInBrowser(url: string) {
-    setBrowserOpen(true);
-    setPanelMode("browser");
+    let id: number;
+    if (panelMode.startsWith("browser:") && browserTabs.includes(Number(panelMode.slice(8)))) {
+      id = Number(panelMode.slice(8));
+    } else if (browserTabs.length > 0) {
+      id = browserTabs[browserTabs.length - 1];
+    } else {
+      id = tabIdRef.current++;
+      setBrowserTabs((ts) => [...ts, id]);
+    }
+    setPanelMode(`browser:${id}`);
     setSideOpenPersisted(true);
-    void window.unbiased.openBrowser(url);
+    void window.unbiased.openBrowser({ id, url });
   }
 
-  function closeBrowserTab() {
-    setBrowserOpen(false);
-    void window.unbiased.closeBrowser();
+  function closeBrowserTab(id: number) {
+    setBrowserTabs((ts) => ts.filter((x) => x !== id));
+    setBrowserTitles((m) => {
+      const rest = { ...m };
+      delete rest[id];
+      return rest;
+    });
+    void window.unbiased.closeBrowser(id);
     // Fallback to a surviving tab happens in the tab-order effect.
   }
 
@@ -3020,8 +3050,13 @@ export function App() {
                       ? { icon: <FolderOutlineIcon size={13} />, label: "Files", close: () => closeTab(t), aria: "Close files" }
                       : t === "review"
                         ? { icon: <ReviewIcon />, label: "Review", close: closeReviewTab, aria: "Close review" }
-                        : t === "browser"
-                          ? { icon: <GlobeIcon size={13} />, label: "Browser", close: closeBrowserTab, aria: "Close browser" }
+                        : t.startsWith("browser:")
+                          ? {
+                              icon: <GlobeIcon size={13} />,
+                              label: browserTitles[Number(t.slice(8))] || "Browser",
+                              close: () => closeTab(t),
+                              aria: "Close browser",
+                            }
                           : agent
                             ? {
                                 icon: <span style={{ fontSize: 13 }}>{agentEmoji(agent.threadId)}</span>,
@@ -3259,18 +3294,19 @@ export function App() {
               <TerminalPane />
             </div>
           ))}
-          {browserOpen && (
+          {browserTabs.map((id) => (
             <div
+              key={id}
               style={{
                 flex: 1,
                 minHeight: 0,
-                display: panelMode === "browser" ? "flex" : "none",
+                display: panelMode === `browser:${id}` ? "flex" : "none",
                 flexDirection: "column",
               }}
             >
-              <BrowserPane />
+              <BrowserPane browserId={id} />
             </div>
-          )}
+          ))}
           <div
             style={{
               flex: 1,
@@ -5087,10 +5123,11 @@ function ReviewPane({ gitPath }: { gitPath: string | null }) {
 /** The embedded browser's renderer half: toolbar + a placeholder div whose
  *  bounds the native WebContentsView (main process) is pinned to. The
  *  actual page pixels are the native layer floating above this spot. */
-function BrowserPane() {
+function BrowserPane({ browserId }: { browserId: number }) {
   const holdRef = useRef<HTMLDivElement>(null);
   const [urlDraft, setUrlDraft] = useState("");
   const [state, setState] = useState<BrowserState>({
+    id: browserId,
     url: "",
     title: "",
     canGoBack: false,
@@ -5100,8 +5137,9 @@ function BrowserPane() {
   const editingRef = useRef(false);
 
   useEffect(() => {
-    void window.unbiased.openBrowser();
+    void window.unbiased.openBrowser({ id: browserId });
     const off = window.unbiased.onBrowserState((s) => {
+      if (s.id !== browserId) return;
       setState(s);
       if (!editingRef.current) setUrlDraft(s.url === "about:blank" ? "" : s.url);
     });
@@ -5109,7 +5147,7 @@ function BrowserPane() {
     if (!el) return off;
     const sync = () => {
       const r = el.getBoundingClientRect();
-      void window.unbiased.setBrowserBounds({ x: r.x, y: r.y, width: r.width, height: r.height });
+      void window.unbiased.setBrowserBounds({ id: browserId, x: r.x, y: r.y, width: r.width, height: r.height });
     };
     sync();
     const ro = new ResizeObserver(sync);
@@ -5120,11 +5158,12 @@ function BrowserPane() {
       ro.disconnect();
       window.removeEventListener("resize", sync);
     };
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [browserId]);
 
   const navBtn = (label: string, enabled: boolean, action: "back" | "forward" | "reload") => (
     <button
-      onClick={() => void window.unbiased.navigateBrowser({ action })}
+      onClick={() => void window.unbiased.navigateBrowser({ id: browserId, action })}
       disabled={!enabled}
       aria-label={label}
       title={label}
@@ -5170,7 +5209,7 @@ function BrowserPane() {
           }}
           onKeyDown={(e) => {
             if (e.key === "Enter" && urlDraft.trim()) {
-              void window.unbiased.navigateBrowser({ url: urlDraft.trim() });
+              void window.unbiased.navigateBrowser({ id: browserId, url: urlDraft.trim() });
               (e.currentTarget as HTMLInputElement).blur();
             }
           }}
@@ -5210,7 +5249,7 @@ function BrowserPane() {
           <ExternalLinkIcon />
         </button>
         <button
-          onClick={() => void window.unbiased.startBrowserAnnotate()}
+          onClick={() => void window.unbiased.startBrowserAnnotate(browserId)}
           disabled={!state.url || state.url === "about:blank"}
           title="Annotate"
           aria-label="Annotate page"

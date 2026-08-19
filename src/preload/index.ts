@@ -101,13 +101,13 @@ contextBridge.exposeInMainWorld("unbiased", {
   reviewCreatePr: (path: string) => ipcRenderer.invoke("review:create-pr", path),
   openExternal: (url: string) => ipcRenderer.invoke("browser:open-external", url),
 
-  openBrowser: (url?: string) => ipcRenderer.invoke("browser:open", url),
-  setBrowserBounds: (b: { x: number; y: number; width: number; height: number }) =>
+  openBrowser: (p: { id: number; url?: string }) => ipcRenderer.invoke("browser:open", p),
+  setBrowserBounds: (b: { id: number; x: number; y: number; width: number; height: number }) =>
     ipcRenderer.invoke("browser:bounds", b),
-  setBrowserVisible: (visible: boolean) => ipcRenderer.invoke("browser:visible", visible),
-  navigateBrowser: (p: { url?: string; action?: string }) => ipcRenderer.invoke("browser:navigate", p),
-  closeBrowser: () => ipcRenderer.invoke("browser:close"),
-  startBrowserAnnotate: () => ipcRenderer.invoke("browser:annotate-mode"),
+  setBrowserVisible: (p: { id: number; visible: boolean }) => ipcRenderer.invoke("browser:visible", p),
+  navigateBrowser: (p: { id: number; url?: string; action?: string }) => ipcRenderer.invoke("browser:navigate", p),
+  closeBrowser: (id: number) => ipcRenderer.invoke("browser:close", id),
+  startBrowserAnnotate: (id: number) => ipcRenderer.invoke("browser:annotate-mode", id),
   onBrowserState: (cb: (p: unknown) => void) => subscribe("browser:state", cb),
   onBrowserAnnotate: (cb: (p: unknown) => void) => subscribe("browser:annotate", cb),
 
