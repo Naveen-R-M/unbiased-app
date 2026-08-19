@@ -214,16 +214,6 @@ function browserWallHint(out: string): string {
 // permission in prose when the APP is the thing that asks: without this the
 // model reliably stalls on private-data requests ("go over my email") with a
 // "shall I?" instead of calling the tool that triggers the real prompt.
-// The engine home pins model_reasoning_effort = "none" (inherited from the
-// CLI's Pareto-only config). That is measurably too low for agentic work:
-// with the browser tools registered and a "go over my email" request, the
-// model called the tool 1/3 of the time at none, 2/3 at low and 3/3 at
-// medium — otherwise it narrated its intent and ended the turn, which is what
-// made approval cards look like they never appeared. Asked for per thread so
-// the engine default (and the CLI's shape) stays untouched, and so this can
-// become a user-facing picker later.
-const APP_REASONING_EFFORT = "medium";
-
 const APP_DEVELOPER_INSTRUCTIONS = [
   "Permission in this app is handled by the app, not by you. When a tool needs the user's consent —",
   "network access, or a signed-in browser session — calling it shows the user a permission card they",
@@ -2543,7 +2533,6 @@ app.whenReady().then(async () => {
           experimentalRawEvents: true,
           dynamicTools: agentBrowserTools(),
           developerInstructions: APP_DEVELOPER_INSTRUCTIONS,
-          reasoningEffort: APP_REASONING_EFFORT,
         })) as { thread: { id: string } };
       } else {
         // Explicit default when no project is chosen — left implicit, the
@@ -2568,7 +2557,6 @@ app.whenReady().then(async () => {
           // installed — the calls come back as item/tool/call requests.
           dynamicTools: agentBrowserTools(),
           developerInstructions: APP_DEVELOPER_INSTRUCTIONS,
-          reasoningEffort: APP_REASONING_EFFORT,
           // Raw response items feed the sub-agent viewer (task text + spawn
           // instructions). Sub-threads inherit this from their parent.
           experimentalRawEvents: true,
