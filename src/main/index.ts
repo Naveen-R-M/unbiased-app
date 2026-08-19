@@ -2333,26 +2333,43 @@ app.whenReady().then(async () => {
     return { ok: true };
   });
 
-  // Create = make the folder and remember it; an empty project is just a
-  // fresh directory with no chats yet.
-  ipcMain.handle("project:create", (_e, p: { name: string; parent?: string }) => {
-    const safe = p.name.trim().replace(/[/\\]/g, "-");
-    if (!safe) return { path: null, name: null, error: "Project name is required" };
-    const dir = join(p.parent ?? app.getPath("home"), safe);
-    try {
-      mkdirSync(dir, { recursive: true });
-    } catch (err) {
-      return { path: null, name: null, error: `Couldn't create ${dir}: ${String(err)}` };
-    }
-    rememberProject(dir);
-    pendingCwd = dir;
-    mainCwd = dir;
-    panes.main.threadId = null;
-    panes.main.turnId = null;
-    panes.side.threadId = null;
-    panes.side.turnId = null;
-    return { path: dir, name: safe };
-  });
+  // Create takes the same record the edit modal produces. With source
+  // folders it just registers them; with none, an empty project is a fresh
+  // directory named after the project in the home folder.
+  ipcMain.handle(
+    "project:create",
+    (_e, p: { name: string; folders?: string[]; primary?: string; icon?: string; color?: string | null }) => {
+      const name = p.name.trim();
+      if (!name) return { path: null, name: null, error: "Project name is required" };
+      const folders = (p.folders ?? []).filter(Boolean);
+      let primary: string;
+      if (folders.length > 0) {
+        primary = p.primary && folders.includes(p.primary) ? p.primary : folders[0];
+      } else {
+        const safe = name.replace(/[/\\]/g, "-");
+        primary = join(app.getPath("home"), safe);
+        try {
+          mkdirSync(primary, { recursive: true });
+        } catch (err) {
+          return { path: null, name: null, error: `Couldn't create ${primary}: ${String(err)}` };
+        }
+        folders.push(primary);
+      }
+      const projects = loadProjects();
+      if (projects.some((r) => r.primary === primary)) {
+        return { path: null, name: null, error: "A project already uses that primary folder" };
+      }
+      projects.unshift({ name, folders, primary, icon: p.icon ?? "folder", color: p.color ?? null });
+      saveProjects(projects);
+      pendingCwd = primary;
+      mainCwd = primary;
+      panes.main.threadId = null;
+      panes.main.turnId = null;
+      panes.side.threadId = null;
+      panes.side.turnId = null;
+      return { path: primary, name };
+    },
+  );
 
   ipcMain.handle("project:pick-location", async () => {
     if (!win) return { path: null };
