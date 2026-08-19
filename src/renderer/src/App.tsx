@@ -10041,6 +10041,36 @@ type ChangelogRelease = {
 };
 const CHANGELOG: ChangelogRelease[] = [
   {
+    version: "1.2.0",
+    date: "August 19, 2026",
+    sections: [
+      {
+        title: "New",
+        items: [
+          "The assistant can browse the web. Ask it to look something up and it searches, reads pages, clicks through, and can take screenshots — reporting what it actually saw rather than what it remembers. Requires the agent-browser tool to be installed.",
+          "Signed-in browsing: when a task needs your own accounts (your email, a dashboard, an admin panel), the assistant asks permission and the app opens a browser window for it. Sign in there once and it stays available for later requests.",
+          "Every side-panel surface now opens in multiple tabs — up to five each of sub-agent conversations, side chats, browsers, terminals, file trees, and file viewers.",
+          "The side panel remembers itself per conversation: leave a chat and come back to find the same tabs, with the one you were reading still in front.",
+          "Creating a project now uses the full project editor — name, icon and color, and as many source folders as you want.",
+          "This “What’s new” log, reachable from the bell beside Settings, with a dot when there is something you have not read.",
+        ],
+      },
+      {
+        title: "Fixed",
+        items: [
+          "Deleting a conversation or worktree from Settings → Resources now asks first, and spells out exactly what gets removed.",
+          "Sub-agent conversations in Settings → Resources are named (nickname, task, and the conversation that spawned them) instead of showing a raw id.",
+          "Chats outside a project now run in a dedicated ~/Unbiased folder. Previously they ran in your home directory, which let a personal Codex CLI config leak into the app and break turns with a tool error.",
+          "Diagrams and other code blocks without a language tag render as proper blocks instead of ragged inline text.",
+          "The stored API key is kept on sign-out by default, so signing back in is one click. The toggle is in Settings.",
+          "Interrupting a chat now also stops its sub-agents, and permission cards that no longer apply are retired instead of sitting there live.",
+          "A permission card raised by the app itself no longer stays stuck on “running” after you answer it.",
+          "The update banner shows its status inline with a face — glum while an update waits, cheerful once it is ready to relaunch.",
+        ],
+      },
+    ],
+  },
+  {
     version: "1.1.0",
     date: "August 18, 2026",
     sections: [

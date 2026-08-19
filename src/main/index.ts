@@ -55,9 +55,23 @@ function ensurePane(paneId: string): { threadId: string | null; turnId: string |
 
 /** Drop every scratch pane — their ephemeral threads die with the context
  *  that spawned them (conversation switch, delete, engine restart). */
+/** Answer any local approval waiting on this thread. A dynamic tool call is
+ *  blocked on that promise and the engine is blocked on the tool call, so a
+ *  torn-down pane would otherwise wedge the turn forever. */
+function settleLocalApprovals(threadId: string | null | undefined): void {
+  if (!threadId) return;
+  for (const [reqId, pending] of pendingApprovals) {
+    if (pending.kind !== "local" || pending.threadId !== threadId) continue;
+    pendingApprovals.delete(reqId);
+    pending.settle("decline");
+  }
+}
+
 function resetSidePanes(): void {
   for (const k of Object.keys(panes)) {
-    if (k !== "main") delete panes[k];
+    if (k === "main") continue;
+    settleLocalApprovals(panes[k]?.threadId);
+    delete panes[k];
   }
 }
 
@@ -90,6 +104,10 @@ function defaultChatDir(): string {
 // only in "ask" mode (auto and full already permit network work); attaching
 // to the user's own Chrome is gated in EVERY mode, because it hands the
 // agent their signed-in sessions rather than public pages.
+// The mode a thread STARTED under. codex takes approvalPolicy at thread/start,
+// so the browser gate must too — otherwise flipping the global toggle for one
+// conversation silently ungates a backgrounded one.
+const threadAccessModes = new Map<string, AccessMode>();
 const browserNetGrants = new Set<string>();
 const browserConnectGrants = new Set<string>();
 // Unbiased's own Chrome, launched on demand once the user approves session
@@ -107,6 +125,10 @@ const CHROME_BINARIES = [
   "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
 ];
 let managedChrome: ChildProcess | null = null;
+// Two threads can call browser_connect at once; without this both would spawn
+// Chrome against the same profile, the loser would exit on Chrome's profile
+// singleton, and its exit handler would wipe state belonging to the winner.
+let chromeLaunch: Promise<{ ok: boolean; launched: boolean; firstRun: boolean; error?: string }> | null = null;
 
 /** Is something speaking the DevTools protocol on this port? */
 function cdpAlive(port: number): Promise<boolean> {
@@ -129,6 +151,16 @@ const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
  *  listening (including one the user started themselves), otherwise our own
  *  Chrome, launched here so the user never has to run a terminal command. */
 async function ensureAgentChrome(
+  port: number,
+): Promise<{ ok: boolean; launched: boolean; firstRun: boolean; error?: string }> {
+  if (chromeLaunch) return chromeLaunch;
+  chromeLaunch = launchAgentChrome(port).finally(() => {
+    chromeLaunch = null;
+  });
+  return chromeLaunch;
+}
+
+async function launchAgentChrome(
   port: number,
 ): Promise<{ ok: boolean; launched: boolean; firstRun: boolean; error?: string }> {
   if (await cdpAlive(port)) return { ok: true, launched: false, firstRun: false };
@@ -160,9 +192,10 @@ async function ensureAgentChrome(
     ],
     { stdio: "ignore" },
   );
-  managedChrome.on("exit", () => {
-    managedChrome = null;
-    browserAttached = false;
+  const child = managedChrome;
+  child.on("exit", () => {
+    // Only clear state if the process that died is still the current one.
+    if (managedChrome === child) managedChrome = null;
   });
   for (let tries = 0; tries < 24; tries++) {
     await wait(500);
@@ -171,8 +204,9 @@ async function ensureAgentChrome(
   return { ok: false, launched: true, firstRun, error: `Chrome started but never opened port ${port}.` };
 }
 
-// True while driving the user's Chrome: close must not take their tabs down.
-let browserAttached = false;
+// Set when attached to a browser WE DID NOT LAUNCH: closing it would take
+// down tabs that are not ours. A browser this app started is ours to close.
+let browserAttachedExternal = false;
 
 let agentBrowserBinCache: string | null | undefined;
 function agentBrowserBin(): string | null {
@@ -397,12 +431,12 @@ async function ensureBrowserAllowed(tool: string, threadId: string | null, detai
   const attaching = tool === "browser_connect";
   if (attaching) {
     if (browserConnectGrants.has(root)) return null;
-  } else if (accessMode !== "ask" || browserNetGrants.has(root)) {
+  } else if ((threadAccessModes.get(root) ?? accessMode) !== "ask" || browserNetGrants.has(root)) {
     return null;
   }
   const decision = await requestLocalApproval(
     threadId,
-    attaching ? "Use a signed-in browser session" : `Browse the web — ${detail}`,
+    attaching ? `Use a signed-in browser session (${detail})` : `Browse the web — ${detail}`,
     attaching
       ? "The agent wants a browser it can use as you — reading pages you are signed into (mail, X, dashboards, internal tools). Approving opens an Unbiased-managed Chrome window; anything you sign into there stays available to the agent. Allow only if you want it acting with those accounts."
       : "The agent wants to use the browser, which reaches the network. This conversation is in Ask-for-approval mode, so nothing goes out until you allow it.",
@@ -414,6 +448,40 @@ async function ensureBrowserAllowed(tool: string, threadId: string | null, detai
   }
   if (decision === "acceptForSession") (attaching ? browserConnectGrants : browserNetGrants).add(root);
   return null;
+}
+
+/** Only real web pages. Without this the model can point browser_open at
+ *  file:///… (verified reachable: /etc/hosts came back through browser_read)
+ *  and exfiltrate local files to the gateway, which is the classic
+ *  prompt-injection sink for a page-driving agent. */
+function webUrlOrNull(raw: string): string | null {
+  const candidate = /^[a-z][a-z0-9+.-]*:/i.test(raw) ? raw : `https://${raw}`;
+  try {
+    const u = new URL(candidate);
+    return u.protocol === "http:" || u.protocol === "https:" ? u.toString() : null;
+  } catch {
+    return null;
+  }
+}
+
+/** A CDP endpoint browser_connect may attach to: a local port, or a ws/http
+ *  URL on this machine. Remote hosts are refused — attaching to someone
+ *  else's debugger is not a thing the model gets to choose. */
+function cdpTargetOrNull(raw: string): { port: number } | { url: string } | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return { port: AGENT_CHROME_PORT };
+  if (/^\d+$/.test(trimmed)) {
+    const port = Number(trimmed);
+    return port > 0 && port < 65_536 ? { port } : null;
+  }
+  try {
+    const u = new URL(trimmed);
+    if (!["ws:", "wss:", "http:", "https:"].includes(u.protocol)) return null;
+    if (!["127.0.0.1", "localhost", "[::1]", "::1"].includes(u.hostname)) return null;
+    return { url: u.toString() };
+  } catch {
+    return null;
+  }
 }
 
 const AGENT_BROWSER_OUTPUT_CAP = 30_000;
@@ -439,13 +507,21 @@ async function handleAgentBrowserCall(
       : tool === "browser_search"
         ? `search: ${str("query")}`
         : tool === "browser_connect"
-          ? str("port") || "port 9222"
+          ? str("port") || `port ${AGENT_CHROME_PORT}`
           : tool.replace(/^browser_/, "");
   const refusal = await ensureBrowserAllowed(tool, threadId, gateDetail);
   if (refusal) return text(refusal, false);
   switch (tool) {
     case "browser_open": {
-      const r = await runAgentBrowser(["open", str("url")], 90_000);
+      const url = webUrlOrNull(str("url"));
+      if (!url) {
+        return text(
+          `Refused: ${JSON.stringify(str("url"))} is not an http(s) web address. The browser only opens web ` +
+            "pages — it cannot read local files or other schemes. Use the file tools for anything on disk.",
+          false,
+        );
+      }
+      const r = await runAgentBrowser(["open", url], 90_000);
       return text(r.out + browserWallHint(r.out), r.ok);
     }
     case "browser_snapshot": {
@@ -488,25 +564,48 @@ async function handleAgentBrowserCall(
       );
     }
     case "browser_connect": {
-      const port = Number(str("port")) || AGENT_CHROME_PORT;
-      // Approved above — now make a debuggable browser exist. Nothing for the
-      // user to run: an already-listening browser is reused, otherwise we
-      // start Unbiased's own Chrome and wait for its port.
-      const ready = await ensureAgentChrome(port);
-      if (!ready.ok) {
+      const target = cdpTargetOrNull(str("port"));
+      if (!target) {
         return text(
-          `Could not start a browser session: ${ready.error ?? "unknown error"}. ` +
-            "Use browser_search and public pages instead.",
+          `Refused: ${JSON.stringify(str("port"))} is not a local debugging target. Pass a port number, or a ` +
+            "ws://127.0.0.1 URL — attaching to a remote host is not allowed.",
           false,
         );
       }
-      const r = await runAgentBrowser(["connect", String(port)], 30_000);
+      let launched = false;
+      let firstRun = false;
+      let connectArg: string;
+      if ("url" in target) {
+        connectArg = target.url; // someone else already serves this endpoint
+      } else {
+        // Approved above — now make a debuggable browser exist. Nothing for
+        // the user to run: an already-listening browser is reused, otherwise
+        // we start Unbiased's own Chrome and wait for its port.
+        const ready = await ensureAgentChrome(target.port);
+        if (!ready.ok) {
+          return text(
+            `Could not start a browser session: ${ready.error ?? "unknown error"}. ` +
+              "Use browser_search and public pages instead.",
+            false,
+          );
+        }
+        launched = ready.launched;
+        firstRun = ready.firstRun;
+        connectArg = String(target.port);
+      }
+      const r = await runAgentBrowser(["connect", connectArg], 30_000);
       // `connect` exits 0 even when discovery fails, so read the output.
       if (!r.ok || /✗|failed|refused/i.test(r.out)) {
-        return text(`Attach failed on port ${port}: ${r.out || "no detail"}`, false);
+        // Don't leave a window open for a session that never attached.
+        if (launched && managedChrome) {
+          managedChrome.kill();
+          managedChrome = null;
+        }
+        return text(`Attach failed on ${connectArg}: ${r.out || "no detail"}`, false);
       }
-      browserAttached = true;
-      if (ready.launched && ready.firstRun) {
+      // Only a browser we started is ours to close later.
+      browserAttachedExternal = !launched;
+      if (launched && firstRun) {
         return text(
           "Attached to a freshly created Unbiased Chrome profile — a browser window is now open on the " +
             "user's screen, but it is NOT signed into anything yet (Chrome refuses remote debugging on their " +
@@ -517,10 +616,10 @@ async function handleAgentBrowserCall(
         );
       }
       return text(
-        (ready.launched
-          ? "Attached to Unbiased's Chrome (a window is open on the user's screen). Sessions signed in " +
-            "there previously are available."
-          : "Attached to the browser already listening on this port.") +
+        (launched
+          ? "Attached to Unbiased's Chrome (a window is open on the user's screen). It may already hold " +
+            "sign-ins from earlier sessions."
+          : "Attached to the browser already listening on that endpoint.") +
           " If a page comes back signed out, ask the user to sign in in that window rather than looking for " +
           "another way around it.",
         true,
@@ -539,12 +638,21 @@ async function handleAgentBrowserCall(
       return text(r.out, r.ok);
     }
     case "browser_press": {
-      const r = await runAgentBrowser(["press", str("key")]);
+      const key = str("key");
+      // Key names and chords only — nothing that could read as a CLI flag.
+      if (!/^[A-Za-z0-9+_]{1,40}$/.test(key)) {
+        return text(`Refused: ${JSON.stringify(key)} is not a key name (try Enter, Tab, Control+a).`, false);
+      }
+      const r = await runAgentBrowser(["press", key]);
       return text(r.out, r.ok);
     }
     case "browser_scroll": {
       const px = typeof a.pixels === "number" && a.pixels > 0 ? [String(Math.round(a.pixels))] : [];
-      const r = await runAgentBrowser(["scroll", str("direction") || "down", ...px]);
+      const dir = str("direction") || "down";
+      if (!["up", "down", "left", "right"].includes(dir)) {
+        return text(`Refused: direction must be up, down, left or right (got ${JSON.stringify(dir)}).`, false);
+      }
+      const r = await runAgentBrowser(["scroll", dir, ...px]);
       return text(r.out, r.ok);
     }
     case "browser_back": {
@@ -552,11 +660,18 @@ async function handleAgentBrowserCall(
       return text(r.out, r.ok);
     }
     case "browser_close": {
-      if (browserAttached) {
-        return text("Attached to the user's own Chrome — leaving it open. Nothing to close.", true);
+      if (browserAttachedExternal) {
+        return text("Attached to a browser this app did not launch — leaving it open. Nothing to close.", true);
       }
       const r = await runAgentBrowser(["close"]);
-      return text(r.out, r.ok);
+      // A browser we launched goes down with the session, closing its
+      // debugging port too — leaving that open all session is what let any
+      // local process attach to the signed-in profile.
+      if (managedChrome) {
+        managedChrome.kill();
+        managedChrome = null;
+      }
+      return text(r.out || "closed", r.ok);
     }
     case "browser_screenshot": {
       const file = join(app.getPath("temp"), `unbiased-shot-${Date.now()}.png`);
@@ -564,10 +679,11 @@ async function handleAgentBrowserCall(
       if (!r.ok) return text(r.out, false);
       try {
         const b64 = readFileSync(file).toString("base64");
-        rmSync(file, { force: true });
         return { contentItems: [{ type: "inputImage", imageUrl: `data:image/png;base64,${b64}` }], success: true };
       } catch (err) {
         return text(`screenshot unreadable: ${String(err)}`, false);
+      } finally {
+        rmSync(file, { force: true });
       }
     }
     default:
@@ -666,7 +782,8 @@ function resetSubAgentState(): void {
   pendingApprovals.clear();
   browserNetGrants.clear();
   browserConnectGrants.clear();
-  browserAttached = false;
+  threadAccessModes.clear();
+  browserAttachedExternal = false;
 }
 
 /** Strip the engine's inter-agent envelope ("Message Type: …\nTask name: …\n
@@ -2564,6 +2681,7 @@ app.whenReady().then(async () => {
         mainCwd = (started as { cwd?: string }).cwd ?? cwd;
       }
       pane.threadId = started.thread.id;
+      threadAccessModes.set(started.thread.id, accessMode);
       created = true;
     }
     // Attachments ride as `mention` input items — the engine resolves the
@@ -3100,6 +3218,9 @@ app.whenReady().then(async () => {
           cwd?: string;
         });
     mainCwd = result.cwd ?? result.thread.cwd ?? null;
+    // An unanswered browser card on the conversation we are leaving would
+    // otherwise block its tool call — and therefore its turn — forever.
+    settleLocalApprovals(panes.main.threadId);
     panes.main.threadId = id;
     panes.main.turnId = runningTurns.get(id) ?? null;
     // The side chat (if any) was forked from the previous conversation;
@@ -3125,6 +3246,7 @@ app.whenReady().then(async () => {
 
   ipcMain.handle("threads:detach", (_e, cwd?: string) => {
     // Fresh main-chat view: the next send creates a new thread, in `cwd` if given.
+    settleLocalApprovals(panes.main.threadId);
     panes.main.threadId = null;
     panes.main.turnId = null;
     resetSidePanes();
@@ -3206,8 +3328,12 @@ app.whenReady().then(async () => {
   ipcMain.handle("side:reset", (_e, paneId?: string) => {
     // Side chats are disposable: dropping the reference is the whole
     // cleanup — the ephemeral thread evaporates with the engine.
-    if (paneId) delete panes[paneId];
-    else resetSidePanes();
+    if (paneId) {
+      settleLocalApprovals(panes[paneId]?.threadId);
+      delete panes[paneId];
+    } else {
+      resetSidePanes();
+    }
     return { ok: true };
   });
 
@@ -3281,7 +3407,9 @@ app.whenReady().then(async () => {
     // DIPs. They differ by the page zoom factor (Cmd+= / Cmd+-), so an
     // unzoomed conversion strands the view at the wrong spot and size.
     const z = win?.webContents.getZoomFactor() ?? 1;
-    ensureBrowserView(p.id).setBounds({
+    // Lookup, never create: a late ResizeObserver tick for a tab the user
+    // just closed would otherwise mint an orphan view layered over the panel.
+    browserViews.get(p.id)?.setBounds({
       x: Math.round(p.x * z),
       y: Math.round(p.y * z),
       width: Math.max(0, Math.round(p.width * z)),
@@ -3706,12 +3834,17 @@ app.whenReady().then(async () => {
         }
       }
       runningTurns.delete(subId);
+      settleLocalApprovals(subId);
       subAgents.delete(subId);
       subAgentMail.delete(subId);
       heldApprovals.delete(subId);
       bgStream.delete(subId);
     }
     runningTurns.delete(id);
+    settleLocalApprovals(id);
+    browserNetGrants.delete(id);
+    browserConnectGrants.delete(id);
+    threadAccessModes.delete(id);
     bgStream.delete(id);
     heldApprovals.delete(id);
     heldErrors.delete(id);
@@ -3745,7 +3878,7 @@ app.on("window-all-closed", () => {
   engine.stop();
   // The agent browser's daemon outlives us otherwise — close every session.
   const bin = agentBrowserBinCache;
-  if (bin && !browserAttached) execFile(bin, ["close", "--all"], () => {});
+  if (bin && !browserAttachedExternal) execFile(bin, ["close", "--all"], () => {});
   // Our own Chrome goes with us; its profile (and logins) persist on disk.
   managedChrome?.kill();
   app.quit();
