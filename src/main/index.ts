@@ -1668,14 +1668,18 @@ app.whenReady().then(async () => {
 
   // Sign out: stop the engine and remove the stored credentials file. An
   // env-provided key can't be removed by us — report that so the UI can say so.
-  ipcMain.handle("auth:logout", () => {
+  ipcMain.handle("auth:logout", (_e, opts?: { removeKey?: boolean }) => {
     engine.stop();
     pushStatus({ state: "exited", code: null, detail: "signed out" });
     const envKey = !!process.env.UNBIASED_API_KEY?.trim();
-    try {
-      rmSync(credentialsPath(), { force: true });
-    } catch {
-      // nothing to remove
+    // Removing the stored key is now the user's choice (Settings → Account):
+    // keeping it makes the next sign-in a one-click "Continue".
+    if (opts?.removeKey !== false) {
+      try {
+        rmSync(credentialsPath(), { force: true });
+      } catch {
+        // nothing to remove
+      }
     }
     resetKnownSecrets();
     return { ok: true, envKeyRemains: envKey };
@@ -1910,6 +1914,40 @@ app.whenReady().then(async () => {
   ipcMain.handle("workmode:set", (_e, p: { mode: string; dir?: string }) => {
     if (p.mode === "local" || p.mode === "worktree") workMode = p.mode;
     else if (p.mode === "existing" && p.dir) workMode = { existing: p.dir };
+    return { ok: true };
+  });
+
+  // Delete a conversation worktree: git removes it from the parent repo's
+  // bookkeeping (force — agent work in it is disposable by definition once
+  // the user deletes it), falling back to a plain rm if the repo is gone.
+  ipcMain.handle("worktrees:remove", async (_e, dir: string) => {
+    const map = loadWorktrees();
+    const info = map[dir];
+    if (info) {
+      const removed = await new Promise<boolean>((resolve) => {
+        execFile(
+          "git",
+          ["-C", info.project, "worktree", "remove", "--force", dir],
+          { timeout: 30000 },
+          (error) => resolve(!error),
+        );
+      });
+      if (!removed) {
+        try {
+          rmSync(dir, { recursive: true, force: true });
+        } catch (err) {
+          return { ok: false, error: String(err) };
+        }
+      }
+      delete map[dir];
+      writeFileSync(worktreesFile(), JSON.stringify(map, null, 2) + "\n");
+    } else {
+      try {
+        rmSync(dir, { recursive: true, force: true });
+      } catch (err) {
+        return { ok: false, error: String(err) };
+      }
+    }
     return { ok: true };
   });
 
@@ -2270,6 +2308,18 @@ app.whenReady().then(async () => {
       return { fullPath, relPath: rel.startsWith("..") ? fullPath : rel, content };
     } catch {
       return { error: `Could not open ${rawPath}`, fullPath };
+    }
+  });
+
+  // Existence probe for inline file chips: same resolution as file:read,
+  // so a chip only renders as a link when clicking it would actually work.
+  ipcMain.handle("file:exists", (_e, rawPath: string) => {
+    const base = mainCwd ?? pendingCwd ?? app.getPath("home");
+    const fullPath = isAbsolute(rawPath) ? rawPath : join(base, rawPath);
+    try {
+      return { exists: statSync(fullPath).isFile() };
+    } catch {
+      return { exists: false };
     }
   });
 

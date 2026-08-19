@@ -294,7 +294,7 @@ declare global {
       authStatus: () => Promise<{ hasKey: boolean; source: "env" | "file" | null }>;
       authValidate: (key?: string) => Promise<WhoamiResult>;
       authLogin: (key?: string) => Promise<WhoamiResult>;
-      authLogout: () => Promise<{ ok: boolean; envKeyRemains: boolean }>;
+      authLogout: (removeKey?: boolean) => Promise<{ ok: boolean; envKeyRemains: boolean }>;
       sendMessage: (
         paneId: PaneId,
         text: string,
@@ -316,6 +316,7 @@ declare global {
       setPlanMode: (on: boolean) => Promise<{ planMode: boolean }>;
       onPlan: (cb: (p: { paneId: PaneId; text: string }) => void) => () => void;
       listWorktrees: (project: string) => Promise<{ worktrees: { dir: string; branch: string }[] }>;
+      removeWorktree: (dir: string) => Promise<{ ok: boolean; error?: string }>;
       saveTranscript: (threadId: string, entries: Entry[]) => Promise<{ ok: boolean }>;
       loadTranscript: (threadId: string) => Promise<{ entries: Entry[] | null }>;
       conversationInfo: () => Promise<{
@@ -402,6 +403,7 @@ declare global {
       ) => Promise<{ ok: boolean; error?: string }>;
       revealProject: (path: string) => Promise<{ ok: boolean }>;
       readFile: (path: string) => Promise<{ fullPath: string; relPath?: string; content?: string; error?: string }>;
+      fileExists: (path: string) => Promise<{ exists: boolean }>;
       readImage: (path: string) => Promise<{ dataUrl?: string; error?: string }>;
       listDir: (dir?: string) => Promise<{ dir: string; entries: DirEntry[]; error?: string }>;
       searchRefs: (word: string) => Promise<{ results: RefHit[]; truncated?: boolean; error?: string }>;
@@ -567,12 +569,13 @@ function agentEmoji(seed: string): string {
   return AGENT_EMOJI[h % AGENT_EMOJI.length];
 }
 
-/** Shimmering "is working" text (gradient sweep, Codex-style). */
-function WorkingShimmer() {
+/** Shimmering status text (gradient sweep, Codex-style) — the universal
+ *  "something is in flight" treatment. */
+function ShimmerText({ text, fontSize = 12.5 }: { text: string; fontSize?: number }) {
   return (
     <span
       style={{
-        fontSize: 12.5,
+        fontSize,
         background: `linear-gradient(90deg, var(--dim) 30%, var(--fg) 50%, var(--dim) 70%)`,
         backgroundSize: "200% 100%",
         WebkitBackgroundClip: "text",
@@ -581,9 +584,13 @@ function WorkingShimmer() {
         animation: "unbiased-shimmer 2s linear infinite",
       }}
     >
-      is working
+      {text}
     </span>
   );
+}
+
+function WorkingShimmer() {
+  return <ShimmerText text="is working" />;
 }
 
 /** Whole-unit variant for settled durations: "5s", "2m 20s". */
@@ -707,7 +714,8 @@ export function App() {
   }
 
   async function signOut() {
-    await window.unbiased.authLogout();
+    const removeKey = localStorage.getItem("signoutKeepsKey") !== "true";
+    await window.unbiased.authLogout(removeKey);
     localStorage.removeItem("unbiased.authed");
     setShowSettings(false);
     setAuthed("out");
@@ -2363,24 +2371,25 @@ export function App() {
                           style={{
                             display: "flex",
                             alignItems: "center",
-                            gap: 10,
+                            gap: 11,
                             width: "100%",
                             background: "transparent",
                             border: "none",
                             borderRadius: 8,
-                            padding: "7px 10px",
+                            padding: "9px 10px",
                             cursor: "pointer",
                             textAlign: "left",
                             fontFamily: "inherit",
                           }}
                         >
-                          <span style={{ fontSize: 15, flexShrink: 0 }}>{agentEmoji(a.threadId)}</span>
+                          <span style={{ fontSize: 16, flexShrink: 0, lineHeight: 1 }}>{agentEmoji(a.threadId)}</span>
                           <span
                             style={{
                               flex: 1,
                               minWidth: 0,
-                              fontSize: 13.5,
-                              fontWeight: 500,
+                              fontSize: 14.5,
+                              fontWeight: 600,
+                              letterSpacing: -0.15,
                               color: colors.fg,
                               whiteSpace: "nowrap",
                               overflow: "hidden",
@@ -2390,9 +2399,9 @@ export function App() {
                             {a.name}
                           </span>
                           {a.status === "running" ? (
-                            <WorkingShimmer />
+                            <ShimmerText text="is working" fontSize={13} />
                           ) : (
-                            <span style={{ color: a.status === "failed" ? colors.err : colors.dim, fontSize: 12.5 }}>
+                            <span style={{ color: a.status === "failed" ? colors.err : colors.dim, fontSize: 13 }}>
                               {a.status === "failed" ? "failed" : "done"}
                             </span>
                           )}
@@ -5333,13 +5342,15 @@ function SubAgentPane({ threadId, name, status }: { threadId: string; name: stri
         }}
         title={path ?? undefined}
       >
-        <span style={{ fontSize: 14 }}>{agentEmoji(threadId)}</span>
-        <span style={{ color: colors.fg, fontWeight: 500 }}>{name}</span>
+        <span style={{ fontSize: 15, lineHeight: 1 }}>{agentEmoji(threadId)}</span>
+        <span style={{ color: colors.fg, fontWeight: 600, fontSize: 13.5, letterSpacing: -0.1 }}>{name}</span>
         <span style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{path}</span>
         <span style={{ flex: 1 }} />
-        <span style={{ color: status === "running" ? colors.amber : status === "failed" ? colors.err : colors.dim }}>
-          {status === "running" ? "working…" : status}
-        </span>
+        {status === "running" ? (
+          <ShimmerText text="working…" />
+        ) : (
+          <span style={{ color: status === "failed" ? colors.err : colors.dim }}>{status}</span>
+        )}
       </div>
       <div ref={scrollRef} style={{ flex: 1, overflowY: "auto", padding: "18px 20px" }}>
         {error && <div style={{ color: colors.err, fontSize: 13 }}>{error}</div>}
@@ -5422,7 +5433,7 @@ function SubAgentPane({ threadId, name, status }: { threadId: string; name: stri
                 color: colors.dim,
               }}
             >
-              working…
+              <ShimmerText text="working…" fontSize={13} />
             </div>
           </div>
         )}
@@ -6461,10 +6472,19 @@ function ChatPane({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [entries, persistTranscript]);
 
+  // Where the running turn's output starts in `entries`, and when it began —
+  // consumed on completion to fold the work into a "Worked for Ns" group.
+  const turnStartIndexRef = useRef<number | null>(null);
+  const turnStartedAtRef = useRef<number | null>(null);
+
   // An undecided approval means the agent is waiting on the human — the
   // thinking clock pauses rather than blaming the model for our latency.
+  // Scoped to the RUNNING turn: an orphaned card from an earlier turn must
+  // not pin the status line forever.
+  const turnScopeStart = turnStartIndexRef.current ?? entries.length;
   const awaitingApproval = entries.some(
-    (e) => e.kind === "command" && e.status === "awaitingApproval" && e.approval && !e.approval.decision,
+    (e, i) =>
+      i >= turnScopeStart && e.kind === "command" && e.status === "awaitingApproval" && e.approval && !e.approval.decision,
   );
 
   // Pareto completes the whole response before its first byte arrives
@@ -6692,11 +6712,6 @@ function ChatPane({
     !busy &&
     entries.length > 0 &&
     lastEntry?.kind !== "compaction";
-
-  // Where the running turn's output starts in `entries`, and when it began —
-  // consumed on completion to fold the work into a "Worked for Ns" group.
-  const turnStartIndexRef = useRef<number | null>(null);
-  const turnStartedAtRef = useRef<number | null>(null);
 
   /** Send a prepared message right now (fresh sends and queue flushes). */
   async function sendNow(q: QueuedMsg) {
@@ -6945,33 +6960,15 @@ function ChatPane({
           return <code style={{ fontFamily: "inherit", fontSize: "inherit" }}>{props.children}</code>;
         }
         const text = extractText(props.children);
-        // Only file references are interactive — they open in the panel.
-        // Plain inline code is not clickable (it no longer opens a side chat).
-        const isPath = Boolean(onOpenFileRef.current) && looksLikeFilePath(text);
+        // Only file references that ACTUALLY resolve are interactive — the
+        // chip verifies existence before dressing itself as a link.
         return (
-          <code
-            onClick={isPath ? () => onOpenFileRef.current!(text) : undefined}
-            title={isPath ? "Open file" : undefined}
-            style={{
-              fontFamily: "var(--font-code)",
-              fontSize: "0.875em",
-              background: "var(--chip)",
-              // File references read as navigation, not code — accent them.
-              color: isPath ? "var(--accent)" : "var(--fg-msg)",
-              padding: "3px 8px",
-              borderRadius: 6,
-              cursor: isPath ? "pointer" : "inherit",
-            }}
-          >
+          <InlineCodeChip text={text} openRef={onOpenFileRef}>
             {props.children}
-          </code>
+          </InlineCodeChip>
         );
       },
-      pre: (props: { children?: React.ReactNode }) => (
-        <CodeBlock onOpenCode={onAskSideChatRef.current ? (t) => onAskSideChatRef.current!(t) : undefined}>
-          {props.children}
-        </CodeBlock>
-      ),
+      pre: (props: { children?: React.ReactNode }) => <CodeBlock>{props.children}</CodeBlock>,
       a: (props: { href?: string; children?: React.ReactNode }) => (
         <a
           href={props.href}
@@ -7269,26 +7266,21 @@ function ChatPane({
                     animation: "unbiased-spin 0.8s linear infinite",
                   }}
                 />
-                Compacting conversation…
+                <ShimmerText text="Compacting conversation…" fontSize={14} />
               </div>
             </div>
           )}
-          {showThinking && !compacting && (
-            <div style={{ display: "flex", justifyContent: "flex-start", margin: "10px 0" }}>
-              <div
-                style={{
-                  padding: "10px 14px",
-                  borderRadius: 12,
-                  background: colors.panel,
-                  border: `1px solid ${colors.border}`,
-                  fontSize: 14,
-                  color: colors.dim,
-                }}
-              >
-                {awaitingApproval
-                  ? `thinking… ${formatElapsed(elapsed)} · waiting for user input…`
-                  : `thinking… ${formatElapsed(elapsed)}`}
-              </div>
+          {busy && !compacting && (
+            // Bare status line, no bubble: "thinking… Ns" until the first
+            // output, then "waiting…" while the turn is still running
+            // (streaming pauses, sub-agents working). Static text while
+            // blocked on the human — shimmer means the MACHINE is busy.
+            <div style={{ display: "flex", margin: "10px 0" }}>
+              {showThinking && !awaitingApproval ? (
+                <ShimmerText text={`thinking… ${formatDuration(elapsed)}`} fontSize={14} />
+              ) : (
+                <ShimmerText text="waiting…" fontSize={14} />
+              )}
             </div>
           )}
         </div>
@@ -7997,6 +7989,54 @@ function ChatPane({
   );
 }
 
+/** Inline-code chip: becomes a clickable file link only after the path is
+ *  CONFIRMED to resolve in the conversation's cwd — a dead link that opens
+ *  "Could not open …" is worse than no link. The check runs per chip text;
+ *  a file mentioned before the agent creates it stays plain until the
+ *  message re-renders (rare, and honest either way). The open handler rides
+ *  a ref so the markdown component map stays referentially stable. */
+function InlineCodeChip({
+  text,
+  children,
+  openRef,
+}: {
+  text: string;
+  children?: React.ReactNode;
+  openRef: React.MutableRefObject<((path: string) => void) | undefined>;
+}) {
+  const candidate = Boolean(openRef.current) && looksLikeFilePath(text);
+  const [exists, setExists] = useState(false);
+  useEffect(() => {
+    if (!candidate) return;
+    let alive = true;
+    void window.unbiased.fileExists(text).then((r) => {
+      if (alive) setExists(r.exists);
+    });
+    return () => {
+      alive = false;
+    };
+  }, [candidate, text]);
+  const clickable = candidate && exists;
+  return (
+    <code
+      onClick={clickable ? () => openRef.current!(text) : undefined}
+      title={clickable ? "Open file" : undefined}
+      style={{
+        fontFamily: "var(--font-code)",
+        fontSize: "0.875em",
+        background: "var(--chip)",
+        // File references read as navigation, not code — accent them.
+        color: clickable ? "var(--accent)" : "var(--fg-msg)",
+        padding: "3px 8px",
+        borderRadius: 6,
+        cursor: clickable ? "pointer" : "inherit",
+      }}
+    >
+      {children}
+    </code>
+  );
+}
+
 /** Pull the raw text out of react-markdown's rendered children. */
 function extractText(node: React.ReactNode): string {
   if (node == null || typeof node === "boolean") return "";
@@ -8032,7 +8072,42 @@ const LANGUAGE_NAMES: Record<string, string> = {
 
 /** Codex-style fenced code block: header bar with a language label and copy,
  *  dark canvas, and (in the main pane) click-to-open in the side chat. */
-function CodeBlock({ children, onOpenCode }: { children?: React.ReactNode; onOpenCode?: (text: string) => void }) {
+// Markdown fence language → loaded Prism grammar (the file viewer's
+// EXT_TO_PRISM maps file EXTENSIONS; fences use language names).
+const FENCE_TO_PRISM: Record<string, string> = {
+  python: "python",
+  py: "python",
+  js: "javascript",
+  javascript: "javascript",
+  mjs: "javascript",
+  cjs: "javascript",
+  ts: "typescript",
+  typescript: "typescript",
+  tsx: "tsx",
+  jsx: "jsx",
+  json: "json",
+  bash: "bash",
+  sh: "bash",
+  shell: "bash",
+  zsh: "bash",
+  console: "bash",
+  go: "go",
+  golang: "go",
+  rust: "rust",
+  rs: "rust",
+  toml: "toml",
+  yaml: "yaml",
+  yml: "yaml",
+  sql: "sql",
+  markdown: "markdown",
+  md: "markdown",
+  html: "markup",
+  xml: "markup",
+  svg: "markup",
+  css: "css",
+};
+
+function CodeBlock({ children }: { children?: React.ReactNode }) {
   const [copied, setCopied] = useState(false);
   const child = Array.isArray(children) ? children[0] : children;
   const className: string =
@@ -8042,25 +8117,19 @@ function CodeBlock({ children, onOpenCode }: { children?: React.ReactNode; onOpe
   const lang = /language-([\w-]+)/.exec(className)?.[1]?.toLowerCase() ?? "";
   const label = LANGUAGE_NAMES[lang] ?? (lang ? lang.toUpperCase() : "Plain text");
   const text = extractText(children).replace(/\n$/, "");
+  // Syntax colors (prism-tomorrow, already themed for the file viewer).
+  const prismLang = FENCE_TO_PRISM[lang];
+  const grammar = prismLang ? Prism.languages[prismLang] : undefined;
+  const highlighted = grammar ? Prism.highlight(text, grammar, prismLang) : null;
 
   return (
     <div
-      onClick={
-        onOpenCode
-          ? () => {
-              // A drag-select inside the block is reading, not clicking.
-              if (window.getSelection()?.isCollapsed) onOpenCode(text);
-            }
-          : undefined
-      }
-      title={onOpenCode ? "Open in side chat" : undefined}
       style={{
         background: colors.panel,
         border: `1px solid ${colors.border}`,
         borderRadius: 10,
         margin: "12px 0",
         overflow: "hidden",
-        cursor: onOpenCode ? "pointer" : "default",
       }}
     >
       <div
@@ -8093,25 +8162,47 @@ function CodeBlock({ children, onOpenCode }: { children?: React.ReactNode; onOpe
             alignItems: "center",
           }}
         >
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-            <rect x="9" y="9" width="13" height="13" rx="2" />
-            <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
-          </svg>
+          {copied ? (
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <path d="M20 6 9 17l-5-5" />
+            </svg>
+          ) : (
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <rect x="9" y="9" width="13" height="13" rx="2" />
+              <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+            </svg>
+          )}
         </button>
       </div>
-      <pre
-        style={{
-          margin: 0,
-          padding: "2px 14px 12px",
-          overflowX: "auto",
-          fontFamily: "var(--font-code)",
-          fontSize: 12.75,
-          lineHeight: 1.65,
-          color: "var(--code-fg)",
-        }}
-      >
-        {children}
-      </pre>
+      {highlighted !== null ? (
+        <pre
+          style={{
+            margin: 0,
+            padding: "2px 14px 12px",
+            overflowX: "auto",
+            fontFamily: "var(--font-code)",
+            fontSize: 12.75,
+            lineHeight: 1.65,
+            color: "var(--code-fg)",
+          }}
+        >
+          <code style={{ fontFamily: "inherit", fontSize: "inherit" }} dangerouslySetInnerHTML={{ __html: highlighted }} />
+        </pre>
+      ) : (
+        <pre
+          style={{
+            margin: 0,
+            padding: "2px 14px 12px",
+            overflowX: "auto",
+            fontFamily: "var(--font-code)",
+            fontSize: 12.75,
+            lineHeight: 1.65,
+            color: "var(--code-fg)",
+          }}
+        >
+          {children}
+        </pre>
+      )}
     </div>
   );
 }
@@ -8606,6 +8697,19 @@ function ResourcesView() {
     };
   }, []);
 
+  // Deleting from here must not fight an in-flight sample — refetch after.
+  const refreshStorage = () => void window.unbiased.storageStats().then(setStorage);
+
+  async function deleteConversation(id: string) {
+    await window.unbiased.deleteThread(id);
+    refreshStorage();
+  }
+
+  async function deleteWorktree(dir: string) {
+    await window.unbiased.removeWorktree(dir);
+    refreshStorage();
+  }
+
   useEffect(() => {
     void window.unbiased.storageStats().then(setStorage);
     void window.unbiased.listThreads().then((d) => {
@@ -8755,6 +8859,24 @@ function ResourcesView() {
             <span style={{ width: 80, textAlign: "right", fontVariantNumeric: "tabular-nums", flexShrink: 0 }}>
               {fmtBytes(r.bytes)}
             </span>
+            <button
+              onClick={() => void deleteConversation(r.id)}
+              title="Delete conversation (engine log + transcript cache)"
+              aria-label={`Delete ${r.title}`}
+              style={{
+                flexShrink: 0,
+                display: "flex",
+                background: "transparent",
+                border: "none",
+                color: colors.dim,
+                cursor: "pointer",
+                padding: "4px 0 4px 10px",
+              }}
+              onMouseEnter={(ev) => ((ev.currentTarget as HTMLButtonElement).style.color = colors.err)}
+              onMouseLeave={(ev) => ((ev.currentTarget as HTMLButtonElement).style.color = colors.dim)}
+            >
+              <TrashIcon />
+            </button>
           </div>
         ))}
         {convRows.length > 12 && (
@@ -8796,6 +8918,24 @@ function ResourcesView() {
                   </span>
                 </span>
                 <span style={{ fontVariantNumeric: "tabular-nums", flexShrink: 0 }}>{fmtBytes(w.kb * 1024)}</span>
+                <button
+                  onClick={() => void deleteWorktree(w.dir)}
+                  title={`Delete worktree ${w.dir}`}
+                  aria-label={`Delete worktree ${w.branch}`}
+                  style={{
+                    flexShrink: 0,
+                    display: "flex",
+                    background: "transparent",
+                    border: "none",
+                    color: colors.dim,
+                    cursor: "pointer",
+                    padding: "4px 0 4px 10px",
+                  }}
+                  onMouseEnter={(ev) => ((ev.currentTarget as HTMLButtonElement).style.color = colors.err)}
+                  onMouseLeave={(ev) => ((ev.currentTarget as HTMLButtonElement).style.color = colors.dim)}
+                >
+                  <TrashIcon />
+                </button>
               </div>
             ))}
           </div>
@@ -8817,6 +8957,16 @@ function SettingsView({
   onSignOut: () => void;
 }) {
   const [tab, setTab] = useState<"appearance" | "resources" | "account">("appearance");
+  // Sign-out key handling: default removes the saved key; flipping this
+  // keeps ~/.unbiased/credentials.json so the next sign-in is one click.
+  const [keepKey, setKeepKey] = useState(() => localStorage.getItem("signoutKeepsKey") === "true");
+
+  function toggleKeepKey() {
+    setKeepKey((k) => {
+      localStorage.setItem("signoutKeepsKey", String(!k));
+      return !k;
+    });
+  }
   const [importText, setImportText] = useState("");
   const [importError, setImportError] = useState<string | null>(null);
   const [account, setAccount] = useState<WhoamiResult | null>(null);
@@ -8954,9 +9104,48 @@ function SettingsView({
                     <span style={{ color: colors.dim }}>Key</span>
                     <span style={{ fontFamily: "var(--font-code)", fontSize: 13 }}>{account.keyName}</span>
                   </div>
-                  <div style={{ ...rowStyle, borderBottom: "none" }}>
+                  <div style={rowStyle}>
                     <span style={{ color: colors.dim }}>Access</span>
                     <span>{account.accessStatus}</span>
+                  </div>
+                  <div style={{ ...rowStyle, borderBottom: "none" }}>
+                    <span style={{ minWidth: 0 }}>
+                      <span style={{ display: "block", color: colors.dim }}>Keep key on sign out</span>
+                      <span style={{ display: "block", fontSize: 12, color: "var(--gutter)", marginTop: 2 }}>
+                        Leave the saved key on this machine for one-click sign-in
+                      </span>
+                    </span>
+                    <button
+                      onClick={toggleKeepKey}
+                      role="switch"
+                      aria-checked={keepKey}
+                      aria-label="Keep key on sign out"
+                      style={{
+                        width: 38,
+                        height: 22,
+                        borderRadius: 11,
+                        border: "none",
+                        background: keepKey ? colors.accent : "var(--gutter)",
+                        position: "relative",
+                        cursor: "pointer",
+                        flexShrink: 0,
+                        padding: 0,
+                        transition: "background 120ms",
+                      }}
+                    >
+                      <span
+                        style={{
+                          position: "absolute",
+                          top: 3,
+                          left: keepKey ? 19 : 3,
+                          width: 16,
+                          height: 16,
+                          borderRadius: "50%",
+                          background: "#fff",
+                          transition: "left 120ms",
+                        }}
+                      />
+                    </button>
                   </div>
                 </>
               ) : (
@@ -8982,7 +9171,9 @@ function SettingsView({
               Sign out
             </button>
             <div style={{ fontSize: 12, color: colors.dim, marginTop: 10 }}>
-              Signing out stops the engine and removes the saved key from this machine.
+              {keepKey
+                ? "Signing out stops the engine. The saved key stays on this machine for the next sign-in."
+                : "Signing out stops the engine and removes the saved key from this machine."}
             </div>
           </div>
         ) : (
@@ -9586,11 +9777,16 @@ function CopyButton({ text }: { text: string }) {
         fontFamily: "inherit",
       }}
     >
-      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-        <rect x="9" y="9" width="13" height="13" rx="2" />
-        <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
-      </svg>
-      {copied ? "copied" : ""}
+      {copied ? (
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+          <path d="M20 6 9 17l-5-5" />
+        </svg>
+      ) : (
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+          <rect x="9" y="9" width="13" height="13" rx="2" />
+          <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+        </svg>
+      )}
     </button>
   );
 }
@@ -10550,7 +10746,7 @@ function StepsGroup({
           fontFamily: "var(--font-ui)",
         }}
       >
-        {summary.text}
+        {running && !needsApproval ? <ShimmerText text={summary.text} fontSize={13.5} /> : summary.text}
         <span
           style={{
             display: "inline-block",

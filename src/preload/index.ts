@@ -26,7 +26,7 @@ contextBridge.exposeInMainWorld("unbiased", {
   authStatus: () => ipcRenderer.invoke("auth:status"),
   authValidate: (key?: string) => ipcRenderer.invoke("auth:validate", key),
   authLogin: (key?: string) => ipcRenderer.invoke("auth:login", { key }),
-  authLogout: () => ipcRenderer.invoke("auth:logout"),
+  authLogout: (removeKey?: boolean) => ipcRenderer.invoke("auth:logout", { removeKey }),
 
   sendMessage: (paneId: string, text: string, attachments?: { name: string; path: string; kind?: string }[]) =>
     ipcRenderer.invoke("chat:send", { paneId, text, attachments }),
@@ -45,6 +45,7 @@ contextBridge.exposeInMainWorld("unbiased", {
   setPlanMode: (on: boolean) => ipcRenderer.invoke("planmode:set", on),
   onPlan: (cb: (p: unknown) => void) => subscribe("chat:plan", cb),
   listWorktrees: (project: string) => ipcRenderer.invoke("worktrees:list", project),
+  removeWorktree: (dir: string) => ipcRenderer.invoke("worktrees:remove", dir),
   conversationInfo: () => ipcRenderer.invoke("conversation:info"),
   saveTranscript: (threadId: string, entries: unknown) =>
     ipcRenderer.invoke("transcript:save", { threadId, entries }),
@@ -83,6 +84,7 @@ contextBridge.exposeInMainWorld("unbiased", {
   updateProject: (path: string, record: unknown) => ipcRenderer.invoke("project:update", { path, record }),
   revealProject: (path: string) => ipcRenderer.invoke("project:reveal", path),
   readFile: (path: string) => ipcRenderer.invoke("file:read", path),
+  fileExists: (path: string) => ipcRenderer.invoke("file:exists", path),
   readImage: (path: string) => ipcRenderer.invoke("file:read-image", path),
   listDir: (dir?: string) => ipcRenderer.invoke("fs:list", dir),
   searchRefs: (word: string) => ipcRenderer.invoke("fs:search-refs", word),
