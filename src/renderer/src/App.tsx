@@ -829,6 +829,7 @@ export function App() {
     if (!editProj) return;
     if (editProj.mode === "create") {
       if (!editProj.name.trim()) return;
+      snapshotSideView(); // same as every other context switch
       const r = await window.unbiased.createProject({
         name: editProj.name.trim(),
         folders: editProj.folders,
@@ -1330,8 +1331,18 @@ export function App() {
     >(),
   );
 
+  const MAX_SIDE_SNAPSHOTS = 12;
   function snapshotSideView(): void {
     if (!activeThreadId) return;
+    // Each snapshot can hold several file contents, and conversations deleted
+    // from Settings never come back through here — so cap the store and drop
+    // the least recently visited.
+    sidePanelSnapshots.current.delete(activeThreadId);
+    while (sidePanelSnapshots.current.size >= MAX_SIDE_SNAPSHOTS) {
+      const oldest = sidePanelSnapshots.current.keys().next().value;
+      if (oldest === undefined) break;
+      sidePanelSnapshots.current.delete(oldest);
+    }
     sidePanelSnapshots.current.set(activeThreadId, {
       openAgents,
       openFiles,
@@ -1849,17 +1860,16 @@ export function App() {
    *  tab with fresh content; at the cap the oldest tab yields. */
   function addFileTab(info: OpenFileInfo): void {
     const existing = openFiles.find((f) => f.info.fullPath === info.fullPath);
-    if (existing) {
-      setOpenFiles((fs) => fs.map((f) => (f.id === existing.id ? { ...f, info } : f)));
-      setPanelMode(`file:${existing.id}`);
-    } else {
-      const id = tabIdRef.current++;
-      setOpenFiles((fs) => {
-        const next = [...fs, { id, info }];
-        return next.length > MAX_TABS_PER_KIND ? next.slice(next.length - MAX_TABS_PER_KIND) : next;
-      });
-      setPanelMode(`file:${id}`);
-    }
+    const id = existing?.id ?? tabIdRef.current++;
+    setOpenFiles((fs) => {
+      // Decide here, not from the render closure: two quick opens of the same
+      // path would both miss `existing` and mint duplicate tabs.
+      const hit = fs.find((f) => f.info.fullPath === info.fullPath);
+      if (hit) return fs.map((f) => (f.id === hit.id ? { ...f, info } : f));
+      const next = [...fs, { id, info }];
+      return next.length > MAX_TABS_PER_KIND ? next.slice(next.length - MAX_TABS_PER_KIND) : next;
+    });
+    setPanelMode(`file:${id}`);
     setSideOpenPersisted(true);
   }
 

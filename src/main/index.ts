@@ -67,11 +67,30 @@ function settleLocalApprovals(threadId: string | null | undefined): void {
   }
 }
 
+/** Forget a scratch pane AND stop whatever it was doing. Dropping the record
+ *  alone left the ephemeral fork generating in the engine with no stream, no
+ *  stop control and no way to reach it — tokens burning invisibly. */
+function dropSidePane(paneId: string): void {
+  const pane = panes[paneId];
+  if (!pane) return;
+  const threadId = pane.threadId;
+  settleLocalApprovals(threadId);
+  if (threadId) {
+    const turnId = pane.turnId ?? runningTurns.get(threadId) ?? null;
+    if (turnId) {
+      void engine.request("turn/interrupt", { threadId, turnId }).catch(() => {
+        // the turn may have just finished on its own
+      });
+      runningTurns.delete(threadId);
+    }
+    threadAccessModes.delete(threadId);
+  }
+  delete panes[paneId];
+}
+
 function resetSidePanes(): void {
   for (const k of Object.keys(panes)) {
-    if (k === "main") continue;
-    settleLocalApprovals(panes[k]?.threadId);
-    delete panes[k];
+    if (k !== "main") dropSidePane(k);
   }
 }
 
@@ -3328,12 +3347,8 @@ app.whenReady().then(async () => {
   ipcMain.handle("side:reset", (_e, paneId?: string) => {
     // Side chats are disposable: dropping the reference is the whole
     // cleanup — the ephemeral thread evaporates with the engine.
-    if (paneId) {
-      settleLocalApprovals(panes[paneId]?.threadId);
-      delete panes[paneId];
-    } else {
-      resetSidePanes();
-    }
+    if (paneId) dropSidePane(paneId);
+    else resetSidePanes();
     return { ok: true };
   });
 
