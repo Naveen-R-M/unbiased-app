@@ -100,6 +100,7 @@ contextBridge.exposeInMainWorld("unbiased", {
   reviewCommitPush: (path: string) => ipcRenderer.invoke("review:commit-push", path),
   reviewCreatePr: (path: string) => ipcRenderer.invoke("review:create-pr", path),
   openExternal: (url: string) => ipcRenderer.invoke("browser:open-external", url),
+  favicon: (host: string) => ipcRenderer.invoke("link:favicon", host),
 
   openBrowser: (p: { id: number; url?: string }) => ipcRenderer.invoke("browser:open", p),
   setBrowserBounds: (b: { id: number; x: number; y: number; width: number; height: number }) =>

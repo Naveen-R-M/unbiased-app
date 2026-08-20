@@ -442,6 +442,7 @@ declare global {
       reviewCommitPush: (path: string) => Promise<{ ok: boolean; error?: string }>;
       reviewCreatePr: (path: string) => Promise<{ ok: boolean; error?: string }>;
       openExternal: (url: string) => Promise<{ ok: boolean }>;
+      favicon: (host: string) => Promise<{ dataUrl: string | null }>;
       openBrowser: (p: { id: number; url?: string }) => Promise<{ ok: boolean }>;
       setBrowserBounds: (b: { id: number; x: number; y: number; width: number; height: number }) => Promise<void>;
       setBrowserVisible: (p: { id: number; visible: boolean }) => Promise<void>;
@@ -5535,6 +5536,17 @@ function AgentIcon() {
  *  and the commands it runs. */
 /** Markdown component set shared by the main chat and the sub-agent pane —
  *  same code blocks, file chips, links, and typography everywhere. */
+/** The host of an external link, or null for anything that gets no icon:
+ *  relative links, in-page anchors, and non-http(s) schemes. */
+function linkHost(href?: string): string | null {
+  if (!href || !/^https?:\/\//i.test(href)) return null;
+  try {
+    return new URL(href).hostname.toLowerCase() || null;
+  } catch {
+    return null;
+  }
+}
+
 function buildMdComponents(
   openFileRef: React.MutableRefObject<((path: string) => void) | undefined>,
   openLink?: (url: string) => void,
@@ -5558,20 +5570,24 @@ function buildMdComponents(
       );
     },
     pre: (props: { children?: React.ReactNode }) => <CodeBlock>{props.children}</CodeBlock>,
-    a: (props: { href?: string; children?: React.ReactNode }) => (
-      <a
-        href={props.href}
-        onClick={(e) => {
-          e.preventDefault();
-          const href = props.href ?? "";
-          if (/^https?:/.test(href)) openLink?.(href);
-        }}
-        style={{ color: "var(--accent)", cursor: "pointer" }}
-        title="Open in browser tab"
-      >
-        {props.children}
-      </a>
-    ),
+    a: (props: { href?: string; children?: React.ReactNode }) => {
+      const host = linkHost(props.href);
+      return (
+        <a
+          href={props.href}
+          onClick={(e) => {
+            e.preventDefault();
+            const href = props.href ?? "";
+            if (/^https?:/.test(href)) openLink?.(href);
+          }}
+          style={{ color: "var(--accent)", cursor: "pointer" }}
+          title="Open in browser tab"
+        >
+          {host ? <Favicon host={host} /> : null}
+          {props.children}
+        </a>
+      );
+    },
     blockquote: (props: { children?: React.ReactNode }) => (
       <blockquote
         style={{
@@ -8336,6 +8352,68 @@ function ChatPane({
  *  a file mentioned before the agent creates it stays plain until the
  *  message re-renders (rare, and honest either way). The open handler rides
  *  a ref so the markdown component map stays referentially stable. */
+// Site icons, keyed by host and never cleared — unlike the path cache below,
+// a host means the same thing in every conversation. Every link to the same
+// site shares one in-flight request, and a null (no icon) is cached too.
+const faviconCache = new Map<string, Promise<string | null>>();
+function probeFavicon(host: string): Promise<string | null> {
+  let p = faviconCache.get(host);
+  if (!p) {
+    p = window.unbiased
+      .favicon(host)
+      .then((r) => r.dataUrl)
+      .catch(() => null);
+    faviconCache.set(host, p);
+  }
+  return p;
+}
+
+/** The site's icon for a source link, falling back to a globe.
+ *
+ *  Its own component because buildMdComponents is memoized with EMPTY deps:
+ *  holding this state in the `a` override would change that component's
+ *  identity every time an icon resolved, remounting the markdown subtree and
+ *  detaching the DOM nodes an open text selection points at — the same hazard
+ *  the ref-routed callbacks there exist to avoid.
+ *
+ *  The box is a fixed size from the first frame, so an icon arriving mid-turn
+ *  cannot reflow a streaming message. */
+function Favicon({ host }: { host: string }) {
+  const [src, setSrc] = useState<string | null>(null);
+  useEffect(() => {
+    let live = true;
+    setSrc(null);
+    void probeFavicon(host).then((d) => {
+      if (live) setSrc(d);
+    });
+    return () => {
+      live = false;
+    };
+  }, [host]);
+  return (
+    <span
+      aria-hidden="true"
+      style={{
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+        width: 14,
+        height: 14,
+        marginRight: 4,
+        verticalAlign: "-2px",
+        flex: "none",
+        color: "var(--dim)",
+      }}
+    >
+      {src ? (
+        <img src={src} width={14} height={14} alt="" style={{ borderRadius: 2, objectFit: "contain" }} />
+      ) : (
+        <GlobeIcon size={12} />
+      )}
+    </span>
+  );
+}
+
 // One probe per unique path text — chips remount en masse when a turn
 // folds, and every probe is an IPC + stat. Cleared on thread switch (the
 // resolution base changes with the conversation's cwd).

@@ -503,6 +503,55 @@ function cdpTargetOrNull(raw: string): { port: number } | { url: string } | null
   }
 }
 
+/** A host we're willing to fetch a favicon from. The renderer's CSP forbids
+ *  remote images, so main fetches them instead — which means a link inside a
+ *  model-written message becomes an outbound request from this process. Public
+ *  DNS names only: loopback and RFC1918 literals are refused so a rendered
+ *  message cannot probe the user's LAN, and 169.254 keeps cloud metadata out
+ *  of reach. Hostname-level only — a public name that RESOLVES to a private
+ *  address still gets through; closing that needs a custom DNS lookup, and the
+ *  request carries no credentials or cookies either way. */
+function faviconHostOrNull(raw: string): string | null {
+  const host = raw.trim().toLowerCase();
+  if (!host || host.length > 253) return null;
+  // No ports, paths, userinfo or IPv6 brackets — a bare name is all we take.
+  if (!/^[a-z0-9.-]+$/.test(host)) return null;
+  if (!host.includes(".") || host.endsWith(".local")) return null;
+  if (host === "0.0.0.0" || /^127\./.test(host)) return null;
+  if (/^10\./.test(host) || /^192\.168\./.test(host)) return null;
+  if (/^172\.(1[6-9]|2\d|3[01])\./.test(host)) return null;
+  if (/^169\.254\./.test(host)) return null;
+  return host;
+}
+
+/** One favicon attempt: fetch https://<host><path> and hand it back as a data:
+ *  URL, or null for anything we won't use. Never throws — a missing icon is
+ *  not an error condition. */
+async function fetchIcon(host: string, path: string): Promise<string | null> {
+  try {
+    const res = await fetch(`https://${host}${path}`, {
+      signal: AbortSignal.timeout(3_000),
+      redirect: "follow",
+      headers: { accept: "image/*" },
+    });
+    // Redirects are followed, but the bytes must still come from the site we
+    // asked about — otherwise a 302 could source the icon, and the request,
+    // from anywhere. A leading `www.` on either side is the same site
+    // (anthropic.com serves its icon from www); anything else is not.
+    const sameSite = (a: string, b: string) => a.replace(/^www\./, "") === b.replace(/^www\./, "");
+    const finalHost = new URL(res.url || `https://${host}/`).hostname.toLowerCase();
+    const type = (res.headers.get("content-type") ?? "").split(";")[0].trim().toLowerCase();
+    if (!res.ok || !sameSite(finalHost, host) || !type.startsWith("image/")) return null;
+    const buf = Buffer.from(await res.arrayBuffer());
+    // Anything this big is not a favicon. The bytes sit in renderer state for
+    // the session, so an unbounded body is a memory bug waiting to happen.
+    if (buf.length === 0 || buf.length > 100_000) return null;
+    return `data:${type};base64,${buf.toString("base64")}`;
+  } catch {
+    return null; // timeout, DNS, TLS, abort
+  }
+}
+
 /** agent-browser parses its global flags positionally, and one of them is
  *  `--executable-path` — so a model-controlled value starting with "-" in a
  *  fill/type argument is a flag, not text. Verified: filling a field with
@@ -3849,6 +3898,28 @@ app.whenReady().then(async () => {
     } catch {
       return { error: `Could not open ${path}` };
     }
+  });
+
+  // Site icons for source links in assistant markdown. Same shape as
+  // file:read-image above and for the same reason: `img-src 'self' data:`
+  // means the renderer cannot load a remote icon itself. Misses are cached as
+  // null so a site without an icon is asked once per run, not once per render.
+  // Site icons for source links in assistant markdown. Same shape as
+  // file:read-image below and for the same reason: `img-src 'self' data:`
+  // means the renderer cannot load a remote icon itself. Misses are cached as
+  // null too, so a site without an icon is asked once per run.
+  const faviconCache = new Map<string, string | null>();
+  ipcMain.handle("link:favicon", async (_e, rawHost: string) => {
+    const host = faviconHostOrNull(String(rawHost ?? ""));
+    if (!host) return { dataUrl: null };
+    if (faviconCache.has(host)) return { dataUrl: faviconCache.get(host) ?? null };
+    // /favicon.ico first, then /favicon.png. Sites served out of a bundler
+    // increasingly ship only the PNG and point at it with <link rel="icon">,
+    // which we deliberately don't fetch pages to read — learn.chatgpt.com is
+    // one. The second guess costs a request only when the first one misses.
+    const dataUrl = (await fetchIcon(host, "/favicon.ico")) ?? (await fetchIcon(host, "/favicon.png"));
+    faviconCache.set(host, dataUrl);
+    return { dataUrl };
   });
 
   ipcMain.handle("clipboard:has-image", () => !clipboard.readImage().isEmpty());
