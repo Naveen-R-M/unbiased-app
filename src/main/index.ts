@@ -2394,7 +2394,10 @@ function wireNotifications(): void {
         const usage = {
           used,
           window,
-          percent: window ? Math.min(100, Math.round((used / window) * 100)) : null,
+          // NOT clamped: a conversation that outgrows the window is exactly
+          // what the user needs to see. Clamping to 100 showed a calm "100%"
+          // at 154% while every request was already failing.
+          percent: window ? Math.round((used / window) * 100) : null,
         };
         // Persist per thread so the gauge survives restarts and resumes.
         try {

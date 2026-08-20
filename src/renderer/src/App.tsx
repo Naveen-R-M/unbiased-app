@@ -7059,6 +7059,17 @@ function ChatPane({
     entries.length > 0 &&
     lastEntry?.kind !== "compaction";
 
+  /** Summarize the history: frees context, and cuts the tool-call density
+   *  that makes long conversations return empty responses. Stays "compacting"
+   *  until the engine emits its contextCompaction item — the start RPC
+   *  resolving only means it kicked off. */
+  async function compactNow(): Promise<void> {
+    if (!canCompact) return;
+    setCompacting(true);
+    const r = await window.unbiased.compact(paneId);
+    if (!r.ok) setCompacting(false);
+  }
+
   /** Send a prepared message right now (fresh sends and queue flushes). */
   async function sendNow(q: QueuedMsg) {
     setBusy(true);
@@ -8053,13 +8064,43 @@ function ChatPane({
                     <div style={{ height: 4, borderRadius: 2, background: "var(--panel-2)", overflow: "hidden" }}>
                       <div
                         style={{
-                          width: `${ctxUsage.percent}%`,
+                          // The bar caps at full; the number beside it does not.
+                          width: `${Math.min(100, ctxUsage.percent)}%`,
                           height: "100%",
                           borderRadius: 2,
                           background: ctxUsage.percent > 90 ? colors.err : ctxUsage.percent > 70 ? colors.amber : colors.accent,
                         }}
                       />
                     </div>
+                    {ctxUsage.percent > 80 && (
+                      <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 10 }}>
+                        <span style={{ flex: 1, minWidth: 0, color: ctxUsage.percent > 100 ? colors.err : colors.dim }}>
+                          {ctxUsage.percent > 100
+                            ? "Past the window — requests can start failing until this is compacted."
+                            : "Getting full. Compacting summarizes the history and frees room."}
+                        </span>
+                        <button
+                          onClick={() => {
+                            setUsageOpen(false);
+                            void compactNow();
+                          }}
+                          disabled={!canCompact}
+                          style={{
+                            flexShrink: 0,
+                            background: "var(--chip)",
+                            border: `1px solid ${colors.border}`,
+                            borderRadius: 8,
+                            color: colors.fg,
+                            fontSize: 12.5,
+                            padding: "5px 10px",
+                            cursor: canCompact ? "pointer" : "default",
+                            fontFamily: "inherit",
+                          }}
+                        >
+                          {compacting ? "Compacting…" : "Compact now"}
+                        </button>
+                      </div>
+                    )}
                     {/* Credits and spend from the platform. Pareto on an API
                         key is prepaid, not quota'd, so there are no reset
                         windows to show — balance is the number that matters. */}
@@ -8126,14 +8167,9 @@ function ChatPane({
                     <div style={{ borderTop: `1px solid ${colors.border}`, margin: "14px 0 0" }} />
                     <button
                       disabled={!canCompact}
-                      onClick={async () => {
-                        // Stays "compacting" until the engine emits the
-                        // contextCompaction item (onCompaction clears it); the
-                        // start RPC resolving only means it kicked off.
-                        setCompacting(true);
+                      onClick={() => {
                         setUsageOpen(false);
-                        const r = await window.unbiased.compact(paneId);
-                        if (!r.ok) setCompacting(false);
+                        void compactNow();
                       }}
                       style={{
                         width: "100%",
