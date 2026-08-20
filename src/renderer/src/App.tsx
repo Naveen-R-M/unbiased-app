@@ -276,7 +276,15 @@ type HeldApproval = {
 
 // A spawned sub-agent (multi-agent v2): its own engine thread, grouped
 // under the parent conversation. name = the model-chosen task name.
-type SubAgent = { threadId: string; name: string; path: string; status: string };
+type SubAgent = {
+  threadId: string;
+  name: string;
+  path: string;
+  status: string;
+  /** Which pane's conversation spawned it — set when rosters are merged, so a
+   *  later push from one pane can't drop another pane's agents. */
+  paneId?: PaneId;
+};
 
 declare global {
   interface Window {
@@ -1388,14 +1396,16 @@ export function App() {
     setTerminalTabs([]); // the shells ran in the previous conversation's cwd
     setReviewOpen(false); // the diff reviewed the previous conversation's cwd
     // The browser isn't cwd-bound — the page you're reading survives.
+    const browsers = browserTabsRef.current;
+    const chats = sideChatsRef.current;
     setPanelMode(
-      browserTabs.length > 0
-        ? `browser:${browserTabs[browserTabs.length - 1]}`
-        : sideChats.length > 0
-          ? sideChats[sideChats.length - 1]
+      browsers.length > 0
+        ? `browser:${browsers[browsers.length - 1]}`
+        : chats.length > 0
+          ? chats[chats.length - 1]
           : "launcher",
     );
-    if (sideChats.length === 0 && browserTabs.length === 0) setSideOpenPersisted(false);
+    if (chats.length === 0 && browsers.length === 0) setSideOpenPersisted(false);
   }
 
   // Switching away from a running conversation is fine — its turn keeps
@@ -1501,7 +1511,15 @@ export function App() {
 
   useEffect(() => {
     return window.unbiased.onSubAgents((p) => {
-      if (p.paneId === "main") setSubAgentsList(p.agents);
+      // Rosters arrive per pane: main's conversation, and any side chat that
+      // spawned its own agents. Agent tabs are panel-global, so merge by
+      // thread id — filtering to "main" made side-chat sub-agents invisible
+      // and their lifecycle rows dead links.
+      setSubAgentsList((prev) => {
+        const incoming = new Set(p.agents.map((a) => a.threadId));
+        const fromOtherPanes = prev.filter((a) => !incoming.has(a.threadId) && a.paneId !== p.paneId);
+        return [...fromOtherPanes, ...p.agents.map((a) => ({ ...a, paneId: p.paneId }))];
+      });
     });
   }, []);
 
@@ -1527,6 +1545,14 @@ export function App() {
   const [treeFiles, setTreeFiles] = useState<Record<number, OpenFileInfo | null>>({});
   const [terminalTabs, setTerminalTabs] = useState<number[]>([]);
   const [browserTabs, setBrowserTabs] = useState<number[]>([]);
+  // resetSideView runs after openThread's awaits, so its closure values are
+  // stale by then: the user may have closed the last browser tab while a big
+  // thread loaded, which left panelMode pointing at a dead tab and the panel
+  // wrongly open. These refs give it the arrays as they are at call time.
+  const browserTabsRef = useRef(browserTabs);
+  browserTabsRef.current = browserTabs;
+  const sideChatsRef = useRef(sideChats);
+  sideChatsRef.current = sideChats;
   // Live page titles per browser tab (for the strip labels).
   const [browserTitles, setBrowserTitles] = useState<Record<number, string>>({});
   useEffect(
@@ -1791,13 +1817,15 @@ export function App() {
 
   function openFilesTab() {
     setSidePlusOpen(false);
-    if (filesTabs.length >= MAX_TABS_PER_KIND) {
-      setPanelMode(`files:${filesTabs[filesTabs.length - 1]}`);
-      setSideOpenPersisted(true);
-      return;
-    }
+    // At the cap, tabs holding LIVE state refuse (a terminal's PTY, a
+    // browser's page, a side chat's conversation would all be destroyed);
+    // tabs that are just views evict the oldest, like an editor. A file tree
+    // is a view, so it evicts.
     const id = tabIdRef.current++;
-    setFilesTabs((ts) => [...ts, id]);
+    setFilesTabs((ts) => {
+      const next = [...ts, id];
+      return next.length > MAX_TABS_PER_KIND ? next.slice(next.length - MAX_TABS_PER_KIND) : next;
+    });
     setPanelMode(`files:${id}`);
     setSideOpenPersisted(true);
   }
