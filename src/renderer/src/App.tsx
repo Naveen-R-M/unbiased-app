@@ -8033,7 +8033,7 @@ function ChatPane({
                       }
                       strokeWidth="2.5"
                       strokeLinecap="round"
-                      strokeDasharray={`${(ctxUsage.percent / 100) * 40.8} 40.8`}
+                      strokeDasharray={`${(Math.min(100, ctxUsage.percent) / 100) * 40.8} 40.8`}
                       transform="rotate(-90 8 8)"
                     />
                   </svg>
@@ -8090,7 +8090,7 @@ function ChatPane({
                             background: "var(--chip)",
                             border: `1px solid ${colors.border}`,
                             borderRadius: 8,
-                            color: colors.fg,
+                            color: canCompact ? colors.fg : colors.dim,
                             fontSize: 12.5,
                             padding: "5px 10px",
                             cursor: canCompact ? "pointer" : "default",
@@ -10086,6 +10086,19 @@ type ChangelogRelease = {
   sections: { title: string; items: string[] }[];
 };
 const CHANGELOG: ChangelogRelease[] = [
+  {
+    version: "1.2.2",
+    date: "August 19, 2026",
+    sections: [
+      {
+        title: "Fixed",
+        items: [
+          "Long conversations now summarize themselves before they outgrow the model's context window. Previously nothing ever compacted, so a long thread could grow past what the service accepts — and once it did, every message in it failed, including a plain \u201cHello\u201d.",
+          "The context meter tells the truth instead of stopping at 100%. Over the limit it says so, and offers Compact right there rather than hiding it below the usage details.",
+        ],
+      },
+    ],
+  },
   {
     version: "1.2.1",
     date: "August 19, 2026",
