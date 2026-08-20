@@ -626,6 +626,11 @@ function withoutTrailingPlaceholder(es: Entry[]): Entry[] {
 
 // Composer placeholders for a conversation that already has history — a
 // fresh one is drawn every time a chat opens.
+// Composer height bounds. The floor keeps the resting two-row shape; past the
+// ceiling it scrolls, so pasting a long document can't swallow the transcript.
+const COMPOSER_MIN_H = 44;
+const COMPOSER_MAX_H = 320;
+
 const CHAT_PLACEHOLDERS = [
   "Start typing, we'll keep up",
   "What are we doing today",
@@ -5547,6 +5552,19 @@ function linkHost(href?: string): string | null {
   }
 }
 
+/** `[X](X)` → `X`, for a pasted markdown link that only points at itself —
+ *  what you get copying a link out of a rendered markdown surface. Returns
+ *  null for everything else, deliberately including links that carry a real
+ *  label: that label is content someone chose, not packaging. Only a whole
+ *  pasted string is considered, so a link inside a larger paste is untouched. */
+function collapseSelfLink(text: string): string | null {
+  const m = /^\s*\[([^\]]+)\]\((\S+)\)\s*$/.exec(text);
+  if (!m) return null;
+  const label = m[1].trim();
+  const href = m[2].trim();
+  return label === href ? href : null;
+}
+
 function buildMdComponents(
   openFileRef: React.MutableRefObject<((path: string) => void) | undefined>,
   openLink?: (url: string) => void,
@@ -6577,6 +6595,19 @@ function ChatPane({
 }) {
   const [entries, setEntries] = useState<Entry[]>(reset.entries);
   const [draft, setDraft] = useState("");
+  // The composer grows with its content instead of scrolling a fixed two-row
+  // box: a pasted URL wraps to three lines, and hiding two of them behind a
+  // scrollbar makes it look like the paste half-failed. Height is measured,
+  // not counted from "\n" — soft-wrapped long tokens have no newline to count.
+  const taRef = useRef<HTMLTextAreaElement | null>(null);
+  useLayoutEffect(() => {
+    const el = taRef.current;
+    if (!el) return;
+    // Collapse first: scrollHeight only shrinks back if the box isn't already
+    // holding the taller content open.
+    el.style.height = "auto";
+    el.style.height = `${Math.min(Math.max(el.scrollHeight, COMPOSER_MIN_H), COMPOSER_MAX_H)}px`;
+  }, [draft]);
   const [attachments, setAttachments] = useState<Attachment[]>([]);
 
   useEffect(() => {
@@ -7950,14 +7981,30 @@ function ChatPane({
               }
             }}
             onPaste={(e) => {
-              // A pasted image becomes an attachment; text pastes as usual.
+              // A pasted image becomes an attachment.
               const items = Array.from(e.clipboardData?.items ?? []);
-              if (!items.some((it) => it.type.startsWith("image/"))) return;
+              if (items.some((it) => it.type.startsWith("image/"))) {
+                e.preventDefault();
+                void attachClipboardImage();
+                return;
+              }
+              // Text pastes as usual, except a link that only points at itself:
+              // brackets around a URL are packaging, not content.
+              const bare = collapseSelfLink(e.clipboardData?.getData("text/plain") ?? "");
+              if (bare === null) return;
               e.preventDefault();
-              void attachClipboardImage();
+              const el = e.currentTarget;
+              const start = el.selectionStart ?? draft.length;
+              const end = el.selectionEnd ?? start;
+              setDraft(draft.slice(0, start) + bare + draft.slice(end));
+              // React restores the caret to the end of the value; put it back
+              // after what was inserted, so typing continues where you paused.
+              const caret = start + bare.length;
+              requestAnimationFrame(() => taRef.current?.setSelectionRange(caret, caret));
             }}
             placeholder={!connected ? "Engine starting…" : entries.length > 0 ? chatPlaceholder : "Do anything"}
             disabled={!connected}
+            ref={taRef}
             rows={2}
             style={{
               width: "100%",
@@ -7966,9 +8013,13 @@ function ChatPane({
               color: colors.fg,
               border: "none",
               fontSize: 14.5,
+              lineHeight: 1.5,
               fontFamily: "inherit",
               outline: "none",
               display: "block",
+              minHeight: COMPOSER_MIN_H,
+              maxHeight: COMPOSER_MAX_H,
+              overflowY: "auto",
             }}
           />
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginTop: 6 }}>
