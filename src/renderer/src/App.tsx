@@ -10724,25 +10724,27 @@ function releaseDateLabel(date: string | null): string {
 /** Release notes are markdown now, so a new entry needs no code change. Plain
  *  remark-gfm only — no rehypeRaw. These come off the network, and the rule
  *  the chat renderer follows applies here too. */
+// Module-level for stable identity: an inline object would hand Markdown a
+// fresh component map every render and remount the whole notes subtree — the
+// same hazard buildMdComponents documents. Stateless, so a const suffices.
+const RELEASE_NOTE_COMPONENTS = {
+  // Default markdown gives a ul the browser's 40px indent, which is what
+  // overflowed the modal. Match the transcript's tighter indent.
+  ul: (p: { children?: React.ReactNode }) => <ul style={{ margin: "6px 0", paddingLeft: 20 }}>{p.children}</ul>,
+  ol: (p: { children?: React.ReactNode }) => <ol style={{ margin: "6px 0", paddingLeft: 20 }}>{p.children}</ol>,
+  // A wide code block scrolls itself rather than the whole modal — notes are
+  // markdown off the network, so someday one will have code.
+  pre: (p: { children?: React.ReactNode }) => (
+    <pre style={{ overflowX: "auto", maxWidth: "100%", background: "var(--code-bg)", borderRadius: 8, padding: "10px 12px" }}>
+      {p.children}
+    </pre>
+  ),
+};
+
 function ReleaseNotes({ body }: { body: string }) {
   return (
     <div style={{ fontSize: 13.5, lineHeight: 1.55, color: "var(--fg-msg)", maxWidth: "100%", overflowWrap: "break-word" }}>
-      <Markdown
-        remarkPlugins={REMARK_PLUGINS}
-        components={{
-          // Default markdown gives a ul the browser's 40px indent, which is
-          // what overflowed the modal. Match the transcript's tighter indent.
-          ul: (p) => <ul style={{ margin: "6px 0", paddingLeft: 20 }}>{p.children}</ul>,
-          ol: (p) => <ol style={{ margin: "6px 0", paddingLeft: 20 }}>{p.children}</ol>,
-          // A wide code block scrolls itself rather than the whole modal —
-          // notes are markdown off the network, so someday one will have code.
-          pre: (p) => (
-            <pre style={{ overflowX: "auto", maxWidth: "100%", background: "var(--code-bg)", borderRadius: 8, padding: "10px 12px" }}>
-              {p.children}
-            </pre>
-          ),
-        }}
-      >
+      <Markdown remarkPlugins={REMARK_PLUGINS} components={RELEASE_NOTE_COMPONENTS}>
         {body}
       </Markdown>
     </div>

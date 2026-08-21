@@ -6,6 +6,14 @@ Format matters: `## <version> — <date>`, then `### <section>`, then `-` bullet
 
 Write for the person using the app, not the person who wrote the code.
 
+## 1.3.2 — August 21, 2026
+
+### Fixed
+
+- An automatically downloaded update now tells you it is ready. It used to download and stage itself silently, then show the "Relaunch to update" banner only after your next restart — you could sit on a finished update for hours without knowing.
+- A conversation that was mid-command when you quit no longer says "Working…" forever when you reopen it. Those steps now read as canceled, since the run ended with the app.
+- No more sideways scrollbar in the What's new popup.
+
 ## 1.3.1 — August 21, 2026
 
 ### Fixed
