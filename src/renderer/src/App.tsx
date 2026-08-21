@@ -56,6 +56,10 @@ type Entry =
       exitCode?: number;
       output?: string;
       approval?: {
+        /** The turn behind this card is gone — quitting the app is the usual
+         *  way. Kept visible rather than dropped, because the request really
+         *  was made; it just cannot be answered now. */
+        expired?: boolean;
         requestId: string;
         reason: string | null;
         kind?: "command" | "fileChange";
@@ -381,7 +385,11 @@ declare global {
         project: string | null;
         branch: string | null;
       }>;
-      decideApproval: (requestId: string, decision: ApprovalDecision) => Promise<{ ok: boolean }>;
+      decideApproval: (
+        requestId: string,
+        decision: ApprovalDecision,
+      ) => Promise<{ ok: boolean; expired?: boolean }>;
+      liveApprovals: () => Promise<{ requestIds: string[] }>;
       onApprovalCanceled: (cb: (p: { paneId: PaneId; requestId: string }) => void) => () => void;
       onApprovalRequest: (
         cb: (p: {
@@ -6948,6 +6956,17 @@ function ChatPane({
     });
   }
 
+  /** Every command entry, walking into folded work groups — the same reach as
+   *  mapCommandsDeep, but reading rather than rewriting. */
+  function collectCommands(es: Entry[]): CommandEntry[] {
+    const out: CommandEntry[] = [];
+    for (const e of es) {
+      if (e.kind === "command") out.push(e);
+      else if (e.kind === "work") out.push(...collectCommands(e.entries));
+    }
+    return out;
+  }
+
   // Attach an approval request to its command card (or make one). Shared
   // by the live event and the replay of requests held while backgrounded.
   function applyApproval(p: HeldApproval): void {
@@ -6996,6 +7015,32 @@ function ChatPane({
     // the id actually changes — this covers a reset where it does not.
     setCtxUsage(null);
     setCompacting(false);
+    // A card persisted in the transcript looks exactly like a live one, so
+    // anything restored has to be checked against what main is actually
+    // holding. Without this, an approval whose turn died with the app still
+    // offers Allow — and clicking it does nothing at all.
+    // Only the cards being RESTORED are candidates. The answer arrives an IPC
+    // round trip later, and an approval raised in that window would not be in
+    // the set — judging it against a snapshot that predates it would expire a
+    // live request permanently, since the verdict is persisted too. Opening a
+    // thread mid-turn is exactly when that race is live.
+    const restored = new Set(
+      collectCommands(reset.entries)
+        .filter((e) => e.status === "awaitingApproval" && e.approval && !e.approval.decision)
+        .map((e) => e.approval!.requestId),
+    );
+    if (restored.size > 0) {
+      void window.unbiased.liveApprovals().then(({ requestIds }) => {
+        const live = new Set(requestIds);
+        setEntries((es) =>
+          mapCommandsDeep(es, (e) =>
+            e.approval && restored.has(e.approval.requestId) && !live.has(e.approval.requestId)
+              ? { ...e, approval: { ...e.approval, expired: true } }
+              : e,
+          ),
+        );
+      });
+    }
     // Staged annotations belong to the conversation they came from.
     setAnnotations([]);
     setPendingComment(null);
@@ -7028,7 +7073,12 @@ function ChatPane({
   const turnScopeStart = turnStartIndexRef.current ?? entries.length;
   const awaitingApproval = entries.some(
     (e, i) =>
-      i >= turnScopeStart && e.kind === "command" && e.status === "awaitingApproval" && e.approval && !e.approval.decision,
+      i >= turnScopeStart &&
+      e.kind === "command" &&
+      e.status === "awaitingApproval" &&
+      e.approval &&
+      !e.approval.decision &&
+      !e.approval.expired,
   );
 
   // Pareto completes the whole response before its first byte arrives
@@ -7389,11 +7439,29 @@ function ChatPane({
           : e,
       ),
     );
-    await window.unbiased.decideApproval(requestId, decision);
+    const r = await window.unbiased.decideApproval(requestId, decision);
+    // Nothing was listening. Put the card back and say why, instead of
+    // leaving it spinning on "running" forever.
+    if (!r.ok) {
+      setEntries((es) =>
+        mapCommandsDeep(es, (e) =>
+          e.itemId === itemId && e.approval
+            ? {
+                ...e,
+                approval: { ...e.approval, decision: undefined, expired: true },
+                status: "awaitingApproval",
+              }
+            : e,
+        ),
+      );
+    }
   }
 
   const statusLabel = (e: CommandEntry) => {
-    if (e.status === "awaitingApproval") return { text: "▸ needs approval", color: colors.dim };
+    if (e.status === "awaitingApproval")
+      return e.approval?.expired
+        ? { text: "▸ expired", color: colors.dim }
+        : { text: "▸ needs approval", color: colors.dim };
     if (e.status === "canceled") return { text: "▸ canceled", color: colors.dim };
     if (e.status === "inProgress") return { text: "▸ running", color: colors.amber };
     if (e.status === "declined") return { text: "▸ declined", color: colors.dim };
@@ -11831,7 +11899,9 @@ function StepsGroup({
 }) {
   const [open, setOpen] = useState(false);
   const [openItems, setOpenItems] = useState<Set<string>>(new Set());
-  const needsApproval = items.some((e) => e.status === "awaitingApproval" && e.approval && !e.approval.decision);
+  const needsApproval = items.some(
+    (e) => e.status === "awaitingApproval" && e.approval && !e.approval.decision && !e.approval.expired,
+  );
 
   const toggleItem = (itemId: string) =>
     setOpenItems((s) => {
@@ -11896,7 +11966,9 @@ function StepsGroup({
                 margin: "8px 0",
                 padding: "10px 14px",
                 borderRadius: 12,
-                border: `1px solid ${e.status === "awaitingApproval" ? colors.amber : colors.border}`,
+                border: `1px solid ${
+                  e.status === "awaitingApproval" && !e.approval?.expired ? colors.amber : colors.border
+                }`,
                 background: "var(--code-bg)",
                 fontSize: 12.5,
                 fontFamily: "var(--font-code)",
@@ -11929,10 +12001,17 @@ function StepsGroup({
                 </span>
               </div>
               {e.status === "awaitingApproval" && e.approval && !e.approval.decision && (
-                <PermissionsPrompt
-                  approval={e.approval}
-                  onDecide={(d) => void decide(e.itemId, e.approval!.requestId, d)}
-                />
+                e.approval.expired ? (
+                  <div style={{ marginTop: 8, fontSize: 12.5, color: colors.dim, lineHeight: 1.5 }}>
+                    This request is no longer active — the turn behind it ended, usually because the
+                    app was closed. Ask again to run it.
+                  </div>
+                ) : (
+                  <PermissionsPrompt
+                    approval={e.approval}
+                    onDecide={(d) => void decide(e.itemId, e.approval!.requestId, d)}
+                  />
+                )
               )}
               {e.output && itemOpen && (
                 <pre

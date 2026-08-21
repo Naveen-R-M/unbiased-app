@@ -2064,6 +2064,13 @@ type PendingApproval = { threadId: string | null } & (
 );
 const pendingApprovals = new Map<string, PendingApproval>();
 let nextLocalApproval = 1;
+// Approval handles are persisted in the transcript, so a card outlives the
+// process that created it. Counters restart at 1 every boot, which means a
+// card restored from a previous run could carry the SAME id as a live request
+// in this one — and answering the stale card would silently answer the new
+// request instead. The boot nonce makes that collision impossible: an id from
+// a previous run can never match one from this run.
+const APPROVAL_BOOT = Math.random().toString(36).slice(2, 8);
 // Approval handles are minted here, never derived from the engine's JSON-RPC
 // id. Keying the map on `apr_${msg.id}` let a reused id overwrite a live
 // entry: the first rpcId was orphaned so that turn waited on a reply that
@@ -2076,7 +2083,7 @@ let nextEngineApproval = 1;
  *  request surfaces in its PARENT's pane, and a backgrounded conversation
  *  holds it until reopened. */
 function requestLocalApproval(threadId: string | null, command: string, reason: string): Promise<ApprovalDecision> {
-  const requestId = `apr_local_${nextLocalApproval++}`;
+  const requestId = `apr_${APPROVAL_BOOT}_local_${nextLocalApproval++}`;
   return new Promise((resolve) => {
     pendingApprovals.set(requestId, { kind: "local", threadId, settle: resolve });
     const sub = threadId ? subAgents.get(threadId) : undefined;
@@ -2737,7 +2744,7 @@ function wireNotifications(): void {
       }
       const approvalThread = typeof params.threadId === "string" ? params.threadId : null;
       if (msg.method === "item/commandExecution/requestApproval") {
-        const requestId = `apr_${nextEngineApproval++}`;
+        const requestId = `apr_${APPROVAL_BOOT}_${nextEngineApproval++}`;
         pendingApprovals.set(requestId, { kind: "engine", rpcId: msg.id, threadId: approvalThread });
         deliverApproval({
           requestId,
@@ -2752,7 +2759,7 @@ function wireNotifications(): void {
         return;
       }
       if (msg.method === "item/fileChange/requestApproval") {
-        const requestId = `apr_${nextEngineApproval++}`;
+        const requestId = `apr_${APPROVAL_BOOT}_${nextEngineApproval++}`;
         pendingApprovals.set(requestId, { kind: "engine", rpcId: msg.id, threadId: approvalThread });
         deliverApproval({
           requestId,
@@ -3294,12 +3301,20 @@ app.whenReady().then(async () => {
     }
   });
 
+  // Which approvals are actually still answerable. A card restored from the
+  // transcript looks identical to a live one, so the renderer has to ask —
+  // otherwise a request whose turn died with the app still shows Allow/Deny.
+  ipcMain.handle("chat:live-approvals", () => ({ requestIds: [...pendingApprovals.keys()] }));
+
   ipcMain.handle("chat:approve", (_e, payload: {
     requestId: string;
     decision: "accept" | "acceptForSession" | "decline";
   }) => {
     const pending = pendingApprovals.get(payload.requestId);
-    if (pending === undefined) return { ok: false };
+    // Nothing is waiting on this: the turn died, most often because the app
+    // was quit while the card was up. Say so rather than returning a bare
+    // false the caller can mistake for "sent".
+    if (pending === undefined) return { ok: false, expired: true };
     pendingApprovals.delete(payload.requestId);
     if (pending.kind === "engine") {
       engine.respond(pending.rpcId, { decision: payload.decision });
