@@ -1710,9 +1710,13 @@ async function checkForUpdate(): Promise<UpdateInfo | null> {
       silentInstall = true;
       void installUpdate(info).then((r) => {
         silentInstall = false;
-        // A failed silent attempt falls back to the manual banner rather than
-        // retrying forever — the user can see it and decide.
-        if (!r.ok) send("update:available", info);
+        // Announce on BOTH outcomes. Failure falls back to the manual banner.
+        // Success must announce too: the banner renders only when the
+        // renderer's `update` state is set, and update:staged alone never sets
+        // it — so a silently staged update was invisible until the next app
+        // restart. Verified live: 1.3.1 sat fully staged on disk for an hour
+        // with no banner. staged fired first, so the label says "Relaunch".
+        send("update:available", info);
       });
       return info;
     }
@@ -2862,9 +2866,13 @@ app.whenReady().then(async () => {
     setUpdatePrefs({ autoDownload: !!p.autoDownload });
     // Turning it on mid-session should act now, not in six hours.
     if (p.autoDownload && pendingUpdate && !stagedUpdate && !updateInstalling) {
+      // Capture: pendingUpdate is module state and a 6h check could swap it
+      // mid-download; the announcement must name what was actually staged.
+      const toStage = pendingUpdate;
       silentInstall = true;
-      void installUpdate(pendingUpdate).then(() => {
+      void installUpdate(toStage).then(() => {
         silentInstall = false;
+        send("update:available", toStage); // same invisibility fix as above
       });
     }
     return { ok: true };

@@ -767,10 +767,15 @@ export function App() {
     });
     const offs = [
       window.unbiased.onUpdateAvailable((u) => setUpdate(u)),
-      window.unbiased.onUpdateStaged(() => {
+      window.unbiased.onUpdateStaged((p) => {
         // Downloaded and verified — now it's the user's call when to restart.
         setUpdateProgress(null);
         setUpdateStaged(true);
+        // The banner renders only when `update` is set, and a silent download
+        // deliberately never sent update:available first — so staged alone
+        // left the banner invisible. Main now announces as well, but this
+        // stands on its own so the banner can never depend on event order.
+        setUpdate((u) => u ?? { version: p.version, dmgUrl: "", sumsUrl: null });
       }),
       window.unbiased.onUpdateProgress((p) => {
         setUpdateProgress(p);
