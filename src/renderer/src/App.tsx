@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeRaw from "rehype-raw";
@@ -8647,13 +8647,35 @@ const FENCE_TO_PRISM: Record<string, string> = {
   css: "css",
 };
 
-function CodeBlock({ children }: { children?: React.ReactNode }) {
-  const [copied, setCopied] = useState(false);
+/** The fence's `language-x` class. Split out so the memo comparator below
+ *  compares exactly what the render reads. */
+function fenceClassOf(children?: React.ReactNode): string {
   const child = Array.isArray(children) ? children[0] : children;
-  const className: string =
+  return (
     (typeof child === "object" && child && "props" in child
       ? ((child as { props: { className?: string } }).props.className ?? "")
-      : "") || "";
+      : "") || ""
+  );
+}
+
+/** Memoized on its TEXT, not on `children` — react-markdown hands us a fresh
+ *  element tree on every render, so the default shallow compare never hits and
+ *  the block re-renders whenever anything in the pane changes.
+ *
+ *  That re-render rewrites the highlighted markup through
+ *  dangerouslySetInnerHTML, which destroys and rebuilds every text node inside
+ *  the block. Any live selection pointing into them dies with them — and it
+ *  dies SILENTLY: addRange on a stale Range collapses rather than throwing, so
+ *  the restore in ChatPane's mouseup path cannot even detect it, and its catch
+ *  never fires. Selecting code to copy it was therefore impossible, while the
+ *  same drag over prose worked, because prose text nodes are reconciled in
+ *  place instead of replaced.
+ *
+ *  Streaming still updates the block: the text changes, so the compare fails
+ *  and it re-renders, as it should. */
+const CodeBlock = memo(function CodeBlock({ children }: { children?: React.ReactNode }) {
+  const [copied, setCopied] = useState(false);
+  const className: string = fenceClassOf(children);
   const lang = /language-([\w-]+)/.exec(className)?.[1]?.toLowerCase() ?? "";
   const label = LANGUAGE_NAMES[lang] ?? (lang ? lang.toUpperCase() : "Plain text");
   const text = extractText(children).replace(/\n$/, "");
@@ -8750,7 +8772,10 @@ function CodeBlock({ children }: { children?: React.ReactNode }) {
       )}
     </div>
   );
-}
+},
+(prev, next) =>
+  extractText(prev.children) === extractText(next.children) &&
+  fenceClassOf(prev.children) === fenceClassOf(next.children));
 
 const pillButtonStyle: React.CSSProperties = {
   background: "transparent",
