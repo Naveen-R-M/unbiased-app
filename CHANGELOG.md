@@ -6,6 +6,24 @@ Format matters: `## <version> — <date>`, then `### <section>`, then `-` bullet
 
 Write for the person using the app, not the person who wrote the code.
 
+## 1.3.0 — August 21, 2026
+
+### New
+
+- Updates now download in the background. When one is ready the app asks you to restart, and nothing changes until you do. Settings has a new Updates page where you can turn that off, see your version, and read what changed in it.
+
+### Improved
+
+- Settings is reorganised: grouped navigation with icons, and the same layout and text sizes on every page.
+- What's new is written once and published with the release, so the notes you read in the app are the notes on the release itself.
+
+### Fixed
+
+- A new chat appears in the sidebar the moment you send the first message. Starting one and walking away used to look as though the chat had been thrown out — it was there and running the whole time, just invisible until it finished.
+- Selecting code in a code block stays selected, so you can copy it. Selecting ordinary text always worked; code did not.
+- A new chat no longer shows the previous conversation's context usage, and Compact acts on the conversation you are actually in. The title bar shows the real conversation name instead of staying on "New chat".
+- An update that fails no longer loops. A finished download used to be forgotten on restart, so the app fetched the same version over and over.
+
 ## 1.2.3 — August 21, 2026
 
 ### New
