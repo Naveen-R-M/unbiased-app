@@ -10275,6 +10275,35 @@ type ChangelogRelease = {
 };
 const CHANGELOG: ChangelogRelease[] = [
   {
+    version: "1.2.3",
+    date: "August 21, 2026",
+    sections: [
+      {
+        title: "New",
+        items: [
+          "Links in a reply now show the site's icon beside them, so you can tell at a glance where a source comes from.",
+        ],
+      },
+      {
+        title: "Improved",
+        items: [
+          "The message box grows as you type or paste, instead of staying two lines tall and hiding the rest behind a scrollbar.",
+          "Pasting a link pastes the link. Copying one out of a page often gives you markdown brackets around it; those are dropped now.",
+        ],
+      },
+      {
+        title: "Fixed",
+        items: [
+          "Security: when two commands were waiting for approval at once, a single Enter approved both. Enter now acts only when one is waiting \u2014 with more than one, you choose each explicitly.",
+          "Security: an approval could be answered by the wrong card, which also left the other one waiting forever on a reply that never came.",
+          "Sub-agents started from a side chat show up in the list again. They were invisible, and their rows in the transcript led nowhere.",
+          "Closing the last browser tab while a long conversation was loading no longer leaves the side panel open on a tab that is not there.",
+          "The tab limit follows one rule: tabs holding something live \u2014 a terminal, a page, a chat \u2014 refuse when full, while plain views make room by closing the oldest.",
+        ],
+      },
+    ],
+  },
+  {
     version: "1.2.2",
     date: "August 19, 2026",
     sections: [
