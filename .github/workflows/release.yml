@@ -116,18 +116,43 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
         run: |
+          # Notes come from CHANGELOG.md — the same file the app bundles and
+          # parses, so what ships in the build and what the releases repo
+          # serves cannot disagree. The section for THIS tag only: from its
+          # `## <version> — <date>` heading to the next one.
+          VERSION="${GITHUB_REF_NAME#v}"
+          # index/substr, not a regex: the dots in a version are literal.
+          awk -v head="## $VERSION — " '
+            index($0, head) == 1 { found = 1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md > /tmp/notes.md
+          if [ ! -s /tmp/notes.md ]; then
+            echo "::error::CHANGELOG.md has no '## $VERSION — <date>' section. Add one before tagging."
+            exit 1
+          fi
+          # Everything below the rule is for someone browsing GitHub; the app
+          # strips it, so keep it last.
+          {
+            cat /tmp/notes.md
+            echo
+            echo "---"
+            echo
+            echo "Apple Silicon Mac, macOS 12+."
+            echo
+            echo "Install:"
+            echo '```'
+            echo "curl -fsSL https://raw.githubusercontent.com/$RELEASES_REPO/main/install.sh | bash"
+            echo '```'
+            echo "Or download the .dmg below, drag Unbiased to Applications, then right-click → Open the first time (the app is ad-hoc signed, not notarized)."
+            echo
+            echo "On first launch, paste your Unbiased API key."
+          } > /tmp/body.md
+
           gh release create "$GITHUB_REF_NAME" \
             --repo "$RELEASES_REPO" \
             --title "$GITHUB_REF_NAME" \
-            --notes "Apple Silicon Mac, macOS 12+.
-
-          Install:
-          \`\`\`
-          curl -fsSL https://raw.githubusercontent.com/$RELEASES_REPO/main/install.sh | bash
-          \`\`\`
-          Or download the .dmg below, drag Unbiased to Applications, then right-click → Open the first time (the app is ad-hoc signed, not notarized).
-
-          On first launch, paste your Unbiased API key." \
+            --notes-file /tmp/body.md \
             release/*.dmg \
             release/SHA256SUMS
 

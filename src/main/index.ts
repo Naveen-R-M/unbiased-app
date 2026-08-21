@@ -1537,6 +1537,66 @@ const UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const UPDATE_FOCUS_THROTTLE_MS = 10 * 60 * 1000;
 let lastUpdateCheck = 0;
 
+// Release notes come from the releases repo so shipping a changelog entry no
+// longer means shipping a build. Cached to disk because the Updates tab must
+// say something on a plane, and because GitHub's unauthenticated limit is 60
+// requests an hour per IP — several people behind one office NAT would burn
+// that on update checks alone.
+type ReleaseNote = { version: string; date: string | null; body: string };
+function releaseNotesFile(): string {
+  return join(app.getPath("userData"), "release-notes.json");
+}
+let releaseNotesCache: ReleaseNote[] | null = null;
+function loadReleaseNotes(): ReleaseNote[] {
+  if (!releaseNotesCache) {
+    try {
+      releaseNotesCache = JSON.parse(readFileSync(releaseNotesFile(), "utf8")) as ReleaseNote[];
+    } catch {
+      releaseNotesCache = [];
+    }
+  }
+  return releaseNotesCache;
+}
+
+/** Everything above the first `---`. Release bodies carry install instructions
+ *  below that rule, which are for someone looking at GitHub, not for someone
+ *  already running the app. */
+function notesAboveRule(body: string): string {
+  // Only the rule that DIRECTLY introduces the install block. A bare `---` is
+  // also markdown's horizontal rule and its setext-h2 underline, so cutting at
+  // the first one anywhere would swallow hand-written notes that use either.
+  const m = /^[ \t]*---[ \t]*\r?\n\s*(?:Apple Silicon Mac|Install:)/m.exec(body);
+  return (m ? body.slice(0, m.index) : body).trim();
+}
+
+async function refreshReleaseNotes(): Promise<void> {
+  try {
+    const res = await fetch(`https://api.github.com/repos/${UPDATE_REPO}/releases?per_page=30`, {
+      headers: { Accept: "application/vnd.github+json" },
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) return; // rate-limited or offline — the cache still stands
+    const body = (await res.json()) as { tag_name?: string; published_at?: string; body?: string }[];
+    const notes = body
+      .filter((r) => r.tag_name)
+      .map((r) => ({
+        version: String(r.tag_name).replace(/^v/, ""),
+        date: r.published_at ?? null,
+        body: notesAboveRule(r.body ?? ""),
+      }))
+      .filter((r) => r.body.length > 0);
+    if (notes.length === 0) return; // never replace a good cache with nothing
+    releaseNotesCache = notes;
+    try {
+      writeFileSync(releaseNotesFile(), JSON.stringify(notes));
+    } catch {
+      /* cache is an optimisation, not a requirement */
+    }
+  } catch {
+    /* offline — the cache still stands */
+  }
+}
+
 // Auto-download lives HERE, not in renderer localStorage with the other
 // preferences: the check fires on a timer 8s after boot and every 6h after,
 // with no guarantee a renderer has mounted, let alone told us anything.
@@ -1602,6 +1662,10 @@ function compareVersions(a: string, b: string): number {
 /** Ask the public releases repo what the latest version is. */
 async function checkForUpdate(): Promise<UpdateInfo | null> {
   lastUpdateCheck = Date.now();
+  // Alongside the version check, so an app left open for days has the notes
+  // for whatever it is about to offer. Boot-only would mean the Updates tab
+  // describing the version you are already on while the banner offers another.
+  void refreshReleaseNotes();
   // Dev preview: UNBIASED_FAKE_UPDATE=1 surfaces the banner without a
   // packaged build, so the update UI can be iterated on with `npm run dev`.
   // Installing is still gated on isPackaged, so this can't swap anything.
@@ -2779,6 +2843,8 @@ app.whenReady().then(async () => {
     update: stagedUpdate || !updatePrefs().autoDownload ? pendingUpdate : null,
     staged: stagedUpdate ? { version: stagedUpdate.version } : null,
   }));
+
+  ipcMain.handle("changelog:releases", () => ({ releases: loadReleaseNotes() }));
 
   ipcMain.handle("update:prefs", () => ({
     autoDownload: updatePrefs().autoDownload,
@@ -4127,6 +4193,7 @@ app.whenReady().then(async () => {
   // Before the first check, so a bundle staged by a previous run is offered
   // as "restart" instead of being downloaded all over again.
   recoverStagedUpdate();
+  void refreshReleaseNotes();
   if (stagedUpdate) {
     send("update:available", { version: stagedUpdate.version, dmgUrl: "", sumsUrl: null });
     send("update:staged", { version: stagedUpdate.version });

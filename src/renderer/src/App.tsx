@@ -1,5 +1,9 @@
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import Markdown from "react-markdown";
+// The changelog SHIPS with the build so the Updates tab works offline and on
+// first run, and is superseded at runtime by whatever the releases repo has —
+// which is generated from this same file, so the two cannot disagree.
+import changelogMd from "../../../CHANGELOG.md?raw";
 import remarkGfm from "remark-gfm";
 import rehypeRaw from "rehype-raw";
 import { Terminal } from "@xterm/xterm";
@@ -487,6 +491,7 @@ declare global {
       reviewCreatePr: (path: string) => Promise<{ ok: boolean; error?: string }>;
       openExternal: (url: string) => Promise<{ ok: boolean }>;
       favicon: (host: string) => Promise<{ dataUrl: string | null }>;
+      changelogReleases: () => Promise<{ releases: ChangelogRelease[] }>;
       updatePrefs: () => Promise<{ autoDownload: boolean; version: string; lastCheckedAt: number | null }>;
       setUpdatePrefs: (p: { autoDownload: boolean }) => Promise<{ ok: boolean }>;
       openBrowser: (p: { id: number; url?: string }) => Promise<{ ok: boolean }>;
@@ -719,9 +724,21 @@ export function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [showChangelog, setShowChangelog] = useState(false);
   // Unread until the user has opened the log at its current top version.
+  // The releases repo wins when we have it; the bundled copy covers offline
+  // and first run. Both are generated from CHANGELOG.md, so neither can drift.
+  const [releases, setReleases] = useState<ChangelogRelease[]>(BUNDLED_CHANGELOG);
+  useEffect(() => {
+    void window.unbiased.changelogReleases().then((r) => {
+      if (r.releases.length > 0) setReleases(r.releases);
+    });
+  }, []);
   const [changelogUnread, setChangelogUnread] = useState(
-    () => localStorage.getItem("changelogSeen") !== CHANGELOG[0].version,
+    () => localStorage.getItem("changelogSeen") !== BUNDLED_CHANGELOG[0]?.version,
   );
+  useEffect(() => {
+    const top = releases[0]?.version;
+    if (top) setChangelogUnread(localStorage.getItem("changelogSeen") !== top);
+  }, [releases]);
   const [status, setStatus] = useState<EngineStatus>({ state: "starting" });
   // Sign-in gate: "checking" until we know, then either the login screen or
   // the app. A remembered session (prior successful login) with a stored key
@@ -2123,6 +2140,7 @@ export function App() {
         }}
       >
         <SettingsView
+          releases={releases}
           theme={theme}
           onChange={applyTheme}
           onBack={() => setShowSettings(false)}
@@ -2412,7 +2430,7 @@ export function App() {
           </div>
           <button
             onClick={() => {
-              localStorage.setItem("changelogSeen", CHANGELOG[0].version);
+              localStorage.setItem("changelogSeen", releases[0]?.version ?? "");
               setChangelogUnread(false);
               setShowChangelog(true);
             }}
@@ -4238,7 +4256,9 @@ export function App() {
           </div>
         </div>
       )}
-      {showChangelog && <ChangelogModal onClose={() => setShowChangelog(false)} />}
+      {showChangelog && (
+        <ChangelogModal releases={releases} onClose={() => setShowChangelog(false)} />
+      )}
       {renameDialog && (
         <div
           onMouseDown={(e) => {
@@ -9437,8 +9457,8 @@ function ResourcesView() {
   };
 
   return (
-    <div style={{ maxWidth: 640, margin: "0 auto" }}>
-      <h1 style={{ fontSize: 22, fontWeight: 600, margin: "0 0 24px" }}>Resources</h1>
+    <div style={{ maxWidth: 720, margin: "0 auto" }}>
+      <h1 style={{ fontSize: 28, fontWeight: 600, letterSpacing: "-0.01em", margin: "0 0 28px" }}>Resources</h1>
 
       <div style={{ display: "flex", gap: 12, marginBottom: 24 }}>
         <AreaChart
@@ -9696,11 +9716,13 @@ function SettingsView({
   onChange,
   onBack,
   onSignOut,
+  releases,
 }: {
   theme: ThemeConfig;
   onChange: (t: ThemeConfig) => void;
   onBack: () => void;
   onSignOut: () => void;
+  releases: ChangelogRelease[];
 }) {
   const [tab, setTab] = useState<"appearance" | "resources" | "account" | "updates">("appearance");
   const [updPrefs, setUpdPrefs] = useState<{
@@ -9714,7 +9736,7 @@ function SettingsView({
   // Notes for the version actually running, not merely the newest we ship —
   // someone on an older build should see what THEY have.
   const runningRelease =
-    CHANGELOG.find((r) => r.version === updPrefs?.version) ?? CHANGELOG[0];
+    releases.find((r) => r.version === updPrefs?.version) ?? releases[0];
   function toggleAutoDownload() {
     setUpdPrefs((p) => {
       if (!p) return p;
@@ -9747,7 +9769,7 @@ function SettingsView({
     justifyContent: "space-between",
     padding: "14px 18px",
     borderBottom: `1px solid ${colors.border}`,
-    fontSize: 14,
+    fontSize: 13.5,
   };
   const textInputStyle: React.CSSProperties = {
     background: "var(--panel-2)",
@@ -9760,6 +9782,17 @@ function SettingsView({
     width: 260,
     outline: "none",
   };
+
+  /** Heading above a group of cards. Codex labels each block rather than
+   *  relying on the cards alone to imply structure. */
+  function Group({ title, children }: { title: string; children: React.ReactNode }) {
+    return (
+      <section style={{ marginBottom: 30 }}>
+        <div style={{ fontSize: 13, color: colors.dim, margin: "0 0 10px 2px" }}>{title}</div>
+        {children}
+      </section>
+    );
+  }
 
   function ColorRow({ label, value, set }: { label: string; value: string; set: (v: string) => void }) {
     return (
@@ -9811,45 +9844,67 @@ function SettingsView({
         >
           ← Back to app
         </button>
-        <SectionLabel>Personal</SectionLabel>
-        {(
+{(
           [
-            { id: "appearance", label: "Appearance" },
-            { id: "resources", label: "Resources" },
-            { id: "account", label: "Account" },
-            { id: "updates", label: "Updates" },
+            {
+              group: "Personal",
+              items: [
+                { id: "appearance", label: "Appearance", icon: <ContrastIcon /> },
+                { id: "account", label: "Account", icon: <PersonIcon /> },
+              ],
+            },
+            {
+              group: "Application",
+              items: [
+                { id: "updates", label: "Updates", icon: <DownloadIcon /> },
+                { id: "resources", label: "Resources", icon: <LaptopIcon /> },
+              ],
+            },
           ] as const
-        ).map((item) => (
-          <button
-            key={item.id}
-            onClick={() => setTab(item.id)}
-            style={{
-              display: "block",
-              width: "100%",
-              textAlign: "left",
-              background: tab === item.id ? colors.panel : "transparent",
-              color: tab === item.id ? colors.fg : colors.dim,
-              border: "none",
-              borderRadius: 8,
-              padding: "8px 10px",
-              fontSize: 13.5,
-              cursor: "pointer",
-              fontFamily: "inherit",
-              marginBottom: 2,
-            }}
-          >
-            {item.label}
-          </button>
+        ).map((sec) => (
+          <div key={sec.group} style={{ marginBottom: 10 }}>
+            <SectionLabel>{sec.group}</SectionLabel>
+            {sec.items.map((item) => (
+              <button
+                key={item.id}
+                onClick={() => setTab(item.id)}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 9,
+                  width: "100%",
+                  textAlign: "left",
+                  background: tab === item.id ? colors.panel : "transparent",
+                  color: tab === item.id ? colors.fg : colors.dim,
+                  border: "none",
+                  borderRadius: 8,
+                  padding: "7px 10px",
+                  fontSize: 13.5,
+                  cursor: "pointer",
+                  fontFamily: "inherit",
+                  marginBottom: 2,
+                }}
+              >
+                <span style={{ display: "flex", flexShrink: 0, opacity: tab === item.id ? 1 : 0.75 }}>
+                  {item.icon}
+                </span>
+                {item.label}
+              </button>
+            ))}
+          </div>
         ))}
       </nav>
 
-      <div style={{ flex: 1, overflowY: "auto", padding: "40px 48px" }}>
+      <div style={{ flex: 1, overflowY: "auto", padding: "44px 48px 64px" }}>
         {tab === "resources" ? (
-          <ResourcesView />
+          <div style={{ maxWidth: 720, margin: "0 auto" }}>
+            <ResourcesView />
+          </div>
         ) : tab === "updates" ? (
-          <div style={{ maxWidth: 640, margin: "0 auto" }}>
-            <h1 style={{ fontSize: 22, fontWeight: 600, margin: "0 0 24px" }}>Updates</h1>
+          <div style={{ maxWidth: 720, margin: "0 auto" }}>
+            <h1 style={{ fontSize: 28, fontWeight: 600, letterSpacing: "-0.01em", margin: "0 0 28px" }}>Updates</h1>
 
+            <Group title="Automatic updates">
             <div
               style={{
                 border: `1px solid ${colors.border}`,
@@ -9901,14 +9956,15 @@ function SettingsView({
                 </button>
               </div>
             </div>
+            </Group>
 
+            <Group title="This version">
             <div
               style={{
                 border: `1px solid ${colors.border}`,
                 borderRadius: 12,
                 background: colors.panel,
                 overflow: "hidden",
-                marginTop: 16,
                 padding: "14px 18px 18px",
               }}
             >
@@ -9925,38 +9981,17 @@ function SettingsView({
                       Notes for {runningRelease.version}
                     </div>
                   )}
-                  {runningRelease.sections.map((sec) => (
-                    <div key={sec.title}>
-                      <div
-                        style={{
-                          color: colors.dim,
-                          fontSize: 11.5,
-                          letterSpacing: 1.1,
-                          textTransform: "uppercase",
-                          margin: "16px 0 2px",
-                        }}
-                      >
-                        {sec.title}
-                      </div>
-                      <ul style={{ margin: "6px 0 0", paddingLeft: 20 }}>
-                        {sec.items.map((it, j) => (
-                          <li
-                            key={j}
-                            style={{ margin: "8px 0", fontSize: 13.5, lineHeight: 1.55, color: "var(--fg-msg)" }}
-                          >
-                            {it}
-                          </li>
-                        ))}
-                      </ul>
-                    </div>
-                  ))}
+                  <div style={{ marginTop: 4 }}>
+                    <ReleaseNotes body={runningRelease.body} />
+                  </div>
                 </>
               )}
             </div>
+            </Group>
           </div>
         ) : tab === "account" ? (
-          <div style={{ maxWidth: 640, margin: "0 auto" }}>
-            <h1 style={{ fontSize: 22, fontWeight: 600, margin: "0 0 24px" }}>Account</h1>
+          <div style={{ maxWidth: 720, margin: "0 auto" }}>
+            <h1 style={{ fontSize: 28, fontWeight: 600, letterSpacing: "-0.01em", margin: "0 0 28px" }}>Account</h1>
             <div
               style={{
                 border: `1px solid ${colors.border}`,
@@ -10052,8 +10087,8 @@ function SettingsView({
             </div>
           </div>
         ) : (
-        <div style={{ maxWidth: 640, margin: "0 auto" }}>
-          <h1 style={{ fontSize: 22, fontWeight: 600, margin: "0 0 24px" }}>Appearance</h1>
+        <div style={{ maxWidth: 720, margin: "0 auto" }}>
+          <h1 style={{ fontSize: 28, fontWeight: 600, letterSpacing: "-0.01em", margin: "0 0 28px" }}>Appearance</h1>
 
           <div
             style={{
@@ -10454,6 +10489,34 @@ function CompactIcon() {
   );
 }
 
+function ContrastIcon({ size = 15 }: { size?: number } = {}) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <circle cx="12" cy="12" r="9" />
+      <path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor" stroke="none" />
+    </svg>
+  );
+}
+
+function PersonIcon({ size = 15 }: { size?: number } = {}) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <circle cx="12" cy="8" r="3.6" />
+      <path d="M5 20a7 7 0 0 1 14 0" />
+    </svg>
+  );
+}
+
+function DownloadIcon({ size = 15 }: { size?: number } = {}) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M12 3v11" />
+      <path d="m7.5 10 4.5 4.5L16.5 10" />
+      <path d="M5 20h14" />
+    </svg>
+  );
+}
+
 function LaptopIcon() {
   return (
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" style={{ flexShrink: 0 }}>
@@ -10530,168 +10593,65 @@ function ShieldAlertIcon() {
  *  "changelogSeen"), so add new releases at the head. */
 type ChangelogRelease = {
   version: string;
-  date: string;
-  sections: { title: string; items: string[] }[];
+  /** ISO string from GitHub, or the free-text date written in CHANGELOG.md. */
+  date: string | null;
+  /** Markdown. Rendered as-is, so a release note needs no code change. */
+  body: string;
 };
-const CHANGELOG: ChangelogRelease[] = [
-  {
-    version: "1.2.3",
-    date: "August 21, 2026",
-    sections: [
-      {
-        title: "New",
-        items: [
-          "Links in a reply now show the site's icon beside them, so you can tell at a glance where a source comes from.",
-        ],
-      },
-      {
-        title: "Improved",
-        items: [
-          "The message box grows as you type or paste, instead of staying two lines tall and hiding the rest behind a scrollbar.",
-          "Pasting a link pastes the link. Copying one out of a page often gives you markdown brackets around it; those are dropped now.",
-        ],
-      },
-      {
-        title: "Fixed",
-        items: [
-          "Security: when two commands were waiting for approval at once, a single Enter approved both. Enter now acts only when one is waiting \u2014 with more than one, you choose each explicitly.",
-          "Security: an approval could be answered by the wrong card, which also left the other one waiting forever on a reply that never came.",
-          "Sub-agents started from a side chat show up in the list again. They were invisible, and their rows in the transcript led nowhere.",
-          "Closing the last browser tab while a long conversation was loading no longer leaves the side panel open on a tab that is not there.",
-          "The tab limit follows one rule: tabs holding something live \u2014 a terminal, a page, a chat \u2014 refuse when full, while plain views make room by closing the oldest.",
-        ],
-      },
-    ],
-  },
-  {
-    version: "1.2.2",
-    date: "August 19, 2026",
-    sections: [
-      {
-        title: "Fixed",
-        items: [
-          "Long conversations now summarize themselves before they outgrow the model's context window. Previously nothing ever compacted, so a long thread could grow past what the service accepts — and once it did, every message in it failed, including a plain \u201cHello\u201d.",
-          "The context meter tells the truth instead of stopping at 100%. Over the limit it says so, and offers Compact right there rather than hiding it below the usage details.",
-        ],
-      },
-    ],
-  },
-  {
-    version: "1.2.1",
-    date: "August 19, 2026",
-    sections: [
-      {
-        title: "Fixed",
-        items: [
-          "Security: text the assistant typed into a page could be misread as a command-line option by the browser tool, including one that changes which program it launches. Text is now entered directly into the page and never reaches that parser.",
-          "Browser steps in the transcript show as running while they are still going, instead of jumping straight to done.",
-        ],
-      },
-    ],
-  },
-  {
-    version: "1.2.0",
-    date: "August 19, 2026",
-    sections: [
-      {
-        title: "New",
-        items: [
-          "The assistant can browse the web. Ask it to look something up and it searches, reads pages, clicks through, and can take screenshots — reporting what it actually saw rather than what it remembers. Requires the agent-browser tool to be installed.",
-          "Signed-in browsing: when a task needs your own accounts (your email, a dashboard, an admin panel), the assistant asks permission and the app opens a browser window for it. Sign in there once and it stays available for later requests.",
-          "Every side-panel surface now opens in multiple tabs — up to five each of sub-agent conversations, side chats, browsers, terminals, file trees, and file viewers.",
-          "The side panel remembers itself per conversation: leave a chat and come back to find the same tabs, with the one you were reading still in front.",
-          "Creating a project now uses the full project editor — name, icon and color, and as many source folders as you want.",
-          "This “What’s new” log, reachable from the bell beside Settings, with a dot when there is something you have not read.",
-        ],
-      },
-      {
-        title: "Fixed",
-        items: [
-          "Deleting a conversation or worktree from Settings → Resources now asks first, and spells out exactly what gets removed.",
-          "Sub-agent conversations in Settings → Resources are named (nickname, task, and the conversation that spawned them) instead of showing a raw id.",
-          "Chats outside a project now run in a dedicated ~/Unbiased folder. Previously they ran in your home directory, which let a personal Codex CLI config leak into the app and break turns with a tool error.",
-          "Diagrams and other code blocks without a language tag render as proper blocks instead of ragged inline text.",
-          "The stored API key is kept on sign-out by default, so signing back in is one click. The toggle is in Settings.",
-          "Interrupting a chat now also stops its sub-agents, and permission cards that no longer apply are retired instead of sitting there live.",
-          "A permission card raised by the app itself no longer stays stuck on “running” after you answer it.",
-          "The update banner shows its status inline with a face — glum while an update waits, cheerful once it is ready to relaunch.",
-        ],
-      },
-    ],
-  },
-  {
-    version: "1.1.0",
-    date: "August 18, 2026",
-    sections: [
-      {
-        title: "New",
-        items: [
-          "Sub-agents: the assistant can spawn parallel agents to split up a task. Each gets a nickname, shows up in the environment popover, and leaves lifecycle rows in the chat (“Created an agent”, “Messaged an agent”, “Closed an agent”).",
-          "Click a sub-agent’s name to open the agent-to-agent conversation in the side panel, rendered with the same formatting as the main chat.",
-          "A turn’s intermediate work now folds under a “Worked for …” header when it finishes, Codex-style.",
-          "Projects: create one from the + button in the sidebar, give it an icon and a color, and attach multiple folders with a primary.",
-          "Rename conversations, move them into projects, and delete conversations and worktrees from Settings → Resources.",
-          "The composer rotates through fresh placeholder prompts in existing chats.",
-          "New setting to keep the stored API key when signing out.",
-        ],
-      },
-      {
-        title: "Fixed",
-        items: [
-          "Code blocks are syntax-highlighted, and every copy button flashes a tick to confirm the copy.",
-          "Thinking and waiting status shimmer, and durations read as whole seconds.",
-          "A sub-agent’s permission request lands in the main chat naming the agent, and interrupting a chat now also stops its sub-agents and retires stale Allow/Deny cards.",
-          "Corrections sent to a busy sub-agent appear in its conversation immediately instead of after it finishes.",
-          "Long commands wrap inside their cards instead of stretching the chat.",
-          "Message timestamps appear when hovering the actions row.",
-        ],
-      },
-    ],
-  },
-  {
-    version: "1.0.6",
-    date: "August 17, 2026",
-    sections: [
-      {
-        title: "New",
-        items: ["The usage popover shows real credits and spend from your account."],
-      },
-      {
-        title: "Fixed",
-        items: ["New releases are noticed right away instead of waiting for the six-hour check."],
-      },
-    ],
-  },
-  {
-    version: "1.0.1 – 1.0.5",
-    date: "August 17, 2026",
-    sections: [
-      {
-        title: "New",
-        items: [
-          "In-app update banner with self-installing updates — downloads in the background, relaunches on demand.",
-          "The mascot joined the update banner.",
-        ],
-      },
-      {
-        title: "Fixed",
-        items: ["Installer reliability: staged installs and a macOS mount-point fix."],
-      },
-    ],
-  },
-  {
-    version: "1.0.0",
-    date: "August 17, 2026",
-    sections: [
-      {
-        title: "New",
-        items: [
-          "Initial release: chat with Pareto, worktrees, plan mode, the Review pane, an integrated terminal, an embedded browser with annotations, a real file viewer, and themes.",
-        ],
-      },
-    ],
-  },
-];
+
+/** `## <version> — <date>` starts a release; everything until the next one is
+ *  its body. Deliberately forgiving: a malformed heading yields one fewer
+ *  entry rather than throwing away the whole log. */
+function parseChangelogMd(md: string): ChangelogRelease[] {
+  const out: ChangelogRelease[] = [];
+  let cur: ChangelogRelease | null = null;
+  let buf: string[] = [];
+  const flush = () => {
+    if (cur) out.push({ ...cur, body: buf.join("\n").trim() });
+    buf = [];
+  };
+  for (const line of md.split("\n")) {
+    const m = /^##\s+(.+?)\s+—\s+(.+?)\s*$/.exec(line);
+    if (m) {
+      flush();
+      cur = { version: m[1].trim(), date: m[2].trim(), body: "" };
+      continue;
+    }
+    if (cur) buf.push(line);
+  }
+  flush();
+  return out;
+}
+
+/** GitHub gives an ISO timestamp; CHANGELOG.md gives prose someone wrote.
+ *  Both land in the same field, and the fetched one wins, so an unformatted
+ *  render shows "2026-08-21T17:41:30Z" as the heading. Parse what parses,
+ *  pass through what does not. */
+function releaseDateLabel(date: string | null): string {
+  if (!date) return "";
+  const t = Date.parse(date);
+  if (Number.isNaN(t)) return date; // already human-written
+  return new Date(t).toLocaleDateString(undefined, {
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+  });
+}
+
+/** Release notes are markdown now, so a new entry needs no code change. Plain
+ *  remark-gfm only — no rehypeRaw. These come off the network, and the rule
+ *  the chat renderer follows applies here too. */
+function ReleaseNotes({ body }: { body: string }) {
+  return (
+    <div style={{ fontSize: 13.5, lineHeight: 1.55, color: "var(--fg-msg)" }}>
+      <Markdown remarkPlugins={REMARK_PLUGINS}>{body}</Markdown>
+    </div>
+  );
+}
+
+/** What ships in this build. Superseded by the releases repo when reachable. */
+const BUNDLED_CHANGELOG: ChangelogRelease[] = parseChangelogMd(changelogMd);
+
 
 function BellIcon() {
   return (
@@ -10702,7 +10662,13 @@ function BellIcon() {
   );
 }
 
-function ChangelogModal({ onClose }: { onClose: () => void }) {
+function ChangelogModal({
+  releases,
+  onClose,
+}: {
+  releases: ChangelogRelease[];
+  onClose: () => void;
+}) {
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
       if (e.key === "Escape") {
@@ -10759,11 +10725,13 @@ function ChangelogModal({ onClose }: { onClose: () => void }) {
           </button>
         </div>
         <div style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: "6px 24px 22px" }}>
-          {CHANGELOG.map((rel, i) => (
+          {releases.map((rel, i) => (
             <div key={rel.version}>
               {i > 0 && <div style={{ height: 1, background: colors.border, margin: "22px 0" }} />}
               <div style={{ display: "flex", alignItems: "center", margin: "10px 0 2px" }}>
-                <div style={{ fontSize: 16.5, fontWeight: 600, color: colors.fg }}>{rel.date}</div>
+                <div style={{ fontSize: 16.5, fontWeight: 600, color: colors.fg }}>
+                  {releaseDateLabel(rel.date)}
+                </div>
                 <span style={{ flex: 1 }} />
                 <span
                   style={{
@@ -10779,20 +10747,7 @@ function ChangelogModal({ onClose }: { onClose: () => void }) {
                   {rel.version}
                 </span>
               </div>
-              {rel.sections.map((sec) => (
-                <div key={sec.title}>
-                  <div style={{ color: colors.dim, fontSize: 11.5, letterSpacing: 1.1, textTransform: "uppercase", margin: "16px 0 2px" }}>
-                    {sec.title}
-                  </div>
-                  <ul style={{ margin: "6px 0 0", paddingLeft: 22 }}>
-                    {sec.items.map((it, j) => (
-                      <li key={j} style={{ margin: "8px 0", fontSize: 13.5, lineHeight: 1.55, color: "var(--fg-msg)" }}>
-                        {it}
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              ))}
+              <ReleaseNotes body={rel.body} />
             </div>
           ))}
         </div>
