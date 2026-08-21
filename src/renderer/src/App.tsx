@@ -3062,6 +3062,7 @@ export function App() {
             if (b) setMainStarted(true);
           }}
           onTurnLanded={refreshThreads}
+          onThreadCreated={setActiveThreadId}
           onAskSideChat={askInSideChat}
           onOpenFile={(p) => void openFileInPanel(p)}
           onPreviewImage={(a) => void openImagePreview(a)}
@@ -6547,6 +6548,7 @@ function ChatPane({
   emptyState,
   onBusyChange,
   onTurnLanded,
+  onThreadCreated,
   onAskSideChat,
   onOpenFile,
   onPreviewImage,
@@ -6574,6 +6576,15 @@ function ChatPane({
   emptyState: React.ReactNode;
   onBusyChange?: (busy: boolean) => void;
   onTurnLanded?: () => void;
+  /** The thread this pane is on, once the engine has made one. Threads are
+   *  created lazily by the first send, and until App knows the id it treats
+   *  the pane as having no conversation at all: the title stays "New chat",
+   *  the sidebar highlights nothing, the side panel is never snapshotted, and
+   *  — the reason this exists — the context gauge is never cleared, because
+   *  the only reset is keyed on the thread id changing and null never became
+   *  anything. Main-pane only; a side chat's ephemeral fork is not the
+   *  conversation the window is showing. */
+  onThreadCreated?: (threadId: string) => void;
   onAskSideChat?: (text: string) => void;
   onOpenFile?: (path: string) => void;
   onPreviewImage?: (a: Attachment) => void;
@@ -6877,6 +6888,11 @@ function ChatPane({
     turnStartIndexRef.current = reset.resume?.running ? reset.entries.length : null;
     turnStartedAtRef.current = null;
     for (const held of reset.resume?.approvals ?? []) applyApproval(held);
+    // Occupancy is a property of the conversation being left, not the one
+    // being entered. The [threadId] effect below also clears it, but only when
+    // the id actually changes — this covers a reset where it does not.
+    setCtxUsage(null);
+    setCompacting(false);
     // Staged annotations belong to the conversation they came from.
     setAnnotations([]);
     setPendingComment(null);
@@ -7162,7 +7178,13 @@ function ChatPane({
     if (!canCompact) return;
     setCompacting(true);
     const r = await window.unbiased.compact(paneId);
-    if (!r.ok) setCompacting(false);
+    if (!r.ok) {
+      setCompacting(false);
+      setEntries((es) => [
+        ...es,
+        { kind: "assistant", text: `⚠ Could not compact: ${r.error ?? "unknown error"}` },
+      ]);
+    }
   }
 
   /** Send a prepared message right now (fresh sends and queue flushes). */
@@ -7178,6 +7200,7 @@ function ChatPane({
     try {
       const res = await window.unbiased.sendMessage(paneId, q.wire, q.attachments);
       threadIdRef.current = res.threadId;
+      onThreadCreated?.(res.threadId);
     } catch (err) {
       setBusy(false);
       setEntries((es) => [...es, { kind: "assistant", text: `Something went wrong: ${String(err)}` }]);
