@@ -1922,6 +1922,12 @@ type PendingApproval = { threadId: string | null } & (
 );
 const pendingApprovals = new Map<string, PendingApproval>();
 let nextLocalApproval = 1;
+// Approval handles are minted here, never derived from the engine's JSON-RPC
+// id. Keying the map on `apr_${msg.id}` let a reused id overwrite a live
+// entry: the first rpcId was orphaned so that turn waited on a reply that
+// could never come, and an Allow click landed on a different request than the
+// card described. The rpcId is data we answer with, not identity.
+let nextEngineApproval = 1;
 
 /** Raise a Permissions card for work this process is about to do itself, and
  *  wait for the human. Routed exactly like an engine approval: a sub-agent's
@@ -2589,7 +2595,7 @@ function wireNotifications(): void {
       }
       const approvalThread = typeof params.threadId === "string" ? params.threadId : null;
       if (msg.method === "item/commandExecution/requestApproval") {
-        const requestId = `apr_${msg.id}`;
+        const requestId = `apr_${nextEngineApproval++}`;
         pendingApprovals.set(requestId, { kind: "engine", rpcId: msg.id, threadId: approvalThread });
         deliverApproval({
           requestId,
@@ -2604,7 +2610,7 @@ function wireNotifications(): void {
         return;
       }
       if (msg.method === "item/fileChange/requestApproval") {
-        const requestId = `apr_${msg.id}`;
+        const requestId = `apr_${nextEngineApproval++}`;
         pendingApprovals.set(requestId, { kind: "engine", rpcId: msg.id, threadId: approvalThread });
         deliverApproval({
           requestId,

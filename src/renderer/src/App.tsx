@@ -11328,6 +11328,13 @@ function QueuedRow({
 /** Codex-style Permissions card: title derived from what's being asked,
  *  Deny (Esc) and a split Allow button — once (Enter) or, via the
  *  chevron, for the whole conversation (acceptForSession). */
+// Every mounted prompt installs its own document-level key handler, so with
+// two cards awaiting a decision one Enter approved BOTH — in the surface the
+// entire consent model rests on. Tracked here so the key acts only when a
+// single card is pending; with more than one, which card Enter means is
+// genuinely ambiguous and guessing approves a command nobody read.
+const mountedPrompts = new Set<object>();
+
 function PermissionsPrompt({
   approval,
   onDecide,
@@ -11337,19 +11344,30 @@ function PermissionsPrompt({
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
   const menuRef = useRef<HTMLSpanElement>(null);
+  // The listener is installed once, so it would otherwise answer with the
+  // first render's onDecide forever.
+  const onDecideRef = useRef(onDecide);
+  useEffect(() => {
+    onDecideRef.current = onDecide;
+  });
 
   useEffect(() => {
+    const token = {};
+    mountedPrompts.add(token);
     function onKey(e: KeyboardEvent) {
       if (e.defaultPrevented) return;
       const t = e.target as HTMLElement | null;
       // Never steal Enter/Escape from the composer or other inputs.
       if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) return;
+      // Two cards pending means two listeners; acting on either would decide
+      // both. Require a click instead — see mountedPrompts above.
+      if (mountedPrompts.size !== 1) return;
       if (e.key === "Escape") {
         e.preventDefault();
-        onDecide("decline");
+        onDecideRef.current("decline");
       } else if (e.key === "Enter") {
         e.preventDefault();
-        onDecide("accept");
+        onDecideRef.current("accept");
       }
     }
     function onDown(e: MouseEvent) {
@@ -11358,6 +11376,7 @@ function PermissionsPrompt({
     document.addEventListener("keydown", onKey);
     document.addEventListener("mousedown", onDown);
     return () => {
+      mountedPrompts.delete(token);
       document.removeEventListener("keydown", onKey);
       document.removeEventListener("mousedown", onDown);
     };
