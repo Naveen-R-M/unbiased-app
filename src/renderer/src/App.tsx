@@ -182,11 +182,55 @@ type ProjectInfo = {
   folders?: string[];
   threads: ThreadSummary[];
 };
+/** A thread we know exists because we just created it, but which the engine
+ *  will not return from thread/list yet — verified: a list issued straight
+ *  after thread/start does not include the new id. Without a stand-in row, a
+ *  chat you start and leave running is invisible until its first turn ends,
+ *  which for a long job reads as "it deleted my chat". */
+type PendingThread = { id: string; title: string; projectPath: string | null };
+
+/** Stand-in title until the engine names the thread — the first line of what
+ *  was sent, which is roughly what it derives its own title from anyway. */
+function provisionalTitle(text: string): string {
+  const line = text.trim().split("\n")[0]?.trim() ?? "";
+  if (!line) return "New chat";
+  return line.length > 80 ? line.slice(0, 79) + "…" : line;
+}
+
 type SidebarData = {
   projects: ProjectInfo[];
   recents: ThreadSummary[];
   running?: string[];
 };
+
+/** The engine's thread list plus any thread it does not know about yet, so a
+ *  chat is never missing from the nav between pressing Enter and the engine
+ *  deciding it exists. A stand-in drops out the moment the real row lands —
+ *  matched on id, so the handover never shows the thread twice. Pure so the
+ *  merge can be tested without a renderer. */
+function mergePendingThreads(sidebar: SidebarData, pending: PendingThread[]): SidebarData {
+  if (pending.length === 0) return sidebar;
+  const known = new Set([
+    ...sidebar.projects.flatMap((p) => p.threads.map((t) => t.id)),
+    ...sidebar.recents.map((t) => t.id),
+  ]);
+  const extra = pending.filter((p) => !known.has(p.id));
+  if (extra.length === 0) return sidebar;
+  const row = (p: PendingThread): ThreadSummary => ({ id: p.id, title: p.title });
+  const paths = new Set(sidebar.projects.map((p) => p.path));
+  return {
+    ...sidebar,
+    projects: sidebar.projects.map((pr) => {
+      const mine = extra.filter((p) => p.projectPath === pr.path);
+      return mine.length ? { ...pr, threads: [...mine.map(row), ...pr.threads] } : pr;
+    }),
+    // A stand-in whose project is gone still belongs somewhere visible.
+    recents: [
+      ...extra.filter((p) => !p.projectPath || !paths.has(p.projectPath)).map(row),
+      ...sidebar.recents,
+    ],
+  };
+}
 
 // Project identity: 8 colors + a compact icon set (Codex-style customizer).
 const PROJECT_COLORS = ["#E8E8E8", "#FF6B5E", "#FF9F43", "#FFD54F", "#66BB6A", "#42A5F5", "#AB7BF7", "#FF8AC2"];
@@ -754,6 +798,7 @@ export function App() {
     saveTheme(next);
   }
   const [sidebar, setSidebar] = useState<SidebarData>({ projects: [], recents: [] });
+  const [pendingThreads, setPendingThreads] = useState<PendingThread[]>([]);
   // Threads with a turn running right now — including backgrounded ones.
   const [runningThreads, setRunningThreads] = useState<ReadonlySet<string>>(new Set());
 
@@ -765,8 +810,14 @@ export function App() {
         else next.delete(p.threadId);
         return next;
       });
-      // A finished background turn may retitle/reorder its thread.
-      if (!p.running) void refreshThreads();
+      // A finished background turn may retitle/reorder its thread. Once that
+      // list is in, the stand-in row hands over to the real one — or drops,
+      // if the turn ended without the engine ever having anything to list.
+      if (!p.running) {
+        void refreshThreads().then(() => {
+          setPendingThreads((ps) => ps.filter((x) => x.id !== p.threadId));
+        });
+      }
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -1960,6 +2011,11 @@ export function App() {
   }
 
   const connected = status.state === "connected";
+  // The engine's list plus any thread it does not know about yet, so a chat
+  // is never missing from the nav between pressing Enter and the engine
+  // deciding it exists. A stand-in disappears the moment the real row lands.
+  const sidebarView = useMemo(() => mergePendingThreads(sidebar, pendingThreads), [sidebar, pendingThreads]);
+
   // Files (workspace tree) only makes sense inside a project — a plain
   // Recents chat lives in the home directory.
   const activeSidebarProject = sidebar.projects.find((p) =>
@@ -2028,7 +2084,7 @@ export function App() {
   useEffect(() => setPreviewOn(false), [visibleFile?.fullPath]);
   const mainTitle = (() => {
     if (activeThreadId) {
-      const all = [...sidebar.projects.flatMap((p) => p.threads), ...sidebar.recents];
+      const all = [...sidebarView.projects.flatMap((p) => p.threads), ...sidebarView.recents];
       return all.find((t) => t.id === activeThreadId)?.title ?? "Conversation";
     }
     return activeProject ? `New chat · ${activeProject.name}` : "New chat";
@@ -2108,7 +2164,7 @@ export function App() {
           </SidebarAction>
         </div>
         <div style={{ flex: 1, overflowY: "auto", padding: "0 8px 12px" }}>
-          {sidebar.projects.length === 0 && sidebar.recents.length === 0 && (
+          {sidebarView.projects.length === 0 && sidebarView.recents.length === 0 && (
             <div style={{ color: colors.dim, fontSize: 12, padding: "8px 8px" }}>No conversations yet</div>
           )}
 
@@ -2151,7 +2207,7 @@ export function App() {
             </button>
           </div>
           {!projectsCollapsed &&
-          sidebar.projects.map((p) => (
+          sidebarView.projects.map((p) => (
             <div key={p.path} style={{ marginBottom: 12 }}>
               {/* A label, not a button — chats in a project start from the
                   pencil that appears on hover. */}
@@ -2164,7 +2220,14 @@ export function App() {
                   alignItems: "center",
                   gap: 10,
                   width: "100%",
-                  background: activeProject?.path === p.path ? "var(--chip)" : "transparent",
+                  // The project carries the highlight only until its chat has a
+                  // thread; from then on the thread row owns it. openThread keeps
+                  // the same invariant from the other direction by clearing
+                  // activeProject, so exactly one row is ever lit. activeProject
+                  // itself must stay set — the Files view, work mode and the
+                  // chat's working directory all read it.
+                  background:
+                    activeProject?.path === p.path && !activeThreadId ? "var(--chip)" : "transparent",
                   borderRadius: 8,
                   padding: "8px 8px 6px",
                   fontSize: 14.5,
@@ -2185,7 +2248,7 @@ export function App() {
                   {p.name}
                 </span>
                 {(hoveredProject === p.path || projMenu?.path === p.path) && (
-                  <span data-projmenu style={{ display: "flex", alignItems: "center", gap: 6, flexShrink: 0 }}>
+                  <span data-projmenu style={{ display: "flex", alignItems: "center", gap: 10, flexShrink: 0 }}>
                     <button
                       onClick={(e) => {
                         const r = (e.currentTarget as HTMLButtonElement).getBoundingClientRect();
@@ -2308,13 +2371,13 @@ export function App() {
             </div>
           ))}
 
-          {sidebar.recents.length > 0 && (
+          {sidebarView.recents.length > 0 && (
             <SectionLabel collapsed={recentsCollapsed} onToggle={toggleRecentsSection}>
               Recents
             </SectionLabel>
           )}
           {!recentsCollapsed &&
-          sidebar.recents.map((t) => (
+          sidebarView.recents.map((t) => (
             <ThreadRow
               key={t.id}
               thread={t}
@@ -3062,7 +3125,25 @@ export function App() {
             if (b) setMainStarted(true);
           }}
           onTurnLanded={refreshThreads}
-          onThreadCreated={setActiveThreadId}
+          onThreadCreated={(id, created, firstMessage) => {
+            setActiveThreadId(id);
+            // The engine will not list this thread until it has content, so
+            // the nav row has to come from here — otherwise starting a chat
+            // and walking away looks like the chat was thrown out.
+            if (!created) return;
+            setPendingThreads((ps) =>
+              ps.some((p) => p.id === id)
+                ? ps
+                : [
+                    ...ps,
+                    {
+                      id,
+                      title: provisionalTitle(firstMessage),
+                      projectPath: activeProject?.path ?? null,
+                    },
+                  ],
+            );
+          }}
           onAskSideChat={askInSideChat}
           onOpenFile={(p) => void openFileInPanel(p)}
           onPreviewImage={(a) => void openImagePreview(a)}
@@ -6584,7 +6665,7 @@ function ChatPane({
    *  the only reset is keyed on the thread id changing and null never became
    *  anything. Main-pane only; a side chat's ephemeral fork is not the
    *  conversation the window is showing. */
-  onThreadCreated?: (threadId: string) => void;
+  onThreadCreated?: (threadId: string, created: boolean, firstMessage: string) => void;
   onAskSideChat?: (text: string) => void;
   onOpenFile?: (path: string) => void;
   onPreviewImage?: (a: Attachment) => void;
@@ -7200,7 +7281,7 @@ function ChatPane({
     try {
       const res = await window.unbiased.sendMessage(paneId, q.wire, q.attachments);
       threadIdRef.current = res.threadId;
-      onThreadCreated?.(res.threadId);
+      onThreadCreated?.(res.threadId, res.created, q.text);
     } catch (err) {
       setBusy(false);
       setEntries((es) => [...es, { kind: "assistant", text: `Something went wrong: ${String(err)}` }]);
