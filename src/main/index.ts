@@ -524,29 +524,52 @@ function faviconHostOrNull(raw: string): string | null {
   return host;
 }
 
+/** Two hosts that are the same site for icon purposes. A leading `www.` on
+ *  either side counts (anthropic.com serves its icon from www); nothing else
+ *  does. */
+function sameIconSite(a: string, b: string): boolean {
+  return a.replace(/^www\./, "") === b.replace(/^www\./, "");
+}
+
 /** One favicon attempt: fetch https://<host><path> and hand it back as a data:
  *  URL, or null for anything we won't use. Never throws — a missing icon is
- *  not an error condition. */
+ *  not an error condition.
+ *
+ *  Redirects are walked by hand rather than with redirect:"follow", because
+ *  `follow` would carry this request onto whatever a 302 names — including the
+ *  loopback and LAN addresses faviconHostOrNull just refused. Checking the
+ *  final URL afterwards is too late: the connection has already been made.
+ *  Every hop is re-gated, must stay https, and must stay on the same site. */
 async function fetchIcon(host: string, path: string): Promise<string | null> {
+  let url = `https://${host}${path}`;
   try {
-    const res = await fetch(`https://${host}${path}`, {
-      signal: AbortSignal.timeout(3_000),
-      redirect: "follow",
-      headers: { accept: "image/*" },
-    });
-    // Redirects are followed, but the bytes must still come from the site we
-    // asked about — otherwise a 302 could source the icon, and the request,
-    // from anywhere. A leading `www.` on either side is the same site
-    // (anthropic.com serves its icon from www); anything else is not.
-    const sameSite = (a: string, b: string) => a.replace(/^www\./, "") === b.replace(/^www\./, "");
-    const finalHost = new URL(res.url || `https://${host}/`).hostname.toLowerCase();
-    const type = (res.headers.get("content-type") ?? "").split(";")[0].trim().toLowerCase();
-    if (!res.ok || !sameSite(finalHost, host) || !type.startsWith("image/")) return null;
-    const buf = Buffer.from(await res.arrayBuffer());
-    // Anything this big is not a favicon. The bytes sit in renderer state for
-    // the session, so an unbounded body is a memory bug waiting to happen.
-    if (buf.length === 0 || buf.length > 100_000) return null;
-    return `data:${type};base64,${buf.toString("base64")}`;
+    for (let hop = 0; hop < 4; hop++) {
+      const res = await fetch(url, {
+        signal: AbortSignal.timeout(3_000),
+        redirect: "manual",
+        headers: { accept: "image/*" },
+      });
+      if (res.status >= 300 && res.status < 400) {
+        const loc = res.headers.get("location");
+        if (!loc) return null;
+        const next = new URL(loc, url);
+        // A downgrade to http is refused outright: no icon is worth turning a
+        // TLS fetch into a cleartext one a network attacker can answer.
+        if (next.protocol !== "https:") return null;
+        const nextHost = faviconHostOrNull(next.hostname);
+        if (!nextHost || !sameIconSite(nextHost, host)) return null;
+        url = next.toString();
+        continue;
+      }
+      const type = (res.headers.get("content-type") ?? "").split(";")[0].trim().toLowerCase();
+      if (!res.ok || !type.startsWith("image/")) return null;
+      const buf = Buffer.from(await res.arrayBuffer());
+      // Anything this big is not a favicon. The bytes sit in renderer state for
+      // the session, so an unbounded body is a memory bug waiting to happen.
+      if (buf.length === 0 || buf.length > 100_000) return null;
+      return `data:${type};base64,${buf.toString("base64")}`;
+    }
+    return null; // redirect loop
   } catch {
     return null; // timeout, DNS, TLS, abort
   }
@@ -3903,11 +3926,8 @@ app.whenReady().then(async () => {
   // Site icons for source links in assistant markdown. Same shape as
   // file:read-image above and for the same reason: `img-src 'self' data:`
   // means the renderer cannot load a remote icon itself. Misses are cached as
-  // null so a site without an icon is asked once per run, not once per render.
-  // Site icons for source links in assistant markdown. Same shape as
-  // file:read-image below and for the same reason: `img-src 'self' data:`
-  // means the renderer cannot load a remote icon itself. Misses are cached as
   // null too, so a site without an icon is asked once per run.
+  const FAVICON_CACHE_MAX = 256;
   const faviconCache = new Map<string, string | null>();
   ipcMain.handle("link:favicon", async (_e, rawHost: string) => {
     const host = faviconHostOrNull(String(rawHost ?? ""));
@@ -3918,6 +3938,13 @@ app.whenReady().then(async () => {
     // which we deliberately don't fetch pages to read — learn.chatgpt.com is
     // one. The second guess costs a request only when the first one misses.
     const dataUrl = (await fetchIcon(host, "/favicon.ico")) ?? (await fetchIcon(host, "/favicon.png"));
+    // Bounded: a long session citing many domains would otherwise hold every
+    // icon it ever saw, and the renderer keeps its own copy of the same bytes.
+    // Map iterates in insertion order, so the oldest entry goes first.
+    if (faviconCache.size >= FAVICON_CACHE_MAX) {
+      const oldest = faviconCache.keys().next().value;
+      if (oldest !== undefined) faviconCache.delete(oldest);
+    }
     faviconCache.set(host, dataUrl);
     return { dataUrl };
   });

@@ -6600,14 +6600,34 @@ function ChatPane({
   // scrollbar makes it look like the paste half-failed. Height is measured,
   // not counted from "\n" — soft-wrapped long tokens have no newline to count.
   const taRef = useRef<HTMLTextAreaElement | null>(null);
-  useLayoutEffect(() => {
+  const fitComposer = () => {
     const el = taRef.current;
     if (!el) return;
     // Collapse first: scrollHeight only shrinks back if the box isn't already
     // holding the taller content open.
     el.style.height = "auto";
     el.style.height = `${Math.min(Math.max(el.scrollHeight, COMPOSER_MIN_H), COMPOSER_MAX_H)}px`;
-  }, [draft]);
+  };
+  useLayoutEffect(fitComposer, [draft]);
+  // Width drives wrapping, and wrapping drives height — dragging the side-panel
+  // divider rewraps a draft that never changed, so measuring only on [draft]
+  // leaves the box the wrong size and hides the overflow it was meant to show.
+  const lastWidth = useRef(0);
+  useEffect(() => {
+    const el = taRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver((entries) => {
+      // Width only. Reacting to height would observe the very change this
+      // callback makes and spin the observer against itself.
+      const w = entries[0]?.contentRect.width ?? 0;
+      if (w === lastWidth.current) return;
+      lastWidth.current = w;
+      fitComposer();
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   const [attachments, setAttachments] = useState<Attachment[]>([]);
 
   useEffect(() => {
@@ -8407,6 +8427,10 @@ function ChatPane({
 // a host means the same thing in every conversation. Every link to the same
 // site shares one in-flight request, and a null (no icon) is cached too.
 const faviconCache = new Map<string, Promise<string | null>>();
+// The settled answers, readable without awaiting. A resolved promise still
+// costs a microtask, which is one frame of globe — and a turn folding remounts
+// the whole transcript at once, so that frame is a visible flicker.
+const faviconResolved = new Map<string, string | null>();
 function probeFavicon(host: string): Promise<string | null> {
   let p = faviconCache.get(host);
   if (!p) {
@@ -8415,6 +8439,7 @@ function probeFavicon(host: string): Promise<string | null> {
       .then((r) => r.dataUrl)
       .catch(() => null);
     faviconCache.set(host, p);
+    void p.then((d) => faviconResolved.set(host, d));
   }
   return p;
 }
@@ -8430,8 +8455,14 @@ function probeFavicon(host: string): Promise<string | null> {
  *  The box is a fixed size from the first frame, so an icon arriving mid-turn
  *  cannot reflow a streaming message. */
 function Favicon({ host }: { host: string }) {
-  const [src, setSrc] = useState<string | null>(null);
+  const [src, setSrc] = useState<string | null>(() => faviconResolved.get(host) ?? null);
   useEffect(() => {
+    // Already settled: paint it and skip the async path entirely.
+    const known = faviconResolved.get(host);
+    if (known !== undefined) {
+      setSrc(known);
+      return;
+    }
     let live = true;
     setSrc(null);
     void probeFavicon(host).then((d) => {
