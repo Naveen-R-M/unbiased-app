@@ -8,13 +8,17 @@ name: Release
 #
 #   git tag v1.0.0 && git push origin v1.0.0
 #
-# REQUIRES two secrets:
-#   RELEASES_TOKEN — fine-grained PAT, "Contents: read and write" on
-#                    unbiased-app-releases ONLY. The default github.token
-#                    cannot write to another repository.
-#   ENGINE_TOKEN   — fine-grained PAT, "Contents: read" on unbiased-app-engine.
-#                    The engine is a separate private repo and its bundle must
-#                    be built here; nothing else crosses that boundary.
+# REQUIRES two ORG secrets, from the release GitHub App:
+#   RELEASE_APP_ID          — the App's numeric id.
+#   RELEASE_APP_PRIVATE_KEY — the App's private key (PEM).
+#
+# This job reaches three repositories — it checks the engine out of one and
+# publishes to another — and the default github.token is scoped to this one,
+# so it needs a credential of its own. That used to be two fine-grained PATs,
+# which belong to a PERSON: invisible from the org side, unrevokable by
+# offboarding, and expiring on their own 90-day clock. The App is owned by the
+# org, and what actually flows through CI is an installation token that lasts
+# about an hour (planning#262).
 #
 # Runs on macOS because a .dmg can only be built (and codesigned) on macOS.
 # macos-15 is an Apple Silicon runner, which matches our arm64-only target —
@@ -39,13 +43,29 @@ jobs:
         with:
           path: unbiased-app
 
+      # One token for every cross-repo step below. `repositories:` is not
+      # optional here: by default the minted token is scoped to THIS repo
+      # alone, and this job also reads unbiased-app-engine and writes
+      # unbiased-app-releases. The App must be installed on all three.
+      - name: mint a release token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: |
+            unbiased-app
+            unbiased-app-engine
+            unbiased-app-releases
+
       # The engine must sit BESIDE the app: package.json's extraResources
       # copies from ../unbiased-app-engine/dist/bundle.
       - name: checkout engine
         uses: actions/checkout@v4
         with:
           repository: circuitandchisel/unbiased-app-engine
-          token: ${{ secrets.ENGINE_TOKEN }}
+          token: ${{ steps.app-token.outputs.token }}
           path: unbiased-app-engine
 
       - uses: actions/setup-go@v5
@@ -114,7 +134,7 @@ jobs:
       - name: publish release to the public repo
         working-directory: unbiased-app
         env:
-          GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           # Notes come from CHANGELOG.md — the same file the app bundles and
           # parses, so what ships in the build and what the releases repo
@@ -162,7 +182,7 @@ jobs:
       - name: sync install.sh to the public repo
         working-directory: unbiased-app
         env:
-          GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           current_sha=$(gh api "repos/$RELEASES_REPO/contents/install.sh" --jq .sha 2>/dev/null || true)
           if [ -n "$current_sha" ]; then
