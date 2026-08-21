@@ -6,6 +6,13 @@ Format matters: `## <version> — <date>`, then `### <section>`, then `-` bullet
 
 Write for the person using the app, not the person who wrote the code.
 
+## 1.3.1 — August 21, 2026
+
+### Fixed
+
+- A permission request left unanswered when you quit now says so when you come back, instead of showing Allow and Deny buttons that do nothing. The turn behind it ended with the app, so the request cannot be answered — the card says that plainly and you can simply ask again.
+- Security: a permission card restored from a closed session could, in rare cases, answer a different request made after reopening — approving something you never saw. Requests are now tagged per session so an old card can never be mistaken for a new one.
+
 ## 1.3.0 — August 21, 2026
 
 ### New
