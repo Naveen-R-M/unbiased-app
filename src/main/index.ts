@@ -1537,6 +1537,38 @@ const UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const UPDATE_FOCUS_THROTTLE_MS = 10 * 60 * 1000;
 let lastUpdateCheck = 0;
 
+// Auto-download lives HERE, not in renderer localStorage with the other
+// preferences: the check fires on a timer 8s after boot and every 6h after,
+// with no guarantee a renderer has mounted, let alone told us anything.
+// Default on — the people this helps are the ones who would never find the
+// switch. Off restores the old behaviour exactly.
+function updatePrefsFile(): string {
+  return join(app.getPath("userData"), "update-prefs.json");
+}
+let updatePrefsCache: { autoDownload: boolean } | null = null;
+function updatePrefs(): { autoDownload: boolean } {
+  if (!updatePrefsCache) {
+    try {
+      const raw = JSON.parse(readFileSync(updatePrefsFile(), "utf8")) as { autoDownload?: unknown };
+      updatePrefsCache = { autoDownload: raw.autoDownload !== false };
+    } catch {
+      updatePrefsCache = { autoDownload: true };
+    }
+  }
+  return updatePrefsCache;
+}
+function setUpdatePrefs(next: { autoDownload: boolean }): void {
+  updatePrefsCache = next;
+  try {
+    writeFileSync(updatePrefsFile(), JSON.stringify(next));
+  } catch {
+    /* a preference that fails to persist is not worth failing the app over */
+  }
+}
+// Suppresses per-chunk progress while auto-downloading: the whole point is
+// that nothing interrupts until there is something to act on.
+let silentInstall = false;
+
 type UpdateInfo = { version: string; dmgUrl: string; sumsUrl: string | null };
 let pendingUpdate: UpdateInfo | null = null;
 let updateInstalling = false;
@@ -1606,6 +1638,20 @@ async function checkForUpdate(): Promise<UpdateInfo | null> {
       sumsUrl: assets.find((a) => a.name === "SHA256SUMS")?.browser_download_url ?? null,
     };
     pendingUpdate = info;
+    if (updatePrefs().autoDownload && !stagedUpdate && !updateInstalling) {
+      // Stage it quietly. The banner appears once, saying the only thing the
+      // user can usefully act on: restart. update:pending withholds the
+      // update from the renderer until then, so no Download button flashes up
+      // and then changes under them mid-download.
+      silentInstall = true;
+      void installUpdate(info).then((r) => {
+        silentInstall = false;
+        // A failed silent attempt falls back to the manual banner rather than
+        // retrying forever — the user can see it and decide.
+        if (!r.ok) send("update:available", info);
+      });
+      return info;
+    }
     send("update:available", info);
     return info;
   } catch {
@@ -1616,6 +1662,32 @@ async function checkForUpdate(): Promise<UpdateInfo | null> {
 /** The running app's bundle: .../Unbiased.app/Contents/MacOS/Unbiased → the .app. */
 function appBundlePath(): string {
   return join(app.getPath("exe"), "..", "..", "..");
+}
+
+/** Adopt a bundle staged by a previous run. Without this a completed
+ *  180MB+ download is forgotten the moment the app restarts — stagedUpdate is
+ *  memory-only — so an interrupted update re-downloads from scratch every
+ *  time, which is what made a failed update feel like a loop. */
+function recoverStagedUpdate(): void {
+  if (!app.isPackaged) return;
+  const staged = stagedPathFor(appBundlePath());
+  const plist = join(staged, "Contents/Info.plist");
+  if (!existsSync(plist)) return;
+  try {
+    const version = execFileSync("/usr/libexec/PlistBuddy", [
+      "-c", "Print :CFBundleShortVersionString", plist,
+    ], { encoding: "utf8" }).trim();
+    if (version && compareVersions(version, app.getVersion()) > 0) {
+      stagedUpdate = { path: staged, version };
+      pendingUpdate = { version, dmgUrl: "", sumsUrl: null };
+      return;
+    }
+    // Same version or older: it already landed, or it is stale. Either way it
+    // is 180MB of nothing, so reclaim the space.
+    rmSync(staged, { recursive: true, force: true });
+  } catch {
+    /* unreadable plist — leave it alone rather than delete something unknown */
+  }
 }
 
 async function installUpdate(info: UpdateInfo): Promise<{ ok: boolean; error?: string }> {
@@ -1641,7 +1713,7 @@ async function installUpdate(info: UpdateInfo): Promise<{ ok: boolean; error?: s
   };
   try {
     // ── download with progress ──
-    send("update:progress", { phase: "downloading", percent: 0 });
+    if (!silentInstall) send("update:progress", { phase: "downloading", percent: 0 });
     const res = await fetch(info.dmgUrl);
     if (!res.ok || !res.body) throw new Error(`download failed (HTTP ${res.status})`);
     const total = Number(res.headers.get("content-length") ?? 0);
@@ -1656,7 +1728,7 @@ async function installUpdate(info: UpdateInfo): Promise<{ ok: boolean; error?: s
       // Throttle: a 190MB download would otherwise flood the renderer.
       if (percent !== lastSent && percent % 2 === 0) {
         lastSent = percent;
-        send("update:progress", { phase: "downloading", percent });
+        if (!silentInstall) send("update:progress", { phase: "downloading", percent });
       }
     }
     const data = Buffer.concat(chunks);
@@ -1665,7 +1737,7 @@ async function installUpdate(info: UpdateInfo): Promise<{ ok: boolean; error?: s
     // ── verify ──
     // A corrupted 190MB download must never replace a working app.
     if (info.sumsUrl) {
-      send("update:progress", { phase: "verifying", percent: 100 });
+      if (!silentInstall) send("update:progress", { phase: "verifying", percent: 100 });
       const sums = await (await fetch(info.sumsUrl)).text();
       const name = info.dmgUrl.split("/").pop() ?? "";
       const expected = sums
@@ -1679,7 +1751,7 @@ async function installUpdate(info: UpdateInfo): Promise<{ ok: boolean; error?: s
     }
 
     // ── swap the bundle ──
-    send("update:progress", { phase: "installing", percent: 100 });
+    if (!silentInstall) send("update:progress", { phase: "installing", percent: 100 });
     // NOT -quiet: it suppresses the very table we parse the mount point out
     // of, leaving us mounted with no idea where. Columns are tab-separated;
     // the mount point is the last field of the volume's row.
@@ -1746,6 +1818,12 @@ function applyUpdate(): { ok: boolean; error?: string } {
     }
     app.relaunch();
     app.quit();
+    // relaunch only spawns once this process exits, so a quit that stalls
+    // leaves the user with an app that swapped itself on disk and never came
+    // back — indistinguishable, from the outside, from a broken update.
+    // Nothing here should block, but the cost of being wrong is high and the
+    // cost of the guard is one timer.
+    setTimeout(() => app.exit(0), 4000).unref();
     return { ok: true };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -2695,9 +2773,29 @@ app.whenReady().then(async () => {
   // ── Update IPC ──────────────────────────────────────────────────────
   ipcMain.handle("update:check", async () => (await checkForUpdate()) ?? { none: true });
   ipcMain.handle("update:pending", () => ({
-    update: pendingUpdate,
+    // While a silent download is in flight the renderer is told nothing: a
+    // Download button that appears and then rewrites itself to Restart is
+    // worse than no banner at all.
+    update: stagedUpdate || !updatePrefs().autoDownload ? pendingUpdate : null,
     staged: stagedUpdate ? { version: stagedUpdate.version } : null,
   }));
+
+  ipcMain.handle("update:prefs", () => ({
+    autoDownload: updatePrefs().autoDownload,
+    version: app.getVersion(),
+    lastCheckedAt: lastUpdateCheck || null,
+  }));
+  ipcMain.handle("update:set-prefs", (_e, p: { autoDownload: boolean }) => {
+    setUpdatePrefs({ autoDownload: !!p.autoDownload });
+    // Turning it on mid-session should act now, not in six hours.
+    if (p.autoDownload && pendingUpdate && !stagedUpdate && !updateInstalling) {
+      silentInstall = true;
+      void installUpdate(pendingUpdate).then(() => {
+        silentInstall = false;
+      });
+    }
+    return { ok: true };
+  });
   ipcMain.handle("update:download", async () => {
     if (!pendingUpdate) return { ok: false, error: "no update available" };
     return installUpdate(pendingUpdate);
@@ -4026,6 +4124,13 @@ app.whenReady().then(async () => {
   createWindow();
   // Check for updates shortly after launch (let the window settle first),
   // then on a slow timer — a desktop app can stay open for days.
+  // Before the first check, so a bundle staged by a previous run is offered
+  // as "restart" instead of being downloaded all over again.
+  recoverStagedUpdate();
+  if (stagedUpdate) {
+    send("update:available", { version: stagedUpdate.version, dmgUrl: "", sumsUrl: null });
+    send("update:staged", { version: stagedUpdate.version });
+  }
   setTimeout(() => void checkForUpdate(), 8000);
   setInterval(() => void checkForUpdate(), UPDATE_INTERVAL_MS);
   // The engine no longer auto-starts: the renderer's login gate decides

@@ -18,6 +18,8 @@ contextBridge.exposeInMainWorld("unbiased", {
   pendingUpdate: () => ipcRenderer.invoke("update:pending"),
   downloadUpdate: () => ipcRenderer.invoke("update:download"),
   applyUpdate: () => ipcRenderer.invoke("update:apply"),
+  updatePrefs: () => ipcRenderer.invoke("update:prefs"),
+  setUpdatePrefs: (p: { autoDownload: boolean }) => ipcRenderer.invoke("update:set-prefs", p),
   onUpdateAvailable: (cb: (p: unknown) => void) => subscribe("update:available", cb),
   onUpdateStaged: (cb: (p: unknown) => void) => subscribe("update:staged", cb),
   onUpdateProgress: (cb: (p: unknown) => void) => subscribe("update:progress", cb),

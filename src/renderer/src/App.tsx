@@ -487,6 +487,8 @@ declare global {
       reviewCreatePr: (path: string) => Promise<{ ok: boolean; error?: string }>;
       openExternal: (url: string) => Promise<{ ok: boolean }>;
       favicon: (host: string) => Promise<{ dataUrl: string | null }>;
+      updatePrefs: () => Promise<{ autoDownload: boolean; version: string; lastCheckedAt: number | null }>;
+      setUpdatePrefs: (p: { autoDownload: boolean }) => Promise<{ ok: boolean }>;
       openBrowser: (p: { id: number; url?: string }) => Promise<{ ok: boolean }>;
       setBrowserBounds: (b: { id: number; x: number; y: number; width: number; height: number }) => Promise<void>;
       setBrowserVisible: (p: { id: number; visible: boolean }) => Promise<void>;
@@ -9700,7 +9702,27 @@ function SettingsView({
   onBack: () => void;
   onSignOut: () => void;
 }) {
-  const [tab, setTab] = useState<"appearance" | "resources" | "account">("appearance");
+  const [tab, setTab] = useState<"appearance" | "resources" | "account" | "updates">("appearance");
+  const [updPrefs, setUpdPrefs] = useState<{
+    autoDownload: boolean;
+    version: string;
+    lastCheckedAt: number | null;
+  } | null>(null);
+  useEffect(() => {
+    if (tab === "updates" && !updPrefs) void window.unbiased.updatePrefs().then(setUpdPrefs);
+  }, [tab, updPrefs]);
+  // Notes for the version actually running, not merely the newest we ship —
+  // someone on an older build should see what THEY have.
+  const runningRelease =
+    CHANGELOG.find((r) => r.version === updPrefs?.version) ?? CHANGELOG[0];
+  function toggleAutoDownload() {
+    setUpdPrefs((p) => {
+      if (!p) return p;
+      const next = { ...p, autoDownload: !p.autoDownload };
+      void window.unbiased.setUpdatePrefs({ autoDownload: next.autoDownload });
+      return next;
+    });
+  }
   // Sign-out key handling: default removes the saved key; flipping this
   // keeps ~/.unbiased/credentials.json so the next sign-in is one click.
   const [keepKey, setKeepKey] = useState(() => localStorage.getItem("signoutKeepsKey") !== "false");
@@ -9795,6 +9817,7 @@ function SettingsView({
             { id: "appearance", label: "Appearance" },
             { id: "resources", label: "Resources" },
             { id: "account", label: "Account" },
+            { id: "updates", label: "Updates" },
           ] as const
         ).map((item) => (
           <button
@@ -9823,6 +9846,114 @@ function SettingsView({
       <div style={{ flex: 1, overflowY: "auto", padding: "40px 48px" }}>
         {tab === "resources" ? (
           <ResourcesView />
+        ) : tab === "updates" ? (
+          <div style={{ maxWidth: 640, margin: "0 auto" }}>
+            <h1 style={{ fontSize: 22, fontWeight: 600, margin: "0 0 24px" }}>Updates</h1>
+
+            <div
+              style={{
+                border: `1px solid ${colors.border}`,
+                borderRadius: 12,
+                background: colors.panel,
+                overflow: "hidden",
+              }}
+            >
+              <div style={{ ...rowStyle, borderBottom: "none", alignItems: "flex-start", gap: 14 }}>
+                <span style={{ flex: 1, minWidth: 0 }}>
+                  <span style={{ display: "block" }}>Download updates automatically</span>
+                  <span style={{ display: "block", fontSize: 12.5, color: colors.dim, marginTop: 3, lineHeight: 1.5 }}>
+                    New versions download quietly in the background. Nothing changes until you choose to
+                    restart.
+                  </span>
+                </span>
+                <button
+                  onClick={toggleAutoDownload}
+                  disabled={!updPrefs}
+                  role="switch"
+                  aria-checked={!!updPrefs?.autoDownload}
+                  aria-label="Download updates automatically"
+                  style={{
+                    width: 38,
+                    height: 22,
+                    borderRadius: 11,
+                    border: "none",
+                    background: updPrefs?.autoDownload ? colors.accent : "var(--gutter)",
+                    position: "relative",
+                    cursor: updPrefs ? "pointer" : "default",
+                    flexShrink: 0,
+                    padding: 0,
+                    marginTop: 1,
+                    transition: "background 120ms",
+                  }}
+                >
+                  <span
+                    style={{
+                      position: "absolute",
+                      top: 3,
+                      left: updPrefs?.autoDownload ? 19 : 3,
+                      width: 16,
+                      height: 16,
+                      borderRadius: "50%",
+                      background: "#fff",
+                      transition: "left 120ms",
+                    }}
+                  />
+                </button>
+              </div>
+            </div>
+
+            <div
+              style={{
+                border: `1px solid ${colors.border}`,
+                borderRadius: 12,
+                background: colors.panel,
+                overflow: "hidden",
+                marginTop: 16,
+                padding: "14px 18px 18px",
+              }}
+            >
+              <div style={{ display: "flex", alignItems: "baseline", gap: 8, flexWrap: "wrap" }}>
+                <span style={{ fontSize: 14, fontWeight: 500 }}>Version {updPrefs?.version ?? "—"}</span>
+                <span style={{ color: colors.dim, fontSize: 12.5 }}>
+                  {updPrefs?.lastCheckedAt ? `checked ${relTime(updPrefs.lastCheckedAt)}` : "not checked yet"}
+                </span>
+              </div>
+              {runningRelease && (
+                <>
+                  {runningRelease.version !== updPrefs?.version && (
+                    <div style={{ color: colors.dim, fontSize: 12.5, marginTop: 10 }}>
+                      Notes for {runningRelease.version}
+                    </div>
+                  )}
+                  {runningRelease.sections.map((sec) => (
+                    <div key={sec.title}>
+                      <div
+                        style={{
+                          color: colors.dim,
+                          fontSize: 11.5,
+                          letterSpacing: 1.1,
+                          textTransform: "uppercase",
+                          margin: "16px 0 2px",
+                        }}
+                      >
+                        {sec.title}
+                      </div>
+                      <ul style={{ margin: "6px 0 0", paddingLeft: 20 }}>
+                        {sec.items.map((it, j) => (
+                          <li
+                            key={j}
+                            style={{ margin: "8px 0", fontSize: 13.5, lineHeight: 1.55, color: "var(--fg-msg)" }}
+                          >
+                            {it}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  ))}
+                </>
+              )}
+            </div>
+          </div>
         ) : tab === "account" ? (
           <div style={{ maxWidth: 640, margin: "0 auto" }}>
             <h1 style={{ fontSize: 22, fontWeight: 600, margin: "0 0 24px" }}>Account</h1>
