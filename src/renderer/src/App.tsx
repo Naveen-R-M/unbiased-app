@@ -10716,8 +10716,25 @@ function releaseDateLabel(date: string | null): string {
  *  the chat renderer follows applies here too. */
 function ReleaseNotes({ body }: { body: string }) {
   return (
-    <div style={{ fontSize: 13.5, lineHeight: 1.55, color: "var(--fg-msg)" }}>
-      <Markdown remarkPlugins={REMARK_PLUGINS}>{body}</Markdown>
+    <div style={{ fontSize: 13.5, lineHeight: 1.55, color: "var(--fg-msg)", maxWidth: "100%", overflowWrap: "break-word" }}>
+      <Markdown
+        remarkPlugins={REMARK_PLUGINS}
+        components={{
+          // Default markdown gives a ul the browser's 40px indent, which is
+          // what overflowed the modal. Match the transcript's tighter indent.
+          ul: (p) => <ul style={{ margin: "6px 0", paddingLeft: 20 }}>{p.children}</ul>,
+          ol: (p) => <ol style={{ margin: "6px 0", paddingLeft: 20 }}>{p.children}</ol>,
+          // A wide code block scrolls itself rather than the whole modal —
+          // notes are markdown off the network, so someday one will have code.
+          pre: (p) => (
+            <pre style={{ overflowX: "auto", maxWidth: "100%", background: "var(--code-bg)", borderRadius: 8, padding: "10px 12px" }}>
+              {p.children}
+            </pre>
+          ),
+        }}
+      >
+        {body}
+      </Markdown>
     </div>
   );
 }
@@ -10797,7 +10814,11 @@ function ChangelogModal({
             ×
           </button>
         </div>
-        <div style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: "6px 24px 22px" }}>
+        {/* overflowX explicit: with only overflowY set, CSS computes the x
+            axis from visible to auto, so ANY child a few px too wide grows a
+            horizontal scrollbar — markdown's default 40px list indent did
+            exactly that once the notes became rendered markdown. */}
+        <div style={{ flex: 1, minHeight: 0, overflowY: "auto", overflowX: "hidden", padding: "6px 24px 22px" }}>
           {releases.map((rel, i) => (
             <div key={rel.version}>
               {i > 0 && <div style={{ height: 1, background: colors.border, margin: "22px 0" }} />}
