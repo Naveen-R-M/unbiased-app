@@ -7015,6 +7015,16 @@ function ChatPane({
     turnStartIndexRef.current = reset.resume?.running ? reset.entries.length : null;
     turnStartedAtRef.current = null;
     for (const held of reset.resume?.approvals ?? []) applyApproval(held);
+    // A restored step can only still be running if the thread is. Statuses are
+    // persisted in the transcript, so a command that died as inProgress when
+    // the app quit is restored as inProgress — and StepsGroup reads exactly
+    // that to say "Working…", forever, about work no process is doing. Same
+    // disease as the stale approval cards above, one field over.
+    if (!reset.resume?.running) {
+      setEntries((es) =>
+        mapCommandsDeep(es, (e) => (e.status === "inProgress" ? { ...e, status: "canceled" } : e)),
+      );
+    }
     // Occupancy is a property of the conversation being left, not the one
     // being entered. The [threadId] effect below also clears it, but only when
     // the id actually changes — this covers a reset where it does not.
