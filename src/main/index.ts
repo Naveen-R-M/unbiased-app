@@ -33,11 +33,13 @@ import { execFile, execFileSync, spawn as spawnProcess } from "node:child_proces
 import type { ChildProcess } from "node:child_process";
 import { get as httpGet } from "node:http";
 import { EngineClient, engineVersionFromUserAgent, type EngineStatus } from "./engine";
+import { BrowserExtensionBridge } from "./browser-extension-bridge";
 import { spawn as ptySpawn, type IPty } from "@lydell/node-pty";
 
 const engine = new EngineClient();
 let win: BrowserWindow | null = null;
 let lastStatus: EngineStatus = { state: "starting" };
+let browserExtensionBridge: BrowserExtensionBridge | null = null;
 
 // Conversation panes share one engine. "main" is the persistent,
 // sidebar-listed conversation; "side:<n>" panes are scratch tabs on
@@ -564,6 +566,22 @@ async function handleAgentBrowserCall(
           : tool.replace(/^browser_/, "");
   const refusal = await ensureBrowserAllowed(tool, threadId, gateDetail);
   if (refusal) return text(refusal, false);
+  if (browserExtensionBridge?.connected() && (tool === "browser_snapshot" || tool === "browser_read" || tool === "browser_click")) {
+    try {
+      const result = await browserExtensionBridge.call(tool, a);
+      const out = result.content.map((item) => item.text).join("\n");
+      return text(out + browserWallHint(out), result.ok);
+    } catch (error) {
+      if (tool === "browser_click") {
+        return text(
+          `Chrome extension click failed: ${error instanceof Error ? error.message : String(error)}. ` +
+            "Take a new browser_snapshot before retrying; the click may already have reached the page.",
+          false,
+        );
+      }
+      console.warn(`Chrome extension backend failed for ${tool}; falling back to agent-browser`, error);
+    }
+  }
   switch (tool) {
     case "browser_open": {
       const url = webUrlOrNull(str("url"));
@@ -2609,6 +2627,9 @@ async function startEngine(): Promise<void> {
 }
 
 app.whenReady().then(async () => {
+  browserExtensionBridge = new BrowserExtensionBridge(join(app.getPath("userData"), "browser-extension-token"));
+  browserExtensionBridge.start();
+  console.log(`Chrome extension pairing token: ${browserExtensionBridge.pairingToken()}`);
   ipcMain.handle("engine:status", () => lastStatus);
 
   // ── Auth IPC ────────────────────────────────────────────────────────
@@ -3930,6 +3951,8 @@ app.whenReady().then(async () => {
 });
 
 app.on("window-all-closed", () => {
+  browserExtensionBridge?.stop();
+  browserExtensionBridge = null;
   for (const pty of ptys.values()) pty.kill();
   ptys.clear();
   engine.stop();

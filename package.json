@@ -1,7 +1,7 @@
 {
   "name": "unbiased-app",
   "version": "1.2.2",
-  "description": "Unbiased desktop \u2014 Pareto-powered coding agent",
+  "description": "Unbiased desktop — Pareto-powered coding agent",
   "main": "out/main/index.js",
   "scripts": {
     "dev": "electron-vite dev",
@@ -67,17 +67,21 @@
     "react-dom": "^19.2.8",
     "react-markdown": "^10.1.0",
     "rehype-raw": "^7.0.0",
-    "remark-gfm": "^4.0.1"
+    "remark-gfm": "^4.0.1",
+    "ws": "^8.21.3",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/node": "^26.2.0",
     "@types/prismjs": "^1.26.6",
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.4",
+    "@types/ws": "^8.18.1",
     "@vitejs/plugin-react": "^5.2.0",
     "electron": "^43.4.0",
     "electron-builder": "^26.15.3",
     "electron-vite": "^5.0.0",
+    "tsx": "^4.23.12",
     "typescript": "^7.0.2",
     "vite": "^7.3.6"
   },
