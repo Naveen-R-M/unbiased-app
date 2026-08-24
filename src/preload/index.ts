@@ -105,6 +105,13 @@ contextBridge.exposeInMainWorld("unbiased", {
   reviewCreatePr: (path: string) => ipcRenderer.invoke("review:create-pr", path),
   openExternal: (url: string) => ipcRenderer.invoke("browser:open-external", url),
   favicon: (host: string) => ipcRenderer.invoke("link:favicon", host),
+  agentMirrorStart: (p: { width: number; height: number; dpr: number }) => ipcRenderer.invoke("agentmirror:start", p),
+  agentMirrorStop: () => ipcRenderer.invoke("agentmirror:stop"),
+  agentMirrorResize: (p: { width: number; height: number; dpr: number }) => ipcRenderer.invoke("agentmirror:resize", p),
+  agentMirrorInput: (ev: unknown) => ipcRenderer.invoke("agentmirror:input", ev),
+  onAgentMirrorFrame: (cb: (p: unknown) => void) => subscribe("agentmirror:frame", cb),
+  onAgentMirrorState: (cb: (p: unknown) => void) => subscribe("agentmirror:state", cb),
+  onAgentMirrorActivity: (cb: (p: unknown) => void) => subscribe("agentmirror:activity", cb),
 
   openBrowser: (p: { id: number; url?: string }) => ipcRenderer.invoke("browser:open", p),
   setBrowserBounds: (b: { id: number; x: number; y: number; width: number; height: number }) =>

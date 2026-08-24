@@ -499,6 +499,13 @@ declare global {
       reviewCreatePr: (path: string) => Promise<{ ok: boolean; error?: string }>;
       openExternal: (url: string) => Promise<{ ok: boolean }>;
       favicon: (host: string) => Promise<{ dataUrl: string | null }>;
+      agentMirrorStart: (p: { width: number; height: number; dpr: number }) => Promise<{ ok: boolean; error?: string }>;
+      agentMirrorStop: () => Promise<{ ok: boolean }>;
+      agentMirrorResize: (p: { width: number; height: number; dpr: number }) => Promise<{ ok: boolean }>;
+      agentMirrorInput: (ev: Record<string, unknown>) => Promise<{ ok: boolean }>;
+      onAgentMirrorFrame: (cb: (p: { src: string; width: number; height: number }) => void) => () => void;
+      onAgentMirrorState: (cb: (p: { connected: boolean; url?: string; title?: string }) => void) => () => void;
+      onAgentMirrorActivity: (cb: (p: { tool: string }) => void) => () => void;
       changelogReleases: () => Promise<{ releases: ChangelogRelease[] }>;
       updatePrefs: () => Promise<{ autoDownload: boolean; version: string; lastCheckedAt: number | null }>;
       setUpdatePrefs: (p: { autoDownload: boolean }) => Promise<{ ok: boolean }>;
@@ -1633,6 +1640,27 @@ export function App() {
   const [filesTabs, setFilesTabs] = useState<number[]>([]);
   const [treeFiles, setTreeFiles] = useState<Record<number, OpenFileInfo | null>>({});
   const [terminalTabs, setTerminalTabs] = useState<number[]>([]);
+  // Singleton: one Chrome, one mirror — like the terminal, a LIVE tab.
+  const [agentMirrorOpen, setAgentMirrorOpen] = useState(false);
+  useEffect(
+    () =>
+      window.unbiased.onAgentMirrorActivity(() => {
+        // Fires on every approved browser tool (main gates the attached-
+        // external case), so the pane shows up whenever the agent starts
+        // browsing — not only on the one launch per session.
+        setAgentMirrorOpen((already) => {
+          // Don't yank focus away from a tab the user is reading if the pane
+          // is already there; just make sure it exists.
+          if (!already) {
+            setPanelMode("agentmirror");
+            setSideOpenPersisted(true);
+          }
+          return true;
+        });
+      }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
+  );
   const [browserTabs, setBrowserTabs] = useState<number[]>([]);
   // resetSideView runs after openThread's awaits, so its closure values are
   // stale by then: the user may have closed the last browser tab while a big
@@ -1665,6 +1693,7 @@ export function App() {
     ...(reviewOpen ? ["review"] : []),
     ...browserTabs.map((id) => `browser:${id}`),
     ...terminalTabs.map((id) => `terminal:${id}`),
+    ...(agentMirrorOpen ? ["agentmirror"] : []),
     ...openAgents.map((a) => `agent:${a.threadId}`),
   ];
   // Seq numbers survive re-renders; assigning during render is idempotent.
@@ -1680,17 +1709,25 @@ export function App() {
 
   // When the active tab disappears, activate the most recent survivor;
   // only an empty strip closes the panel.
+  //
+  // Keyed on the tab list ITSELF, not on the collections behind it. The old
+  // dependency array named all eight sources by hand, so every new tab kind
+  // had to remember to enlist — and the ninth (the agent browser) did not,
+  // which left the panel open and empty after closing the last tab. This
+  // derived key cannot fall out of date.
+  const tabKeysKey = tabKeys.join("\u0000");
   useEffect(() => {
     if (!sideOpen || panelMode === "launcher") return;
     if (tabKeys.includes(panelMode)) return;
     if (tabOrder.length > 0) setPanelMode(tabOrder[tabOrder.length - 1]);
     else setSideOpenPersisted(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sideOpen, panelMode, sideChats, openFiles, filesTabs, reviewOpen, browserTabs, terminalTabs, openAgents]);
+  }, [sideOpen, panelMode, tabKeysKey]);
 
   /** Close any tab by its key — one dispatcher instead of per-kind closers. */
   function closeTab(key: string): void {
     if (key.startsWith("side:")) closeSideChat(key);
+    else if (key === "agentmirror") setAgentMirrorOpen(false);
     else if (key === "review") setReviewOpen(false);
     else if (key.startsWith("browser:")) closeBrowserTab(Number(key.slice(8)));
     else if (key.startsWith("agent:")) setOpenAgents((as) => as.filter((a) => `agent:${a.threadId}` !== key));
@@ -1943,6 +1980,17 @@ export function App() {
 
   // Closing a terminal tab KILLS its shell (unmount disposes the PTY) —
   // unlike the side chat, a dead terminal has no transcript worth keeping.
+  function openAgentMirrorTab() {
+    setSidePlusOpen(false);
+    setAgentMirrorOpen(true);
+    setPanelMode("agentmirror");
+    setSideOpenPersisted(true);
+  }
+  // StepsGroup renders far below and needs to reopen the pane from a
+  // transcript label; a ref keeps the callback stable without threading a prop
+  // through every layer between here and there.
+  openAgentMirrorRef.current = openAgentMirrorTab;
+  closeAgentMirrorRef.current = () => setAgentMirrorOpen(false);
   function openTerminalTab() {
     setSidePlusOpen(false);
     if (terminalTabs.length >= MAX_TABS_PER_KIND) {
@@ -3266,15 +3314,22 @@ export function App() {
                                 close: () => closeTab(t),
                                 aria: "Close sub-agent",
                               }
-                            : {
-                                icon: <TerminalIcon size={13} />,
-                                label:
-                                  terminalTabs.length > 1
-                                    ? `Terminal ${termIdx + 1}`
-                                    : (activeProjectName ?? "Terminal"),
-                                close: () => closeTab(t),
-                                aria: "Close terminal",
-                              };
+                            : t === "agentmirror"
+                              ? {
+                                  icon: <GlobeIcon size={13} />,
+                                  label: "Agent browser",
+                                  close: () => closeTab(t),
+                                  aria: "Close agent browser",
+                                }
+                              : {
+                                  icon: <TerminalIcon size={13} />,
+                                  label:
+                                    terminalTabs.length > 1
+                                      ? `Terminal ${termIdx + 1}`
+                                      : (activeProjectName ?? "Terminal"),
+                                  close: () => closeTab(t),
+                                  aria: "Close terminal",
+                                };
               return (
                 <button
                   key={t}
@@ -3495,6 +3550,18 @@ export function App() {
               <TerminalPane />
             </div>
           ))}
+          {agentMirrorOpen && (
+            <div
+              style={{
+                flex: 1,
+                minHeight: 0,
+                display: panelMode === "agentmirror" ? "flex" : "none",
+                flexDirection: "column",
+              }}
+            >
+              <AgentMirrorPane active={panelMode === "agentmirror"} />
+            </div>
+          )}
           {browserTabs.map((id) => (
             <div
               key={id}
@@ -5558,14 +5625,20 @@ function AgentLifecycleRow({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
   const prompt = entry.prompt ?? fetchedPrompt;
-  const LABELS: Record<string, { row: string; detail: string }> = {
-    started: { row: "Created an agent", detail: "Created" },
-    interacted: { row: "Messaged an agent", detail: "Messaged" },
-    interrupted: { row: "Interrupted an agent", detail: "Interrupted" },
-    completed: { row: "Closed an agent", detail: "Closed" },
-    failed: { row: "An agent failed", detail: "Failed:" },
+  const LABELS: Record<string, { verb: string; detail: string }> = {
+    started: { verb: "Created", detail: "Created" },
+    interacted: { verb: "Messaged", detail: "Messaged" },
+    interrupted: { verb: "Interrupted", detail: "Interrupted" },
+    completed: { verb: "Closed", detail: "Closed" },
+    failed: { verb: "Failed", detail: "Failed:" },
   };
-  const label = LABELS[entry.event] ?? { row: `Agent ${entry.event}`, detail: entry.event };
+  const label = LABELS[entry.event] ?? { verb: entry.event, detail: entry.event };
+  // The identity lives in the header ("Created 🍄 Singer"), so the expanded
+  // line goes generic — repeating the name twice taught nothing. A row whose
+  // agent never registered a name falls back to the old wording.
+  const headerName = entry.name
+    ? `${entry.agentThreadId ? `${agentEmoji(entry.agentThreadId)} ` : ""}${entry.name}`
+    : "an agent";
   return (
     <div style={{ margin: "14px 0" }}>
       <button
@@ -5585,7 +5658,9 @@ function AgentLifecycleRow({
         }}
       >
         <AgentIcon />
-        {label.row}
+        <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          {label.verb} <span style={{ color: entry.event === "failed" ? "inherit" : "var(--fg-soft)" }}>{headerName}</span>
+        </span>
         <span
           style={{
             display: "inline-block",
@@ -5612,6 +5687,8 @@ function AgentLifecycleRow({
           <span style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
             {label.detail}{" "}
             {onOpen ? (
+              // "a sub-agent" keeps the open-conversation affordance the name
+              // button used to carry — the name itself moved to the header.
               <button
                 onClick={onOpen}
                 title="Open conversation"
@@ -5625,11 +5702,10 @@ function AgentLifecycleRow({
                   padding: 0,
                 }}
               >
-                {entry.agentThreadId ? `${agentEmoji(entry.agentThreadId)} ` : ""}
-                {entry.name}
+                a sub-agent
               </button>
             ) : (
-              <span style={{ color: "var(--fg-soft)" }}>{entry.name}</span>
+              <span>a sub-agent</span>
             )}
             {prompt ? ` with the instructions: ${prompt}` : entry.path ? ` — ${entry.path}` : ""}
           </span>
@@ -5928,6 +6004,154 @@ function SubAgentPane({ threadId, name, status }: { threadId: string; name: stri
               <ShimmerText text="working…" fontSize={13} />
             </div>
           </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/** Live mirror of the agent's Chrome: JPEG frames from main's CDP screencast,
+ *  with clicks/scroll/typing forwarded back. object-fit:contain letterboxes
+ *  the frame, so a click's pane coordinates must be mapped through the drawn
+ *  rect to page coordinates or input lands in the wrong place. */
+function AgentMirrorPane({ active }: { active: boolean }) {
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const imgRef = useRef<HTMLImageElement>(null);
+  const [frame, setFrame] = useState<{ src: string; width: number; height: number } | null>(null);
+  const frameRef = useRef(frame);
+  frameRef.current = frame;
+  const [status, setStatus] = useState<{ connected: boolean; url?: string }>({ connected: false });
+  const lastMoveRef = useRef(0);
+
+  // Start when this tab is shown, stop when hidden — no point streaming JPEGs
+  // into a pane nobody is looking at.
+  useEffect(() => {
+    if (!active) return;
+    const el = wrapRef.current;
+    const w = el?.clientWidth ?? 800;
+    const h = el?.clientHeight ?? 600;
+    // devicePixelRatio: the pane is painted at w*dpr real pixels, so the
+    // capture must match or the frame is upscaled and text goes soft.
+    void window.unbiased.agentMirrorStart({ width: w, height: h, dpr: window.devicePixelRatio || 1 });
+    // TRAILING debounce. The old version was leading-edge only: it sent the
+    // first size it saw and dropped everything within 250ms after it. The pane
+    // is still laying out at mount, so the size it sent was a half-height box
+    // and the corrected one — arriving milliseconds later — was thrown away.
+    // The page then rendered at the wrong aspect and letterboxed for good.
+    let resizeTimer: ReturnType<typeof setTimeout> | null = null;
+    const ro =
+      typeof ResizeObserver !== "undefined"
+        ? new ResizeObserver((entries) => {
+            const r = entries[0]?.contentRect;
+            if (!r || r.width < 1 || r.height < 1) return;
+            if (resizeTimer) clearTimeout(resizeTimer);
+            resizeTimer = setTimeout(() => {
+              resizeTimer = null;
+              void window.unbiased.agentMirrorResize({
+                width: r.width,
+                height: r.height,
+                dpr: window.devicePixelRatio || 1,
+              });
+            }, 150);
+          })
+        : null;
+    if (el && ro) ro.observe(el);
+    return () => {
+      if (resizeTimer) clearTimeout(resizeTimer);
+      ro?.disconnect();
+      void window.unbiased.agentMirrorStop();
+    };
+  }, [active]);
+
+  useEffect(() => {
+    const offs = [
+      window.unbiased.onAgentMirrorFrame((p) => setFrame(p)),
+      window.unbiased.onAgentMirrorState((p) => setStatus({ connected: p.connected, url: p.url })),
+    ];
+    return () => offs.forEach((off) => off());
+  }, []);
+
+  // Pane point -> page point, accounting for the letterbox contain-fit.
+  const toPage = (clientX: number, clientY: number): { x: number; y: number } | null => {
+    const img = imgRef.current;
+    const f = frameRef.current;
+    if (!img || !f) return null;
+    const box = img.getBoundingClientRect();
+    const scale = Math.min(box.width / f.width, box.height / f.height);
+    const drawnW = f.width * scale;
+    const drawnH = f.height * scale;
+    const offX = box.left + (box.width - drawnW) / 2;
+    const offY = box.top + (box.height - drawnH) / 2;
+    const x = (clientX - offX) / scale;
+    const y = (clientY - offY) / scale;
+    if (x < 0 || y < 0 || x > f.width || y > f.height) return null; // clicked the letterbox
+    return { x: Math.round(x), y: Math.round(y) };
+  };
+
+  const send = (ev: Record<string, unknown>) => void window.unbiased.agentMirrorInput(ev);
+  // Modifiers come from the event that carries them — a shared ref would go
+  // stale, since a mouse event can be modified without any key event firing.
+  const modsOf = (e: { altKey: boolean; ctrlKey: boolean; metaKey: boolean; shiftKey: boolean }) =>
+    (e.altKey ? 1 : 0) | (e.ctrlKey ? 2 : 0) | (e.metaKey ? 4 : 0) | (e.shiftKey ? 8 : 0);
+
+  const onMouse = (type: "mousePressed" | "mouseReleased" | "mouseMoved") => (e: React.MouseEvent) => {
+    // Native mousemove fires ~120x/s; each one is an IPC round trip and Chrome
+    // only needs enough to drive hover. Presses and releases are never dropped.
+    if (type === "mouseMoved") {
+      const now = Date.now();
+      if (now - lastMoveRef.current < 33) return;
+      lastMoveRef.current = now;
+    }
+    const p = toPage(e.clientX, e.clientY);
+    if (!p) return;
+    const button = e.button === 2 ? "right" : e.button === 1 ? "middle" : "left";
+    send({ kind: "mouse", type, x: p.x, y: p.y, button: type === "mouseMoved" ? "none" : button, clickCount: e.detail || 1, modifiers: modsOf(e) });
+  };
+
+  const onWheel = (e: React.WheelEvent) => {
+    const p = toPage(e.clientX, e.clientY);
+    if (!p) return;
+    send({ kind: "wheel", x: p.x, y: p.y, deltaX: -e.deltaX, deltaY: -e.deltaY, modifiers: modsOf(e) });
+  };
+
+  const onKeyDown = (e: React.KeyboardEvent) => {
+    // Focus lives on the wrapper; keep the app's own shortcuts out of the page.
+    e.preventDefault();
+    const mods = modsOf(e);
+    // A single printable char with no ctrl/meta is text; everything else is a key.
+    if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) {
+      send({ kind: "text", text: e.key });
+      return;
+    }
+    const keyCode = e.key === "Enter" ? 13 : e.key === "Backspace" ? 8 : e.key === "Tab" ? 9 : e.key === "Escape" ? 27 : e.key === "ArrowUp" ? 38 : e.key === "ArrowDown" ? 40 : e.key === "ArrowLeft" ? 37 : e.key === "ArrowRight" ? 39 : (e.keyCode || 0);
+    send({ kind: "key", type: "rawKeyDown", key: e.key, code: e.code, keyCode, modifiers: mods });
+    send({ kind: "key", type: "keyUp", key: e.key, code: e.code, keyCode, modifiers: mods });
+  };
+
+  return (
+    <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", background: "var(--code-bg)" }}>
+      <div style={{ padding: "6px 12px", fontSize: 12, color: colors.dim, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", flexShrink: 0 }}>
+        {status.connected ? status.url || "Agent browser" : "Connecting to the agent browser…"}
+      </div>
+      <div
+        ref={wrapRef}
+        tabIndex={0}
+        onMouseDown={onMouse("mousePressed")}
+        onMouseUp={onMouse("mouseReleased")}
+        onMouseMove={onMouse("mouseMoved")}
+        onWheel={onWheel}
+        onKeyDown={onKeyDown}
+        onContextMenu={(e) => e.preventDefault()}
+        style={{ flex: 1, minHeight: 0, display: "flex", alignItems: "center", justifyContent: "center", outline: "none", cursor: "default", overflow: "hidden" }}
+      >
+        {frame ? (
+          // width/height 100% + contain: the frame's aspect now matches the
+          // pane's, so "contain" fills it edge to edge with no bars.
+          <img ref={imgRef} src={frame.src} draggable={false} style={{ width: "100%", height: "100%", objectFit: "contain", userSelect: "none" }} alt="" />
+        ) : (
+          <span style={{ color: colors.dim, fontSize: 13 }}>
+            {status.connected ? "Waiting for the first frame…" : "The agent browser is not open."}
+          </span>
         )}
       </div>
     </div>
@@ -7129,6 +7353,12 @@ function ChatPane({
         messageBoundaryRef.current = true;
       }),
       window.unbiased.onTurnCompleted((p) => {
+        // The agent browser is a view of work in progress — when the turn ends
+        // there is nothing left to watch, so it closes itself rather than
+        // lingering as a still frame. Reopen any time from the "Agent Browser"
+        // label in the transcript; that is now its only door, which matters
+        // for sign-ins, where the page is the only place to type.
+        if (p.paneId === paneId) closeAgentMirrorRef.current?.();
         if (p.paneId !== paneId) return;
         setBusy(false);
         onTurnLanded?.();
@@ -7212,6 +7442,13 @@ function ChatPane({
       }),
       window.unbiased.onApprovalRequest((p) => {
         if (p.paneId !== paneId) return;
+        // A permission card IS output — the turn-completion check below already
+        // counts it as work (kind === "command"), but producedRef did not, so a
+        // turn whose only visible result was a card got labelled "the model
+        // returned an empty response" — and on the second one, told the user to
+        // abandon a perfectly good conversation. Two notions of "did anything
+        // happen" in one function, disagreeing.
+        producedRef.current = true;
         applyApproval(p);
       }),
       // The owning turn died (interrupt/failure) — the engine dropped the
@@ -11926,6 +12163,21 @@ function ChatFooter({ status, busy }: { status: EngineStatus; busy: boolean }) {
   );
 }
 
+/** Set by App; read by StepsGroup, which sits outside the component tree that
+ *  owns the side panel. A module ref beats threading a prop through six
+ *  layers for one label. */
+const openAgentMirrorRef: { current: (() => void) | null } = { current: null };
+/** Same indirection for the close side: ChatPane ends the turn, App owns the
+ *  panel. */
+const closeAgentMirrorRef: { current: (() => void) | null } = { current: null };
+
+/** A step driven by the agent browser. Keyed on the tool name rather than the
+ *  human label, which is localised prose and changes. */
+function isBrowserStep(e: CommandEntry): boolean {
+  const c = e.command ?? "";
+  return c.startsWith("browser_") || c.startsWith("Browse the web") || c.startsWith("Use a signed-in browser session");
+}
+
 function StepsGroup({
   items,
   statusLabel,
@@ -11953,35 +12205,80 @@ function StepsGroup({
   // A hidden approval would hang the turn on a question nobody can see.
   const expanded = open || needsApproval;
 
+  // Browser work says so, and says it about a thing the user can go look at.
+  const browsing = items.some(isBrowserStep);
   const summary = needsApproval
-    ? { text: "Needs your approval", color: colors.fg }
+    ? { text: "Needs your approval", color: colors.fg, verb: null as string | null }
     : running
-      ? { text: "Working…", color: colors.amber }
-      : {
-          text: `Worked · ${items.length} step${items.length === 1 ? "" : "s"}${failed ? " · issues" : ""}`,
-          color: failed ? colors.err : colors.dim,
-        };
+      ? { text: browsing ? "Using" : "Working…", color: colors.amber, verb: browsing ? "Using" : null }
+      : browsing
+        ? { text: "Used", color: failed ? colors.err : colors.dim, verb: "Used" }
+        : {
+            text: `Worked · ${items.length} step${items.length === 1 ? "" : "s"}${failed ? " · issues" : ""}`,
+            color: failed ? colors.err : colors.dim,
+            verb: null,
+          };
 
   return (
     <div style={{ margin: "14px 0" }}>
-      <button
-        onClick={() => setOpen((o) => !o)}
-        style={{
-          display: "flex",
-          alignItems: "center",
-          gap: 6,
-          background: "transparent",
-          border: "none",
-          color: summary.color,
-          fontSize: 13.5,
-          cursor: "pointer",
-          padding: "2px 0",
-          fontFamily: "var(--font-ui)",
-        }}
-      >
-        {running && !needsApproval ? <ShimmerText text={summary.text} fontSize={13.5} /> : summary.text}
-        <span
+      {/* A row, not one button: the browser's name is its own control, and a
+          button inside a button is invalid markup. */}
+      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+        <button
+          onClick={() => setOpen((o) => !o)}
+          aria-expanded={expanded}
           style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 6,
+            background: "transparent",
+            border: "none",
+            color: summary.color,
+            fontSize: 13.5,
+            cursor: "pointer",
+            padding: "2px 0",
+            fontFamily: "var(--font-ui)",
+          }}
+        >
+          {running && !needsApproval ? <ShimmerText text={summary.text} fontSize={13.5} /> : summary.text}
+        </button>
+        {summary.verb && (
+          <button
+            onClick={() => openAgentMirrorRef.current?.()}
+            title="Show the agent browser in the side panel"
+            style={{
+              background: "transparent",
+              border: "none",
+              padding: "2px 0",
+              color: colors.accent,
+              fontSize: 13.5,
+              cursor: "pointer",
+              fontFamily: "var(--font-ui)",
+              textDecoration: "underline",
+              textDecorationColor: "transparent",
+              transition: "text-decoration-color 120ms",
+            }}
+            onMouseEnter={(e) => (e.currentTarget.style.textDecorationColor = colors.accent)}
+            onMouseLeave={(e) => (e.currentTarget.style.textDecorationColor = "transparent")}
+          >
+            {/* Inline emoji + name, the same shape sub-agent rows use. Kept
+                inside the button so the icon is part of the click target, and
+                marked decorative — the adjacent word already names it. */}
+            <span aria-hidden="true" style={{ fontSize: 13, marginRight: 5 }}>
+              🌐
+            </span>
+            Agent Browser
+          </button>
+        )}
+        <button
+          onClick={() => setOpen((o) => !o)}
+          aria-label={expanded ? "Hide steps" : "Show steps"}
+          style={{
+            background: "transparent",
+            border: "none",
+            padding: 0,
+            color: summary.color,
+            cursor: "pointer",
             display: "inline-block",
             transform: expanded ? "rotate(90deg)" : "none",
             transition: "transform 120ms",
@@ -11990,8 +12287,8 @@ function StepsGroup({
           }}
         >
           ›
-        </span>
-      </button>
+        </button>
+      </div>
       {expanded &&
         items.map((e) => {
           const label = statusLabel(e);

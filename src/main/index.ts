@@ -199,12 +199,27 @@ async function launchAgentChrome(
   } catch (err) {
     return { ok: false, launched: false, firstRun, error: `Could not create ${profile}: ${String(err)}` };
   }
-  // Visible on purpose: the user signs in here and watches the agent work.
+  // Windowless by default: the Agent browser side tab IS the window, so a
+  // second Chrome on the desktop is just clutter. The tab streams frames and
+  // forwards clicks/typing, so sign-ins happen there too.
+  //
+  // Escape hatch: some sites refuse headless clients outright (bot checks,
+  // certain Google sign-in flows). UNBIASED_AGENT_CHROME_HEADED=1 restores the
+  // real window for those cases without a rebuild.
+  const headed = process.env.UNBIASED_AGENT_CHROME_HEADED === "1";
   managedChrome = spawnProcess(
     bin,
     [
       `--remote-debugging-port=${port}`,
       `--user-data-dir=${profile}`,
+      ...(headed
+        ? // A covered window gets its rendering throttled, which stalls
+          // Page.startScreencast — the mirror must keep working behind the app.
+          ["--disable-backgrounding-occluded-windows"]
+        : ["--headless=new"]),
+      // Headless defaults to 800x600, which makes desktop sites render their
+      // narrow layout. Give pages a normal viewport to lay out in.
+      "--window-size=1440,900",
       "--no-first-run",
       "--no-default-browser-check",
       "about:blank",
@@ -218,7 +233,12 @@ async function launchAgentChrome(
   });
   for (let tries = 0; tries < 24; tries++) {
     await wait(500);
-    if (await cdpAlive(port)) return { ok: true, launched: true, firstRun };
+    if (await cdpAlive(port)) {
+      // Our Chrome is up — same signal the per-tool path sends, so the pane
+      // appears on a cold start too, before the first tool returns.
+      send("agentmirror:activity", { tool: "launch" });
+      return { ok: true, launched: true, firstRun };
+    }
   }
   return { ok: false, launched: true, firstRun, error: `Chrome started but never opened port ${port}.` };
 }
@@ -226,6 +246,272 @@ async function launchAgentChrome(
 // Set when attached to a browser WE DID NOT LAUNCH: closing it would take
 // down tabs that are not ours. A browser this app started is ours to close.
 let browserAttachedExternal = false;
+
+// ── Agent-browser mirror ─────────────────────────────────────────────
+// Shows the agent's Chrome inside the side panel: a minimal CDP client on the
+// same 127.0.0.1 port agent-browser drives. Frames come from
+// Page.startScreencast and cross IPC as data URLs (the renderer's CSP forbids
+// remote images); input goes back through Input.* — the renderer sends only
+// normalized {kind,...} shapes and the mapping to CDP methods lives HERE, so
+// a compromised renderer cannot name arbitrary protocol methods.
+let mirrorWs: WebSocket | null = null;
+// Supervisor state. The pane can be opened before Chrome exists, the agent can
+// close and reopen tabs, and a target can be destroyed mid-session — a single
+// attach attempt loses in all three cases, so "wanting" the mirror is a
+// standing intent that a timer keeps trying to satisfy.
+let mirrorDesired = false;
+let mirrorSize = { width: 800, height: 600, dpr: 1 };
+let mirrorTargetId: string | null = null;
+// The last page the agent asked for. /json/list is not ordered by what the
+// agent is doing — a stray chrome://settings tab sorted ahead of the real work
+// and the pane mirrored the wrong tab — so the agent's own navigation is the
+// authority on which tab to watch.
+let mirrorPreferredUrl: string | null = null;
+// Dimensions of the last frame Chrome sent, in page CSS pixels. Compared each
+// tick against the shape we asked for: if they drift — a dropped resize, or
+// another CDP client changing emulation — the mirror re-imposes its viewport
+// instead of letterboxing until someone drags the pane.
+let mirrorLastFrame: { width: number; height: number } | null = null;
+
+type CdpTarget = { id?: string; type: string; url: string; title?: string; webSocketDebuggerUrl?: string };
+
+function originOf(u: string): string | null {
+  try {
+    return new URL(u).origin;
+  } catch {
+    return null;
+  }
+}
+
+/** Which tab to mirror, most specific signal first. Deterministic for a given
+ *  list, so the supervisor cannot flap between two candidates. */
+function pickMirrorTarget(targets: CdpTarget[]): CdpTarget | null {
+  const pages = targets.filter((t) => t.type === "page" && t.webSocketDebuggerUrl);
+  const web = pages.filter((t) => t.url.startsWith("http://") || t.url.startsWith("https://"));
+  const want = mirrorPreferredUrl;
+  const wantOrigin = want ? originOf(want) : null;
+  return (
+    (want ? web.find((t) => t.url === want) : undefined) ??
+    (wantOrigin ? web.find((t) => originOf(t.url) === wantOrigin) : undefined) ??
+    // Any real web page beats chrome://, devtools://, about: — the agent reads
+    // the web, and those are never the work.
+    web[0] ??
+    pages.find((t) => t.url && t.url !== "about:blank") ??
+    pages[0] ??
+    null
+  );
+}
+let mirrorTimer: NodeJS.Timeout | null = null;
+let mirrorAttaching = false;
+let mirrorMsgId = 0;
+const mirrorPending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
+
+function mirrorCall(method: string, params?: Record<string, unknown>): Promise<unknown> {
+  const ws = mirrorWs;
+  if (!ws || ws.readyState !== WebSocket.OPEN) return Promise.reject(new Error("mirror not connected"));
+  const id = ++mirrorMsgId;
+  ws.send(JSON.stringify({ id, method, params: params ?? {} }));
+  return new Promise((resolve, reject) => {
+    mirrorPending.set(id, { resolve, reject });
+    setTimeout(() => {
+      if (mirrorPending.delete(id)) reject(new Error(`CDP ${method} timed out`));
+    }, 10_000).unref?.();
+  });
+}
+
+/** Make the PAGE's viewport match the pane's shape, so the mirror fills the
+ *  tab like a real browser instead of letterboxing a fixed 1440x900 window
+ *  into it. Width is floored at a desktop size: the pane can be narrow, and a
+ *  700px-wide viewport makes sites serve their mobile layout — which the agent
+ *  would then be reading too. Above that floor the page simply renders larger
+ *  and scales down, exactly like zooming out. */
+function mirrorViewport(paneW: number, paneH: number): { width: number; height: number } {
+  const width = Math.max(1024, Math.round(paneW) || 1024);
+  const ratio = paneW > 0 && paneH > 0 ? paneH / paneW : 0.75;
+  const height = Math.min(4096, Math.max(400, Math.round(width * ratio)));
+  return { width, height };
+}
+
+/** Capture at the density the pane is actually PAINTED at. The frame is drawn
+ *  into paneW*dpr physical pixels, so a deviceScaleFactor of 1 means Chrome
+ *  hands us a 1024px-wide image that gets stretched across ~1490 real pixels —
+ *  visibly soft text. Scale so the frame carries one image pixel per physical
+ *  pixel, and no more: past that it is bytes nobody can see. */
+async function mirrorApplyViewport(
+  paneW: number,
+  paneH: number,
+  dpr: number,
+): Promise<{ width: number; height: number; scale: number }> {
+  const vp = mirrorViewport(paneW, paneH);
+  const wanted = Math.max(1, paneW) * (dpr > 0 ? dpr : 1);
+  const scale = Math.min(2, Math.max(1, wanted / vp.width));
+  await mirrorCall("Emulation.setDeviceMetricsOverride", {
+    width: vp.width,
+    height: vp.height,
+    deviceScaleFactor: scale,
+    mobile: false,
+  });
+  return { ...vp, scale };
+}
+
+/** Screencast bounds in the SAME pixels the frame is rendered in. */
+function mirrorFrameBounds(vp: { width: number; height: number; scale: number }) {
+  return {
+    maxWidth: Math.min(3200, Math.round(vp.width * vp.scale)),
+    maxHeight: Math.min(3200, Math.round(vp.height * vp.scale)),
+  };
+}
+
+function mirrorTeardown(notify: boolean): void {
+  mirrorLastFrame = null;
+  const ws = mirrorWs;
+  // Hand the tab back at its natural size — the agent keeps using it after the
+  // pane closes, and leaving our pane's shape imposed on it would be rude.
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    try {
+      ws.send(JSON.stringify({ id: ++mirrorMsgId, method: "Emulation.clearDeviceMetricsOverride", params: {} }));
+    } catch {
+      /* closing anyway */
+    }
+  }
+  mirrorWs = null;
+  for (const p of mirrorPending.values()) p.reject(new Error("mirror closed"));
+  mirrorPending.clear();
+  try {
+    ws?.close();
+  } catch {
+    /* already gone */
+  }
+  if (notify) send("agentmirror:state", { connected: false });
+}
+
+/** Attach to the most recently active page tab and start streaming frames.
+ *  maxWidth/maxHeight bound the JPEG Chrome renders — the pane's size, so a
+ *  small pane never pays for 4K frames. */
+async function mirrorStart(maxWidth: number, maxHeight: number): Promise<{ ok: boolean; error?: string }> {
+  mirrorTeardown(false);
+  try {
+    const res = await fetch(`http://127.0.0.1:${AGENT_CHROME_PORT}/json/list`, {
+      signal: AbortSignal.timeout(3_000),
+    });
+    if (!res.ok) return { ok: false, error: `CDP list failed (${res.status})` };
+    const targets = (await res.json()) as CdpTarget[];
+    const page = pickMirrorTarget(targets);
+    if (!page) return { ok: false, error: "no page tab to mirror" };
+    mirrorTargetId = page.id ?? null;
+
+    const ws = new WebSocket(page.webSocketDebuggerUrl!);
+    mirrorWs = ws;
+    await new Promise<void>((resolve, reject) => {
+      ws.onopen = () => resolve();
+      ws.onerror = () => reject(new Error("CDP socket failed to open"));
+    });
+    ws.onclose = () => {
+      if (mirrorWs === ws) mirrorTeardown(true);
+    };
+    ws.onmessage = (ev) => {
+      let msg: { id?: number; method?: string; result?: unknown; error?: { message?: string }; params?: Record<string, unknown> };
+      try {
+        msg = JSON.parse(String(ev.data));
+      } catch {
+        return;
+      }
+      if (typeof msg.id === "number") {
+        const p = mirrorPending.get(msg.id);
+        if (p) {
+          mirrorPending.delete(msg.id);
+          if (msg.error) p.reject(new Error(msg.error.message ?? "CDP error"));
+          else p.resolve(msg.result);
+        }
+        return;
+      }
+      if (msg.method === "Page.screencastFrame" && msg.params) {
+        const { data, metadata, sessionId } = msg.params as {
+          data: string;
+          metadata: { deviceWidth: number; deviceHeight: number };
+          sessionId: number;
+        };
+        // Ack immediately or Chrome stops sending after a handful of frames.
+        void mirrorCall("Page.screencastFrameAck", { sessionId }).catch(() => {});
+        mirrorLastFrame = { width: metadata.deviceWidth, height: metadata.deviceHeight };
+        send("agentmirror:frame", {
+          src: `data:image/jpeg;base64,${data}`,
+          width: metadata.deviceWidth,
+          height: metadata.deviceHeight,
+        });
+      } else if (msg.method === "Page.frameNavigated" && msg.params) {
+        const frame = (msg.params as { frame?: { parentId?: string; url?: string } }).frame;
+        if (frame && !frame.parentId) send("agentmirror:state", { connected: true, url: frame.url ?? "" });
+      }
+    };
+
+    await mirrorCall("Page.enable");
+    // A background tab is not painted, so the screencast emits NOTHING — the
+    // pane sat on "Waiting for the first frame…" forever while the agent
+    // worked in a tab Chrome had parked. Measured: 0 frames hidden, 7 in 2.5s
+    // after this call. Both are best-effort: neither is worth failing on.
+    await mirrorCall("Page.bringToFront").catch(() => {});
+    await mirrorCall("Page.setWebLifecycleState", { state: "active" }).catch(() => {});
+    const vp = await mirrorApplyViewport(maxWidth, maxHeight, mirrorSize.dpr);
+    await mirrorCall("Page.startScreencast", {
+      format: "jpeg",
+      // 60 was visibly lossy on text; 85 is near-transparent for UI
+      // screenshots and still a fraction of PNG.
+      quality: 85,
+      ...mirrorFrameBounds(vp),
+      everyNthFrame: 1,
+    });
+    send("agentmirror:state", { connected: true, url: page.url, title: page.title });
+    return { ok: true };
+  } catch (err) {
+    mirrorTeardown(false);
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+// Modifier bitmask (alt 1, ctrl 2, meta 4, shift 8) is computed renderer-side
+// from the DOM event and passed through verbatim.
+type MirrorInput =
+  | { kind: "mouse"; type: "mousePressed" | "mouseReleased" | "mouseMoved"; x: number; y: number; button: "left" | "middle" | "right" | "none"; clickCount: number; modifiers: number }
+  | { kind: "wheel"; x: number; y: number; deltaX: number; deltaY: number; modifiers: number }
+  | { kind: "text"; text: string }
+  | { kind: "key"; type: "rawKeyDown" | "keyUp"; key: string; code: string; keyCode: number; modifiers: number; text?: string };
+
+async function mirrorInput(ev: MirrorInput): Promise<void> {
+  if (ev.kind === "mouse") {
+    await mirrorCall("Input.dispatchMouseEvent", {
+      type: ev.type,
+      x: ev.x,
+      y: ev.y,
+      button: ev.button,
+      clickCount: ev.clickCount,
+      modifiers: ev.modifiers,
+    });
+  } else if (ev.kind === "wheel") {
+    await mirrorCall("Input.dispatchMouseEvent", {
+      type: "mouseWheel",
+      x: ev.x,
+      y: ev.y,
+      deltaX: ev.deltaX,
+      deltaY: ev.deltaY,
+      modifiers: ev.modifiers,
+    });
+  } else if (ev.kind === "text") {
+    // insertText types verbatim into the focused element and needs no key
+    // mapping — the reliable path for printable characters.
+    await mirrorCall("Input.insertText", { text: ev.text.slice(0, 1024) });
+  } else {
+    await mirrorCall("Input.dispatchKeyEvent", {
+      type: ev.type,
+      key: ev.key,
+      code: ev.code,
+      windowsVirtualKeyCode: ev.keyCode,
+      nativeVirtualKeyCode: ev.keyCode,
+      modifiers: ev.modifiers,
+      ...(ev.text !== undefined ? { text: ev.text, unmodifiedText: ev.text } : {}),
+    });
+  }
+}
 
 let agentBrowserBinCache: string | null | undefined;
 function agentBrowserBin(): string | null {
@@ -275,6 +561,23 @@ const APP_DEVELOPER_INSTRUCTIONS = [
   "applies to private data too (their email, messages, dashboards): the card covers it. The one case",
   "to stop and ask is when a tool result says the browser profile is new and not signed in yet — then",
   "tell the user to sign in in the window that opened, and never ask them for a password yourself.",
+  // Delegation. The collaboration tools are available on every turn, but models
+  // rarely reach for them unprompted — Claude Code and codex get "automatic"
+  // sub-agents purely by saying when to delegate, so this does the same. The
+  // retry rule below is not hypothetical: re-briefing a failed agent in-thread
+  // stacks instruction blocks into a growing context until it cannot succeed
+  // (the Euler failure, 2026-08-21). Keep spawning model-initiated — never
+  // tell the user they must ask for agents.
+  "Use sub-agents (spawn_agent) on your own initiative when work splits into independent,",
+  "parallelizable pieces: exploring several modules or directories at once, producing one artifact",
+  "per item in a list, broad research where only conclusions matter, or long self-contained jobs",
+  "that would otherwise fill this conversation with intermediate output. Give each agent a",
+  "self-contained brief — exact paths, the deliverable, acceptance criteria — because it starts",
+  "with none of this conversation's context. Do NOT delegate small edits, sequential steps where",
+  "each depends on the last, or anything needing the full discussion so far; do those yourself.",
+  "Keep it to the few agents the work genuinely needs. If an agent fails on a provider or stream",
+  "error, spawn a FRESH agent with the same brief instead of re-sending instructions to the failed",
+  "one — a retried thread accumulates every prior attempt and only gets more likely to fail.",
 ].join(" ");
 
 const AGENT_BROWSER_TOOLS = [
@@ -636,6 +939,20 @@ async function handleAgentBrowserCall(
           : tool.replace(/^browser_/, "");
   const refusal = await ensureBrowserAllowed(tool, threadId, gateDetail);
   if (refusal) return text(refusal, false);
+  // Any approved browser tool means the agent is about to browse — that, not
+  // Chrome's launch, is the moment to show the user what it is doing. Launch
+  // was the wrong trigger: Chrome usually already exists by the second task,
+  // so the pane never opened again for the rest of the session. Denied calls
+  // fall out above, so this only fires for browsing that actually happens.
+  // Still withheld for a browser the user already had open — auto-mirroring
+  // someone's personal Chrome and its tabs stays opt-in.
+  if (!browserAttachedExternal) send("agentmirror:activity", { tool });
+  // Remember where the agent is going, so the mirror follows it rather than
+  // whatever tab happens to sort first.
+  if (tool === "browser_open") {
+    const target = webUrlOrNull(str("url"));
+    if (target) mirrorPreferredUrl = target;
+  }
   switch (tool) {
     case "browser_open": {
       const url = webUrlOrNull(str("url"));
@@ -4140,6 +4457,114 @@ app.whenReady().then(async () => {
     }
     faviconCache.set(host, dataUrl);
     return { dataUrl };
+  });
+
+  // ── Agent-browser mirror IPC ──
+  /** One supervision step: attach if we are not attached, and notice when the
+   *  tab we were mirroring is gone so the next step re-attaches. */
+  async function mirrorTick(): Promise<{ ok: boolean; error?: string }> {
+    if (!mirrorDesired || mirrorAttaching) return { ok: !!mirrorWs };
+    if (mirrorWs) {
+      // Still attached — make sure the target still exists. A closed tab does
+      // not always deliver a socket close promptly.
+      try {
+        const res = await fetch(`http://127.0.0.1:${AGENT_CHROME_PORT}/json/list`, {
+          signal: AbortSignal.timeout(2_000),
+        });
+        const targets = (await res.json()) as CdpTarget[];
+        const best = pickMirrorTarget(targets);
+        // Re-attach when our tab is gone OR when the agent has moved to a
+        // better one — opening a new tab used to leave the pane on the old.
+        if (mirrorTargetId && (!targets.some((t) => t.id === mirrorTargetId) || (best?.id && best.id !== mirrorTargetId))) {
+          mirrorTeardown(true);
+        } else if (mirrorWs) {
+          // Chrome can park our tab again whenever another one comes forward,
+          // and a parked tab silently stops painting. Cheap to reassert.
+          await mirrorCall("Page.bringToFront").catch(() => {});
+          // Self-correct a wrong-shaped viewport rather than living with it.
+          const want = mirrorViewport(mirrorSize.width, mirrorSize.height);
+          const got = mirrorLastFrame;
+          if (got && (Math.abs(got.width - want.width) > 2 || Math.abs(got.height - want.height) > 2)) {
+            try {
+              const vp = await mirrorApplyViewport(mirrorSize.width, mirrorSize.height, mirrorSize.dpr);
+              await mirrorCall("Page.startScreencast", {
+                format: "jpeg",
+                quality: 85,
+                ...mirrorFrameBounds(vp),
+                everyNthFrame: 1,
+              });
+            } catch {
+              /* next tick */
+            }
+          }
+        }
+      } catch {
+        mirrorTeardown(true); // Chrome went away
+      }
+      return { ok: !!mirrorWs };
+    }
+    mirrorAttaching = true;
+    try {
+      return await mirrorStart(mirrorSize.width, mirrorSize.height);
+    } finally {
+      mirrorAttaching = false;
+    }
+  }
+  function mirrorSupervise(): void {
+    if (mirrorTimer) return;
+    mirrorTimer = setInterval(() => void mirrorTick(), 1_500);
+    mirrorTimer.unref?.();
+  }
+
+  ipcMain.handle("agentmirror:start", async (_e, p: { width: number; height: number; dpr: number }) => {
+    mirrorDesired = true;
+    mirrorSize = {
+      width: Number(p?.width) || 800,
+      height: Number(p?.height) || 600,
+      dpr: Math.min(3, Math.max(1, Number(p?.dpr) || 1)),
+    };
+    mirrorSupervise();
+    return mirrorTick();
+  });
+  ipcMain.handle("agentmirror:stop", () => {
+    mirrorDesired = false;
+    if (mirrorTimer) {
+      clearInterval(mirrorTimer);
+      mirrorTimer = null;
+    }
+    mirrorTeardown(false);
+    return { ok: true };
+  });
+  // Resize = restart the screencast at the new bounds; Chrome allows calling
+  // startScreencast again on a live session.
+  ipcMain.handle("agentmirror:resize", async (_e, p: { width: number; height: number; dpr: number }) => {
+    // Remember it even while detached, so a later re-attach uses the real size.
+    mirrorSize = {
+      width: Number(p?.width) || 800,
+      height: Number(p?.height) || 600,
+      dpr: Math.min(3, Math.max(1, Number(p?.dpr) || mirrorSize.dpr)),
+    };
+    if (!mirrorWs) return { ok: false };
+    try {
+      const vp = await mirrorApplyViewport(mirrorSize.width, mirrorSize.height, mirrorSize.dpr);
+      await mirrorCall("Page.startScreencast", {
+        format: "jpeg",
+        quality: 85,
+        ...mirrorFrameBounds(vp),
+        everyNthFrame: 1,
+      });
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: String(err) };
+    }
+  });
+  ipcMain.handle("agentmirror:input", async (_e, ev: MirrorInput) => {
+    try {
+      await mirrorInput(ev);
+      return { ok: true };
+    } catch {
+      return { ok: false }; // a dropped click is not worth a dialog
+    }
   });
 
   ipcMain.handle("clipboard:has-image", () => !clipboard.readImage().isEmpty());
