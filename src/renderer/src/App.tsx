@@ -1,4 +1,4 @@
-import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import Markdown from "react-markdown";
 // The changelog SHIPS with the build so the Updates tab works offline and on
 // first run, and is superseded at runtime by whatever the releases repo has —
@@ -62,8 +62,12 @@ type Entry =
         expired?: boolean;
         requestId: string;
         reason: string | null;
-        kind?: "command" | "fileChange";
+        kind?: "command" | "fileChange" | "mcpTool";
         grantRoot?: string | null;
+        /** The engine's own wording for the question. codex writes it for MCP
+         *  tool calls and it is the only place the tool's name appears, so it
+         *  is shown verbatim rather than rebuilt here. */
+        message?: string | null;
         decision?: ApprovalDecision;
       };
     };
@@ -313,14 +317,38 @@ type WhoamiResult =
 
 // An approval request replayed when a backgrounded conversation reopens
 // (same payload as the live chat:approval-request event, minus paneId).
+/** A user-added MCP server, as stored in ~/.unbiased/mcp-servers.json and read
+ *  by the supervisor at launch. Local (command) or remote (url), never both. */
+type McpServerConfig = {
+  name: string;
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  url?: string;
+  bearerTokenEnvVar?: string;
+  startupTimeoutSec?: number;
+  toolTimeoutSec?: number;
+  enabledTools?: string[];
+};
+/** What the RUNNING engine reports — authoritative, and empty while the engine
+ *  is down or a newly added server has not been picked up yet. */
+type McpConnected = {
+  name: string;
+  authStatus?: string;
+  tools?: Record<string, unknown>;
+  serverInfo?: { name?: string; title?: string; version?: string; description?: string | null } | null;
+};
+type McpStatusEvent = { name: string; status: string; error: string | null; failureReason: string | null };
+
 type HeldApproval = {
   requestId: string;
-  kind?: "command" | "fileChange";
+  kind?: "command" | "fileChange" | "mcpTool";
   itemId: string | null;
   command: string;
   cwd: string | null;
   reason: string | null;
   grantRoot?: string | null;
+  message?: string | null;
   // Present when the request came from a sub-agent's thread (multi-agent) —
   // the card renders in the parent's pane, tagged with the agent's name.
   agentName?: string;
@@ -390,17 +418,22 @@ declare global {
         decision: ApprovalDecision,
       ) => Promise<{ ok: boolean; expired?: boolean }>;
       liveApprovals: () => Promise<{ requestIds: string[] }>;
+      mcpList: () => Promise<{ connected: McpConnected[]; configured: McpServerConfig[]; error: string | null; configError: string | null }>;
+      mcpSave: (servers: McpServerConfig[]) => Promise<{ ok: boolean; error?: string }>;
+      mcpApply: () => Promise<{ ok: boolean; busy?: boolean }>;
+      onMcpStatus: (cb: (p: McpStatusEvent) => void) => () => void;
       onApprovalCanceled: (cb: (p: { paneId: PaneId; requestId: string }) => void) => () => void;
       onApprovalRequest: (
         cb: (p: {
           paneId: PaneId;
           requestId: string;
-          kind?: "command" | "fileChange";
+          kind?: "command" | "fileChange" | "mcpTool";
           itemId: string | null;
           command: string;
           cwd: string | null;
           reason: string | null;
           grantRoot?: string | null;
+          message?: string | null;
         }) => void,
       ) => () => void;
       onCommand: (
@@ -738,6 +771,7 @@ export function App() {
   const [theme, setTheme] = useState<ThemeConfig>(loadTheme);
   const [showSettings, setShowSettings] = useState(false);
   const [showChangelog, setShowChangelog] = useState(false);
+  const [mcpOpen, setMcpOpen] = useState(false);
   // Unread until the user has opened the log at its current top version.
   // The releases repo wins when we have it; the bundled copy covers offline
   // and first run. Both are generated from CHANGELOG.md, so neither can drift.
@@ -3201,6 +3235,7 @@ export function App() {
             ) : undefined
           }
           onOpenAgent={openAgentTab}
+          onOpenMcp={() => setMcpOpen(true)}
           onBusyChange={(b) => {
             setMainBusy(b);
             if (b) setMainStarted(true);
@@ -3598,6 +3633,7 @@ export function App() {
             onAccessModeChange={changeAccessMode}
             planMode={planMode}
             onTogglePlanMode={togglePlanMode}
+            onOpenMcp={() => setMcpOpen(true)}
             emptyState={
               <div style={{ textAlign: "center", padding: "0 24px" }}>
                 <div style={{ color: colors.dim, display: "flex", justifyContent: "center", marginBottom: 10 }}>
@@ -4336,6 +4372,7 @@ export function App() {
           </div>
         </div>
       )}
+      {mcpOpen && <McpPanel onClose={() => setMcpOpen(false)} />}
       {showChangelog && (
         <ChangelogModal releases={releases} onClose={() => setShowChangelog(false)} />
       )}
@@ -6902,6 +6939,7 @@ function ChatPane({
   threadId,
   persistTranscript,
   onOpenAgent,
+  onOpenMcp,
 }: {
   paneId: PaneId;
   connected: boolean;
@@ -6943,6 +6981,7 @@ function ChatPane({
   persistTranscript?: boolean;
   // Opens a sub-agent's conversation in the side panel (lifecycle rows).
   onOpenAgent?: (a: { threadId: string; name: string }) => void;
+  onOpenMcp?: () => void;
 }) {
   const [entries, setEntries] = useState<Entry[]>(reset.entries);
   const [draft, setDraft] = useState("");
@@ -7201,7 +7240,13 @@ function ChatPane({
   function applyApproval(p: HeldApproval): void {
     setEntries((es) => {
       const cleaned = withoutTrailingPlaceholder(es);
-      const approval = { requestId: p.requestId, reason: p.reason, kind: p.kind, grantRoot: p.grantRoot };
+      const approval = {
+        requestId: p.requestId,
+        reason: p.reason,
+        kind: p.kind,
+        grantRoot: p.grantRoot,
+        message: p.message,
+      };
       const idx = cleaned.findIndex((e) => e.kind === "command" && e.itemId === p.itemId);
       // A resumed conversation's approval attaches to a card INSIDE history,
       // below the turn scope — widen the scope so the waiting… status sees
@@ -8174,6 +8219,15 @@ function ChatPane({
                 desc={clipHasImage ? undefined : "Nothing copied"}
                 disabled={!clipHasImage}
                 onClick={() => void attachClipboardImage()}
+              />
+              <MenuItem
+                icon={<McpIcon />}
+                label="MCP"
+                desc="Show MCP server status"
+                onClick={() => {
+                  setPlusOpen(false);
+                  onOpenMcp?.();
+                }}
               />
               <MenuItem
                 icon={<LightbulbIcon />}
@@ -9214,6 +9268,383 @@ const pillButtonStyle: React.CSSProperties = {
 /** Sidebar card offering the newer release. Click = download, verify, swap
  *  the app bundle, relaunch. Progress replaces the label in place so the
  *  card never changes size mid-update. */
+/** The Model Context Protocol mark.
+ *
+ *  viewBox and stroke are fitted to sit beside the app's other line icons
+ *  rather than taken from the official asset. Measured: the paths span
+ *  25–167.8 x 22.9–199.3, so the box is centred on (96.4, 111.1) and sized so
+ *  the inked height fills 86% of it — the paperclip fills ~90% of its 24 box,
+ *  and the official 12/195 stroke read visibly lighter than the paperclip's
+ *  1.7/24 (7.1%) next to it. 17/225 is 7.6%, which matches. Straight from the
+ *  asset the mark was both smaller and thinner than every icon around it. */
+function McpIcon({ size = 15 }: { size?: number }) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="-16 -1 225 225"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="17"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M25 97.8528L92.8823 29.9706C102.255 20.598 117.451 20.598 126.823 29.9706C136.196 39.3431 136.196 54.5391 126.823 63.9117L75.5581 115.177" />
+      <path d="M76.2652 114.47L126.823 63.9117C136.196 54.5391 151.392 54.5391 160.765 63.9117C170.137 73.2843 170.137 88.4802 160.765 97.8528L92.8823 165.735C87.2254 171.392 87.2254 180.564 92.8823 186.221L105.941 199.28" />
+      <path d="M109.485 46.7157L58.2196 97.9812C48.8471 107.354 48.8471 122.55 58.2196 131.922C67.5922 141.295 82.7882 141.295 92.1608 131.922L143.426 80.6569" />
+    </svg>
+  );
+}
+
+/** Connected MCP servers, and the form for adding one.
+ *
+ *  Two lists on purpose. `connected` is what the running engine has; the
+ *  supervisor reads the config file only at launch, so a server the user just
+ *  added is configured but not yet connected. Collapsing the two would either
+ *  hide a real server or claim a pending one is live. */
+function McpPanel({ onClose }: { onClose: () => void }) {
+  const [connected, setConnected] = useState<McpConnected[]>([]);
+  const [configured, setConfigured] = useState<McpServerConfig[]>([]);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [configError, setConfigError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [adding, setAdding] = useState(false);
+  const [applying, setApplying] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
+
+  // Form state
+  const [fName, setFName] = useState("");
+  const [fRemote, setFRemote] = useState(false);
+  const [fCommand, setFCommand] = useState("");
+  const [fArgs, setFArgs] = useState("");
+  const [fUrl, setFUrl] = useState("");
+  const [fToken, setFToken] = useState("");
+  const [fEnv, setFEnv] = useState("");
+  const [formError, setFormError] = useState<string | null>(null);
+
+  const refresh = useCallback(() => {
+    void window.unbiased.mcpList().then((r) => {
+      setConnected(r.connected ?? []);
+      setConfigured(r.configured ?? []);
+      setLoadError(r.error);
+      setConfigError(r.configError);
+      setLoading(false);
+    });
+  }, []);
+  useEffect(refresh, [refresh]);
+  // A server starting or failing while the panel is open should be visible
+  // without a manual refresh — this is the only signal that a server died.
+  useEffect(() => window.unbiased.onMcpStatus(() => refresh()), [refresh]);
+
+  const connectedNames = new Set(connected.map((c) => c.name.toLowerCase()));
+  const pending = configured.filter((c) => !connectedNames.has(c.name.toLowerCase()));
+
+  function resetForm() {
+    setFName(""); setFRemote(false); setFCommand(""); setFArgs("");
+    setFUrl(""); setFToken(""); setFEnv(""); setFormError(null);
+  }
+
+  async function saveNew() {
+    const env: Record<string, string> = {};
+    for (const line of fEnv.split("\n").map((l) => l.trim()).filter(Boolean)) {
+      const eq = line.indexOf("=");
+      if (eq <= 0) { setFormError(`"${line}" should be written as NAME=value.`); return; }
+      env[line.slice(0, eq).trim()] = line.slice(eq + 1).trim();
+    }
+    const srv: McpServerConfig = fRemote
+      ? { name: fName.trim(), url: fUrl.trim(), ...(fToken.trim() ? { bearerTokenEnvVar: fToken.trim() } : {}) }
+      : {
+          name: fName.trim(),
+          command: fCommand.trim(),
+          ...(fArgs.trim() ? { args: fArgs.trim().split(/\s+/) } : {}),
+          ...(Object.keys(env).length ? { env } : {}),
+        };
+    const next = [...configured, srv];
+    const res = await window.unbiased.mcpSave(next);
+    if (!res.ok) { setFormError(res.error ?? "Could not save."); return; }
+    setConfigured(next);
+    setAdding(false);
+    resetForm();
+    setNotice("Saved. Restart the engine to connect it.");
+  }
+
+  async function removeServer(name: string) {
+    const next = configured.filter((c) => c.name !== name);
+    const res = await window.unbiased.mcpSave(next);
+    if (!res.ok) { setNotice(res.error ?? "Could not save."); return; }
+    setConfigured(next);
+    setNotice("Removed. Restart the engine to apply.");
+  }
+
+  async function apply() {
+    setApplying(true);
+    const res = await window.unbiased.mcpApply();
+    setApplying(false);
+    if (!res.ok && res.busy) { setNotice("The conversation is still working — try again once it finishes."); return; }
+    setNotice(null);
+    refresh();
+  }
+
+  const inputStyle: React.CSSProperties = {
+    width: "100%",
+    // box-sizing: form controls get border-box from the UA sheet, but this app
+    // has no global reset (it is set per-element, as in LoginView), so state it
+    // rather than inherit it by luck.
+    boxSizing: "border-box",
+    // THE fix for the off-centre form. These fields sit inside a flex column,
+    // and a flex item defaults to min-width:auto — which for an input is its
+    // intrinsic ~20-character width, NOT zero. On a window narrow enough that
+    // the card is 92vw rather than 560px, the fields refused to shrink, spilled
+    // past the content box, and swallowed the padding on the right while the
+    // left stayed put. min-width:0 lets them track the container instead.
+    minWidth: 0,
+    background: "var(--panel-2)",
+    color: colors.fg,
+    border: `1px solid ${colors.border}`,
+    borderRadius: 10,
+    padding: "10px 12px",
+    fontSize: 13.5,
+    fontFamily: "var(--font-ui)",
+    outline: "none",
+  };
+  const labelStyle: React.CSSProperties = { color: colors.dim, fontSize: 13, lineHeight: 1.4, marginBottom: 6, display: "block" };
+  // Borrowed wholesale from the Full Access disclosure so the two read as the
+  // same kind of dialog: the inset panel-2 group, the 999 pills, and its type
+  // scale (19 title / 14 body / 14.5 row title / 13.5 row detail).
+  const insetStyle: React.CSSProperties = {
+    background: "var(--panel-2)",
+    borderRadius: 14,
+    padding: "4px 16px",
+    marginTop: 16,
+  };
+  const btnSecondary: React.CSSProperties = {
+    background: "var(--chip)", border: "none", borderRadius: 999, color: colors.fg,
+    fontSize: 14.5, cursor: "pointer", fontFamily: "inherit", padding: "10px 20px",
+  };
+  const btnPrimary: React.CSSProperties = {
+    display: "flex", alignItems: "center", gap: 8,
+    background: "rgba(255, 86, 63, 0.14)", border: "none", borderRadius: 999,
+    color: colors.accent, fontSize: 14.5, fontWeight: 500, cursor: "pointer",
+    fontFamily: "inherit", padding: "10px 20px",
+  };
+  // Row-level actions sit inside the inset group, so they step down a size.
+  const btnSmall: React.CSSProperties = {
+    background: "var(--chip)", border: "none", borderRadius: 999, color: colors.fg,
+    fontSize: 13, cursor: "pointer", fontFamily: "inherit", padding: "6px 14px", flexShrink: 0,
+  };
+
+  return (
+    <div
+      style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)", display: "grid", placeItems: "center", zIndex: 100 }}
+      onClick={onClose}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          background: colors.panel,
+          border: `1px solid ${colors.border}`,
+          // Matching the Full Access disclosure: 18 radius, 560 wide, the
+          // heavier 0.55 shadow.
+          borderRadius: 18,
+          width: 560,
+          maxWidth: "calc(100vw - 48px)",
+          boxSizing: "border-box",
+          // That dialog is short enough never to scroll; this one grows with
+          // the server list and the form, so it needs a cap. The 6px scrollbar
+          // (index.html styles it, so it takes layout space rather than
+          // overlaying) sits outside padding-right, flush to the border — hence
+          // 20 + 6 = 26, matching the 26 on the left. `stable` reserves the
+          // gutter even when the content fits, so the padding does not jump as
+          // servers are added and removed.
+          maxHeight: "84vh",
+          overflowY: "auto",
+          padding: "24px 20px 22px 26px",
+          scrollbarGutter: "stable",
+          boxShadow: "0 16px 48px rgba(0,0,0,0.55)",
+          fontFamily: "var(--font-ui)",
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 19, fontWeight: 600, color: colors.fg }}>
+          <span style={{ color: colors.accent, display: "flex" }}><McpIcon size={18} /></span>
+          MCP servers
+        </div>
+        <p style={{ color: colors.dim, fontSize: 14, lineHeight: 1.55, margin: "12px 0 0" }}>
+          Model Context Protocol servers give Pareto extra tools. Some are a program
+          Pareto runs; others already listen on a URL — including apps on this
+          machine, like Figma's Dev Mode server.
+        </p>
+
+        {loading && (
+          <div style={{ color: colors.dim, fontSize: 14, lineHeight: 1.55, marginTop: 16 }}>Loading…</div>
+        )}
+
+        {!loading && connected.length === 0 && pending.length === 0 && (
+          <div style={{ color: colors.dim, fontSize: 14, lineHeight: 1.55, marginTop: 16 }}>
+            No MCP servers yet.
+          </div>
+        )}
+
+        {/* One inset group holding every server, the way the disclosure groups
+            its capabilities — rather than rows floating on the card. */}
+        {(connected.length > 0 || pending.length > 0) && (
+          <div style={insetStyle}>
+            {[
+              ...connected.map((srv) => {
+                const toolCount = Object.keys(srv.tools ?? {}).length;
+                return {
+                  key: srv.name,
+                  dot: colors.ok,
+                  title: srv.serverInfo?.title || srv.name,
+                  detail:
+                    `${toolCount} ${toolCount === 1 ? "tool" : "tools"}` +
+                    (srv.serverInfo?.version ? ` · v${srv.serverInfo.version}` : "") +
+                    (srv.authStatus && srv.authStatus !== "unsupported" && srv.authStatus !== "unknown"
+                      ? ` · ${srv.authStatus}`
+                      : ""),
+                  removable: configured.some((c) => c.name === srv.name),
+                  name: srv.name,
+                };
+              }),
+              ...pending.map((srv) => ({
+                key: `pending-${srv.name}`,
+                dot: colors.amber,
+                title: srv.name,
+                detail: "Added — restart the engine to connect",
+                removable: true,
+                name: srv.name,
+              })),
+            ].map((row, i) => (
+              <div
+                key={row.key}
+                style={{
+                  display: "flex",
+                  alignItems: "flex-start",
+                  gap: 14,
+                  padding: "13px 0",
+                  borderTop: i > 0 ? `1px solid ${colors.border}` : "none",
+                }}
+              >
+                <span
+                  style={{
+                    width: 8, height: 8, borderRadius: 99, background: row.dot,
+                    flexShrink: 0, marginTop: 7,
+                  }}
+                />
+                <span style={{ minWidth: 0, flex: 1 }}>
+                  <div style={{ fontSize: 14.5, fontWeight: 600, color: colors.fg }}>{row.title}</div>
+                  <div style={{ fontSize: 13.5, color: colors.dim, marginTop: 2, lineHeight: 1.45 }}>{row.detail}</div>
+                </span>
+                {row.removable && (
+                  <button onClick={() => void removeServer(row.name)} style={{ ...btnSmall, color: colors.err }}>
+                    Remove
+                  </button>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+
+        {configError && (
+          <div style={{ color: colors.err, fontSize: 13.5, lineHeight: 1.5, marginTop: 16 }}>
+            {configError}
+          </div>
+        )}
+        {loadError && (
+          <div style={{ color: colors.dim, fontSize: 13.5, lineHeight: 1.5, marginTop: 16 }}>
+            The engine did not answer, so only your saved list is shown. {loadError}
+          </div>
+        )}
+
+        {/* Keyed on there BEING pending servers, not on having saved one in
+            this session: a server added last time the panel was open would
+            otherwise sit amber forever with no way to connect it. */}
+        {(notice || pending.length > 0) && (
+          <div style={{ display: "flex", alignItems: "center", gap: 12, marginTop: 16, color: colors.amber, fontSize: 13.5, lineHeight: 1.5 }}>
+            <span style={{ flex: 1 }}>
+              {notice ??
+                `${pending.length} ${pending.length === 1 ? "server is" : "servers are"} waiting for a restart to connect.`}
+            </span>
+            <button onClick={() => void apply()} disabled={applying} style={{ ...btnSmall, flexShrink: 0 }}>
+              {applying ? "Restarting…" : "Restart engine"}
+            </button>
+          </div>
+        )}
+
+        {!adding ? (
+          // Right-aligned secondary-then-primary, as in the disclosure.
+          <div style={{ display: "flex", justifyContent: "flex-end", gap: 12, marginTop: 20 }}>
+            <button onClick={onClose} style={btnSecondary}>Close</button>
+            <button onClick={() => setAdding(true)} style={btnPrimary}>
+              <McpIcon size={15} />
+              Add custom MCP
+            </button>
+          </div>
+        ) : (
+          <div style={{ marginTop: 20, borderTop: `1px solid ${colors.border}`, paddingTop: 18, display: "flex", flexDirection: "column", gap: 14 }}>
+            <div>
+              <label style={labelStyle}>Name</label>
+              <input value={fName} onChange={(e) => setFName(e.target.value)} placeholder="my-server" style={inputStyle} />
+            </div>
+            <div style={{ display: "flex", gap: 10 }}>
+              {([[false, "Runs a program"], [true, "Listens on a URL"]] as const).map(([remote, label]) => (
+                <button
+                  key={label}
+                  onClick={() => setFRemote(remote)}
+                  style={fRemote === remote ? { ...btnPrimary, padding: "8px 16px", fontSize: 13.5 } : { ...btnSecondary, padding: "8px 16px", fontSize: 13.5 }}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+            {fRemote ? (
+              <>
+                <div>
+                  <label style={labelStyle}>URL</label>
+                  <input value={fUrl} onChange={(e) => setFUrl(e.target.value)} placeholder="http://127.0.0.1:3845/mcp" style={inputStyle} />
+                  <div style={{ color: colors.dim, fontSize: 13, lineHeight: 1.45, marginTop: 6 }}>
+                    https anywhere, or http for a server on this machine.
+                  </div>
+                </div>
+                <div>
+                  <label style={labelStyle}>Environment variable holding the bearer token (optional)</label>
+                  <input value={fToken} onChange={(e) => setFToken(e.target.value)} placeholder="MY_MCP_TOKEN" style={inputStyle} />
+                  <div style={{ color: colors.dim, fontSize: 13, lineHeight: 1.45, marginTop: 6 }}>
+                    The variable's name is stored, never its value.
+                  </div>
+                </div>
+              </>
+            ) : (
+              <>
+                <div>
+                  <label style={labelStyle}>Command</label>
+                  <input value={fCommand} onChange={(e) => setFCommand(e.target.value)} placeholder="npx" style={inputStyle} />
+                </div>
+                <div>
+                  <label style={labelStyle}>Arguments</label>
+                  <input value={fArgs} onChange={(e) => setFArgs(e.target.value)} placeholder="-y @modelcontextprotocol/server-filesystem" style={inputStyle} />
+                </div>
+                <div>
+                  <label style={labelStyle}>Environment (one NAME=value per line)</label>
+                  <textarea value={fEnv} onChange={(e) => setFEnv(e.target.value)} rows={3} placeholder={"API_TOKEN=abc123"} style={{ ...inputStyle, resize: "vertical" }} />
+                  <div style={{ color: colors.dim, fontSize: 13, lineHeight: 1.45, marginTop: 6 }}>
+                    The server sees only these plus HOME, PATH, SHELL, USER and TMPDIR — not your Unbiased key.
+                  </div>
+                </div>
+              </>
+            )}
+            {formError && <div style={{ color: colors.err, fontSize: 13.5, lineHeight: 1.5 }}>{formError}</div>}
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 12, marginTop: 4 }}>
+              <button onClick={() => { setAdding(false); resetForm(); }} style={btnSecondary}>Cancel</button>
+              <button onClick={() => void saveNew()} style={btnPrimary}>Save</button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function UpdateBanner({
   version,
   progress,
@@ -11926,7 +12357,12 @@ function PermissionsPrompt({
   approval,
   onDecide,
 }: {
-  approval: { reason: string | null; kind?: "command" | "fileChange"; grantRoot?: string | null };
+  approval: {
+    reason: string | null;
+    kind?: "command" | "fileChange" | "mcpTool";
+    grantRoot?: string | null;
+    message?: string | null;
+  };
   onDecide: (d: ApprovalDecision) => void;
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
@@ -11972,7 +12408,13 @@ function PermissionsPrompt({
 
   const rootName = approval.grantRoot?.split("/").filter(Boolean).pop();
   const title =
-    approval.kind === "fileChange" ? (
+    // An MCP tool call arrives with codex's own wording, which names the
+    // server and the tool. Showing it verbatim keeps the card truthful when
+    // the engine changes its phrasing, and avoids inventing a sentence that
+    // cannot mention the tool (the request carries no tool field).
+    approval.kind === "mcpTool" ? (
+      <>{approval.message ?? "Allow Pareto to run this MCP tool?"}</>
+    ) : approval.kind === "fileChange" ? (
       rootName ? (
         <>
           Allow Pareto to edit the contents of{" "}

@@ -31,16 +31,27 @@ export class EngineClient extends EventEmitter {
 
   start(enginePath: string, extraEnv?: Record<string, string>): void {
     this.emitStatus({ state: "starting" });
-    this.proc = spawn(enginePath, [], {
+    // Held in a local as well as on `this`, because every handler below has to
+    // know WHICH process it is speaking for. A restart (stop() then start())
+    // leaves the old child's events to arrive asynchronously, after the new
+    // child is already live and owns `this.proc` and `this.pending` — so an
+    // unguarded handler acts on the new engine's state using the dead one's
+    // news. That surfaced as "engine exited with code null" sitting in the
+    // footer while a perfectly healthy engine was running, and could reject
+    // the new engine's in-flight handshake. `code` is null there because our
+    // own stop() kills with SIGTERM rather than the child exiting on its own.
+    const proc = spawn(enginePath, [], {
       stdio: ["pipe", "pipe", "pipe"],
       // extraEnv lets the caller pin the API key for THIS launch (login flow)
       // so a stale process-level UNBIASED_API_KEY can't override the key the
       // user just signed in with.
       env: extraEnv ? { ...process.env, ...extraEnv } : process.env,
     });
+    this.proc = proc;
 
-    const lines = createInterface({ input: this.proc.stdout });
+    const lines = createInterface({ input: proc.stdout });
     lines.on("line", (line) => {
+      if (this.proc !== proc) return; // superseded: not our protocol stream
       const text = line.trim();
       if (!text) return;
       let msg: Record<string, unknown>;
@@ -53,15 +64,24 @@ export class EngineClient extends EventEmitter {
     });
 
     // Engine logs (RUST_LOG etc.) arrive on stderr; keep them out of the
-    // protocol path but visible for debugging.
-    this.proc.stderr.on("data", (chunk: Buffer) => {
+    // protocol path but visible for debugging. Not gated on the identity
+    // check: a dying engine's last words are the most useful ones.
+    proc.stderr.on("data", (chunk: Buffer) => {
       console.error("[engine]", chunk.toString().trimEnd());
     });
 
-    this.proc.on("exit", (code) => {
-      const detail = `engine exited with code ${code}`;
+    proc.on("exit", (code, signal) => {
+      // Superseded by a newer child: its exit is ours to expect, not to
+      // report, and `this.pending` no longer belongs to it.
+      if (this.proc !== proc) return;
+      // Name the signal. "code null" alone is what a kill looks like, and it
+      // reads as a mystery crash to anyone who did not send the signal.
+      const detail = signal
+        ? `engine stopped (${signal})`
+        : `engine exited with code ${code}`;
       for (const p of this.pending.values()) p.reject(new Error(detail));
       this.pending.clear();
+      this.proc = null;
       this.emitStatus({ state: "exited", code, detail });
     });
   }

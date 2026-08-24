@@ -23,6 +23,7 @@ import {
   readdirSync,
   readFileSync,
   readSync,
+  renameSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -1662,6 +1663,26 @@ function threadToEntries(thread: WireThread): unknown[] {
           });
           break;
         }
+        case "mcpToolCall": {
+          const t = item as unknown as {
+            id?: string;
+            server?: string;
+            tool?: string;
+            arguments?: unknown;
+            status?: string;
+            error?: { message?: string } | null;
+          };
+          const margs = t.arguments && typeof t.arguments === "object" ? t.arguments : {};
+          const margsText = Object.keys(margs).length ? ` ${JSON.stringify(margs)}` : "";
+          entries.push({
+            kind: "command",
+            itemId: t.id ?? "unknown",
+            command: `${t.server ?? "mcp"}.${t.tool ?? "tool"}${margsText}`.slice(0, 400),
+            status: t.status ?? "completed",
+            output: t.error?.message ?? undefined,
+          });
+          break;
+        }
         case "contextCompaction":
           entries.push({ kind: "compaction" });
           break;
@@ -2379,6 +2400,13 @@ function createWindow(): void {
 type ApprovalDecision = "accept" | "acceptForSession" | "decline";
 type PendingApproval = { threadId: string | null } & (
   | { kind: "engine"; rpcId: number | string }
+  // An MCP tool call. codex gates every one behind
+  // mcpServer/elicitation/request and expects {action}, NOT the {decision}
+  // every other approval answers with. Answering with {decision} does not
+  // merely get refused — it fails to deserialize server-side, and the call
+  // comes back to the user as "user rejected MCP tool call", blaming them
+  // for a choice they were never shown. Verified against engine 0.147.0.
+  | { kind: "elicitation"; rpcId: number | string }
   // Client-executed tools (the agent browser) need the same card, but the
   // decision resolves a promise here instead of answering an engine RPC.
   | { kind: "local"; settle: (decision: ApprovalDecision) => void }
@@ -2899,6 +2927,33 @@ function wireNotifications(): void {
                   : (d.status ?? (phase === "started" ? "inProgress" : "completed")),
             },
           });
+        } else if (item?.type === "mcpToolCall") {
+          // MCP tool calls render as command-style cards, like the browser
+          // tools above. Status comes straight from the engine, which reports
+          // inProgress / completed / failed.
+          const t = item as unknown as {
+            id?: string;
+            server?: string;
+            tool?: string;
+            arguments?: unknown;
+            status?: string;
+            error?: { message?: string } | null;
+          };
+          const margs = t.arguments && typeof t.arguments === "object" ? t.arguments : {};
+          const margsText = Object.keys(margs).length ? ` ${JSON.stringify(margs)}` : "";
+          send("chat:command", {
+            paneId,
+            phase,
+            item: {
+              id: t.id,
+              command: `${t.server ?? "mcp"}.${t.tool ?? "tool"}${margsText}`.slice(0, 400),
+              status: t.status ?? (phase === "started" ? "inProgress" : "completed"),
+              // Without this a failed call is a red card with an empty body.
+              // The engine puts the cause here ("user rejected MCP tool call",
+              // upstream errors), and the step card already renders output.
+              output: t.error?.message ?? undefined,
+            },
+          });
         } else if (item?.type === "plan") {
           if (phase === "completed") {
             const planItem = params.item as { text?: string };
@@ -3037,6 +3092,20 @@ function wireNotifications(): void {
     }
   });
 
+  // MCP server lifecycle. Purely informational — the panel reflects it, and a
+  // server that fails to start is otherwise invisible: its tools simply never
+  // appear, with nothing saying why.
+  engine.on("notification", (msg: { method: string; params?: Record<string, unknown> }) => {
+    if (msg.method !== "mcpServer/startupStatus/updated") return;
+    const p = msg.params ?? {};
+    send("mcp:status", {
+      name: typeof p.name === "string" ? p.name : "(unknown)",
+      status: typeof p.status === "string" ? p.status : "unknown",
+      error: typeof p.error === "string" ? p.error : null,
+      failureReason: typeof p.failureReason === "string" ? p.failureReason : null,
+    });
+  });
+
   engine.on(
     "server-request",
     (msg: { id: number | string; method: string; params?: Record<string, unknown> }) => {
@@ -3107,6 +3176,45 @@ function wireNotifications(): void {
             success: false,
           }))
           .then((response) => engine.respond(msg.id, response));
+        return;
+      }
+      // MCP tool calls. codex gates each one behind an elicitation request,
+      // and until this branch existed the generic decline below answered it
+      // with the wrong shape — so every MCP tool call failed as "user
+      // rejected MCP tool call".
+      if (msg.method === "mcpServer/elicitation/request") {
+        const meta = (params._meta ?? {}) as Record<string, unknown>;
+        const server = typeof params.serverName === "string" ? params.serverName : "an MCP server";
+        // Two flavours arrive on this method. An approval ("may I run this
+        // tool?") is tagged by codex with _meta.codex_approval_kind and is
+        // answerable with accept/decline. A genuine form elicitation (a
+        // server asking the USER for data, per requestedSchema) needs a form
+        // this app does not have — decline it, but decline it in the shape
+        // codex can actually read.
+        if (meta.codex_approval_kind === undefined) {
+          console.warn("[app] declining MCP form elicitation from", server, "— no form UI");
+          engine.respond(msg.id, { action: "decline" });
+          return;
+        }
+        const requestId = `apr_${APPROVAL_BOOT}_${nextEngineApproval++}`;
+        pendingApprovals.set(requestId, { kind: "elicitation", rpcId: msg.id, threadId: approvalThread });
+        deliverApproval({
+          requestId,
+          kind: "mcpTool",
+          // Deliberately NOT attached to the in-flight mcpToolCall card: the
+          // request carries no item id, and inferring "the most recent one"
+          // is precisely how an approval lands on the wrong card (fixed in
+          // 1.2.3, twice). A standalone card costs one row and cannot
+          // mis-answer.
+          itemId: null,
+          command: `${server} tool call`,
+          cwd: null,
+          reason: typeof meta.tool_description === "string" ? meta.tool_description : null,
+          // codex writes the question itself — "Allow the X MCP server to run
+          // tool \"y\"?" — and it is the only place the tool's name appears.
+          // Re-deriving it here would just drift from the engine.
+          message: typeof params.message === "string" ? params.message : null,
+        });
         return;
       }
       // Anything we don't render yet (user-input tools, permissions):
@@ -3629,6 +3737,171 @@ app.whenReady().then(async () => {
   // Which approvals are actually still answerable. A card restored from the
   // transcript looks identical to a live one, so the renderer has to ask —
   // otherwise a request whose turn died with the app still shows Allow/Deny.
+  // ---- MCP servers -------------------------------------------------------
+  // Two different truths, deliberately reported separately: `connected` is
+  // what the running engine actually has (authoritative, but empty while the
+  // engine is down or before a restart), and `configured` is what the user
+  // has asked for. A server present in the second and absent from the first
+  // is exactly the "restart to apply" case the panel needs to show.
+  function mcpConfigPath(): string {
+    return join(app.getPath("home"), ".unbiased", "mcp-servers.json");
+  }
+  type UserMcpServer = {
+    name: string;
+    command?: string;
+    args?: string[];
+    env?: Record<string, string>;
+    url?: string;
+    bearerTokenEnvVar?: string;
+    startupTimeoutSec?: number;
+    toolTimeoutSec?: number;
+    enabledTools?: string[];
+  };
+  // Absent and unreadable are NOT the same answer. Returning [] for both let a
+  // save overwrite a file we had failed to parse — a malformed file read as
+  // "no servers", and the next Save wrote only the newly added one, silently
+  // destroying the rest. The engine fails loudly on this file for exactly this
+  // reason; so must we.
+  function readMcpConfig(): { servers: UserMcpServer[]; error: string | null } {
+    let text: string;
+    try {
+      text = readFileSync(mcpConfigPath(), "utf8");
+    } catch (err) {
+      const missing = (err as NodeJS.ErrnoException)?.code === "ENOENT";
+      return { servers: [], error: missing ? null : `Could not read ${mcpConfigPath()}: ${String(err)}` };
+    }
+    try {
+      const raw = JSON.parse(text) as { servers?: unknown };
+      if (raw.servers !== undefined && !Array.isArray(raw.servers)) {
+        return { servers: [], error: `${mcpConfigPath()} has a "servers" value that is not a list.` };
+      }
+      return { servers: (raw.servers as UserMcpServer[]) ?? [], error: null };
+    } catch {
+      return { servers: [], error: `${mcpConfigPath()} is not valid JSON. Fix or delete it — saving now would discard whatever it holds.` };
+    }
+  }
+  // Mirrors internal/engine/mcp.go. Kept in sync by hand and deliberately
+  // NOT authoritative: the engine revalidates before writing config.toml.
+  // This copy exists only so the form can refuse a bad server immediately
+  // instead of after an engine restart.
+  const MCP_NAME_RE = /^[A-Za-z0-9_-]+$/;
+  const MCP_NAME_MAX = 24;
+  function validateMcpServer(srv: UserMcpServer): string | null {
+    if (!srv.name || !MCP_NAME_RE.test(srv.name)) {
+      return "Name can use only letters, digits, underscores and hyphens.";
+    }
+    if (srv.name.length > MCP_NAME_MAX) {
+      return `Name must be ${MCP_NAME_MAX} characters or fewer, so its tool names stay within the gateway's limit.`;
+    }
+    const hasCmd = !!srv.command, hasUrl = !!srv.url;
+    if (hasCmd && hasUrl) return "Give a command or a URL, not both.";
+    if (!hasCmd && !hasUrl) return "Give a command (local) or an https URL (remote).";
+    if (hasUrl) {
+      // Mirrors isLoopbackHost in internal/engine/mcp.go. Plaintext is refused
+      // for a network hop, but a loopback server never leaves the machine —
+      // and locally-run servers are the common case (Figma's Dev Mode server
+      // is http://127.0.0.1:3845/mcp). Loopback only: 192.168/10./169.254 are
+      // real hops and stay refused.
+      let u: URL;
+      try {
+        u = new URL(srv.url!);
+      } catch {
+        return "That is not a valid URL.";
+      }
+      // new URL() keeps IPv6 literals bracketed; strip them before parsing.
+      // Lowercased to match the engine, whose url.Parse preserves host case —
+      // "LocalHost" passed here and was then refused there, so the app could
+      // save a config that stopped the engine from booting.
+      const host = u.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+      const loopback = host === "localhost" || host === "::1" || /^127\.\d+\.\d+\.\d+$/.test(host);
+      if (u.protocol === "http:" && !loopback) {
+        return "http is allowed only for a server on this machine (localhost). Use https for anything else.";
+      }
+      if (u.protocol !== "http:" && u.protocol !== "https:") {
+        return "The URL must start with https://, or http:// for a server on this machine.";
+      }
+    }
+    for (const [k, v] of Object.entries(srv.env ?? {})) {
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) return `"${k}" is not a valid environment variable name.`;
+      if (k === "UNBIASED_API_KEY" || k === "CODEX_HOME") return `${k} is reserved and cannot be set.`;
+      if (/["\\]|[\u0000-\u001f]/.test(v)) return `The value for ${k} contains a character that is not allowed.`;
+    }
+    for (const v of [srv.command ?? "", srv.url ?? "", ...(srv.args ?? [])]) {
+      if (/["\\]|[\u0000-\u001f]/.test(v)) return "Commands and arguments cannot contain quotes or backslashes.";
+    }
+    // The engine refuses these too. Without them here, a value that arrived
+    // from a hand-edited file round-tripped through this save and then stopped
+    // the engine from starting.
+    for (const [field, n] of [["Startup timeout", srv.startupTimeoutSec], ["Tool timeout", srv.toolTimeoutSec]] as const) {
+      if (n === undefined || n === null) continue;
+      if (typeof n !== "number" || !Number.isFinite(n) || n < 0) return `${field} must be a positive number of seconds.`;
+    }
+    for (const t of srv.enabledTools ?? []) {
+      if (typeof t !== "string" || !MCP_NAME_RE.test(t)) {
+        return `Tool name "${String(t)}" can use only letters, digits, underscores and hyphens.`;
+      }
+    }
+    return null;
+  }
+  ipcMain.handle("mcp:list", async () => {
+    const cfg = readMcpConfig();
+    let connected: unknown[] = [];
+    let error: string | null = null;
+    try {
+      const res = (await engine.request("mcpServerStatus/list", {})) as { data?: unknown[] };
+      connected = Array.isArray(res?.data) ? res.data : [];
+    } catch (err) {
+      error = err instanceof Error ? err.message : String(err);
+    }
+    // configError is reported separately from `error`: one means "the engine
+    // did not answer", the other "your file is broken" — and only the second
+    // must block saving.
+    return { connected, configured: cfg.servers, error, configError: cfg.error };
+  });
+  ipcMain.handle("mcp:save", (_e, payload: { servers: UserMcpServer[] }) => {
+    const servers = Array.isArray(payload?.servers) ? payload.servers : [];
+    // Writing over a file we could not read would discard servers the user
+    // still has. Refuse, and say what to do about it.
+    const existing = readMcpConfig();
+    if (existing.error) return { ok: false, error: existing.error };
+    const seen = new Set<string>();
+    for (const srv of servers) {
+      const problem = validateMcpServer(srv);
+      if (problem) return { ok: false, error: problem };
+      const key = srv.name.toLowerCase();
+      if (seen.has(key)) return { ok: false, error: `More than one server is named "${srv.name}".` };
+      seen.add(key);
+    }
+    try {
+      const dir = join(app.getPath("home"), ".unbiased");
+      mkdirSync(dir, { recursive: true });
+      // Write-then-rename, the same discipline MaterializeHome uses on
+      // config.toml: the engine reads this file at launch, and Save sits right
+      // beside Restart engine, so a plain write's truncate-then-fill window is
+      // long enough for the supervisor to read an empty file and refuse to
+      // start. 0600 because the file can name variables holding credentials.
+      const tmp = `${mcpConfigPath()}.${process.pid}.tmp`;
+      writeFileSync(tmp, JSON.stringify({ servers }, null, 2), { mode: 0o600 });
+      renameSync(tmp, mcpConfigPath());
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+    return { ok: true };
+  });
+  // Config is read by the supervisor at launch, so a change lands on the next
+  // start. Restarting here rather than asking the user to quit the app.
+  ipcMain.handle("mcp:apply", async () => {
+    if (runningTurns.size > 0) return { ok: false, busy: true };
+    // startEngine() already stops the current process and resets sub-agent
+    // state; doing either here as well just kills the child twice.
+    try {
+      await startEngine();
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+    return { ok: true };
+  });
+
   ipcMain.handle("chat:live-approvals", () => ({ requestIds: [...pendingApprovals.keys()] }));
 
   ipcMain.handle("chat:approve", (_e, payload: {
@@ -3641,21 +3914,36 @@ app.whenReady().then(async () => {
     // false the caller can mistake for "sent".
     if (pending === undefined) return { ok: false, expired: true };
     pendingApprovals.delete(payload.requestId);
-    if (pending.kind === "engine") {
-      engine.respond(pending.rpcId, { decision: payload.decision });
-    } else {
-      pending.settle(payload.decision);
-      // No engine item stands behind a local approval card, so nothing would
-      // ever flip it off "running" — resolve it here.
-      const sub = pending.threadId ? subAgents.get(pending.threadId) : undefined;
-      const paneId = paneForThread(sub ? sub.parent : pending.threadId);
+    // No engine item stands behind a synthesized card, so nothing would ever
+    // flip it off "running" — resolve it here. Shared by local approvals and
+    // MCP elicitations, both of which raise a card of their own.
+    function settleSynthesizedCard(threadId: string | null, requestId: string, decision: ApprovalDecision): void {
+      const sub = threadId ? subAgents.get(threadId) : undefined;
+      const paneId = paneForThread(sub ? sub.parent : threadId);
       if (paneId) {
         send("chat:command", {
           paneId,
           phase: "completed",
-          item: { id: payload.requestId, status: payload.decision === "decline" ? "declined" : "completed" },
+          item: { id: requestId, status: decision === "decline" ? "declined" : "completed" },
         });
       }
+    }
+    if (pending.kind === "engine") {
+      engine.respond(pending.rpcId, { decision: payload.decision });
+    } else if (pending.kind === "elicitation") {
+      // "acceptForSession" collapses to a plain accept: codex advertises
+      // persistence options in the request (_meta.persist), but the shape for
+      // choosing one is undocumented, and guessing at it risks a reply that
+      // fails to deserialize — the exact failure this branch exists to fix.
+      // The card still offers the choice; it just asks again next time.
+      engine.respond(pending.rpcId, {
+        action: payload.decision === "decline" ? "decline" : "accept",
+        content: {},
+      });
+      settleSynthesizedCard(pending.threadId, payload.requestId, payload.decision);
+    } else {
+      pending.settle(payload.decision);
+      settleSynthesizedCard(pending.threadId, payload.requestId, payload.decision);
     }
     return { ok: true };
   });

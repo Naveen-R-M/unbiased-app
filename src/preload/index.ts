@@ -56,6 +56,10 @@ contextBridge.exposeInMainWorld("unbiased", {
   decideApproval: (requestId: string, decision: "accept" | "acceptForSession" | "decline") =>
     ipcRenderer.invoke("chat:approve", { requestId, decision }),
   liveApprovals: () => ipcRenderer.invoke("chat:live-approvals"),
+  mcpList: () => ipcRenderer.invoke("mcp:list"),
+  mcpSave: (servers: unknown[]) => ipcRenderer.invoke("mcp:save", { servers }),
+  mcpApply: () => ipcRenderer.invoke("mcp:apply"),
+  onMcpStatus: (cb: (p: unknown) => void) => subscribe("mcp:status", cb),
   onApprovalRequest: (cb: (p: unknown) => void) => subscribe("chat:approval-request", cb),
   onApprovalCanceled: (cb: (p: unknown) => void) => subscribe("chat:approval-canceled", cb),
   onCommand: (cb: (p: unknown) => void) => subscribe("chat:command", cb),
