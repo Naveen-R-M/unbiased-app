@@ -6,6 +6,18 @@ Format matters: `## <version> — <date>`, then `### <section>`, then `-` bullet
 
 Write for the person using the app, not the person who wrote the code.
 
+## 1.4.0 — August 24, 2026
+
+### New
+
+- MCP servers. Pareto can use tools from Model Context Protocol servers now. The **+** beside the message box has an MCP entry showing what is connected and what each server offers, and you can add your own — either a program on this machine or something already listening on a URL, including local apps like Figma's Dev Mode server. A server you add connects the next time the engine starts, and the panel offers to restart it for you.
+
+### Fixed
+
+- A tool from an MCP server no longer refuses itself. Every call used to come back as "user rejected MCP tool call" — a refusal you were never asked about. You now get a permission card naming the server and the tool, and answering it runs the tool.
+- Steps an MCP server runs show up in the conversation, and a failed one says why. They previously left no trace at all, so a tool that ran, or didn't, looked identical.
+- "Error: engine exited with code null" no longer appears while the engine is running perfectly well. Restarting the engine reported the outgoing one's shutdown as a failure of its replacement, which also cancelled whatever the new one was in the middle of.
+
 ## 1.3.3 — August 24, 2026
 
 ### Added
