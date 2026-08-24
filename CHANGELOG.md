@@ -6,6 +6,19 @@ Format matters: `## <version> — <date>`, then `### <section>`, then `-` bullet
 
 Write for the person using the app, not the person who wrote the code.
 
+## 1.3.3 — August 24, 2026
+
+### Added
+
+- Watch the agent browse, inside the app. When the agent uses the web, an **Agent browser** panel opens beside the conversation showing the page live — and you can click, scroll and type in it, which is where you sign in to sites now. No second Chrome window appears on your desktop any more. The panel arrives with the browsing and leaves when the turn ends; reopen it any time from the "Agent Browser" link in the conversation.
+- The assistant now splits work across sub-agents on its own when a task has genuinely independent parts, instead of waiting to be asked.
+
+### Fixed
+
+- A permission card no longer counts as "the model returned an empty response". A turn whose only visible result was a request for permission was reported as empty, and a second one told you to abandon a perfectly healthy conversation.
+- Closing the last panel tab closes the panel again, instead of leaving an empty strip behind.
+- Sub-agent rows say who they are: "Created 🍄 Singer" rather than "Created an agent".
+
 ## 1.3.2 — August 21, 2026
 
 ### Fixed
