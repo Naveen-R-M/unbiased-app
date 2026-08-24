@@ -16,6 +16,7 @@ import { isAbsolute, join, relative } from "node:path";
 import { homedir } from "node:os";
 import {
   closeSync,
+  cpSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -1734,6 +1735,49 @@ function pushStatus(status: EngineStatus): void {
 
 // ── Auth / credentials ───────────────────────────────────────────────
 // The desktop's sign-in surface. The engine wrapper reads the key from
+// ---- Skills ---------------------------------------------------------------
+// Three tiers, and the difference between them is a protocol fact rather than a
+// preference (measured against engine 0.147.0):
+//
+//   bundled  resources/skills            read-only, ships with the app
+//   global   ~/.unbiased/skills          the user's own, every conversation
+//   project  <cwd>/.codex/skills         codex scans this itself, per cwd
+//
+// Only the third is project-scoped. codex has exactly two inputs: a cwd-relative
+// scan hardcoded to `.codex/skills`, and skills/extraRoots/set — a FLAT GLOBAL
+// list with no cwd binding. Registering a per-project directory as an extra root
+// leaks it: a skill under project A shows up inside a project B conversation,
+// tagged scope "user". Verified. Hence the codex-named directory for project
+// skills; it is the only project-scoped mechanism that exists.
+function bundledSkillsDir(): string {
+  const override = process.env.UNBIASED_SKILLS_DIR?.trim();
+  if (override) return override;
+  return app.isPackaged
+    ? join(process.resourcesPath, "skills")
+    : join(app.getAppPath(), "resources", "skills");
+}
+function globalSkillsDir(): string {
+  return join(app.getPath("home"), ".unbiased", "skills");
+}
+/** The roots we hand the engine. Bundled stays read-only — an app update has to
+ *  be able to replace it, and a user edit must not be silently clobbered, so
+ *  "edit" in the UI means copy-into-global. */
+function skillRoots(): string[] {
+  const roots: string[] = [];
+  const bundled = bundledSkillsDir();
+  if (existsSync(bundled)) roots.push(bundled);
+  // Created eagerly so the folder exists to reveal in Finder before the user
+  // has added anything.
+  const g = globalSkillsDir();
+  try {
+    mkdirSync(g, { recursive: true });
+    roots.push(g);
+  } catch (err) {
+    console.error("[skills] could not create", g, err);
+  }
+  return roots;
+}
+
 // UNBIASED_API_KEY (env) else ~/.unbiased/credentials.json; the login flow
 // writes the file and pins the key into the engine's launch env.
 const PLATFORM_BASE = "https://platform.unbiased.ai";
@@ -2473,6 +2517,10 @@ function rootThreadOf(threadId: string | null): string {
 
 // Live PTYs for the integrated terminal, keyed by handle.
 const ptys = new Map<string, IPty>();
+// Staged downloads and unpacked archives, removed on quit so a skill the user
+// rejected leaves nothing behind. Module scope because window-all-closed —
+// which does the cleaning — lives outside the whenReady closure.
+const skillStages = new Set<string>();
 let nextPtyId = 1;
 
 // The in-page annotation picker, injected with executeJavaScript. Runs
@@ -3256,6 +3304,15 @@ async function startEngine(): Promise<void> {
   engine.start(bin, { UNBIASED_API_KEY: stored.key });
 
   const result = await engine.handshake(app.getVersion());
+  // extraRoots is session state, so it has to be re-sent after every engine
+  // start. It cannot live in the Go supervisor: that process execs itself away
+  // before any JSON-RPC happens.
+  try {
+    await engine.request("skills/extraRoots/set", { extraRoots: skillRoots() });
+  } catch (err) {
+    // Not fatal — project skills still work, and the panel reports the gap.
+    console.error("[skills] extraRoots/set failed:", err);
+  }
   pushStatus({
     state: "connected",
     userAgent: result.userAgent,
@@ -3896,6 +3953,560 @@ app.whenReady().then(async () => {
     // state; doing either here as well just kills the child twice.
     try {
       await startEngine();
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+    return { ok: true };
+  });
+
+  // ---- Skills ------------------------------------------------------------
+  ipcMain.handle("skills:list", async (_e, payload?: { cwd?: string | null }) => {
+    // cwds drives the PROJECT tier. codex does not walk up parent directories,
+    // so the path passed here must be the exact folder holding .codex/skills —
+    // normally the conversation's cwd. Verified: a thread opened in
+    // mono/packages/web sees nothing from mono/.codex/skills.
+    const cwd = payload?.cwd?.trim() || mainCwd || null;
+    try {
+      const res = (await engine.request("skills/list", {
+        cwds: cwd ? [cwd] : [],
+        forceReload: true,
+      })) as { data?: { cwd?: string; skills?: unknown[] }[] };
+      const groups = Array.isArray(res?.data) ? res.data : [];
+      // One cwd in, so one group out; flatten rather than make the renderer
+      // handle a shape it never sees.
+      const skills = groups.flatMap((g) => (Array.isArray(g.skills) ? g.skills : []));
+      return {
+        skills,
+        cwd,
+        roots: { bundled: bundledSkillsDir(), global: globalSkillsDir(), project: cwd ? join(cwd, ".codex", "skills") : null },
+        error: null,
+      };
+    } catch (err) {
+      return {
+        skills: [],
+        cwd,
+        roots: { bundled: bundledSkillsDir(), global: globalSkillsDir(), project: cwd ? join(cwd, ".codex", "skills") : null },
+        error: err instanceof Error ? err.message : String(err),
+      };
+    }
+  });
+  // Selector is by path, not name: two roots can hold the same name, and the
+  // path is what the list already gave the renderer.
+  ipcMain.handle("skills:set-enabled", async (_e, payload: { path: string; enabled: boolean }) => {
+    if (!payload?.path || !isAbsolute(payload.path)) return { ok: false, error: "A skill path is required." };
+    try {
+      await engine.request("skills/config/write", { path: payload.path, enabled: !!payload.enabled });
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  });
+  // Opens the folder holding a skill, or creates and opens a root.
+  ipcMain.handle("skills:reveal", (_e, payload: { path: string; isDir?: boolean }) => {
+    const target = payload?.path;
+    if (!target || !isAbsolute(target)) return { ok: false };
+    try {
+      if (payload.isDir) mkdirSync(target, { recursive: true });
+      shell.showItemInFolder(target);
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  });
+
+  // ---- Limits --------------------------------------------------------------
+  // A skill is prose plus, at most, a few helper scripts. These caps are
+  // generous for that and hostile to everything else: a dropped node_modules,
+  // a repo with its history, a zip bomb.
+  //
+  // The uncompressed cap is checked against the archive's OWN declared sizes
+  // before a single byte is extracted. Checking after extraction is not a
+  // check, it is a cleanup.
+  const SKILL_MAX_BYTES = 10 * 1024 * 1024; // 10 MB on disk, unpacked
+  const SKILL_MAX_FILES = 1000;
+  const SKILL_MAX_DOWNLOAD = 20 * 1024 * 1024; // 20 MB over the wire
+  // GB matters: a rejected zip bomb reporting "1024.0 MB" reads like a bug.
+  const humanBytes = (n: number) =>
+    n >= 1024 ** 3 ? `${(n / 1024 ** 3).toFixed(1)} GB`
+    : n >= 1024 ** 2 ? `${(n / 1024 ** 2).toFixed(1)} MB`
+    : `${Math.ceil(n / 1024)} KB`;
+
+  /** One staging directory at a time. Every zip validation and every fetch
+   *  allocates one, and keeping only the newest stops rejected downloads
+   *  accumulating for the life of the session. */
+  function stageSkillDir(): string {
+    for (const old of skillStages) {
+      try {
+        rmSync(old, { recursive: true, force: true });
+      } catch {
+        // under the OS temp dir either way
+      }
+      skillStages.delete(old);
+    }
+    const dir = mkdtempSync(join(tmpdir(), "unbiased-skill-"));
+    skillStages.add(dir);
+    return dir;
+  }
+
+  /** Walk a tree, refusing early rather than measuring something enormous in
+   *  full. Symlinks are counted but not followed — a link out of the tree must
+   *  not smuggle the whole disk past the cap. */
+  function measureTree(root: string): { bytes: number; files: number; over: string | null } {
+    let bytes = 0, files = 0;
+    const stack = [root];
+    while (stack.length) {
+      const dir = stack.pop()!;
+      let entries: import("node:fs").Dirent[];
+      try {
+        entries = readdirSync(dir, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+      for (const e of entries) {
+        const full = join(dir, e.name);
+        if (e.isSymbolicLink()) { files++; continue; }
+        if (e.isDirectory()) { stack.push(full); continue; }
+        files++;
+        try {
+          bytes += statSync(full).size;
+        } catch {
+          // unreadable entry; it still counts toward the file cap
+        }
+        if (files > SKILL_MAX_FILES) return { bytes, files, over: `More than ${SKILL_MAX_FILES} files. A skill should be a handful of documents, not a source tree.` };
+        if (bytes > SKILL_MAX_BYTES) return { bytes, files, over: `Larger than ${humanBytes(SKILL_MAX_BYTES)} unpacked.` };
+      }
+    }
+    return { bytes, files, over: null };
+  }
+
+  /** Read a zip's central directory: total unpacked size, entry count, and the
+   *  entry names, so both the bomb check and the traversal check happen before
+   *  extraction. */
+  function inspectZip(zip: string): { bytes: number; files: number; error: string | null } {
+    let listing: string, names: string;
+    try {
+      listing = execFileSync("/usr/bin/unzip", ["-Zl", zip], { encoding: "utf8", maxBuffer: 8 * 1024 * 1024 });
+      names = execFileSync("/usr/bin/unzip", ["-Z1", zip], { encoding: "utf8", maxBuffer: 8 * 1024 * 1024 });
+    } catch {
+      return { bytes: 0, files: 0, error: "That does not look like a readable zip file." };
+    }
+    // "N files, M bytes uncompressed, ..." — the archive's own claim, and it is
+    // the LAST line. Taking the first match let a crafted entry impersonate the
+    // summary: a file named "2 files, 100 bytes uncompressed.txt" is printed
+    // above the real total, so exec() read 100 bytes for a 209 MB archive and
+    // both caps passed. Proven with a working zip; hence matchAll and the tail.
+    const totals = [...listing.matchAll(/(\d+)\s+files?,\s+(\d+)\s+bytes uncompressed/g)];
+    const tail = totals.length ? totals[totals.length - 1] : null;
+    if (!tail) return { bytes: 0, files: 0, error: "Could not read the zip's contents listing." };
+    const files = Number(tail[1]);
+    const bytes = Number(tail[2]);
+    if (files > SKILL_MAX_FILES) return { bytes, files, error: `That zip holds ${files} files; the limit is ${SKILL_MAX_FILES}.` };
+    if (bytes > SKILL_MAX_BYTES) {
+      return { bytes, files, error: `That zip unpacks to ${humanBytes(bytes)}; the limit is ${humanBytes(SKILL_MAX_BYTES)}.` };
+    }
+    for (const raw of names.split("\n")) {
+      const entry = raw.trim();
+      if (!entry) continue;
+      if (entry.startsWith("/") || entry.includes("..")) {
+        return { bytes, files, error: `That zip contains an unsafe path (${entry}).` };
+      }
+    }
+    return { bytes, files, error: null };
+  }
+
+  /** Find the skill inside an unpacked archive.
+   *
+   *  A bounded breadth-first search rather than a walk down single-child
+   *  wrappers: real repos nest. vercel-labs/skills unpacks to
+   *  `skills-main/skills/find-skills/SKILL.md` — depth two below the repo root,
+   *  with siblings at every level, which a single-child descent gives up on
+   *  immediately. Anything holding one skill resolves; anything holding several
+   *  gets named so the user can link one directly instead of us guessing. */
+  function findSkillRoot(dir: string, wantName?: string): { root: string | null; choices: string[] } {
+    const SEARCH_DEPTH = 5;
+    const SKIP = new Set([".git", "node_modules", ".github", "__pycache__", "dist", "build"]);
+    const hits: string[] = [];
+    let queue: { dir: string; depth: number }[] = [{ dir, depth: 0 }];
+    while (queue.length && hits.length < 25) {
+      const next: typeof queue = [];
+      for (const { dir: cur, depth } of queue) {
+        if (existsSync(join(cur, "SKILL.md"))) { hits.push(cur); continue; } // a skill is a leaf
+        if (depth >= SEARCH_DEPTH) continue;
+        let entries: import("node:fs").Dirent[];
+        try {
+          entries = readdirSync(cur, { withFileTypes: true });
+        } catch {
+          continue;
+        }
+        for (const e of entries) {
+          if (!e.isDirectory() || SKIP.has(e.name)) continue;
+          // Dot-directories are skipped EXCEPT the ones skill collections
+          // actually use — openai/skills keeps its curated set in `.curated`.
+          if (e.name.startsWith(".") && !/^\.(curated|experimental|codex)$/.test(e.name)) continue;
+          next.push({ dir: join(cur, e.name), depth: depth + 1 });
+        }
+      }
+      queue = next;
+    }
+    // A link that named a skill picks it out of a repo holding many — which is
+    // the whole point of a registry link, and of a /tree/ link to one folder.
+    if (wantName) {
+      const named = hits.find((h) => h.split("/").filter(Boolean).pop() === wantName);
+      if (named) return { root: named, choices: [] };
+    }
+    if (hits.length === 1) return { root: hits[0], choices: [] };
+    if (hits.length > 1) return { root: null, choices: hits.map((h) => relative(dir, h)) };
+    return { root: null, choices: [] };
+  }
+
+  // A skill directory is `<name>/SKILL.md` plus whatever else it needs. Only
+  // the manifest is required, and its frontmatter is the contract.
+  const SKILL_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
+  const SKILL_NAME_MAX = 64;
+  type SkillSource = { kind: "folder" | "manifest"; manifest: string; name: string; description: string | null };
+
+  /** Minimal frontmatter reader. A YAML dependency would be the only one in
+   *  this app, for two scalar fields on the first lines of a file. */
+  function readSkillFrontmatter(manifest: string): { name: string | null; description: string | null } {
+    let text: string;
+    try {
+      text = readFileSync(manifest, "utf8").slice(0, 8192);
+    } catch {
+      return { name: null, description: null };
+    }
+    const m = /^---\r?\n([\s\S]*?)\r?\n---/.exec(text);
+    if (!m) return { name: null, description: null };
+    const field = (key: string): string | null => {
+      const hit = new RegExp(`^${key}:[ \t]*(.+?)[ \t]*$`, "m").exec(m[1]);
+      if (!hit) return null;
+      return hit[1].replace(/^["']|["']$/g, "").trim() || null;
+    };
+    return { name: field("name"), description: field("description") };
+  }
+
+  ipcMain.handle("skills:choose", async () => {
+    if (!win) return { path: null };
+    const res = await dialog.showOpenDialog(win, {
+      // Either shape is legitimate: a whole skill folder, or a lone SKILL.md.
+      properties: ["openFile", "openDirectory"],
+      title: "Choose a skill folder or SKILL.md",
+      buttonLabel: "Choose",
+      defaultPath: mainCwd ?? undefined,
+    });
+    if (res.canceled || res.filePaths.length === 0) return { path: null };
+    return { path: res.filePaths[0] };
+  });
+
+  /** Say yes or no BEFORE anything is copied, and say why in the no case. */
+  /** The shared tail of every add path: a directory (or a lone manifest) that
+   *  should be a skill. Also where the size cap lands for folders and drops. */
+  function validateSkillDir(src: string, opts?: { fromArchive?: boolean }): Record<string, unknown> {
+    const isDir = statSync(src).isDirectory();
+    const manifest = isDir ? join(src, "SKILL.md") : src;
+    if (!existsSync(manifest)) return { ok: false, error: "No SKILL.md found." };
+    let measured: { bytes: number; files: number; over: string | null };
+    if (isDir) {
+      measured = measureTree(src);
+      if (measured.over) return { ok: false, error: measured.over };
+    } else {
+      measured = { bytes: statSync(src).size, files: 1, over: null };
+    }
+    const { name, description } = readSkillFrontmatter(manifest);
+    const folderName = (isDir ? src : join(src, "..")).split("/").filter(Boolean).pop() ?? "";
+    const suggested = name ?? folderName;
+    if (!suggested) return { ok: false, error: "Could not work out a name for this skill." };
+    // Anything the agent might execute is worth naming before it is installed:
+    // a skill is instructions, but it can ship scripts alongside them.
+    const scripts: string[] = [];
+    if (isDir) {
+      const stack = [src];
+      while (stack.length && scripts.length < 20) {
+        const dir = stack.pop()!;
+        for (const e of readdirSync(dir, { withFileTypes: true })) {
+          const full = join(dir, e.name);
+          if (e.isDirectory()) { stack.push(full); continue; }
+          if (/\.(sh|bash|zsh|py|rb|pl|js|mjs|cjs|ts)$/i.test(e.name)) scripts.push(relative(src, full));
+        }
+      }
+    }
+    return {
+      ok: true,
+      path: src,
+      kind: isDir ? "folder" : "manifest",
+      fromArchive: !!opts?.fromArchive,
+      name: suggested,
+      description,
+      bytes: measured.bytes,
+      files: measured.files,
+      sizeLabel: humanBytes(measured.bytes),
+      scripts,
+      warning: description ? null : "This skill has no description, so Pareto has little to go on when deciding to use it.",
+    };
+  }
+
+  ipcMain.handle("skills:validate", (_e, payload: { path?: string }) => {
+    const src = payload?.path;
+    if (!src || !isAbsolute(src)) return { ok: false, error: "Choose a folder or a SKILL.md file." };
+    let isDir: boolean;
+    try {
+      isDir = statSync(src).isDirectory();
+    } catch {
+      return { ok: false, error: "That path could not be read." };
+    }
+    // A zip is staged and unpacked first, then validated like any folder — but
+    // only after its own declared sizes clear the caps.
+    if (!isDir && /\.zip$/i.test(src)) {
+      const zip = inspectZip(src);
+      if (zip.error) return { ok: false, error: zip.error };
+      const stage = stageSkillDir();
+      try {
+        execFileSync("/usr/bin/unzip", ["-q", "-o", "-d", stage, src], { maxBuffer: 8 * 1024 * 1024 });
+      } catch {
+        return { ok: false, error: "That zip could not be unpacked." };
+      }
+      // The pre-check reads the archive's own claim about itself. Measure what
+      // actually landed before going further, so a declaration that lies costs
+      // one rejected extraction rather than the disk.
+      const landed = measureTree(stage);
+      if (landed.over) {
+        rmSync(stage, { recursive: true, force: true });
+        skillStages.delete(stage);
+        return { ok: false, error: `That zip unpacked to more than it declared. ${landed.over}` };
+      }
+      const found = findSkillRoot(stage);
+      if (!found.root) {
+        return {
+          ok: false,
+          error: found.choices.length
+            ? `That zip holds several skills (${found.choices.slice(0, 4).join(", ")}${found.choices.length > 4 ? ", …" : ""}). Unzip it and choose one folder.`
+            : "No SKILL.md inside that zip.",
+        };
+      }
+      return validateSkillDir(found.root, { fromArchive: true });
+    }
+    const manifest = isDir ? join(src, "SKILL.md") : src;
+    if (!isDir && !/(^|\/)SKILL\.md$/.test(src)) {
+      return { ok: false, error: "Choose a skill folder, a SKILL.md file, or a .zip." };
+    }
+    if (!existsSync(manifest)) {
+      return { ok: false, error: "That folder has no SKILL.md at its top level, so nothing would read it." };
+    }
+    return validateSkillDir(src);
+  });
+
+  /** Work out what a pasted link actually points at. Deliberately narrow: the
+   *  shapes people paste, and nothing clever. */
+  function resolveSkillUrl(
+    input: string,
+  ): { downloads: string[]; kind: "zip" | "manifest"; subpath?: string; wantName?: string } | { error: string } {
+    let u: URL;
+    try {
+      u = new URL(input.trim());
+    } catch {
+      return { error: "That is not a valid link." };
+    }
+    if (u.protocol !== "https:") return { error: "Only https links are supported." };
+    const parts = u.pathname.split("/").filter(Boolean);
+
+    // A registry page is HTML about a skill, not the skill. skills.sh encodes
+    // everything needed in its path — /{owner}/{repo}/{skill} — so translate it
+    // to the repo and remember which skill was asked for.
+    if (/^(www\.)?skills\.sh$/.test(u.hostname)) {
+      if (parts.length < 2) return { error: "Link a specific skill on skills.sh, not the index." };
+      const [owner, repo, skill] = parts;
+      return {
+        downloads: [
+          `https://github.com/${owner}/${repo}/archive/refs/heads/main.zip`,
+          `https://github.com/${owner}/${repo}/archive/refs/heads/master.zip`,
+        ],
+        kind: "zip",
+        wantName: skill,
+      };
+    }
+
+    const gh = /^(www\.)?github\.com$/.test(u.hostname);
+    if (gh && parts.length >= 2) {
+      const [owner, repo, kind, ref, ...rest] = parts;
+      const clean = repo.replace(/\.git$/, "");
+      if (kind === "blob" && rest.length) {
+        // A file link. Only a manifest is meaningful on its own.
+        const raw = `https://raw.githubusercontent.com/${owner}/${clean}/${ref}/${rest.join("/")}`;
+        if (!/SKILL\.md$/i.test(raw)) return { error: "Link a skill's folder, or its SKILL.md file." };
+        return { downloads: [raw], kind: "manifest" };
+      }
+      if (kind === "tree") {
+        return {
+          downloads: [`https://github.com/${owner}/${clean}/archive/refs/heads/${ref}.zip`],
+          kind: "zip",
+          subpath: rest.join("/"),
+          wantName: rest.length ? rest[rest.length - 1] : undefined,
+        };
+      }
+      // Bare repo link: the default branch is not in the URL, so try the two
+      // that cover nearly everything rather than spending an API call on it.
+      return {
+        downloads: [
+          `https://github.com/${owner}/${clean}/archive/refs/heads/main.zip`,
+          `https://github.com/${owner}/${clean}/archive/refs/heads/master.zip`,
+        ],
+        kind: "zip",
+      };
+    }
+    if (/\.zip$/i.test(u.pathname)) return { downloads: [u.toString()], kind: "zip" };
+    if (/SKILL\.md$/i.test(u.pathname)) return { downloads: [u.toString()], kind: "manifest" };
+    // Naming the shape that was pasted beats restating the allowlist: the common
+    // mistake is a page about a skill rather than the skill's files.
+    return {
+      error: `That looks like a web page rather than a skill's files. Link its GitHub repo or folder, a .zip, or a SKILL.md — ${u.hostname} is not a source this can download from.`,
+    };
+  }
+
+  /** Stream to disk, refusing at the cap rather than after it. */
+  async function downloadCapped(url: string, dest: string): Promise<string | null> {
+    let res: Response;
+    try {
+      res = await fetch(url, { redirect: "follow", signal: AbortSignal.timeout(60_000) });
+    } catch (err) {
+      return err instanceof Error ? err.message : String(err);
+    }
+    if (!res.ok) return `The server answered ${res.status}.`;
+    if (!res.url.startsWith("https://")) return "That link redirected to an insecure address.";
+    const declared = Number(res.headers.get("content-length") ?? "0");
+    if (declared > SKILL_MAX_DOWNLOAD) return `That download is ${humanBytes(declared)}; the limit is ${humanBytes(SKILL_MAX_DOWNLOAD)}.`;
+    const chunks: Buffer[] = [];
+    let total = 0;
+    const reader = res.body?.getReader();
+    if (!reader) return "Nothing came back from that link.";
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > SKILL_MAX_DOWNLOAD) {
+        void reader.cancel();
+        return `That download passed ${humanBytes(SKILL_MAX_DOWNLOAD)} and was stopped.`;
+      }
+      chunks.push(Buffer.from(value));
+    }
+    writeFileSync(dest, Buffer.concat(chunks));
+    return null;
+  }
+
+  ipcMain.handle("skills:fetch", async (_e, payload: { url?: string }) => {
+    const resolved = resolveSkillUrl(payload?.url ?? "");
+    if ("error" in resolved) return { ok: false, error: resolved.error };
+    const stage = stageSkillDir();
+    const target = join(stage, resolved.kind === "zip" ? "download.zip" : "SKILL.md");
+    let lastError: string | null = null;
+    for (const url of resolved.downloads) {
+      lastError = await downloadCapped(url, target);
+      if (!lastError) break;
+    }
+    if (lastError) return { ok: false, error: lastError };
+
+    if (resolved.kind === "manifest") {
+      // A lone manifest: park it in its own folder so the shape matches.
+      const dir = join(stage, "skill");
+      mkdirSync(dir, { recursive: true });
+      cpSync(target, join(dir, "SKILL.md"));
+      return validateSkillDir(dir, { fromArchive: true });
+    }
+
+    const zip = inspectZip(target);
+    if (zip.error) return { ok: false, error: zip.error };
+    const out = join(stage, "unpacked");
+    try {
+      execFileSync("/usr/bin/unzip", ["-q", "-o", "-d", out, target], { maxBuffer: 8 * 1024 * 1024 });
+    } catch {
+      return { ok: false, error: "That archive could not be unpacked." };
+    }
+    const landed = measureTree(out);
+    if (landed.over) return { ok: false, error: `That archive unpacked to more than it declared. ${landed.over}` };
+    // A /tree/ link names a folder inside the repo; honour it before searching.
+    let base = out;
+    if (resolved.subpath) {
+      const wrappers = readdirSync(out, { withFileTypes: true }).filter((e) => e.isDirectory());
+      const inner = wrappers.length === 1 ? join(out, wrappers[0].name) : out;
+      const candidate = join(inner, resolved.subpath);
+      if (existsSync(candidate)) base = candidate;
+    }
+    const found = findSkillRoot(base, resolved.wantName);
+    if (!found.root) {
+      return {
+        ok: false,
+        error: found.choices.length
+          ? `That link holds several skills (${found.choices.slice(0, 4).join(", ")}${found.choices.length > 4 ? ", …" : ""}). Link one of them directly.`
+          : resolved.wantName
+            ? `No skill named "${resolved.wantName}" in that repository.`
+            : "No SKILL.md found at that link.",
+      };
+    }
+    return validateSkillDir(found.root, { fromArchive: true });
+  });
+
+  ipcMain.handle("skills:limits", () => ({
+    maxBytes: SKILL_MAX_BYTES,
+    maxFiles: SKILL_MAX_FILES,
+    maxDownload: SKILL_MAX_DOWNLOAD,
+    label: humanBytes(SKILL_MAX_BYTES),
+  }));
+
+  ipcMain.handle(
+    "skills:install",
+    (_e, payload: { path?: string; name?: string; scope?: "global" | "project"; cwd?: string | null }) => {
+      const src = payload?.path;
+      const name = (payload?.name ?? "").trim();
+      if (!src || !isAbsolute(src)) return { ok: false, error: "Choose a folder or a SKILL.md file." };
+      if (!SKILL_NAME_RE.test(name) || name.length > SKILL_NAME_MAX) {
+        return { ok: false, error: "Use letters, digits, hyphens and underscores only, starting with a letter or digit." };
+      }
+      let root: string;
+      if (payload.scope === "project") {
+        const cwd = payload.cwd;
+        if (!cwd || !isAbsolute(cwd)) return { ok: false, error: "Open a project first to add a skill to it." };
+        // codex scans exactly <cwd>/.codex/skills and does not walk up, so this
+        // path is the engine's, not a naming choice of ours.
+        root = join(cwd, ".codex", "skills");
+      } else {
+        root = globalSkillsDir();
+      }
+      const dest = join(root, name);
+      if (existsSync(dest)) {
+        return { ok: false, error: `A skill named "${name}" is already there. Rename it or remove the existing one.` };
+      }
+      try {
+        mkdirSync(root, { recursive: true });
+        if (statSync(src).isDirectory()) {
+          cpSync(src, dest, { recursive: true });
+        } else {
+          mkdirSync(dest, { recursive: true });
+          cpSync(src, join(dest, "SKILL.md"));
+        }
+      } catch (err) {
+        return { ok: false, error: err instanceof Error ? err.message : String(err) };
+      }
+      return { ok: true, path: join(dest, "SKILL.md"), root };
+    },
+  );
+
+  ipcMain.handle("skills:remove", (_e, payload: { path?: string; cwd?: string | null }) => {
+    const manifest = payload?.path;
+    if (!manifest || !isAbsolute(manifest)) return { ok: false, error: "No skill given." };
+    // Only ever inside a root WE manage. A skill from ~/.agents/skills or the
+    // engine's own .system belongs to something else; deleting it from here
+    // would be reaching into another tool's files.
+    //
+    // The cwd comes from the caller, matching skills:list and skills:install.
+    // Reading mainCwd instead was wrong: a conversation running in a worktree
+    // has a different mainCwd from the project the panel listed, so deleting a
+    // project skill was refused as "outside the folders Unbiased manages".
+    const projectCwd = payload?.cwd && isAbsolute(payload.cwd) ? payload.cwd : mainCwd;
+    const owned = [globalSkillsDir(), ...(projectCwd ? [join(projectCwd, ".codex", "skills")] : [])];
+    const dir = join(manifest, "..");
+    if (!owned.some((root) => dir.startsWith(root + "/"))) {
+      return { ok: false, error: "That skill lives outside the folders Unbiased manages." };
+    }
+    try {
+      rmSync(dir, { recursive: true, force: true });
     } catch (err) {
       return { ok: false, error: err instanceof Error ? err.message : String(err) };
     }
@@ -4944,6 +5555,15 @@ app.whenReady().then(async () => {
 app.on("window-all-closed", () => {
   for (const pty of ptys.values()) pty.kill();
   ptys.clear();
+  // Downloads and unpacked archives that were never installed.
+  for (const dir of skillStages) {
+    try {
+      rmSync(dir, { recursive: true, force: true });
+    } catch {
+      // best effort; it is under the OS temp dir either way
+    }
+  }
+  skillStages.clear();
   engine.stop();
   // The agent browser's daemon outlives us otherwise — close every session.
   const bin = agentBrowserBinCache;

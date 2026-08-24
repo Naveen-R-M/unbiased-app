@@ -29,6 +29,13 @@
         ]
       },
       {
+        "from": "resources/skills",
+        "to": "skills",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
         "from": "resources/icon.png",
         "to": "icon.png"
       }

@@ -1,4 +1,4 @@
-import { contextBridge, ipcRenderer } from "electron";
+import { contextBridge, ipcRenderer, webUtils } from "electron";
 
 // The renderer's entire view of the engine. Typed, minimal, and additive.
 // Chat traffic is pane-scoped: every event payload carries paneId and every
@@ -60,6 +60,26 @@ contextBridge.exposeInMainWorld("unbiased", {
   mcpSave: (servers: unknown[]) => ipcRenderer.invoke("mcp:save", { servers }),
   mcpApply: () => ipcRenderer.invoke("mcp:apply"),
   onMcpStatus: (cb: (p: unknown) => void) => subscribe("mcp:status", cb),
+  skillsList: (cwd?: string | null) => ipcRenderer.invoke("skills:list", { cwd }),
+  skillsSetEnabled: (path: string, enabled: boolean) =>
+    ipcRenderer.invoke("skills:set-enabled", { path, enabled }),
+  skillsReveal: (path: string, isDir?: boolean) => ipcRenderer.invoke("skills:reveal", { path, isDir }),
+  skillsChoose: () => ipcRenderer.invoke("skills:choose"),
+  skillsValidate: (path: string) => ipcRenderer.invoke("skills:validate", { path }),
+  skillsInstall: (p: { path: string; name: string; scope: "global" | "project"; cwd: string | null }) =>
+    ipcRenderer.invoke("skills:install", p),
+  skillsRemove: (path: string, cwd: string | null) => ipcRenderer.invoke("skills:remove", { path, cwd }),
+  skillsFetch: (url: string) => ipcRenderer.invoke("skills:fetch", { url }),
+  skillsLimits: () => ipcRenderer.invoke("skills:limits"),
+  // A dropped File carries no usable path of its own in Electron 32+; only
+  // this side can resolve one.
+  pathForDroppedFile: (file: File) => {
+    try {
+      return webUtils.getPathForFile(file);
+    } catch {
+      return "";
+    }
+  },
   onApprovalRequest: (cb: (p: unknown) => void) => subscribe("chat:approval-request", cb),
   onApprovalCanceled: (cb: (p: unknown) => void) => subscribe("chat:approval-canceled", cb),
   onCommand: (cb: (p: unknown) => void) => subscribe("chat:command", cb),

@@ -340,6 +340,39 @@ type McpConnected = {
 };
 type McpStatusEvent = { name: string; status: string; error: string | null; failureReason: string | null };
 
+/** One skill as the engine reports it. `scope` is the engine's own word:
+ *  "repo" = found in the conversation's <cwd>/.codex/skills, "user" = a root we
+ *  registered OR one another agent tool left in ~/.agents/skills, "system" =
+ *  codex's own built-ins. Provenance comes from `path`, not from scope alone. */
+/** The answer to "is this a skill, and what would I be installing?" — shared by
+ *  the folder, zip and link paths so the UI has one shape to render. */
+type SkillCheck = {
+  ok: boolean;
+  error?: string;
+  warning?: string | null;
+  path?: string;
+  kind?: "folder" | "manifest";
+  fromArchive?: boolean;
+  name?: string;
+  description?: string | null;
+  bytes?: number;
+  files?: number;
+  sizeLabel?: string;
+  /** Anything the agent might execute. Named before install, not after. */
+  scripts?: string[];
+};
+
+type SkillEntry = {
+  name: string;
+  description?: string;
+  shortDescription?: string | null;
+  path: string;
+  scope: string;
+  enabled: boolean;
+  dependencies?: { tools?: { type: string; value: string }[] } | null;
+  interface?: { displayName?: string | null } | null;
+};
+
 type HeldApproval = {
   requestId: string;
   kind?: "command" | "fileChange" | "mcpTool";
@@ -422,6 +455,22 @@ declare global {
       mcpSave: (servers: McpServerConfig[]) => Promise<{ ok: boolean; error?: string }>;
       mcpApply: () => Promise<{ ok: boolean; busy?: boolean }>;
       onMcpStatus: (cb: (p: McpStatusEvent) => void) => () => void;
+      skillsList: (cwd?: string | null) => Promise<{
+        skills: SkillEntry[];
+        cwd: string | null;
+        roots: { bundled: string; global: string; project: string | null };
+        error: string | null;
+      }>;
+      skillsSetEnabled: (path: string, enabled: boolean) => Promise<{ ok: boolean; error?: string }>;
+      skillsReveal: (path: string, isDir?: boolean) => Promise<{ ok: boolean }>;
+      skillsChoose: () => Promise<{ path: string | null }>;
+      skillsValidate: (path: string) => Promise<SkillCheck>;
+      skillsInstall: (p: { path: string; name: string; scope: "global" | "project"; cwd: string | null }) =>
+        Promise<{ ok: boolean; error?: string }>;
+      skillsRemove: (path: string, cwd: string | null) => Promise<{ ok: boolean; error?: string }>;
+      pathForDroppedFile: (file: File) => string;
+      skillsFetch: (url: string) => Promise<SkillCheck>;
+      skillsLimits: () => Promise<{ maxBytes: number; maxFiles: number; maxDownload: number; label: string }>;
       onApprovalCanceled: (cb: (p: { paneId: PaneId; requestId: string }) => void) => () => void;
       onApprovalRequest: (
         cb: (p: {
@@ -772,6 +821,7 @@ export function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [showChangelog, setShowChangelog] = useState(false);
   const [mcpOpen, setMcpOpen] = useState(false);
+  const [skillsOpen, setSkillsOpen] = useState(false);
   // Unread until the user has opened the log at its current top version.
   // The releases repo wins when we have it; the bundled copy covers offline
   // and first run. Both are generated from CHANGELOG.md, so neither can drift.
@@ -3236,6 +3286,7 @@ export function App() {
           }
           onOpenAgent={openAgentTab}
           onOpenMcp={() => setMcpOpen(true)}
+          onOpenSkills={() => setSkillsOpen(true)}
           onBusyChange={(b) => {
             setMainBusy(b);
             if (b) setMainStarted(true);
@@ -3634,6 +3685,7 @@ export function App() {
             planMode={planMode}
             onTogglePlanMode={togglePlanMode}
             onOpenMcp={() => setMcpOpen(true)}
+            onOpenSkills={() => setSkillsOpen(true)}
             emptyState={
               <div style={{ textAlign: "center", padding: "0 24px" }}>
                 <div style={{ color: colors.dim, display: "flex", justifyContent: "center", marginBottom: 10 }}>
@@ -4373,6 +4425,9 @@ export function App() {
         </div>
       )}
       {mcpOpen && <McpPanel onClose={() => setMcpOpen(false)} />}
+      {skillsOpen && (
+        <SkillsPanel cwd={activeProjectPath ?? null} onClose={() => setSkillsOpen(false)} />
+      )}
       {showChangelog && (
         <ChangelogModal releases={releases} onClose={() => setShowChangelog(false)} />
       )}
@@ -6940,6 +6995,7 @@ function ChatPane({
   persistTranscript,
   onOpenAgent,
   onOpenMcp,
+  onOpenSkills,
 }: {
   paneId: PaneId;
   connected: boolean;
@@ -6982,6 +7038,7 @@ function ChatPane({
   // Opens a sub-agent's conversation in the side panel (lifecycle rows).
   onOpenAgent?: (a: { threadId: string; name: string }) => void;
   onOpenMcp?: () => void;
+  onOpenSkills?: () => void;
 }) {
   const [entries, setEntries] = useState<Entry[]>(reset.entries);
   const [draft, setDraft] = useState("");
@@ -8221,6 +8278,15 @@ function ChatPane({
                 onClick={() => void attachClipboardImage()}
               />
               <MenuItem
+                icon={<SkillIcon />}
+                label="Skills"
+                desc="What Pareto knows how to do"
+                onClick={() => {
+                  setPlusOpen(false);
+                  onOpenSkills?.();
+                }}
+              />
+              <MenuItem
                 icon={<McpIcon />}
                 label="MCP"
                 desc="Show MCP server status"
@@ -9277,6 +9343,87 @@ const pillButtonStyle: React.CSSProperties = {
  *  and the official 12/195 stroke read visibly lighter than the paperclip's
  *  1.7/24 (7.1%) next to it. 17/225 is 7.6%, which matches. Straight from the
  *  asset the mark was both smaller and thinner than every icon around it. */
+/** Destructive confirm, in the same shape Settings → Resources uses: name the
+ *  thing, say exactly what goes, and put the irreversible verb on the right.
+ *  zIndex clears the panel that opened it — both panels sit at 100. */
+function ConfirmRemove({
+  title,
+  detail,
+  confirmLabel = "Remove",
+  onCancel,
+  onConfirm,
+}: {
+  title: string;
+  detail: string;
+  confirmLabel?: string;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  return (
+    <div
+      onMouseDown={(e) => { if (e.target === e.currentTarget) onCancel(); }}
+      style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)", display: "grid", placeItems: "center", zIndex: 110 }}
+    >
+      <div
+        style={{
+          width: 480, maxWidth: "calc(100vw - 48px)", background: colors.panel,
+          border: `1px solid ${colors.border}`, borderRadius: 16,
+          padding: "22px 24px 20px", boxShadow: "0 16px 48px rgba(0,0,0,0.55)",
+          fontFamily: "var(--font-ui)",
+        }}
+      >
+        <div style={{ fontSize: 18, fontWeight: 600, color: colors.fg, overflowWrap: "anywhere" }}>{title}</div>
+        <div style={{ color: colors.dim, fontSize: 14, lineHeight: 1.55, marginTop: 10 }}>{detail}</div>
+        <div style={{ display: "flex", justifyContent: "flex-end", gap: 12, marginTop: 22 }}>
+          <button
+            onClick={onCancel}
+            style={{ background: "transparent", border: "none", color: colors.dim, fontSize: 14.5, cursor: "pointer", fontFamily: "inherit", padding: "9px 14px" }}
+          >
+            Cancel
+          </button>
+          <button
+            onClick={onConfirm}
+            style={{
+              background: "rgba(240, 149, 149, 0.14)", border: "none", borderRadius: 10,
+              color: colors.err, fontSize: 14.5, fontWeight: 500, cursor: "pointer",
+              fontFamily: "inherit", padding: "9px 18px",
+            }}
+          >
+            {confirmLabel}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** An icon-only destructive action. Labelled for screen readers and on hover,
+ *  since the glyph alone carries the meaning. */
+function IconDangerButton({ label, onClick, disabled }: { label: string; onClick: () => void; disabled?: boolean }) {
+  const [hover, setHover] = useState(false);
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      title={label}
+      aria-label={label}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      style={{
+        display: "flex", alignItems: "center", justifyContent: "center",
+        width: 30, height: 30, flexShrink: 0,
+        background: hover && !disabled ? "rgba(240, 149, 149, 0.14)" : "transparent",
+        border: "none", borderRadius: 999,
+        color: disabled ? colors.dim : hover ? colors.err : colors.dim,
+        cursor: disabled ? "default" : "pointer",
+        opacity: disabled ? 0.5 : 1,
+      }}
+    >
+      <TrashIcon />
+    </button>
+  );
+}
+
 function McpIcon({ size = 15 }: { size?: number }) {
   return (
     <svg
@@ -9312,6 +9459,7 @@ function McpPanel({ onClose }: { onClose: () => void }) {
   const [adding, setAdding] = useState(false);
   const [applying, setApplying] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
+  const [confirm, setConfirm] = useState<{ name: string; connected: boolean } | null>(null);
 
   // Form state
   const [fName, setFName] = useState("");
@@ -9457,14 +9605,17 @@ function McpPanel({ onClose }: { onClose: () => void }) {
           // 20 + 6 = 26, matching the 26 on the left. `stable` reserves the
           // gutter even when the content fits, so the padding does not jump as
           // servers are added and removed.
+          // Only the middle scrolls; the footer stays put. With several servers
+          // and the add form open, the buttons were below the fold.
           maxHeight: "84vh",
-          overflowY: "auto",
-          padding: "24px 20px 22px 26px",
-          scrollbarGutter: "stable",
+          display: "flex",
+          flexDirection: "column",
+          overflow: "hidden",
           boxShadow: "0 16px 48px rgba(0,0,0,0.55)",
           fontFamily: "var(--font-ui)",
         }}
       >
+        <div style={{ padding: "24px 26px 0", flexShrink: 0 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 19, fontWeight: 600, color: colors.fg }}>
           <span style={{ color: colors.accent, display: "flex" }}><McpIcon size={18} /></span>
           MCP servers
@@ -9474,6 +9625,11 @@ function McpPanel({ onClose }: { onClose: () => void }) {
           Pareto runs; others already listen on a URL — including apps on this
           machine, like Figma's Dev Mode server.
         </p>
+        </div>
+
+        {/* minHeight:0 or a flex child refuses to shrink and the scroll never
+            engages. */}
+        <div style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: "0 20px 4px 26px", scrollbarGutter: "stable" }}>
 
         {loading && (
           <div style={{ color: colors.dim, fontSize: 14, lineHeight: 1.55, marginTop: 16 }}>Loading…</div>
@@ -9536,9 +9692,10 @@ function McpPanel({ onClose }: { onClose: () => void }) {
                   <div style={{ fontSize: 13.5, color: colors.dim, marginTop: 2, lineHeight: 1.45 }}>{row.detail}</div>
                 </span>
                 {row.removable && (
-                  <button onClick={() => void removeServer(row.name)} style={{ ...btnSmall, color: colors.err }}>
-                    Remove
-                  </button>
+                  <IconDangerButton
+                    label={`Remove ${row.name}`}
+                    onClick={() => setConfirm({ name: row.name, connected: row.dot === colors.ok })}
+                  />
                 )}
               </div>
             ))}
@@ -9571,16 +9728,20 @@ function McpPanel({ onClose }: { onClose: () => void }) {
           </div>
         )}
 
-        {!adding ? (
-          // Right-aligned secondary-then-primary, as in the disclosure.
-          <div style={{ display: "flex", justifyContent: "flex-end", gap: 12, marginTop: 20 }}>
-            <button onClick={onClose} style={btnSecondary}>Close</button>
-            <button onClick={() => setAdding(true)} style={btnPrimary}>
-              <McpIcon size={15} />
-              Add custom MCP
-            </button>
-          </div>
-        ) : (
+        {confirm && (
+          <ConfirmRemove
+            title={`Remove ${confirm.name}?`}
+            detail={
+              confirm.connected
+                ? "This takes the server out of your configuration. Its tools stay available to the current conversation until the engine restarts, and nothing on the server itself is touched."
+                : "This takes the server out of your configuration. Nothing on the server itself is touched."
+            }
+            onCancel={() => setConfirm(null)}
+            onConfirm={() => { const n = confirm.name; setConfirm(null); void removeServer(n); }}
+          />
+        )}
+
+        {!adding ? null : (
           <div style={{ marginTop: 20, borderTop: `1px solid ${colors.border}`, paddingTop: 18, display: "flex", flexDirection: "column", gap: 14 }}>
             <div>
               <label style={labelStyle}>Name</label>
@@ -9634,12 +9795,451 @@ function McpPanel({ onClose }: { onClose: () => void }) {
               </>
             )}
             {formError && <div style={{ color: colors.err, fontSize: 13.5, lineHeight: 1.5 }}>{formError}</div>}
-            <div style={{ display: "flex", justifyContent: "flex-end", gap: 12, marginTop: 4 }}>
-              <button onClick={() => { setAdding(false); resetForm(); }} style={btnSecondary}>Cancel</button>
-              <button onClick={() => void saveNew()} style={btnPrimary}>Save</button>
-            </div>
           </div>
         )}
+        </div>
+
+        {/* Pinned, with the action that matters for the current mode. */}
+        <div
+          style={{
+            flexShrink: 0, display: "flex", justifyContent: "flex-end", gap: 12,
+            padding: "16px 26px 22px", borderTop: `1px solid ${colors.border}`,
+          }}
+        >
+          {adding ? (
+            <>
+              <button onClick={() => { setAdding(false); resetForm(); }} style={btnSecondary}>Cancel</button>
+              <button onClick={() => void saveNew()} style={btnPrimary}>Save</button>
+            </>
+          ) : (
+            <>
+              <button onClick={onClose} style={btnSecondary}>Close</button>
+              <button onClick={() => setAdding(true)} style={btnPrimary}>
+                <McpIcon size={15} />
+                Add custom MCP
+              </button>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function SkillIcon({ size = 15 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M12 2.5l2.6 5.9 6.4.6-4.8 4.3 1.4 6.2L12 16.3l-5.6 3.2 1.4-6.2L3 9l6.4-.6z" />
+    </svg>
+  );
+}
+
+/** Skills, in the two buckets a person actually thinks in: this project, and
+ *  everywhere. Provenance is kept as a small tag on the row rather than its own
+ *  section — a skill sitting in ~/.agents/skills came from another tool
+ *  entirely, and that is worth knowing without turning the panel into a
+ *  filesystem tour. */
+function SkillsPanel({ cwd, onClose }: { cwd: string | null; onClose: () => void }) {
+  const [skills, setSkills] = useState<SkillEntry[]>([]);
+  const [roots, setRoots] = useState<{ bundled: string; global: string; project: string | null } | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [confirm, setConfirm] = useState<SkillEntry | null>(null);
+
+  // Add flow
+  const [adding, setAdding] = useState(false);
+  const [scope, setScope] = useState<"project" | "global">(cwd ? "project" : "global");
+  const [picked, setPicked] = useState<string | null>(null);
+  const [check, setCheck] = useState<SkillCheck | null>(null);
+  const [url, setUrl] = useState("");
+  const [fetching, setFetching] = useState(false);
+  const [limits, setLimits] = useState<{ label: string; maxFiles: number } | null>(null);
+  const [name, setName] = useState("");
+  const [dragging, setDragging] = useState(false);
+  const [saving, setSaving] = useState(false);
+
+  const refresh = useCallback(() => {
+    void window.unbiased.skillsList(cwd).then((r) => {
+      setSkills(r.skills ?? []);
+      setRoots(r.roots);
+      setError(r.error);
+      setLoading(false);
+    });
+  }, [cwd]);
+  useEffect(refresh, [refresh]);
+  useEffect(() => {
+    void window.unbiased.skillsLimits().then((l) => setLimits({ label: l.label, maxFiles: l.maxFiles }));
+  }, []);
+
+  function resetAdd() {
+    setAdding(false); setPicked(null); setCheck(null); setName("");
+    setDragging(false); setUrl(""); setFetching(false); setScope(cwd ? "project" : "global");
+  }
+
+  function accept(r: SkillCheck) {
+    setCheck(r);
+    if (r.ok) {
+      // The staged copy is what gets installed: for a zip or a link the source
+      // is the unpacked folder, not what the user pointed at.
+      if (r.path) setPicked(r.path);
+      if (r.name) setName(r.name);
+    }
+  }
+
+  async function fetchFromUrl() {
+    if (!url.trim()) return;
+    setFetching(true);
+    const r = await window.unbiased.skillsFetch(url.trim());
+    setFetching(false);
+    accept(r);
+  }
+
+  async function validate(path: string) {
+    setPicked(path);
+    accept(await window.unbiased.skillsValidate(path));
+  }
+
+  async function choose() {
+    const r = await window.unbiased.skillsChoose();
+    if (r.path) await validate(r.path);
+  }
+
+  async function save() {
+    if (!picked) return;
+    setSaving(true);
+    const r = await window.unbiased.skillsInstall({ path: picked, name: name.trim(), scope, cwd });
+    setSaving(false);
+    if (!r.ok) { setCheck({ ok: false, error: r.error }); return; }
+    resetAdd();
+    refresh();
+  }
+
+  async function toggle(sk: SkillEntry) {
+    setBusy(sk.path);
+    const r = await window.unbiased.skillsSetEnabled(sk.path, !sk.enabled);
+    setBusy(null);
+    if (!r.ok) { setError(r.error ?? "Could not change that skill."); return; }
+    refresh();
+  }
+
+  async function remove(sk: SkillEntry) {
+    setBusy(sk.path);
+    const r = await window.unbiased.skillsRemove(sk.path, cwd);
+    setBusy(null);
+    if (!r.ok) { setError(r.error ?? "Could not remove that skill."); return; }
+    refresh();
+  }
+
+  // Two buckets. Project = found in this conversation's folder. Everything
+  // else is available everywhere, whoever put it there.
+  const g = roots;
+  const inProject = (sk: SkillEntry) => !!g?.project && sk.path.startsWith(g.project);
+  const ours = (sk: SkillEntry) =>
+    (!!g?.global && sk.path.startsWith(g.global)) || inProject(sk);
+  const tagFor = (sk: SkillEntry): string | null => {
+    if (ours(sk)) return null;
+    if (g?.bundled && sk.path.startsWith(g.bundled)) return "included";
+    if (sk.scope === "system") return "built in";
+    return "another tool";
+  };
+  const project = skills.filter(inProject);
+  const global = skills.filter((sk) => !inProject(sk));
+
+  const inset: React.CSSProperties = { background: "var(--panel-2)", borderRadius: 14, padding: "4px 16px", marginTop: 10 };
+  const btnSecondary: React.CSSProperties = {
+    background: "var(--chip)", border: "none", borderRadius: 999, color: colors.fg,
+    fontSize: 14.5, cursor: "pointer", fontFamily: "inherit", padding: "10px 20px",
+  };
+  const btnPrimary: React.CSSProperties = {
+    display: "flex", alignItems: "center", gap: 8, background: "rgba(255, 86, 63, 0.14)",
+    border: "none", borderRadius: 999, color: colors.accent, fontSize: 14.5, fontWeight: 500,
+    cursor: "pointer", fontFamily: "inherit", padding: "10px 20px",
+  };
+  const btnSmall: React.CSSProperties = {
+    background: "var(--chip)", border: "none", borderRadius: 999, color: colors.fg,
+    fontSize: 13, cursor: "pointer", fontFamily: "inherit", padding: "6px 14px", flexShrink: 0,
+  };
+  const inputStyle: React.CSSProperties = {
+    width: "100%", boxSizing: "border-box", minWidth: 0, background: "var(--panel-2)",
+    color: colors.fg, border: `1px solid ${colors.border}`, borderRadius: 10,
+    padding: "10px 12px", fontSize: 13.5, fontFamily: "var(--font-ui)", outline: "none",
+  };
+  // One label style for every field. The form previously had six text blocks at
+  // near-identical size and weight, which reads as noise rather than structure.
+  const fieldLabel: React.CSSProperties = {
+    color: colors.dim, fontSize: 12.5, fontWeight: 500, lineHeight: 1.4, marginBottom: 7, display: "block",
+  };
+  const helpText: React.CSSProperties = { color: colors.dim, fontSize: 12, lineHeight: 1.45, marginTop: 6 };
+
+  function Group({ title, items, empty }: { title: string; items: SkillEntry[]; empty: string }) {
+    return (
+      <div style={{ marginTop: 18 }}>
+        <div style={{ fontSize: 13, fontWeight: 600, color: colors.fg }}>{title}</div>
+        {items.length === 0 ? (
+          <div style={{ ...inset, padding: "13px 16px", color: colors.dim, fontSize: 13.5, lineHeight: 1.45 }}>{empty}</div>
+        ) : (
+          <div style={inset}>
+            {items.map((sk, i) => {
+              const tag = tagFor(sk);
+              return (
+                <div key={sk.path} style={{ display: "flex", alignItems: "flex-start", gap: 14, padding: "13px 0", borderTop: i > 0 ? `1px solid ${colors.border}` : "none" }}>
+                  <span style={{ minWidth: 0, flex: 1, opacity: sk.enabled ? 1 : 0.5 }}>
+                    <div style={{ fontSize: 14.5, fontWeight: 600, color: colors.fg, display: "flex", alignItems: "center", gap: 8 }}>
+                      <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                        {sk.interface?.displayName || sk.name}
+                      </span>
+                      {tag && (
+                        <span style={{ color: colors.dim, fontSize: 11, fontWeight: 400, border: `1px solid ${colors.border}`, borderRadius: 999, padding: "1px 7px", flexShrink: 0 }}>
+                          {tag}
+                        </span>
+                      )}
+                    </div>
+                    {/* Two lines. A description is written for the MODEL and runs
+                        300-570 characters in practice; full text on hover. */}
+                    <div
+                      title={sk.description || sk.shortDescription || ""}
+                      style={{
+                        fontSize: 13.5, color: colors.dim, marginTop: 2, lineHeight: 1.45,
+                        display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden",
+                      }}
+                    >
+                      {sk.shortDescription || sk.description || "No description."}
+                    </div>
+                  </span>
+                  <button onClick={() => void toggle(sk)} disabled={busy === sk.path} style={{ ...btnSmall, color: sk.enabled ? colors.fg : colors.accent }}>
+                    {busy === sk.path ? "…" : sk.enabled ? "Turn off" : "Turn on"}
+                  </button>
+                  {ours(sk) && (
+                    <IconDangerButton
+                      label={`Delete ${sk.name}`}
+                      disabled={busy === sk.path}
+                      onClick={() => setConfirm(sk)}
+                    />
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div
+      style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)", display: "grid", placeItems: "center", zIndex: 100 }}
+      onClick={onClose}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          background: colors.panel, border: `1px solid ${colors.border}`, borderRadius: 18,
+          width: 560, maxWidth: "calc(100vw - 48px)", boxSizing: "border-box",
+          // The card no longer scrolls; only its middle does. Otherwise the
+          // buttons sit at the bottom of the CONTENT, and with a long list you
+          // had to scroll past every skill to reach "Add skill".
+          maxHeight: "84vh", display: "flex", flexDirection: "column", overflow: "hidden",
+          boxShadow: "0 16px 48px rgba(0,0,0,0.55)", fontFamily: "var(--font-ui)",
+        }}
+      >
+        <div style={{ padding: "24px 26px 0", flexShrink: 0 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 19, fontWeight: 600, color: colors.fg }}>
+            <span style={{ color: colors.accent, display: "flex" }}><SkillIcon size={18} /></span>
+            Skills
+          </div>
+          <p style={{ color: colors.dim, fontSize: 14, lineHeight: 1.55, margin: "12px 0 0" }}>
+            A skill is a folder of instructions Pareto reads when a task calls for it.
+            Add one to this project, or to every conversation.
+          </p>
+        </div>
+
+        {/* minHeight:0 is load-bearing — a flex child will not shrink below its
+            content without it, so the scroll never engages and the footer gets
+            pushed off the bottom instead. */}
+        <div
+          style={{
+            flex: 1, minHeight: 0, overflowY: "auto",
+            padding: "0 20px 4px 26px", scrollbarGutter: "stable",
+          }}
+        >
+
+        {loading && <div style={{ color: colors.dim, fontSize: 14, lineHeight: 1.55, marginTop: 16 }}>Loading…</div>}
+        {error && <div style={{ color: colors.err, fontSize: 13.5, lineHeight: 1.5, marginTop: 16 }}>{error}</div>}
+
+        {confirm && (
+          <ConfirmRemove
+            title={`Delete ${confirm.interface?.displayName || confirm.name}?`}
+            // Unlike an MCP server, this really does delete files.
+            detail={
+              (inProject(confirm)
+                ? "This deletes the skill's folder from this project on disk. If it is committed, it stays in git history and will come back on checkout."
+                : "This deletes the skill's folder from disk.") + " This can't be undone from here."
+            }
+            confirmLabel="Delete"
+            onCancel={() => setConfirm(null)}
+            onConfirm={() => { const sk = confirm; setConfirm(null); void remove(sk); }}
+          />
+        )}
+
+        {!loading && !adding && (
+          <>
+            <Group
+              title="In this project"
+              items={project}
+              empty={cwd ? "Nothing yet." : "Open a project to add skills just for it."}
+            />
+            <Group title="Available everywhere" items={global} empty="Nothing yet." />
+          </>
+        )}
+
+        {adding && (
+          <div style={{ marginTop: 20, borderTop: `1px solid ${colors.border}`, paddingTop: 16, display: "flex", flexDirection: "column", gap: 16 }}>
+            <div>
+              <span style={fieldLabel}>Where should it apply?</span>
+              <div style={{ display: "flex", gap: 8 }}>
+                {([["project", "This project"], ["global", "Everywhere"]] as const).map(([v, label]) => (
+                  <button
+                    key={v}
+                    onClick={() => setScope(v)}
+                    disabled={v === "project" && !cwd}
+                    title={v === "project" && !cwd ? "Open a project first" : undefined}
+                    style={{
+                      ...(scope === v ? btnPrimary : btnSecondary),
+                      padding: "8px 16px", fontSize: 13.5,
+                      opacity: v === "project" && !cwd ? 0.45 : 1,
+                    }}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div
+              onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
+              onDragLeave={() => setDragging(false)}
+              onDrop={(e) => {
+                e.preventDefault();
+                setDragging(false);
+                const f = e.dataTransfer.files[0];
+                if (!f) return;
+                const path = window.unbiased.pathForDroppedFile(f);
+                if (path) void validate(path);
+              }}
+              style={{
+                border: `1px dashed ${dragging ? colors.accent : colors.border}`,
+                background: dragging ? "rgba(255, 86, 63, 0.06)" : "var(--panel-2)",
+                borderRadius: 12, padding: "16px 16px", textAlign: "center",
+              }}
+            >
+              <div style={{ fontSize: 13.5, color: colors.fg, lineHeight: 1.45 }}>
+                Drop a folder or .zip
+              </div>
+              <button
+                onClick={() => void choose()}
+                style={{
+                  background: "none", border: "none", padding: 0, marginTop: 4,
+                  color: colors.dim, fontSize: 12.5, fontFamily: "inherit",
+                  cursor: "pointer", textDecoration: "underline", textUnderlineOffset: 2,
+                }}
+              >
+                or choose one
+              </button>
+              {limits && (
+                <div style={{ color: colors.dim, fontSize: 11.5, lineHeight: 1.4, marginTop: 8, opacity: 0.75 }}>
+                  up to {limits.label}, {limits.maxFiles} files
+                </div>
+              )}
+            </div>
+
+            <div>
+              <span style={fieldLabel}>Or paste a link</span>
+              <div style={{ display: "flex", gap: 8 }}>
+                <input
+                  value={url}
+                  onChange={(e) => setUrl(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === "Enter" && url.trim()) void fetchFromUrl(); }}
+                  placeholder="github.com/owner/repo or skills.sh/…"
+                  style={inputStyle}
+                />
+                <button
+                  onClick={() => void fetchFromUrl()}
+                  disabled={!url.trim() || fetching}
+                  style={{ ...btnSmall, opacity: !url.trim() || fetching ? 0.45 : 1 }}
+                >
+                  {fetching ? "Fetching…" : "Fetch"}
+                </button>
+              </div>
+              <div style={helpText}>A skills.sh page, a GitHub repo or folder, a .zip, or a SKILL.md.</div>
+            </div>
+
+            {check && !check.ok && (
+              <div style={{ color: colors.err, fontSize: 13.5, lineHeight: 1.5 }}>{check.error}</div>
+            )}
+
+            {check?.ok && (
+              <>
+                <div style={{ color: colors.ok, fontSize: 13.5, lineHeight: 1.5 }}>
+                  Looks like a skill
+                  {check.files ? ` — ${check.files} ${check.files === 1 ? "file" : "files"}, ${check.sizeLabel}` : ""}
+                  {check.fromArchive ? ", unpacked and checked" : ""}.
+                </div>
+                {check.description && (
+                  <div style={{ color: colors.dim, fontSize: 13, lineHeight: 1.45 }}>{check.description}</div>
+                )}
+                {check.warning && (
+                  <div style={{ color: colors.amber, fontSize: 13, lineHeight: 1.45 }}>{check.warning}</div>
+                )}
+                {!!check.scripts?.length && (
+                  <div style={{ color: colors.amber, fontSize: 13, lineHeight: 1.45 }}>
+                    Ships {check.scripts.length} script{check.scripts.length === 1 ? "" : "s"} Pareto may run:{" "}
+                    <span style={{ fontFamily: "var(--font-code)", fontSize: 12 }}>
+                      {check.scripts.slice(0, 3).join(", ")}{check.scripts.length > 3 ? ", …" : ""}
+                    </span>
+                  </div>
+                )}
+                <div>
+                  <span style={fieldLabel}>Name</span>
+                  <input value={name} onChange={(e) => setName(e.target.value)} style={inputStyle} />
+                  <div style={helpText}>The folder it lands in, and how Pareto refers to it.</div>
+                </div>
+              </>
+            )}
+
+          </div>
+        )}
+        </div>
+
+        {/* Pinned. Its contents follow the mode, so whichever action matters is
+            always on screen. */}
+        <div
+          style={{
+            flexShrink: 0, display: "flex", justifyContent: "flex-end", gap: 12,
+            padding: "16px 26px 22px", borderTop: `1px solid ${colors.border}`,
+          }}
+        >
+          {adding ? (
+            <>
+              <button onClick={resetAdd} style={btnSecondary}>Cancel</button>
+              <button
+                onClick={() => void save()}
+                disabled={!check?.ok || !name.trim() || saving}
+                style={{ ...btnPrimary, opacity: !check?.ok || !name.trim() || saving ? 0.45 : 1 }}
+              >
+                {saving ? "Adding…" : "Add skill"}
+              </button>
+            </>
+          ) : (
+            <>
+              <button onClick={onClose} style={btnSecondary}>Close</button>
+              <button onClick={() => { setAdding(true); setScope(cwd ? "project" : "global"); }} style={btnPrimary}>
+                <SkillIcon size={15} />
+                Add skill
+              </button>
+            </>
+          )}
+        </div>
       </div>
     </div>
   );
