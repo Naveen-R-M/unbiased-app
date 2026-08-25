@@ -10,14 +10,107 @@
   </head>
   <body style="margin: 0">
     <style>
+      /* Motion tokens. The built-in CSS easings are too weak to read as
+         intentional: `ease` spends its first frames barely moving, which is
+         exactly when the eye is on the element. These are the strong variants
+         — ease-out for anything entering, exiting or responding to a press,
+         ease-in-out for something travelling across the screen. Durations stay
+         where they were (120ms controls, 200ms bars); it was the curve that
+         was missing, not the speed. */
+      :root {
+        --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+        --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+
+        /* Tracking is size-specific — a single letter-spacing is wrong
+           somewhere by definition. Large text reads too loose as it grows, so
+           it tightens; small text needs the opposite to stay legible. Body
+           sits at 0. These are the three values the whole app uses. */
+        --track-title: -0.02em;   /* 17px and up: panel titles, headings   */
+        --track-body: 0em;        /* 13–16px: message text, controls       */
+        --track-meta: 0.01em;     /* 12–12.5px: timestamps, captions       */
+        --track-overline: 0.08em; /* 10–11px uppercase section labels      */
+
+        /* Measure. Long lines are the single biggest readability cost in the
+           transcript — at full pane width a reply runs past 100 characters,
+           well beyond the 45–75 the eye tracks comfortably. */
+        --measure: 72ch;
+
+        /* Materials. Translucency belongs where a surface genuinely sits over
+           content — which in this app means the modal scrims, not the toolbar
+           (that bar is a flex sibling of the transcript, so nothing ever
+           passes behind it). A modal task dims AND pushes the background back;
+           the dim alone flattens everything behind it into one grey sheet.
+           Held in a variable so the reduced-transparency query below can
+           switch it off without every call site needing an opt-out hook. */
+        --scrim-blur: blur(6px);
+      }
+
+      /* Deliberately NOT setting -webkit-font-smoothing: antialiased here.
+         It is a reflex in a lot of CSS boilerplate, and on macOS it swaps
+         subpixel rendering for grayscale, which thins every glyph. Against a
+         dark surface the whole interface goes quiet and washed-out — tried it,
+         and that is exactly what it did. font-synthesis-weight: none made it
+         worse by dropping synthesized bold wherever the face has no real one.
+         The UA default is the right answer; the theme's own font stack already
+         carries the tuning. */
       ::-webkit-scrollbar { width: 6px; height: 6px; }
       ::-webkit-scrollbar-thumb { background: #3a3a40; border-radius: 3px; }
       ::-webkit-scrollbar-thumb:hover { background: #4a4a52; }
       ::-webkit-scrollbar-track { background: transparent; }
-      /* Annotation tints (CSS Custom Highlight API). Follows the default
-         accent #FF563F; per-pane names, see ChatPane's highlight effects. */
-      ::highlight(pending-main), ::highlight(pending-side) { background: rgba(255, 86, 63, 0.32); }
-      ::highlight(annotations-main), ::highlight(annotations-side) { background: rgba(255, 86, 63, 0.22); }
+
+      /* Keyboard focus. Every control in this app sets outline:none and, until
+         now, put nothing back — so keyboard users got no indication of where
+         they were. :focus-visible only fires for keyboard/AT focus, so pointer
+         users never see it. color-mix keeps it on the user's accent instead of
+         a fixed colour. */
+      :focus-visible {
+        outline: 2px solid var(--accent, #FF563F);
+        outline-offset: 2px;
+        border-radius: 4px;
+      }
+
+      /* Press feedback. A control has to acknowledge the press itself, on
+         pointer-down, not when the work finishes — without it the interface
+         reads as not listening. Rows opt out via data-nopress: shrinking a
+         full-width sidebar row looks like the layout moved, not like a button
+         answered. */
+      button:not(:disabled):not([data-nopress]):active {
+        transform: scale(0.97);
+      }
+      button:not([data-nopress]) {
+        transition: transform 120ms var(--ease-out);
+      }
+      /* Navigation and tree rows are excluded, and the reason is the geometry
+         rather than the semantics: a press-scale is proportional, so 3% of a
+         240px-wide row is a 7px shift that reads as the layout moving, not as
+         a control answering. Rows already acknowledge a press through their
+         hover/active background. The sidebar is a <nav>, so one selector
+         covers its actions, project rows and thread rows together. */
+      nav button:not(:disabled):active {
+        transform: none;
+      }
+
+      /* Annotation tints (CSS Custom Highlight API).
+         Two defects fixed here. The colour was the default accent hard-coded,
+         so a custom accent never reached the tints — it now derives from
+         --accent, which is why the theme writes that one variable to
+         documentElement as well as to the app wrapper (a highlight pseudo is
+         document-level and cannot inherit from a div).
+         And the side-pane names never matched anything: panes register
+         `pending-side:1`, not `pending-side`, so side-chat annotations
+         rendered untinted. `:` is not a valid ident character, so the pane id
+         is now sanitised to `side-1` and the names below are spelled out per
+         pane — live-state panes cap at 5, and a few spare cost nothing. */
+      ::highlight(pending-main),
+      ::highlight(pending-side-1), ::highlight(pending-side-2), ::highlight(pending-side-3),
+      ::highlight(pending-side-4), ::highlight(pending-side-5), ::highlight(pending-side-6) {
+        background: color-mix(in srgb, var(--accent, #FF563F) 32%, transparent);
+      }
+      ::highlight(annotations-main),
+      ::highlight(annotations-side-1), ::highlight(annotations-side-2), ::highlight(annotations-side-3),
+      ::highlight(annotations-side-4), ::highlight(annotations-side-5), ::highlight(annotations-side-6) {
+        background: color-mix(in srgb, var(--accent, #FF563F) 22%, transparent);
+      }
       /* Sidebar activity dot for threads with a running turn. */
       @keyframes unbiased-pulse {
         0%, 100% { opacity: 1; }
@@ -31,6 +124,47 @@
       @keyframes unbiased-shimmer {
         0% { background-position: 200% 0; }
         100% { background-position: -200% 0; }
+      }
+
+      /* Reduced transparency. The translucent chrome exists to let content
+         show through and to signal which layer floats; when the user has asked
+         for less of that, the honest answer is a solid surface with a defined
+         edge, not a weaker blur. Paired with the materials above — this block
+         only earns its place now that the app actually uses backdrop-filter. */
+      @media (prefers-reduced-transparency: reduce) {
+        :root { --scrim-blur: none; }
+      }
+      /* Higher contrast wants a heavier, more definite dim behind a modal
+         rather than a see-through one. */
+      @media (prefers-contrast: more) {
+        :root { --scrim-blur: none; }
+      }
+
+      /* Reduced motion. Not "no feedback" — a gentler equivalent. What goes is
+         travel: the shimmer is a gradient sweeping the full width of a row,
+         which is the large-moving-background case this setting exists for, and
+         press-scale is movement rather than information. What stays is
+         everything that carries meaning: the pulse and the spinner are the
+         only signals that a turn is running or a compaction is in flight, and
+         both are small, local and non-vestibular. Opacity and colour survive
+         throughout. */
+      @media (prefers-reduced-motion: reduce) {
+        [style*="unbiased-shimmer"] {
+          animation: none !important;
+          background-image: none !important;
+        }
+        button:not(:disabled):not([data-nopress]):active {
+          transform: none;
+        }
+        button:not([data-nopress]) {
+          transition: none;
+        }
+        /* A popover still fades — that is comprehension, not decoration — but
+           it stops growing out of its trigger, which is the vestibular part. */
+        [data-popover] {
+          transform: none !important;
+          transition: opacity 120ms ease !important;
+        }
       }
     </style>
     <div id="root"></div>

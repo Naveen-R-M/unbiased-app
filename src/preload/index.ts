@@ -34,7 +34,7 @@ contextBridge.exposeInMainWorld("unbiased", {
   sendMessage: (paneId: string, text: string, attachments?: { name: string; path: string; kind?: string }[]) =>
     ipcRenderer.invoke("chat:send", { paneId, text, attachments }),
   chooseAttachments: () => ipcRenderer.invoke("attach:choose"),
-  clipboardHasImage: () => ipcRenderer.invoke("clipboard:has-image"),
+  attachPaths: (paths: string[]) => ipcRenderer.invoke("attach:paths", { paths }),
   clipboardImage: () => ipcRenderer.invoke("attach:clipboard-image"),
   interrupt: (paneId: string) => ipcRenderer.invoke("chat:interrupt", paneId),
   compact: (paneId: string) => ipcRenderer.invoke("chat:compact", paneId),
@@ -86,6 +86,7 @@ contextBridge.exposeInMainWorld("unbiased", {
   scheduledLastRun: (key: string) => ipcRenderer.invoke("scheduled:last-run", key),
   onScheduledUpdated: (cb: (p: unknown) => void) => subscribe("scheduled:updated", cb),
   onScheduledRunState: (cb: (p: unknown) => void) => subscribe("scheduled:run-state", cb),
+  onScheduledCreated: (cb: (p: unknown) => void) => subscribe("chat:scheduled-created", cb),
   // A dropped File carries no usable path of its own in Electron 32+; only
   // this side can resolve one.
   pathForDroppedFile: (file: File) => {

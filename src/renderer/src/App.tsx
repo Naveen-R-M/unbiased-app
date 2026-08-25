@@ -45,6 +45,9 @@ type Entry =
   // Sub-agent lifecycle row in the transcript flow (Codex-style
   // "Created an agent" / "Closed an agent" markers).
   | { kind: "agent"; event: string; name: string; path?: string; agentThreadId?: string; prompt?: string | null }
+  // A scheduled task the agent created and the user approved. Carries the key
+  // so the row can link through to the task it made.
+  | { kind: "scheduled"; key: string; name: string; cadence: string }
   // A completed turn's work — everything before its final message —
   // collapsed under a "Worked for Ns" header, Codex-style.
   | { kind: "work"; duration: number | null; entries: Entry[] }
@@ -336,7 +339,17 @@ type McpConnected = {
   name: string;
   authStatus?: string;
   tools?: Record<string, unknown>;
-  serverInfo?: { name?: string; title?: string; version?: string; description?: string | null } | null;
+  serverInfo?: {
+    name?: string;
+    title?: string;
+    version?: string;
+    description?: string | null;
+    /** MCP's own presentation metadata. Servers advertise these at
+     *  initialize; the engine passes them through untouched, so they have
+     *  been arriving here all along — just undeclared and unrendered. */
+    icons?: { src?: string; mimeType?: string; sizes?: string }[] | null;
+    websiteUrl?: string | null;
+  } | null;
 };
 type McpStatusEvent = { name: string; status: string; error: string | null; failureReason: string | null };
 
@@ -452,7 +465,7 @@ declare global {
         attachments?: Attachment[],
       ) => Promise<{ turnId: string | null; threadId: string; created: boolean }>;
       chooseAttachments: () => Promise<{ attachments: Attachment[] }>;
-      clipboardHasImage: () => Promise<boolean>;
+      attachPaths: (paths: string[]) => Promise<{ attachments: Attachment[] }>;
       clipboardImage: () => Promise<{ attachment: Attachment | null }>;
       interrupt: (paneId: PaneId) => Promise<{ interrupted: boolean }>;
       compact: (paneId: PaneId) => Promise<{ ok: boolean; error?: string }>;
@@ -522,6 +535,9 @@ declare global {
       }>;
       onScheduledUpdated: (cb: (p: { tasks: ScheduledTaskView[] }) => void) => () => void;
       onScheduledRunState: (cb: (p: { key: string; running: boolean }) => void) => () => void;
+      onScheduledCreated: (
+        cb: (p: { paneId: PaneId; key: string; name: string; cadence: string }) => void,
+      ) => () => void;
       onApprovalCanceled: (cb: (p: { paneId: PaneId; requestId: string }) => void) => () => void;
       onApprovalRequest: (
         cb: (p: {
@@ -677,6 +693,56 @@ const colors = {
   amber: "#FAC775",
 };
 
+// ── Buttons ─────────────────────────────────────────────────────────────
+// One definition, because there were three. MCP and Skills each declared an
+// identical pair locally, and the Scheduled panel then invented a third look
+// (solid accent fill, 9px radius, no icon) — so the app's most prominent
+// action wore a different face in every panel that had one.
+//
+// The house primary is a TINTED pill, not a solid fill: accent text on a 14%
+// accent wash. On a near-black surface a solid accent block is the loudest
+// thing on screen, and "Add a server" does not deserve to outrank the content.
+//
+// The tint was also written as a literal rgba of the default accent, which
+// meant these buttons alone kept their blood-orange wash when the accent was
+// themed. color-mix ties them to the live variable.
+const btnPrimaryStyle: React.CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  gap: 8,
+  background: "color-mix(in srgb, var(--accent) 14%, transparent)",
+  border: "none",
+  borderRadius: 999,
+  color: colors.accent,
+  fontSize: 14.5,
+  fontWeight: 500,
+  cursor: "pointer",
+  fontFamily: "inherit",
+  padding: "10px 20px",
+};
+const btnSecondaryStyle: React.CSSProperties = {
+  background: "var(--chip)",
+  border: "none",
+  borderRadius: 999,
+  color: colors.fg,
+  fontSize: 14.5,
+  cursor: "pointer",
+  fontFamily: "inherit",
+  padding: "10px 20px",
+};
+/** Row-level actions sit inside an inset group, so they step down a size. */
+const btnSmallStyle: React.CSSProperties = {
+  background: "var(--chip)",
+  border: "none",
+  borderRadius: 999,
+  color: colors.fg,
+  fontSize: 13,
+  cursor: "pointer",
+  fontFamily: "inherit",
+  padding: "6px 14px",
+  flexShrink: 0,
+};
+
 export type ThemeConfig = {
   accent: string;
   surface: string;
@@ -721,17 +787,51 @@ function mixHex(a: string, b: string, t: number): string {
   return "#" + mixed.map((v) => v.toString(16).padStart(2, "0")).join("");
 }
 
+/** WCAG 2.1 relative luminance — the gamma-corrected kind the contrast
+ *  formula is defined against, not a weighted average of the raw channels. */
+function relLuminance(hex: string): number {
+  const [r, g, b] = hexToRgb(hex) ?? [0, 0, 0];
+  const lin = (v: number) => {
+    const s = v / 255;
+    return s <= 0.03928 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4);
+  };
+  return 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b);
+}
+
+/** WCAG contrast ratio between two opaque colours, 1:1 … 21:1. */
+function contrastRatio(a: string, b: string): number {
+  const la = relLuminance(a);
+  const lb = relLuminance(b);
+  return (Math.max(la, lb) + 0.05) / (Math.min(la, lb) + 0.05);
+}
+
+/**
+ * Which ink to put ON a filled swatch — measured, not guessed.
+ *
+ * This used to be a Rec.601 luma test against a 0.6 threshold, and it got the
+ * brand accent wrong: #FF563F lands at luma 0.525, so it chose white, which is
+ * 3.16:1 — under the 4.5:1 WCAG AA needs for body text. Dark ink on the same
+ * fill is 5.98:1, nearly double. The design system flags the identical trap in
+ * its own notes, calling brand-fill contrast "already borderline (~3.1:1)".
+ *
+ * A retuned threshold would only move the failure to a different hue, and the
+ * accent is user-themeable — an imported theme can carry any colour at all. So
+ * compare the two candidates properly and take the winner; that is right for
+ * every accent rather than for the one we happened to test.
+ */
+function bestInkOn(fill: string): string {
+  return contrastRatio("#111111", fill) >= contrastRatio("#ffffff", fill) ? "#111111" : "#ffffff";
+}
+
 /** Derive every chrome shade from surface + ink + contrast, Codex-style. */
 function themeVars(t: ThemeConfig): Record<string, string> {
   const k = Math.max(t.contrast, 5) / 50;
   const m = (x: number) => mixHex(t.surface, t.ink, Math.min(x * k, 1));
-  const accentRgb = hexToRgb(t.accent) ?? [255, 86, 63];
-  const accentLuma = (0.299 * accentRgb[0] + 0.587 * accentRgb[1] + 0.114 * accentRgb[2]) / 255;
   return {
     "--bg": t.surface,
     "--fg": t.ink,
     "--accent": t.accent,
-    "--accent-fg": accentLuma > 0.6 ? "#111111" : "#ffffff",
+    "--accent-fg": bestInkOn(t.accent),
     "--nav-bg": mixHex(t.surface, "#000000", 0.14),
     "--code-bg": mixHex(t.surface, "#000000", 0.3),
     "--code-fg": mixHex(t.ink, t.surface, 0.14),
@@ -870,11 +970,23 @@ function toDisplayBlocks(entries: Entry[]): DisplayBlock[] {
 
 export function App() {
   const [theme, setTheme] = useState<ThemeConfig>(loadTheme);
+  // themeVars() rides as an inline style object on each root wrapper, so no
+  // :root rule exists — which is fine for everything that inherits, and wrong
+  // for exactly one thing. A ::highlight() pseudo is resolved at document
+  // level and cannot see a variable declared on a div, so the annotation tints
+  // were stuck on a hard-coded accent. Publishing this one variable to
+  // documentElement lets index.html's tints follow the user's accent.
+  useEffect(() => {
+    document.documentElement.style.setProperty("--accent", theme.accent);
+  }, [theme.accent]);
   const [showSettings, setShowSettings] = useState(false);
   const [showChangelog, setShowChangelog] = useState(false);
   const [mcpOpen, setMcpOpen] = useState(false);
   const [skillsOpen, setSkillsOpen] = useState(false);
   const [scheduledOpen, setScheduledOpen] = useState(false);
+  /** Set when arriving from a "View task" link, so the row the agent just
+   *  created is identifiable among the others rather than left to be found. */
+  const [scheduledFocus, setScheduledFocus] = useState<string | null>(null);
   // Badge on the nav row: how many tasks came due while the app was closed.
   // Kept up here rather than inside the panel so it shows without opening it.
   const [missedCount, setMissedCount] = useState(0);
@@ -1676,6 +1788,7 @@ export function App() {
   // going in the engine and the sidebar shows it as active. Only genuinely
   // destructive actions still wait.
   async function newChat(project?: { name: string; path: string }) {
+    setScheduledOpen(false);
     snapshotSideView();
     await window.unbiased.detachThread(project?.path);
     setActiveProject(project ?? null);
@@ -1699,6 +1812,10 @@ export function App() {
 
   const openSeqRef = useRef(0);
   async function openThread(id: string) {
+    // Leaving Scheduled is the same gesture as switching chats — clicking a
+    // destination in the nav. Both entry points clear it so the view never
+    // outlives the row that is lit.
+    setScheduledOpen(false);
     if (id === activeThreadId) return;
     snapshotSideView();
     // Two quick clicks race their awaits — only the latest open may commit.
@@ -2271,6 +2388,12 @@ export function App() {
   );
   const activeProjectName = activeProject?.name ?? activeSidebarProject?.name ?? null;
   const activeProjectPath = activeProject?.path ?? activeSidebarProject?.path ?? null;
+  /** Exactly one row in the sidebar is ever lit. A project carries the
+   *  highlight only until its chat has a thread (the thread row takes over
+   *  from there) — and neither may claim it while Scheduled, which is a
+   *  destination of its own, is what you are actually looking at. */
+  const litProject = (path: string) =>
+    !scheduledOpen && activeProject?.path === path && !activeThreadId;
   const inProject = activeProjectName !== null;
   // Git operations target the conversation's actual checkout — the
   // worktree when isolated, else the project directory. (Referenced by
@@ -2411,7 +2534,12 @@ export function App() {
           <SidebarAction onClick={() => void openProjectDialog()} disabled={false} icon={<FolderPlusIcon />}>
             Open project…
           </SidebarAction>
-          <SidebarAction onClick={() => setScheduledOpen(true)} disabled={false} icon={<ClockIcon />}>
+          <SidebarAction
+            onClick={() => setScheduledOpen(true)}
+            disabled={false}
+            active={scheduledOpen}
+            icon={<ClockIcon />}
+          >
             <span style={{ display: "flex", alignItems: "center", gap: 8, flex: 1, minWidth: 0 }}>
               Scheduled
               {missedCount > 0 && (
@@ -2496,11 +2624,23 @@ export function App() {
                   // activeProject, so exactly one row is ever lit. activeProject
                   // itself must stay set — the Files view, work mode and the
                   // chat's working directory all read it.
-                  background:
-                    activeProject?.path === p.path && !activeThreadId ? "var(--chip)" : "transparent",
+                  // Same selected language as ThreadRow — accent rail plus a
+                  // tint — so "this project is active" and "this chat is
+                  // active" are visibly the same kind of state, which they are.
+                  // `lit` rather than a bare comparison: Scheduled is a
+                  // destination too, so while it is open no chat or project may
+                  // claim the highlight. Without this the sidebar showed two
+                  // selected rows at once — the view you are in, and the chat
+                  // you were in before it.
+                  background: litProject(p.path) ? "var(--chip)" : "transparent",
+                  boxShadow: litProject(p.path) ? "inset 2px 0 0 0 var(--accent)" : "none",
                   borderRadius: 8,
                   padding: "8px 8px 6px",
+                  // A project heads the chats nested under it, so it keeps its
+                  // original 14.5 and takes the weight; the chats stay at 14.
                   fontSize: 14.5,
+                  fontWeight: 500,
+                  letterSpacing: "var(--track-body)",
                   color: "var(--fg-soft)",
                   boxSizing: "border-box",
                 }}
@@ -2628,7 +2768,7 @@ export function App() {
                 <ThreadRow
                   key={t.id}
                   thread={t}
-                  active={t.id === activeThreadId}
+                  active={!scheduledOpen && t.id === activeThreadId}
                   hovered={hoveredThreadId === t.id}
                   running={runningThreads.has(t.id)}
                   indent
@@ -2651,7 +2791,7 @@ export function App() {
             <ThreadRow
               key={t.id}
               thread={t}
-              active={t.id === activeThreadId}
+              active={!scheduledOpen && t.id === activeThreadId}
               hovered={hoveredThreadId === t.id}
               running={runningThreads.has(t.id)}
               onHover={setHoveredThreadId}
@@ -2749,6 +2889,23 @@ export function App() {
           flexDirection: "column",
         }}
       >
+        {/* Scheduled tasks lives in the content area, not over it and not
+            instead of the whole window: the nav stays put and you leave the
+            way you leave a chat — by clicking somewhere else in it. */}
+        {scheduledOpen ? (
+          <ScheduledView
+            defaultProject={activeProjectPath ?? null}
+            navOpen={navOpen}
+            onToggleNav={toggleNav}
+            focusKey={scheduledFocus}
+            onFocusHandled={() => setScheduledFocus(null)}
+            onOpenThread={(id) => {
+              setScheduledOpen(false);
+              void openThread(id);
+            }}
+          />
+        ) : (
+          <>
         <header
           style={{
             padding: "10px 16px",
@@ -2756,8 +2913,21 @@ export function App() {
             alignItems: "center",
             gap: 10,
             flexShrink: 0,
+            // Deliberately NOT translucent. This bar is a flex sibling of the
+            // transcript, not a layer above it, so nothing ever passes behind
+            // it — a backdrop-filter here blurs the parent background and
+            // costs a compositing pass to render something identical to an
+            // opaque fill. Translucency is applied where surfaces genuinely
+            // overlap content instead (the modal scrims).
+            //
+            // Separation comes from HeaderEdge, which needs this element to be
+            // a positioned stacking context so its overflow is not painted
+            // over by the transcript that follows it.
+            position: "relative",
+            zIndex: 2,
           }}
         >
+          <HeaderEdge />
           <IconButton title={navOpen ? "Hide sidebar" : "Show sidebar"} onClick={toggleNav}>
             <PanelIcon />
           </IconButton>
@@ -2766,6 +2936,7 @@ export function App() {
               fontSize: 14,
               fontWeight: 500,
               color: colors.fg,
+              letterSpacing: "var(--track-body)",
               whiteSpace: "nowrap",
               overflow: "hidden",
               textOverflow: "ellipsis",
@@ -3390,6 +3561,10 @@ export function App() {
             ) : undefined
           }
           onOpenAgent={openAgentTab}
+          onOpenScheduled={(key) => {
+            setScheduledFocus(key);
+            setScheduledOpen(true);
+          }}
           onOpenMcp={() => setMcpOpen(true)}
           onOpenSkills={() => setSkillsOpen(true)}
           onBusyChange={(b) => {
@@ -3423,6 +3598,8 @@ export function App() {
           accessMode={accessMode}
           onAccessModeChange={changeAccessMode}
         />
+          </>
+        )}
       </div>
 
       {sideOpen && (
@@ -3818,7 +3995,7 @@ export function App() {
           style={{
             position: "fixed",
             inset: 0,
-            background: "rgba(0,0,0,0.55)",
+            background: "rgba(0,0,0,0.45)", backdropFilter: "var(--scrim-blur)", WebkitBackdropFilter: "var(--scrim-blur)",
             display: "grid",
             placeItems: "center",
             zIndex: 100,
@@ -3954,7 +4131,7 @@ export function App() {
           style={{
             position: "fixed",
             inset: 0,
-            background: "rgba(0,0,0,0.55)",
+            background: "rgba(0,0,0,0.45)", backdropFilter: "var(--scrim-blur)", WebkitBackdropFilter: "var(--scrim-blur)",
             display: "grid",
             placeItems: "center",
             zIndex: 100,
@@ -4074,7 +4251,7 @@ export function App() {
           style={{
             position: "fixed",
             inset: 0,
-            background: "rgba(0,0,0,0.55)",
+            background: "rgba(0,0,0,0.45)", backdropFilter: "var(--scrim-blur)", WebkitBackdropFilter: "var(--scrim-blur)",
             display: "grid",
             placeItems: "center",
             zIndex: 100,
@@ -4091,7 +4268,7 @@ export function App() {
               boxShadow: "0 16px 48px rgba(0,0,0,0.55)",
             }}
           >
-            <div style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 19, fontWeight: 600, color: colors.fg }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 19, fontWeight: 600, color: colors.fg, letterSpacing: "var(--track-title)" }}>
               <span style={{ color: colors.amber, display: "flex" }}>
                 <ShieldAlertIcon />
               </span>
@@ -4243,7 +4420,7 @@ export function App() {
           onMouseDown={(e) => {
             if (e.target === e.currentTarget) setEditProj(null);
           }}
-          style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)", display: "grid", placeItems: "center", zIndex: 100 }}
+          style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.45)", backdropFilter: "var(--scrim-blur)", WebkitBackdropFilter: "var(--scrim-blur)", display: "grid", placeItems: "center", zIndex: 100 }}
         >
           <div
             style={{
@@ -4529,16 +4706,6 @@ export function App() {
           </div>
         </div>
       )}
-      {scheduledOpen && (
-        <ScheduledPanel
-          defaultProject={activeProjectPath ?? null}
-          onOpenThread={(id) => {
-            setScheduledOpen(false);
-            void openThread(id);
-          }}
-          onClose={() => setScheduledOpen(false)}
-        />
-      )}
       {mcpOpen && <McpPanel onClose={() => setMcpOpen(false)} />}
       {skillsOpen && (
         <SkillsPanel cwd={activeProjectPath ?? null} onClose={() => setSkillsOpen(false)} />
@@ -4551,7 +4718,7 @@ export function App() {
           onMouseDown={(e) => {
             if (e.target === e.currentTarget) setRenameDialog(null);
           }}
-          style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)", display: "grid", placeItems: "center", zIndex: 100 }}
+          style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.45)", backdropFilter: "var(--scrim-blur)", WebkitBackdropFilter: "var(--scrim-blur)", display: "grid", placeItems: "center", zIndex: 100 }}
         >
           <div
             style={{
@@ -4621,7 +4788,7 @@ export function App() {
           onMouseDown={(e) => {
             if (e.target === e.currentTarget) setMoveDialog(null);
           }}
-          style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)", display: "grid", placeItems: "center", zIndex: 100 }}
+          style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.45)", backdropFilter: "var(--scrim-blur)", WebkitBackdropFilter: "var(--scrim-blur)", display: "grid", placeItems: "center", zIndex: 100 }}
         >
           <div
             style={{
@@ -4676,7 +4843,7 @@ export function App() {
           style={{
             position: "fixed",
             inset: 0,
-            background: "rgba(0,0,0,0.55)",
+            background: "rgba(0,0,0,0.45)", backdropFilter: "var(--scrim-blur)", WebkitBackdropFilter: "var(--scrim-blur)",
             display: "grid",
             placeItems: "center",
             zIndex: 100,
@@ -4883,7 +5050,7 @@ function DirTree({
       if (e.dir) {
         const open = expanded.has(full);
         out.push(
-          <button key={full} onClick={() => void toggleDir(full)} style={rowStyle}>
+          <button key={full} onClick={() => void toggleDir(full)} style={rowStyle} data-nopress>
             {guides(depth)}
             <span
               style={{
@@ -4893,7 +5060,7 @@ function DirTree({
                 width: 10,
                 flexShrink: 0,
                 transform: open ? "rotate(90deg)" : "none",
-                transition: "transform 120ms",
+                transition: "transform 120ms var(--ease-out)",
               }}
             >
               ›
@@ -4905,7 +5072,7 @@ function DirTree({
       } else if (!f || e.name.toLowerCase().includes(f)) {
         const ext = e.name.includes(".") ? (e.name.split(".").pop() ?? "") : "";
         out.push(
-          <button key={full} onClick={() => onOpenFile(full)} style={rowStyle}>
+          <button key={full} onClick={() => onOpenFile(full)} style={rowStyle} data-nopress>
             {guides(depth)}
             <span
               style={{
@@ -5508,7 +5675,7 @@ function ReviewPane({ gitPath }: { gitPath: string | null }) {
                         flexShrink: 0,
                         color: colors.dim,
                         transform: isCollapsed ? "rotate(-90deg)" : "none",
-                        transition: "transform 120ms",
+                        transition: "transform 120ms var(--ease-out)",
                       }}
                     >
                       <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
@@ -5770,15 +5937,19 @@ function WorkedGroup({ duration, children }: { duration: number | null; children
           display: "flex",
           alignItems: "center",
           gap: 6,
-          width: "100%",
+          // Was width:100% with a full-bleed bottom rule — a horizontal line
+          // across the whole transcript for what is a piece of metadata about
+          // one turn. Shrinking it to its content makes it a label you can
+          // click, and drops a divider that was competing with the content.
+          width: "fit-content",
           background: "transparent",
           border: "none",
-          padding: "0 0 6px",
+          padding: "2px 0 4px",
           color: colors.dim,
-          fontSize: 13.5,
+          fontSize: 12.5,
+          letterSpacing: "var(--track-meta)",
           cursor: "pointer",
           fontFamily: "inherit",
-          borderBottom: `1px solid ${colors.border}`,
         }}
       >
         {duration !== null ? `Worked for ${formatDuration(duration)}` : "Worked"}
@@ -5786,7 +5957,7 @@ function WorkedGroup({ duration, children }: { duration: number | null; children
           style={{
             display: "inline-block",
             transform: open ? "rotate(90deg)" : "none",
-            transition: "transform 120ms",
+            transition: "transform 120ms var(--ease-out)",
             fontSize: 10,
           }}
         >
@@ -5872,7 +6043,7 @@ function AgentLifecycleRow({
           style={{
             display: "inline-block",
             transform: open ? "rotate(90deg)" : "none",
-            transition: "transform 120ms",
+            transition: "transform 120ms var(--ease-out)",
             fontSize: 10,
           }}
         >
@@ -5998,7 +6169,11 @@ function buildMdComponents(
             const href = props.href ?? "";
             if (/^https?:/.test(href)) openLink?.(href);
           }}
-          style={{ color: "var(--accent)", cursor: "pointer" }}
+          // textDecoration:none is doing real work: the underline here was the
+          // UA default, and a full-width solid rule under a long link title
+          // out-weighed every other accent in the transcript. Colour carries
+          // the affordance instead.
+          style={{ color: "var(--accent)", cursor: "pointer", textDecoration: "none" }}
           title="Open in browser tab"
         >
           {host ? <Favicon host={host} /> : null}
@@ -6180,7 +6355,7 @@ function SubAgentPane({ threadId, name, status }: { threadId: string; name: stri
               </div>
             );
           }
-          if (e.kind === "compaction") {
+    if (e.kind === "compaction") {
             return (
               <div key={i} style={{ display: "flex", alignItems: "center", gap: 12, margin: "14px 0" }}>
                 <span style={{ flex: 1, height: 1, background: colors.border }} />
@@ -6536,7 +6711,11 @@ function FileViewer({
             const href = props.href ?? "";
             if (/^https?:/.test(href)) onOpenLinkRef.current?.(href);
           }}
-          style={{ color: "var(--accent)", cursor: "pointer" }}
+          // textDecoration:none is doing real work: the underline here was the
+          // UA default, and a full-width solid rule under a long link title
+          // out-weighed every other accent in the transcript. Colour carries
+          // the affordance instead.
+          style={{ color: "var(--accent)", cursor: "pointer", textDecoration: "none" }}
           title="Open in browser tab"
         >
           {props.children}
@@ -7109,6 +7288,7 @@ function ChatPane({
   threadId,
   persistTranscript,
   onOpenAgent,
+  onOpenScheduled,
   onOpenMcp,
   onOpenSkills,
 }: {
@@ -7152,6 +7332,8 @@ function ChatPane({
   persistTranscript?: boolean;
   // Opens a sub-agent's conversation in the side panel (lifecycle rows).
   onOpenAgent?: (a: { threadId: string; name: string }) => void;
+  /** Open the Scheduled view focused on a task the agent just created. */
+  onOpenScheduled?: (key: string) => void;
   onOpenMcp?: () => void;
   onOpenSkills?: () => void;
 }) {
@@ -7215,7 +7397,19 @@ function ChatPane({
   // The + button's popup menu, plus whether the clipboard held an image
   // when it was opened (drives the "Image from clipboard" item's state).
   const [plusOpen, setPlusOpen] = useState(false);
-  const [clipHasImage, setClipHasImage] = useState(false);
+  // Entry state for the + menu. A transition off a mounted flag rather than a
+  // keyframe: keyframes restart from zero when re-triggered, and this menu can
+  // be toggled fast. Set on the next frame so the browser has a "from" to
+  // animate out of.
+  const [plusShown, setPlusShown] = useState(false);
+  useEffect(() => {
+    if (!plusOpen) {
+      setPlusShown(false);
+      return;
+    }
+    const id = requestAnimationFrame(() => setPlusShown(true));
+    return () => cancelAnimationFrame(id);
+  }, [plusOpen]);
   // The menu panel hangs off the composer box (full width), not the +
   // button, so outside-click must spare both.
   const plusRef = useRef<HTMLSpanElement>(null);
@@ -7239,8 +7433,59 @@ function ChatPane({
     };
   }, [plusOpen]);
 
-  async function openPlusMenu() {
-    setClipHasImage(await window.unbiased.clipboardHasImage());
+  // Drag-and-drop onto the conversation.
+  //
+  // dragleave fires every time the pointer crosses into a CHILD element, so a
+  // naive leave handler makes the overlay strobe as you move across the
+  // transcript. Counting enters against leaves is the standard fix: the drag
+  // has genuinely left only when the depth returns to zero.
+  const dragDepth = useRef(0);
+  const [dropping, setDropping] = useState(false);
+  /** Only file drags. Dragging selected text within the app also fires these
+   *  events, and offering to "attach" a text selection is nonsense. */
+  const isFileDrag = (e: React.DragEvent) => Array.from(e.dataTransfer.types ?? []).includes("Files");
+
+  function onDragEnter(e: React.DragEvent) {
+    if (!isFileDrag(e)) return;
+    dragDepth.current += 1;
+    setDropping(true);
+  }
+  function onDragLeave(e: React.DragEvent) {
+    if (!isFileDrag(e)) return;
+    dragDepth.current = Math.max(0, dragDepth.current - 1);
+    if (dragDepth.current === 0) setDropping(false);
+  }
+  function onDragOver(e: React.DragEvent) {
+    if (!isFileDrag(e)) return;
+    // Required: without preventDefault on dragover the drop never fires, and
+    // Electron falls back to navigating the window to the dropped file.
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "copy";
+  }
+  async function onDrop(e: React.DragEvent) {
+    if (!isFileDrag(e)) return;
+    e.preventDefault();
+    dragDepth.current = 0;
+    setDropping(false);
+    const paths = Array.from(e.dataTransfer.files)
+      .map((f) => window.unbiased.pathForDroppedFile(f))
+      .filter(Boolean);
+    if (paths.length === 0) return;
+    const res = await window.unbiased.attachPaths(paths);
+    if (!res.attachments?.length) return;
+    // De-duplicate against what is already staged — dropping the same file
+    // twice should not queue it twice.
+    setAttachments((list) => {
+      const seen = new Set(list.map((a) => a.path));
+      return [...list, ...res.attachments.filter((a) => !seen.has(a.path))];
+    });
+    taRef.current?.focus();
+  }
+
+  function openPlusMenu() {
+    // No longer async: the clipboard probe existed only to enable or disable
+    // the "Image from clipboard" row, and opening a menu should not wait on
+    // IPC. Pasting an image into the composer still attaches it.
     setPlusOpen(true);
   }
 
@@ -7727,6 +7972,14 @@ function ChatPane({
           { kind: "agent", event: p.event, name: p.name, path: p.path, agentThreadId: p.agentThreadId, prompt: p.prompt },
         ]);
       }),
+      window.unbiased.onScheduledCreated((p) => {
+        if (p.paneId !== paneId) return;
+        producedRef.current = true;
+        setEntries((es) => [
+          ...withoutTrailingPlaceholder(es),
+          { kind: "scheduled", key: p.key, name: p.name, cadence: p.cadence },
+        ]);
+      }),
       window.unbiased.onCompaction((p) => {
         if (p.paneId !== paneId) return;
         setEntries((es) => {
@@ -7997,24 +8250,33 @@ function ChatPane({
   // API — the browser selection collapses the instant the comment input
   // takes focus, so the native highlight can't carry this. Names are
   // pane-scoped because CSS.highlights is a document-global registry.
+  //
+  // The pane id goes through highlightName() first: a side pane is "side:1",
+  // and a registered name containing ":" can never be written as a
+  // ::highlight() selector — the colon is not a valid ident character. So the
+  // side-chat tints were registered and then styled by nothing at all, which
+  // is why annotating in a side chat produced a badge but no colour.
+  const highlightName = (kind: string) => `${kind}-${paneId.replace(/:/g, "-")}`;
   useEffect(() => {
     if (typeof Highlight === "undefined") return;
+    const name = highlightName("pending");
     if (pendingComment !== null && savedRangeRef.current) {
-      CSS.highlights.set(`pending-${paneId}`, new Highlight(savedRangeRef.current));
+      CSS.highlights.set(name, new Highlight(savedRangeRef.current));
     } else {
-      CSS.highlights.delete(`pending-${paneId}`);
+      CSS.highlights.delete(name);
     }
-    return () => void CSS.highlights.delete(`pending-${paneId}`);
+    return () => void CSS.highlights.delete(name);
   }, [pendingComment, paneId]);
 
   // Confirmed annotations keep their tint until the message sends. A range
   // dies silently if its DOM re-renders; the captured text is unaffected.
   useEffect(() => {
     if (typeof Highlight === "undefined") return;
+    const name = highlightName("annotations");
     const ranges = annotations.map((a) => a.range).filter((r): r is Range => Boolean(r));
-    if (ranges.length > 0) CSS.highlights.set(`annotations-${paneId}`, new Highlight(...ranges));
-    else CSS.highlights.delete(`annotations-${paneId}`);
-    return () => void CSS.highlights.delete(`annotations-${paneId}`);
+    if (ranges.length > 0) CSS.highlights.set(name, new Highlight(...ranges));
+    else CSS.highlights.delete(name);
+    return () => void CSS.highlights.delete(name);
   }, [annotations, paneId]);
 
   // Numbered badges pinned at the top-right corner of each annotated
@@ -8091,7 +8353,12 @@ function ChatPane({
     [],
   );
 
-  const renderBlock = (block: DisplayBlock, isLast = false): React.ReactNode => {
+  // `nested` = rendered inside a "Worked for Ns" group. It used to be inferred
+  // from isLast being false, which held only while the action row required
+  // isLast to be TRUE; now that every settled reply shows one, the group's
+  // intermediate narration has to be excluded explicitly or each line of it
+  // sprouts a copy button.
+  const renderBlock = (block: DisplayBlock, isLast = false, nested = false): React.ReactNode => {
     if (block.kind === "steps") {
       return (
         <StepsGroup key={`s${block.key}`} items={block.items} statusLabel={statusLabel} decide={decide} />
@@ -8114,19 +8381,57 @@ function ChatPane({
           {e.text && (
             <div
               style={{
-                maxWidth: "85%",
+                // Narrower than before (85% let a long question run almost the
+                // full pane, which defeats the point of the right-alignment
+                // doing the speaker-identification work) and given a border,
+                // so the bubble reads as a distinct surface rather than a
+                // slightly different shade of the background.
+                maxWidth: "72%",
                 padding: "10px 14px",
-                borderRadius: 12,
-                background: colors.panel,
+                borderRadius: 14,
+                background: "var(--chip)",
+                border: `1px solid ${colors.border}`,
                 whiteSpace: "pre-wrap",
                 lineHeight: 1.55,
                 fontSize: 14,
+                letterSpacing: "var(--track-body)",
               }}
             >
               {e.text}
             </div>
           )}
           {e.text && <CopyButton text={e.text} />}
+        </div>
+      );
+    }
+    if (e.kind === "scheduled") {
+      return (
+        <div
+          key={block.key}
+          style={{ display: "flex", alignItems: "center", gap: 8, margin: "14px 0", fontSize: 13 }}
+        >
+          <span style={{ color: colors.accent, display: "flex" }}>
+            <ClockIcon size={14} />
+          </span>
+          <span style={{ color: colors.dim }}>
+            Scheduled <span style={{ color: colors.fg }}>{e.name}</span> — {e.cadence}.
+          </span>
+          {onOpenScheduled && (
+            <button
+              onClick={() => onOpenScheduled(e.key)}
+              style={{
+                background: "transparent",
+                border: "none",
+                padding: 0,
+                color: colors.accent,
+                fontSize: 13,
+                cursor: "pointer",
+                fontFamily: "inherit",
+              }}
+            >
+              View task
+            </button>
+          )}
         </div>
       );
     }
@@ -8158,22 +8463,73 @@ function ChatPane({
       );
     }
     if (e.kind === "assistant") {
+      // The ⚠ rows are app-authored notices ("empty response", "turn failed"),
+      // not model output — but they were rendered as ordinary assistant text,
+      // so a one-line failure arrived at 15.5px in the reading colour and read
+      // louder than the answer above it. A notice should be quieter than the
+      // content it comments on: smaller, dim, and set apart by a rule rather
+      // than by size.
+      if (e.text.startsWith("⚠")) {
+        return (
+          <div
+            key={block.key}
+            style={{
+              margin: "14px 0",
+              padding: "9px 12px",
+              maxWidth: "var(--measure)",
+              borderRadius: 10,
+              background: "var(--panel-2)",
+              borderLeft: `2px solid ${colors.amber}`,
+              color: colors.dim,
+              fontSize: 13,
+              lineHeight: 1.5,
+              letterSpacing: "var(--track-meta)",
+            }}
+          >
+            {e.text.replace(/^⚠\s*/, "")}
+          </div>
+        );
+      }
       return (
-        <div key={block.key} style={{ margin: "16px 0", lineHeight: 1.7, fontSize: 15.5, color: "var(--fg-msg)" }}>
+        <div
+          key={block.key}
+          style={{
+            margin: "22px 0",
+            lineHeight: 1.7,
+            fontSize: 15.5,
+            color: "var(--fg-msg)",
+            letterSpacing: "var(--track-body)",
+            // Capped measure: at full pane width a reply runs well past 100
+            // characters per line, and the eye loses its place on the return
+            // sweep. Turn spacing goes up with it (16 → 22) so consecutive
+            // turns read as separate rather than as one wall.
+            maxWidth: "var(--measure)",
+          }}
+        >
           <Markdown remarkPlugins={REMARK_PLUGINS} components={mdComponents}>
             {e.text}
           </Markdown>
           {e.interrupted && <div style={{ color: colors.dim, fontSize: 12, marginTop: 4 }}>— stopped</div>}
-          {/* One action row, on the settled final response — intermediate
-              narration (and anything inside a work group) goes without. */}
-          {e.text && isLast && !busy && <AssistantActions text={e.text} at={e.at} />}
+          {/* Every settled reply gets its action row, not just the newest one:
+              wanting to copy an answer from earlier in a conversation is at
+              least as common as copying the last one, and the timestamp is the
+              only record of when a turn landed.
+
+              Two exclusions. The reply still streaming: a copy button on half
+              an answer copies half an answer, and its timestamp does not exist
+              yet. And anything folded into a work group, which `nested`
+              carries — that content is intermediate narration, and a copy row
+              per line of it would bury the group it belongs to. */}
+          {e.text && !nested && !(isLast && busy) && (
+            <AssistantActions text={e.text} at={e.at} />
+          )}
         </div>
       );
     }
     if (e.kind === "work") {
       return (
         <WorkedGroup key={`w${block.key}`} duration={e.duration}>
-          {toDisplayBlocks(e.entries).map((b) => renderBlock(b))}
+          {toDisplayBlocks(e.entries).map((b) => renderBlock(b, false, true))}
         </WorkedGroup>
       );
     }
@@ -8181,7 +8537,47 @@ function ChatPane({
   };
 
   return (
-    <div ref={paneRef} style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", position: "relative" }}>
+    <div
+      ref={paneRef}
+      onDragEnter={onDragEnter}
+      onDragLeave={onDragLeave}
+      onDragOver={onDragOver}
+      onDrop={(e) => void onDrop(e)}
+      style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", position: "relative" }}
+    >
+      {/* The drop target. Feedback has to be visible DURING the drag, not on
+          release — until something on screen changes, there is nothing telling
+          you the window will accept what you are holding. Inert to the pointer
+          so it cannot swallow the drop event it exists to advertise. */}
+      {dropping && (
+        <div
+          data-popover
+          style={{
+            position: "absolute",
+            inset: 8,
+            zIndex: 30,
+            pointerEvents: "none",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            gap: 10,
+            borderRadius: 16,
+            border: `1.5px dashed color-mix(in srgb, var(--accent) 55%, transparent)`,
+            background: "color-mix(in srgb, var(--bg) 72%, transparent)",
+            backdropFilter: "blur(3px)",
+            WebkitBackdropFilter: "blur(3px)",
+            color: colors.fg,
+            fontSize: 14.5,
+            fontWeight: 500,
+            letterSpacing: "var(--track-body)",
+          }}
+        >
+          <span style={{ color: colors.accent, display: "flex" }}>
+            <PaperclipIcon />
+          </span>
+          Drop to attach
+        </div>
+      )}
       {selection && onAskSideChat && (
         <div
           style={{
@@ -8386,34 +8782,73 @@ function ChatPane({
           {plusOpen && (
             <div
               ref={plusMenuRef}
+              data-popover
               style={{
                 position: "absolute",
                 bottom: "calc(100% + 8px)",
+                // Full composer width. Width on its own is what made this look
+                // sparse before — five short labels ragged across 700px — so
+                // the rows are given columns instead: a fixed icon gutter, a
+                // fixed label column, then descriptions all starting at the
+                // same x. Aligned columns are what makes a wide list read as
+                // structured rather than empty.
                 left: 0,
                 right: 0,
                 // Same surface as the composer box — Codex renders both at
                 // one elevation, not the popup a step lighter.
                 background: colors.panel,
                 border: `1px solid ${colors.border}`,
-                borderRadius: 16,
-                padding: "8px 8px 8px",
+                borderRadius: 14,
+                padding: 6,
                 zIndex: 20,
-                boxShadow: "0 8px 24px rgba(0,0,0,0.45)",
+                boxShadow: "0 12px 32px rgba(0,0,0,0.5)",
+                // Grows out of its trigger rather than its own centre, so the
+                // button and the menu read as one object. Starts at 0.96, not
+                // 0 — nothing in the real world appears from nothing.
+                transformOrigin: "bottom left",
+                opacity: plusShown ? 1 : 0,
+                transform: plusShown ? "scale(1)" : "scale(0.96)",
+                // 140ms: this menu is opened many times a day, and past about
+                // 200ms a frequently-used control starts to feel slow.
+                transition: "opacity 140ms var(--ease-out), transform 140ms var(--ease-out)",
               }}
             >
-              <div style={{ color: colors.dim, fontSize: 13, padding: "4px 10px 6px" }}>Add</div>
+              <div
+                style={{
+                  color: colors.dim,
+                  fontSize: 11,
+                  fontWeight: 600,
+                  textTransform: "uppercase",
+                  letterSpacing: "var(--track-overline)",
+                  padding: "6px 10px 6px",
+                }}
+              >
+                Add
+              </div>
               <MenuItem icon={<PaperclipIcon />} label="Files and folders" onClick={() => void addAttachments()} />
-              <MenuItem
-                icon={<ImageIcon />}
-                label="Image from clipboard"
-                desc={clipHasImage ? undefined : "Nothing copied"}
-                disabled={!clipHasImage}
-                onClick={() => void attachClipboardImage()}
-              />
+              {/* Second group. These three neither attach nor add anything —
+                  two open a panel and one flips a mode — so they were sitting
+                  under a heading that did not describe them. Proximity implies
+                  relationship, and it was implying the wrong one. */}
+              <div
+                style={{
+                  color: colors.dim,
+                  fontSize: 11,
+                  fontWeight: 600,
+                  textTransform: "uppercase",
+                  letterSpacing: "var(--track-overline)",
+                  padding: "12px 10px 6px",
+                  marginTop: 4,
+                  borderTop: `1px solid ${colors.border}`,
+                }}
+              >
+                Pareto
+              </div>
               <MenuItem
                 icon={<SkillIcon />}
                 label="Skills"
                 desc="What Pareto knows how to do"
+                trailing={<MenuChevron />}
                 onClick={() => {
                   setPlusOpen(false);
                   onOpenSkills?.();
@@ -8423,6 +8858,7 @@ function ChatPane({
                 icon={<McpIcon />}
                 label="MCP"
                 desc="Show MCP server status"
+                trailing={<MenuChevron />}
                 onClick={() => {
                   setPlusOpen(false);
                   onOpenMcp?.();
@@ -8431,7 +8867,8 @@ function ChatPane({
               <MenuItem
                 icon={<LightbulbIcon />}
                 label="Plan mode"
-                desc={planMode ? "Turn plan mode off" : "Turn plan mode on"}
+                desc="Research first, propose a plan, act after"
+                trailing={<StatePill on={planMode} />}
                 onClick={() => {
                   setPlusOpen(false);
                   onTogglePlanMode();
@@ -9495,7 +9932,7 @@ function ConfirmRemove({
   return (
     <div
       onMouseDown={(e) => { if (e.target === e.currentTarget) onCancel(); }}
-      style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)", display: "grid", placeItems: "center", zIndex: 110 }}
+      style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.45)", backdropFilter: "var(--scrim-blur)", WebkitBackdropFilter: "var(--scrim-blur)", display: "grid", placeItems: "center", zIndex: 110 }}
     >
       <div
         style={{
@@ -9652,36 +10089,45 @@ const TASK_TEMPLATES: { name: string; schedule: ScheduleSpec; prompt: string; bl
 ];
 
 /**
- * Scheduled tasks.
+ * Scheduled tasks — a whole-window route, like Settings.
  *
- * Rendered as a panel rather than a whole-window route because that is what
- * this app's other management surfaces are (MCP servers, Skills), and the nav
- * stays visible behind it. The Codex screenshot this follows shows the same
- * three regions: the search, the starter templates, and the list.
+ * It started as a modal, matching MCP servers and Skills, and that was the
+ * wrong read: those two are dialogs you open, adjust and dismiss, whereas this
+ * has its own list, search, filters and creation flow. A modal frames all of
+ * that as an interruption and caps it at 620px while the content wants a page.
+ * The nav is not kept visible for the same reason Settings does not keep it —
+ * you are somewhere else, and "← Back to app" is the way out.
  *
- * Deliberately NOT built: the "Create with Codex" half of that screenshot's
- * Create menu — describing a task in prose and having the agent derive the
- * schedule. The templates below cover the same "get started without filling a
- * form" intent without a round-trip that can fail.
+ * Still not built: describing a task in prose and having the agent derive the
+ * schedule. That needs a model round-trip that can fail, and it is a feature
+ * rather than a layout, so the starter templates carry the "begin without a
+ * form" intent instead.
  */
-function ScheduledPanel({
+function ScheduledView({
   defaultProject,
   onOpenThread,
-  onClose,
+  navOpen,
+  onToggleNav,
+  focusKey,
+  onFocusHandled,
 }: {
   defaultProject: string | null;
   onOpenThread: (threadId: string) => void;
-  onClose: () => void;
+  navOpen: boolean;
+  onToggleNav: () => void;
+  focusKey?: string | null;
+  onFocusHandled?: () => void;
 }) {
   const [tasks, setTasks] = useState<ScheduledTaskView[]>([]);
   const [engineReady, setEngineReady] = useState(true);
   const [loading, setLoading] = useState(true);
   const [query, setQuery] = useState("");
+  const [filter, setFilter] = useState<"all" | "active" | "paused">("all");
   const [notice, setNotice] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+  const [hovered, setHovered] = useState<string | null>(null);
 
-  // Form state. `editing` is the key being edited, "" for a new task, or null
-  // when the form is closed.
+  // `editing` is the key being edited, "" for a new task, null when closed.
   const [editing, setEditing] = useState<string | null>(null);
   const [fName, setFName] = useState("");
   const [fPrompt, setFPrompt] = useState("");
@@ -9700,8 +10146,8 @@ function ScheduledPanel({
     });
   }, []);
   useEffect(refresh, [refresh]);
-  // A tick that fires while the panel is open, or a run finishing, should
-  // land without a manual refresh — this is the only signal a task ran.
+  // A tick firing or a run finishing while this page is open should land
+  // without a manual refresh — it is the only signal that a task ran.
   useEffect(() => window.unbiased.onScheduledUpdated((p) => setTasks(p.tasks ?? [])), []);
   useEffect(
     () =>
@@ -9713,14 +10159,33 @@ function ScheduledPanel({
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
       if (e.key !== "Escape") return;
-      // Escape backs out one layer at a time, matching the other panels.
+      // One layer at a time — and it stops at the view. Escape used to leave
+      // the whole page, which made sense while this was a modal; now it is a
+      // destination like any conversation, and no conversation closes itself
+      // on Escape.
       if (confirmDelete) setConfirmDelete(null);
       else if (editing !== null) closeForm();
-      else onClose();
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   });
+
+  // Arriving from a "View task" link: scroll the row into view and mark it
+  // long enough to be found. The mark is temporary on purpose — it answers
+  // "which one did it just make", and after that it is an ordinary row.
+  const focusRef = useRef<HTMLDivElement | null>(null);
+  const [marked, setMarked] = useState<string | null>(null);
+  useEffect(() => {
+    if (!focusKey || loading) return;
+    if (!tasks.some((t) => t.key === focusKey)) return;
+    setFilter("all");
+    setQuery("");
+    setMarked(focusKey);
+    focusRef.current?.scrollIntoView({ block: "center", behavior: "smooth" });
+    onFocusHandled?.();
+    const id = setTimeout(() => setMarked(null), 2600);
+    return () => clearTimeout(id);
+  }, [focusKey, loading, tasks, onFocusHandled]);
 
   function closeForm() {
     setEditing(null);
@@ -9781,9 +10246,13 @@ function ScheduledPanel({
     if (!res.ok) setNotice(res.error ?? "The run failed.");
   }
 
-  const filtered = query.trim()
-    ? tasks.filter((t) => `${t.name} ${t.prompt}`.toLowerCase().includes(query.trim().toLowerCase()))
-    : tasks;
+  const q = query.trim().toLowerCase();
+  const filtered = tasks
+    .filter((t) => (filter === "all" ? true : filter === "active" ? t.enabled : !t.enabled))
+    .filter((t) => (q ? `${t.name} ${t.prompt}`.toLowerCase().includes(q) : true));
+  // A template already taken by an existing task is not a suggestion any more.
+  const taken = new Set(tasks.map((t) => t.name.toLowerCase()));
+  const suggestions = TASK_TEMPLATES.filter((t) => !taken.has(t.name.toLowerCase()));
 
   const inputStyle: React.CSSProperties = {
     width: "100%",
@@ -9796,6 +10265,7 @@ function ScheduledPanel({
     padding: "10px 12px",
     fontSize: 13.5,
     fontFamily: "var(--font-ui)",
+    letterSpacing: "var(--track-body)",
     outline: "none",
   };
   const labelStyle: React.CSSProperties = {
@@ -9805,77 +10275,105 @@ function ScheduledPanel({
     marginBottom: 6,
     display: "block",
   };
-  const insetStyle: React.CSSProperties = {
-    background: "var(--panel-2)",
-    border: `1px solid ${colors.border}`,
-    borderRadius: 12,
-    marginTop: 16,
-    overflow: "hidden",
-  };
-  const ghostButton: React.CSSProperties = {
-    background: "transparent",
-    color: "var(--fg-soft)",
-    border: `1px solid ${colors.border}`,
-    borderRadius: 8,
-    padding: "5px 10px",
-    fontSize: 12.5,
-    cursor: "pointer",
-    fontFamily: "inherit",
-  };
-  const primaryButton: React.CSSProperties = {
-    background: colors.accent,
-    color: "var(--accent-fg)",
-    border: "none",
-    borderRadius: 9,
-    padding: "9px 16px",
-    fontSize: 13.5,
-    fontWeight: 600,
-    cursor: "pointer",
-    fontFamily: "inherit",
-  };
+  // The app's own button vocabulary, not a third one invented here: row
+  // actions take the small chip pill that MCP and Skills use for the same job,
+  // and the main action takes the tinted primary pill.
+  const ghostButton = btnSmallStyle;
+  const primaryButton = btnPrimaryStyle;
 
   return (
-    <div
-      onClick={onClose}
-      style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)", display: "grid", placeItems: "center", zIndex: 100 }}
-    >
-      <div
-        onClick={(e) => e.stopPropagation()}
+    <div style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0 }}>
+      {/* The same chrome a conversation gets — sidebar toggle, then the title
+          — so this reads as another place in the app rather than a mode you
+          have been dropped into. No back button: the nav is right there, and
+          a chat does not have one either. */}
+      <header
         style={{
-          background: colors.panel,
-          border: `1px solid ${colors.border}`,
-          borderRadius: 18,
-          width: 620,
-          maxWidth: "calc(100vw - 48px)",
-          boxSizing: "border-box",
-          maxHeight: "84vh",
           display: "flex",
-          flexDirection: "column",
-          overflow: "hidden",
-          boxShadow: "0 16px 48px rgba(0,0,0,0.55)",
-          fontFamily: "var(--font-ui)",
+          alignItems: "center",
+          gap: 10,
+          padding: "10px 16px",
+          flexShrink: 0,
+          position: "relative",
+          zIndex: 2,
         }}
       >
-        <div style={{ padding: "24px 26px 0", flexShrink: 0 }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 19, fontWeight: 600, color: colors.fg }}>
-            <span style={{ color: colors.accent, display: "flex" }}><ClockIcon size={18} /></span>
-            Scheduled tasks
+        <HeaderEdge />
+        <IconButton title={navOpen ? "Hide sidebar" : "Show sidebar"} onClick={onToggleNav}>
+          <PanelIcon />
+        </IconButton>
+        <span
+          style={{
+            fontSize: 14,
+            fontWeight: 500,
+            color: colors.fg,
+            letterSpacing: "var(--track-body)",
+          }}
+        >
+          Scheduled
+        </span>
+      </header>
+
+      <div style={{ flex: 1, minHeight: 0, overflowY: "auto" }}>
+        {/* One centred measure for the whole page — the list, the search and
+            the form all share it, so nothing needs its own width. */}
+        <div style={{ maxWidth: 760, margin: "0 auto", padding: "40px 24px 64px" }}>
+          {/* The action belongs beside what it acts on. In the toolbar it sat
+              at the far edge of the window while the list it adds to lives in
+              a 760px column — a control placed that far from its subject stops
+              reading as related to it. On the title row it is the page's
+              primary action, and it aligns with everything below it. */}
+          <div style={{ display: "flex", alignItems: "flex-start", gap: 24 }}>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <h1
+                style={{
+                  fontSize: 30,
+                  fontWeight: 600,
+                  letterSpacing: "var(--track-title)",
+                  lineHeight: 1.15,
+                  margin: 0,
+                  color: colors.fg,
+                }}
+              >
+                Scheduled tasks
+              </h1>
+              <p
+                style={{
+                  color: colors.dim,
+                  fontSize: 14.5,
+                  lineHeight: 1.55,
+                  margin: "10px 0 0",
+                  maxWidth: "58ch",
+                }}
+              >
+                Ask Pareto to run something on a schedule — a morning brief, a weekly
+                review, a watch on work in progress. Tasks run read-only and only while
+                Unbiased is open; anything that came due while it was closed waits here
+                for you.
+              </p>
+            </div>
+            {editing === null && (
+              <button
+                onClick={() => openNew()}
+                // Nudged down so the button's centre sits on the title's
+                // cap-height rather than its ascender line.
+                style={{ ...primaryButton, flexShrink: 0, marginTop: 2 }}
+              >
+                <PlusIcon />
+                New task
+              </button>
+            )}
           </div>
-          <p style={{ color: colors.dim, fontSize: 14, lineHeight: 1.55, margin: "12px 0 0" }}>
-            Ask Pareto to run something on a schedule — a morning brief, a weekly
-            review, a watch on work in progress. Tasks run read-only and only
-            while Unbiased is open; anything that came due while it was closed
-            waits here for you.
-          </p>
+
           {!engineReady && (
             <div
               style={{
-                marginTop: 14,
-                background: "var(--chip)",
-                border: `1px solid ${colors.border}`,
+                marginTop: 18,
+                background: "var(--panel-2)",
+                borderLeft: `2px solid ${colors.amber}`,
                 borderRadius: 10,
                 padding: "10px 12px",
-                color: colors.amber,
+                color: colors.dim,
                 fontSize: 13,
                 lineHeight: 1.5,
               }}
@@ -9883,27 +10381,18 @@ function ScheduledPanel({
               The engine isn't running, so nothing will fire. Sign in to arm these.
             </div>
           )}
-          <input
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search scheduled tasks"
-            aria-label="Search scheduled tasks"
-            style={{ ...inputStyle, marginTop: 16 }}
-          />
-        </div>
 
-        <div style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: "0 20px 4px 26px", scrollbarGutter: "stable" }}>
-          {loading && <div style={{ color: colors.dim, fontSize: 14, marginTop: 16 }}>Loading…</div>}
-
-          {notice && (
-            <div style={{ color: colors.err, fontSize: 13, lineHeight: 1.5, marginTop: 16 }}>{notice}</div>
-          )}
-
-          {/* The form, when open, replaces the list rather than sitting above
-              it — at 620 wide both at once needs scrolling to do anything. */}
           {editing !== null ? (
-            <div style={{ marginTop: 18 }}>
-              <div style={{ fontSize: 15, fontWeight: 600, color: colors.fg, marginBottom: 14 }}>
+            <div style={{ marginTop: 28, maxWidth: 520 }}>
+              <div
+                style={{
+                  fontSize: 17,
+                  fontWeight: 600,
+                  color: colors.fg,
+                  letterSpacing: "var(--track-title)",
+                  marginBottom: 16,
+                }}
+              >
                 {editing ? "Edit task" : "New task"}
               </div>
 
@@ -9943,7 +10432,9 @@ function ScheduledPanel({
 
               {fType === "hourly" ? (
                 <>
-                  <label style={{ ...labelStyle, marginTop: 14 }} htmlFor="st-interval">Hours between runs</label>
+                  <label style={{ ...labelStyle, marginTop: 14 }} htmlFor="st-interval">
+                    Hours between runs
+                  </label>
                   <input
                     id="st-interval"
                     type="number"
@@ -10004,36 +10495,276 @@ function ScheduledPanel({
               {formError && (
                 <div style={{ color: colors.err, fontSize: 13, lineHeight: 1.5, marginTop: 12 }}>{formError}</div>
               )}
+
+              <div style={{ display: "flex", gap: 10, marginTop: 22 }}>
+                <button onClick={() => void save()} style={primaryButton}>
+                  {editing ? "Save changes" : "Create task"}
+                </button>
+                <button onClick={closeForm} style={btnSecondaryStyle}>
+                  Cancel
+                </button>
+              </div>
             </div>
           ) : (
             <>
-              {!loading && tasks.length === 0 && (
-                <div style={{ marginTop: 20 }}>
-                  <div style={{ color: colors.dim, fontSize: 13, fontWeight: 600, letterSpacing: 0.2 }}>
-                    Suggestions
-                  </div>
-                  <div style={insetStyle}>
-                    {TASK_TEMPLATES.map((t, i) => (
+              <input
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="Search scheduled tasks"
+                aria-label="Search scheduled tasks"
+                style={{ ...inputStyle, marginTop: 24, borderRadius: 999, padding: "11px 16px" }}
+              />
+
+              {/* Filters only earn their place once there is something to
+                  filter; below that they are three controls over one row. */}
+              {tasks.length > 1 && (
+                <div style={{ display: "flex", gap: 4, marginTop: 18 }}>
+                  {(["all", "active", "paused"] as const).map((f) => {
+                    const on = filter === f;
+                    const label = f === "all" ? "All" : f === "active" ? "Active" : "Paused";
+                    return (
+                      <button
+                        key={f}
+                        onClick={() => setFilter(f)}
+                        aria-pressed={on}
+                        style={{
+                          background: on ? "var(--chip)" : "transparent",
+                          color: on ? colors.fg : colors.dim,
+                          border: "none",
+                          borderRadius: 8,
+                          padding: "6px 12px",
+                          fontSize: 13.5,
+                          fontWeight: on ? 500 : 400,
+                          cursor: "pointer",
+                          fontFamily: "inherit",
+                        }}
+                      >
+                        {label}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+
+              {notice && (
+                <div style={{ color: colors.err, fontSize: 13, lineHeight: 1.5, marginTop: 16 }}>{notice}</div>
+              )}
+
+              {loading && <div style={{ color: colors.dim, fontSize: 14, marginTop: 20 }}>Loading…</div>}
+
+              {!loading && filtered.length === 0 && (
+                <div style={{ color: colors.dim, fontSize: 14, lineHeight: 1.55, marginTop: 24 }}>
+                  {tasks.length === 0
+                    ? "Nothing scheduled yet. Start from a suggestion below, or create a task."
+                    : q
+                      ? `Nothing matches “${query.trim()}”.`
+                      : `No ${filter} tasks.`}
+                </div>
+              )}
+
+              {filtered.length > 0 && (
+                <div style={{ marginTop: 22 }}>
+                  {filtered.map((t) => {
+                    const show = hovered === t.key || confirmDelete === t.key;
+                    return (
+                      <div
+                        key={t.key}
+                        ref={t.key === focusKey || t.key === marked ? focusRef : undefined}
+                        onMouseEnter={() => setHovered(t.key)}
+                        onMouseLeave={() => setHovered(null)}
+                        style={{
+                          display: "flex",
+                          alignItems: "flex-start",
+                          gap: 12,
+                          padding: "14px 0",
+                          borderBottom: `1px solid ${colors.border}`,
+                          ...(t.key === marked
+                            ? {
+                                // Same selected language as the sidebar rows:
+                                // neutral fill, accent only in the rail.
+                                background: "var(--chip)",
+                                boxShadow: "inset 2px 0 0 0 var(--accent)",
+                                paddingLeft: 10,
+                              }
+                            : null),
+                          transition: "background 400ms var(--ease-out)",
+                        }}
+                      >
+                        {/* The ring IS the switch — pausing is the most common
+                            thing you do to a task. A tick says "armed" the way
+                            a bare fill cannot: a solid dot reads as a status
+                            light (something is happening now), which is wrong
+                            for a task that is merely scheduled. Empty ring for
+                            paused, so the pair reads as checked/unchecked. */}
+                        <button
+                          onClick={() =>
+                            void window.unbiased
+                              .scheduledSetEnabled(t.key, !t.enabled)
+                              .then((r) => setTasks(r.tasks ?? []))
+                          }
+                          aria-pressed={t.enabled}
+                          title={t.enabled ? "Pause this task" : "Resume this task"}
+                          style={{
+                            marginTop: 1,
+                            width: 18,
+                            height: 18,
+                            flexShrink: 0,
+                            display: "grid",
+                            placeItems: "center",
+                            borderRadius: "50%",
+                            border: `1.5px solid ${t.enabled ? colors.accent : colors.border}`,
+                            background: t.enabled ? colors.accent : "transparent",
+                            color: "var(--accent-fg)",
+                            cursor: "pointer",
+                            padding: 0,
+                          }}
+                        >
+                          {t.enabled && <CheckIcon size={11} />}
+                        </button>
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div
+                            style={{
+                              fontSize: 14.5,
+                              fontWeight: 500,
+                              color: t.enabled ? colors.fg : colors.dim,
+                              letterSpacing: "var(--track-body)",
+                            }}
+                          >
+                            {t.name}
+                          </div>
+                          <div
+                            style={{
+                              color: colors.dim,
+                              fontSize: 13,
+                              lineHeight: 1.5,
+                              marginTop: 3,
+                              letterSpacing: "var(--track-meta)",
+                            }}
+                          >
+                            {describeSchedule(t.schedule)}
+                            {t.running
+                              ? " · running now"
+                              : t.missedAt
+                                ? ` · missed ${relativeTime(t.missedAt)}`
+                                : !t.enabled
+                                  ? " · paused"
+                                  : t.nextDueAt
+                                    ? ` · next run ${relativeTime(t.nextDueAt)}`
+                                    : ""}
+                          </div>
+                          {t.lastRunAt && (
+                            <div style={{ fontSize: 12.5, lineHeight: 1.5, marginTop: 3 }}>
+                              <span style={{ color: t.lastStatus === "completed" ? colors.ok : colors.err }}>
+                                {t.lastStatus === "completed" ? "Last run succeeded" : `Last run ${t.lastStatus}`}
+                              </span>
+                              <span style={{ color: colors.dim }}> · {relativeTime(t.lastRunAt)}</span>
+                              {t.lastError && <span style={{ color: colors.dim }}> · {t.lastError}</span>}
+                            </div>
+                          )}
+                        </div>
+
+                        {/* Revealed on hover, and on focus-within too — a
+                            hover-only control is invisible to the keyboard. */}
+                        <div
+                          style={{
+                            display: "flex",
+                            gap: 8,
+                            flexShrink: 0,
+                            opacity: show ? 1 : 0,
+                            transition: "opacity 120ms var(--ease-out)",
+                          }}
+                          onFocus={() => setHovered(t.key)}
+                        >
+                          {confirmDelete === t.key ? (
+                            <>
+                              <span style={{ color: colors.dim, fontSize: 12.5, alignSelf: "center" }}>Delete?</span>
+                              <button
+                                onClick={() =>
+                                  void window.unbiased.scheduledDelete(t.key).then((r) => {
+                                    setTasks(r.tasks ?? []);
+                                    setConfirmDelete(null);
+                                  })
+                                }
+                                style={{ ...ghostButton, color: colors.err, background: "color-mix(in srgb, #F09595 16%, transparent)" }}
+                              >
+                                Delete
+                              </button>
+                              <button onClick={() => setConfirmDelete(null)} style={ghostButton}>Keep</button>
+                            </>
+                          ) : (
+                            <>
+                              <button
+                                onClick={() => void runNow(t.key)}
+                                disabled={t.running || !engineReady}
+                                style={{
+                                  ...ghostButton,
+                                  cursor: t.running || !engineReady ? "default" : "pointer",
+                                  opacity: t.running || !engineReady ? 0.5 : 1,
+                                }}
+                              >
+                                {t.missedAt ? "Run missed now" : "Run now"}
+                              </button>
+                              {t.lastThreadId && (
+                                <button onClick={() => onOpenThread(t.lastThreadId!)} style={ghostButton}>
+                                  Open last run
+                                </button>
+                              )}
+                              <button onClick={() => openEdit(t)} style={ghostButton}>Edit</button>
+                              <button onClick={() => setConfirmDelete(t.key)} style={ghostButton}>Delete</button>
+                            </>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+
+              {!loading && suggestions.length > 0 && (
+                <div style={{ marginTop: 38 }}>
+                  <SectionLabel>Suggestions</SectionLabel>
+                  <div style={{ marginTop: 4 }}>
+                    {suggestions.map((t) => (
                       <button
                         key={t.name}
                         onClick={() => openNew(t)}
+                        data-nopress
                         style={{
                           display: "block",
                           width: "100%",
                           textAlign: "left",
                           background: "transparent",
                           border: "none",
-                          borderTop: i === 0 ? "none" : `1px solid ${colors.border}`,
-                          padding: "13px 14px",
+                          borderBottom: `1px solid ${colors.border}`,
+                          padding: "13px 0",
                           cursor: "pointer",
                           fontFamily: "inherit",
                         }}
                       >
                         <span style={{ display: "flex", alignItems: "baseline", gap: 8, flexWrap: "wrap" }}>
-                          <span style={{ color: colors.fg, fontSize: 14, fontWeight: 500 }}>{t.name}</span>
-                          <span style={{ color: colors.dim, fontSize: 12.5 }}>{describeSchedule(t.schedule)}</span>
+                          <span
+                            style={{
+                              color: colors.fg,
+                              fontSize: 14.5,
+                              fontWeight: 500,
+                              letterSpacing: "var(--track-body)",
+                            }}
+                          >
+                            {t.name}
+                          </span>
+                          <span style={{ color: colors.dim, fontSize: 13, letterSpacing: "var(--track-meta)" }}>
+                            {describeSchedule(t.schedule)}
+                          </span>
                         </span>
-                        <span style={{ display: "block", color: colors.dim, fontSize: 13, lineHeight: 1.5, marginTop: 4 }}>
+                        <span
+                          style={{
+                            display: "block",
+                            color: colors.dim,
+                            fontSize: 13,
+                            lineHeight: 1.5,
+                            marginTop: 3,
+                          }}
+                        >
                           {t.blurb}
                         </span>
                       </button>
@@ -10041,137 +10772,104 @@ function ScheduledPanel({
                   </div>
                 </div>
               )}
-
-              {!loading && tasks.length > 0 && filtered.length === 0 && (
-                <div style={{ color: colors.dim, fontSize: 14, marginTop: 18 }}>
-                  Nothing matches “{query.trim()}”.
-                </div>
-              )}
-
-              {filtered.length > 0 && (
-                <div style={insetStyle}>
-                  {filtered.map((t, i) => (
-                    <div
-                      key={t.key}
-                      style={{
-                        borderTop: i === 0 ? "none" : `1px solid ${colors.border}`,
-                        padding: "13px 14px",
-                        opacity: t.enabled ? 1 : 0.6,
-                      }}
-                    >
-                      <div style={{ display: "flex", alignItems: "baseline", gap: 8, flexWrap: "wrap" }}>
-                        <span style={{ color: colors.fg, fontSize: 14, fontWeight: 500 }}>{t.name}</span>
-                        <span style={{ color: colors.dim, fontSize: 12.5 }}>{describeSchedule(t.schedule)}</span>
-                        {t.running && <span style={{ color: colors.accent, fontSize: 12.5 }}>running…</span>}
-                        {!t.running && t.missedAt && (
-                          <span style={{ color: colors.amber, fontSize: 12.5 }}>
-                            missed {relativeTime(t.missedAt)}
-                          </span>
-                        )}
-                        {!t.running && !t.missedAt && t.enabled && t.nextDueAt && (
-                          <span style={{ color: colors.dim, fontSize: 12.5 }}>next {relativeTime(t.nextDueAt)}</span>
-                        )}
-                        {!t.enabled && <span style={{ color: colors.dim, fontSize: 12.5 }}>paused</span>}
-                      </div>
-
-                      <div style={{ color: colors.dim, fontSize: 13, lineHeight: 1.5, marginTop: 4 }}>
-                        {t.prompt.length > 140 ? `${t.prompt.slice(0, 140)}…` : t.prompt}
-                      </div>
-
-                      {t.lastRunAt && (
-                        <div style={{ fontSize: 12.5, lineHeight: 1.5, marginTop: 6 }}>
-                          <span style={{ color: t.lastStatus === "completed" ? colors.ok : colors.err }}>
-                            {t.lastStatus === "completed" ? "Last run succeeded" : `Last run ${t.lastStatus}`}
-                          </span>
-                          <span style={{ color: colors.dim }}> · {relativeTime(t.lastRunAt)}</span>
-                          {t.lastError && <span style={{ color: colors.dim }}> · {t.lastError}</span>}
-                        </div>
-                      )}
-
-                      {confirmDelete === t.key ? (
-                        <div style={{ display: "flex", gap: 8, marginTop: 10, alignItems: "center" }}>
-                          <span style={{ color: colors.dim, fontSize: 12.5 }}>Delete this task?</span>
-                          <button
-                            onClick={() =>
-                              void window.unbiased.scheduledDelete(t.key).then((r) => {
-                                setTasks(r.tasks ?? []);
-                                setConfirmDelete(null);
-                              })
-                            }
-                            style={{ ...ghostButton, color: colors.err, borderColor: colors.err }}
-                          >
-                            Delete
-                          </button>
-                          <button onClick={() => setConfirmDelete(null)} style={ghostButton}>Keep</button>
-                        </div>
-                      ) : (
-                        <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
-                          <button
-                            onClick={() => void runNow(t.key)}
-                            disabled={t.running || !engineReady}
-                            style={{
-                              ...ghostButton,
-                              cursor: t.running || !engineReady ? "default" : "pointer",
-                              opacity: t.running || !engineReady ? 0.5 : 1,
-                            }}
-                          >
-                            {t.missedAt ? "Run missed now" : "Run now"}
-                          </button>
-                          <button
-                            onClick={() =>
-                              void window.unbiased.scheduledSetEnabled(t.key, !t.enabled).then((r) => setTasks(r.tasks ?? []))
-                            }
-                            style={ghostButton}
-                          >
-                            {t.enabled ? "Pause" : "Resume"}
-                          </button>
-                          {t.lastThreadId && (
-                            <button onClick={() => onOpenThread(t.lastThreadId!)} style={ghostButton}>
-                              Open last run
-                            </button>
-                          )}
-                          <button onClick={() => openEdit(t)} style={ghostButton}>Edit</button>
-                          <button onClick={() => setConfirmDelete(t.key)} style={ghostButton}>Delete</button>
-                        </div>
-                      )}
-                    </div>
-                  ))}
-                </div>
-              )}
-            </>
-          )}
-        </div>
-
-        <div
-          style={{
-            flexShrink: 0,
-            display: "flex",
-            justifyContent: "flex-end",
-            gap: 10,
-            padding: "16px 26px 20px",
-            borderTop: `1px solid ${colors.border}`,
-          }}
-        >
-          {editing !== null ? (
-            <>
-              <button onClick={closeForm} style={{ ...ghostButton, padding: "9px 14px", fontSize: 13.5 }}>
-                Cancel
-              </button>
-              <button onClick={() => void save()} style={primaryButton}>
-                {editing ? "Save changes" : "Create task"}
-              </button>
-            </>
-          ) : (
-            <>
-              <button onClick={onClose} style={{ ...ghostButton, padding: "9px 14px", fontSize: 13.5 }}>
-                Close
-              </button>
-              <button onClick={() => openNew()} style={primaryButton}>New task</button>
             </>
           )}
         </div>
       </div>
     </div>
+  );
+}
+
+/** A data: image URI an MCP server advertised, if it is one we are willing to
+ *  render.
+ *
+ *  This is third-party content — whatever the server chose to send — so it is
+ *  filtered rather than trusted. Raster types only: an SVG cannot execute
+ *  script inside an <img>, but it can carry external references and arbitrary
+ *  markup, and there is no reason to accept one for a 20px favicon. The length
+ *  cap keeps a server from parking megabytes of base64 in the panel.
+ *
+ *  Remote (https) icon sources are ignored on purpose: the renderer's CSP is
+ *  `img-src 'self' data:`, so they would silently fail to load anyway, and
+ *  routing them through main would turn opening this panel into an outbound
+ *  request per server. */
+const MCP_ICON_MAX = 512_000;
+function mcpIconSrc(info: McpConnected["serverInfo"]): string | null {
+  for (const icon of info?.icons ?? []) {
+    const src = typeof icon?.src === "string" ? icon.src : "";
+    if (!/^data:image\/(png|jpeg|jpg|webp|gif);base64,/i.test(src)) continue;
+    if (src.length > MCP_ICON_MAX) continue;
+    return src;
+  }
+  return null;
+}
+
+/** The server's own mark: an app tile, sized like one.
+ *
+ *  It was a 22px chip with a status dot pinned to its corner, which made the
+ *  icon a detail of the badge rather than the identity of the row. Status is
+ *  now stated in words on the meta line, which frees the mark to be the size
+ *  its content deserves and removes a colour-only signal at the same time.
+ *
+ *  Falls back to a monogram rather than nothing, so every row has a left
+ *  column of the same width and the titles stay aligned. */
+function McpServerMark({ info, name }: { info: McpConnected["serverInfo"]; name: string }) {
+  const src = mcpIconSrc(info);
+  const host = info?.websiteUrl ? linkHost(info.websiteUrl) : null;
+  // One column width for every row, so titles line up whichever branch runs.
+  // flex, not grid. A grid with no explicit tracks sizes its implicit row to
+  // CONTENT, so a 76px-tall icon made a 76px track inside a 40px box and
+  // height:100% resolved against the track — overflow:hidden then clipped the
+  // bottom off. It only became visible once the icons were cropped tight;
+  // before that the padding kept the mark inside the clipped area.
+  const tile: React.CSSProperties = {
+    width: 40,
+    height: 40,
+    borderRadius: 10,
+    flexShrink: 0,
+    overflow: "hidden",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+  };
+  // Chrome only for the fallbacks. A real logo is its own mark and needs no
+  // container; a favicon or a letter needs something to sit in.
+  const framed: React.CSSProperties = {
+    ...tile,
+    background: "var(--panel-2)",
+    border: `1px solid ${colors.border}`,
+  };
+  if (src) {
+    return (
+      <span style={tile}>
+        {/* Fills the box rather than sitting inside it. These marks are not
+            square — Figma's is 128x160 — and with object-fit: contain the
+            HEIGHT is the constraint, so a 26px square box rendered a 26px-tall
+            glyph only ~21px wide, inside a 38px tile. Dropping the tile
+            padding and letting the image take the full 40 is what actually
+            makes it read at the size the row implies. */}
+        {/* max-* rather than width/height 100%: the image sizes itself and is
+            simply not allowed to exceed the box, so no aspect ratio can
+            overflow it regardless of how the icon was authored. */}
+        <img
+          src={src}
+          alt=""
+          style={{ maxWidth: "100%", maxHeight: "100%", width: "auto", height: "auto", display: "block" }}
+        />
+      </span>
+    );
+  }
+  if (host) {
+    return (
+      <span style={framed}>
+        <Favicon host={host} />
+      </span>
+    );
+  }
+  return (
+    <span style={{ ...framed, color: colors.dim, fontSize: 16, fontWeight: 600 }}>
+      {(name.trim()[0] ?? "?").toUpperCase()}
+    </span>
   );
 }
 
@@ -10185,6 +10883,15 @@ function McpPanel({ onClose }: { onClose: () => void }) {
   const [applying, setApplying] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [confirm, setConfirm] = useState<{ name: string; connected: boolean } | null>(null);
+  // Entry transition. A modal is an occasional, deliberate interruption, so it
+  // earns motion where the + menu did not — but it is still under the 300ms
+  // ceiling, and it scales from its own centre rather than from a trigger:
+  // a modal is not anchored to anything, so origin-awareness does not apply.
+  const [shown, setShown] = useState(false);
+  useEffect(() => {
+    const id = requestAnimationFrame(() => setShown(true));
+    return () => cancelAnimationFrame(id);
+  }, []);
 
   // Form state
   const [fName, setFName] = useState("");
@@ -10291,30 +10998,39 @@ function McpPanel({ onClose }: { onClose: () => void }) {
     padding: "4px 16px",
     marginTop: 16,
   };
-  const btnSecondary: React.CSSProperties = {
-    background: "var(--chip)", border: "none", borderRadius: 999, color: colors.fg,
-    fontSize: 14.5, cursor: "pointer", fontFamily: "inherit", padding: "10px 20px",
-  };
-  const btnPrimary: React.CSSProperties = {
-    display: "flex", alignItems: "center", gap: 8,
-    background: "rgba(255, 86, 63, 0.14)", border: "none", borderRadius: 999,
-    color: colors.accent, fontSize: 14.5, fontWeight: 500, cursor: "pointer",
-    fontFamily: "inherit", padding: "10px 20px",
-  };
-  // Row-level actions sit inside the inset group, so they step down a size.
-  const btnSmall: React.CSSProperties = {
-    background: "var(--chip)", border: "none", borderRadius: 999, color: colors.fg,
-    fontSize: 13, cursor: "pointer", fontFamily: "inherit", padding: "6px 14px", flexShrink: 0,
-  };
+  const btnSecondary = btnSecondaryStyle;
+  const btnPrimary = btnPrimaryStyle;
+  const btnSmall = btnSmallStyle;
 
   return (
     <div
-      style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)", display: "grid", placeItems: "center", zIndex: 100 }}
+      data-popover
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="mcp-panel-title"
+      style={{
+        position: "fixed",
+        inset: 0,
+        background: "rgba(0,0,0,0.45)",
+        backdropFilter: "var(--scrim-blur)",
+        WebkitBackdropFilter: "var(--scrim-blur)",
+        display: "grid",
+        placeItems: "center",
+        zIndex: 100,
+        opacity: shown ? 1 : 0,
+        transition: "opacity 180ms var(--ease-out)",
+      }}
       onClick={onClose}
     >
       <div
         onClick={(e) => e.stopPropagation()}
+        // The card carries the transform, so it is the element the
+        // reduced-motion rule has to reach — on the scrim it would have
+        // suppressed a fade that was never the vestibular part.
+        data-popover
         style={{
+          transform: shown ? "scale(1)" : "scale(0.98)",
+          transition: "transform 180ms var(--ease-out)",
           background: colors.panel,
           border: `1px solid ${colors.border}`,
           // Matching the Full Access disclosure: 18 radius, 560 wide, the
@@ -10341,7 +11057,10 @@ function McpPanel({ onClose }: { onClose: () => void }) {
         }}
       >
         <div style={{ padding: "24px 26px 0", flexShrink: 0 }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 19, fontWeight: 600, color: colors.fg }}>
+        <div
+          id="mcp-panel-title"
+          style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 19, fontWeight: 600, color: colors.fg, letterSpacing: "var(--track-title)" }}
+        >
           <span style={{ color: colors.accent, display: "flex" }}><McpIcon size={18} /></span>
           MCP servers
         </div>
@@ -10376,6 +11095,7 @@ function McpPanel({ onClose }: { onClose: () => void }) {
                 return {
                   key: srv.name,
                   dot: colors.ok,
+                  status: "Connected",
                   title: srv.serverInfo?.title || srv.name,
                   detail:
                     `${toolCount} ${toolCount === 1 ? "tool" : "tools"}` +
@@ -10385,36 +11105,55 @@ function McpPanel({ onClose }: { onClose: () => void }) {
                       : ""),
                   removable: configured.some((c) => c.name === srv.name),
                   name: srv.name,
+                  info: srv.serverInfo,
                 };
               }),
               ...pending.map((srv) => ({
                 key: `pending-${srv.name}`,
                 dot: colors.amber,
+                status: "Not connected",
                 title: srv.name,
-                detail: "Added — restart the engine to connect",
+                detail: "restart the engine to connect",
                 removable: true,
                 name: srv.name,
+                // Nothing to show yet: icons arrive at initialize, and a
+                // pending server has not connected.
+                info: null as McpConnected["serverInfo"],
               })),
             ].map((row, i) => (
               <div
                 key={row.key}
                 style={{
                   display: "flex",
-                  alignItems: "flex-start",
+                  // center, not flex-start: the mark is a 40px block sitting
+                  // beside a two-line stack, so top-aligning it leaves it
+                  // visibly low against the pair.
+                  alignItems: "center",
                   gap: 14,
                   padding: "13px 0",
                   borderTop: i > 0 ? `1px solid ${colors.border}` : "none",
                 }}
               >
-                <span
-                  style={{
-                    width: 8, height: 8, borderRadius: 99, background: row.dot,
-                    flexShrink: 0, marginTop: 7,
-                  }}
-                />
+                <McpServerMark info={row.info} name={row.name} />
                 <span style={{ minWidth: 0, flex: 1 }}>
-                  <div style={{ fontSize: 14.5, fontWeight: 600, color: colors.fg }}>{row.title}</div>
-                  <div style={{ fontSize: 13.5, color: colors.dim, marginTop: 2, lineHeight: 1.45 }}>{row.detail}</div>
+                  <div style={{ fontSize: 14.5, fontWeight: 500, color: colors.fg, letterSpacing: "var(--track-body)" }}>
+                    {row.title}
+                  </div>
+                  <div
+                    style={{
+                      fontSize: 13,
+                      color: colors.dim,
+                      marginTop: 3,
+                      lineHeight: 1.45,
+                      letterSpacing: "var(--track-meta)",
+                    }}
+                  >
+                    {/* Said, not signalled. A coloured dot alone is a
+                        colour-only distinction, and it was the one thing in
+                        the row you could not read. */}
+                    <span style={{ color: row.dot, fontWeight: 500 }}>{row.status}</span>
+                    {row.detail ? ` · ${row.detail}` : ""}
+                  </div>
                 </span>
                 {row.removable && (
                   <IconDangerButton
@@ -10672,19 +11411,9 @@ function SkillsPanel({ cwd, onClose }: { cwd: string | null; onClose: () => void
   const global = skills.filter((sk) => !inProject(sk));
 
   const inset: React.CSSProperties = { background: "var(--panel-2)", borderRadius: 14, padding: "4px 16px", marginTop: 10 };
-  const btnSecondary: React.CSSProperties = {
-    background: "var(--chip)", border: "none", borderRadius: 999, color: colors.fg,
-    fontSize: 14.5, cursor: "pointer", fontFamily: "inherit", padding: "10px 20px",
-  };
-  const btnPrimary: React.CSSProperties = {
-    display: "flex", alignItems: "center", gap: 8, background: "rgba(255, 86, 63, 0.14)",
-    border: "none", borderRadius: 999, color: colors.accent, fontSize: 14.5, fontWeight: 500,
-    cursor: "pointer", fontFamily: "inherit", padding: "10px 20px",
-  };
-  const btnSmall: React.CSSProperties = {
-    background: "var(--chip)", border: "none", borderRadius: 999, color: colors.fg,
-    fontSize: 13, cursor: "pointer", fontFamily: "inherit", padding: "6px 14px", flexShrink: 0,
-  };
+  const btnSecondary = btnSecondaryStyle;
+  const btnPrimary = btnPrimaryStyle;
+  const btnSmall = btnSmallStyle;
   const inputStyle: React.CSSProperties = {
     width: "100%", boxSizing: "border-box", minWidth: 0, background: "var(--panel-2)",
     color: colors.fg, border: `1px solid ${colors.border}`, borderRadius: 10,
@@ -10753,7 +11482,7 @@ function SkillsPanel({ cwd, onClose }: { cwd: string | null; onClose: () => void
 
   return (
     <div
-      style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)", display: "grid", placeItems: "center", zIndex: 100 }}
+      style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.45)", backdropFilter: "var(--scrim-blur)", WebkitBackdropFilter: "var(--scrim-blur)", display: "grid", placeItems: "center", zIndex: 100 }}
       onClick={onClose}
     >
       <div
@@ -10769,7 +11498,7 @@ function SkillsPanel({ cwd, onClose }: { cwd: string | null; onClose: () => void
         }}
       >
         <div style={{ padding: "24px 26px 0", flexShrink: 0 }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 19, fontWeight: 600, color: colors.fg }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 19, fontWeight: 600, color: colors.fg, letterSpacing: "var(--track-title)" }}>
             <span style={{ color: colors.accent, display: "flex" }}><SkillIcon size={18} /></span>
             Skills
           </div>
@@ -11025,10 +11754,17 @@ function UpdateBanner({
             style={{
               position: "absolute",
               inset: 0,
-              width: `${progress.percent}%`,
+              // scaleX from a full-width bar rather than an animated width.
+              // This one updates continuously while a download runs, so a
+              // layout-triggering property here is the worst case for it —
+              // and a bar is the one place scaleX is exactly equivalent,
+              // since there is no content inside to distort.
+              width: "100%",
+              transformOrigin: "left center",
+              transform: `scaleX(${Math.max(0, Math.min(100, progress.percent)) / 100})`,
               background: colors.accent,
               opacity: 0.16,
-              transition: "width 200ms",
+              transition: "transform 200ms var(--ease-out)",
             }}
           />
         )}
@@ -11533,8 +12269,8 @@ function ResourcesView() {
   };
 
   return (
-    <div style={{ maxWidth: 720, margin: "0 auto" }}>
-      <h1 style={{ fontSize: 28, fontWeight: 600, letterSpacing: "-0.01em", margin: "0 0 28px" }}>Resources</h1>
+    <div style={{ maxWidth: 760, margin: "0 auto" }}>
+      <h1 style={{ fontSize: 28, fontWeight: 600, letterSpacing: "var(--track-title)", lineHeight: 1.15, margin: "0 0 28px" }}>Resources</h1>
 
       <div style={{ display: "flex", gap: 12, marginBottom: 24 }}>
         <AreaChart
@@ -11721,7 +12457,7 @@ function ResourcesView() {
           style={{
             position: "fixed",
             inset: 0,
-            background: "rgba(0,0,0,0.55)",
+            background: "rgba(0,0,0,0.45)", backdropFilter: "var(--scrim-blur)", WebkitBackdropFilter: "var(--scrim-blur)",
             display: "grid",
             placeItems: "center",
             zIndex: 100,
@@ -11843,9 +12579,11 @@ function SettingsView({
     display: "flex",
     alignItems: "center",
     justifyContent: "space-between",
+    gap: 20,
     padding: "14px 18px",
     borderBottom: `1px solid ${colors.border}`,
     fontSize: 13.5,
+    letterSpacing: "var(--track-body)",
   };
   const textInputStyle: React.CSSProperties = {
     background: "var(--panel-2)",
@@ -11855,7 +12593,12 @@ function SettingsView({
     padding: "6px 10px",
     fontSize: 13,
     fontFamily: "var(--font-code)",
-    width: 260,
+    // Takes the row's spare width instead of a fixed 260, which truncated the
+    // code-font stack mid-string — the one field where the whole value
+    // matters, since a missing fallback is invisible until a glyph is.
+    flex: 1,
+    minWidth: 0,
+    maxWidth: 420,
     outline: "none",
   };
 
@@ -11864,7 +12607,18 @@ function SettingsView({
   function Group({ title, children }: { title: string; children: React.ReactNode }) {
     return (
       <section style={{ marginBottom: 30 }}>
-        <div style={{ fontSize: 13, color: colors.dim, margin: "0 0 10px 2px" }}>{title}</div>
+        <div
+          style={{
+            fontSize: 11,
+            fontWeight: 600,
+            textTransform: "uppercase",
+            letterSpacing: "var(--track-overline)",
+            color: colors.dim,
+            margin: "0 0 10px 2px",
+          }}
+        >
+          {title}
+        </div>
         {children}
       </section>
     );
@@ -11874,18 +12628,28 @@ function SettingsView({
     return (
       <div style={rowStyle}>
         <span>{label}</span>
-        <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <span style={{ display: "flex", alignItems: "center", gap: 8, flex: 1, justifyContent: "flex-end" }}>
           <input
             type="color"
             value={/^#[0-9a-f]{6}$/i.test(value) ? value : "#000000"}
             onChange={(e) => set(e.target.value)}
-            style={{ width: 26, height: 26, border: "none", background: "transparent", padding: 0, cursor: "pointer" }}
+            aria-label={`${label} colour`}
+            style={{
+              width: 26,
+              height: 26,
+              border: `1px solid ${colors.border}`,
+              borderRadius: 7,
+              background: "transparent",
+              padding: 2,
+              cursor: "pointer",
+              flexShrink: 0,
+            }}
           />
           <input
             value={value}
             onChange={(e) => set(e.target.value)}
             spellCheck={false}
-            style={{ ...textInputStyle, width: 110 }}
+            style={{ ...textInputStyle, flex: "0 0 110px", maxWidth: 110 }}
           />
         </span>
       </div>
@@ -11950,7 +12714,12 @@ function SettingsView({
                   gap: 9,
                   width: "100%",
                   textAlign: "left",
-                  background: tab === item.id ? colors.panel : "transparent",
+                  // Same selected treatment as the main sidebar — neutral
+                  // fill, accent in the rail — so "which section am I in"
+                  // looks the same everywhere in the app.
+                  background: tab === item.id ? "var(--chip)" : "transparent",
+                  boxShadow: tab === item.id ? "inset 2px 0 0 0 var(--accent)" : "none",
+                  fontWeight: tab === item.id ? 500 : 400,
                   color: tab === item.id ? colors.fg : colors.dim,
                   border: "none",
                   borderRadius: 8,
@@ -11973,12 +12742,12 @@ function SettingsView({
 
       <div style={{ flex: 1, overflowY: "auto", padding: "44px 48px 64px" }}>
         {tab === "resources" ? (
-          <div style={{ maxWidth: 720, margin: "0 auto" }}>
+          <div style={{ maxWidth: 760, margin: "0 auto" }}>
             <ResourcesView />
           </div>
         ) : tab === "updates" ? (
-          <div style={{ maxWidth: 720, margin: "0 auto" }}>
-            <h1 style={{ fontSize: 28, fontWeight: 600, letterSpacing: "-0.01em", margin: "0 0 28px" }}>Updates</h1>
+          <div style={{ maxWidth: 760, margin: "0 auto" }}>
+            <h1 style={{ fontSize: 28, fontWeight: 600, letterSpacing: "var(--track-title)", lineHeight: 1.15, margin: "0 0 28px" }}>Updates</h1>
 
             <Group title="Automatic updates">
             <div
@@ -12021,12 +12790,17 @@ function SettingsView({
                     style={{
                       position: "absolute",
                       top: 3,
-                      left: updPrefs?.autoDownload ? 19 : 3,
+                      left: 3,
                       width: 16,
                       height: 16,
                       borderRadius: "50%",
                       background: "#fff",
-                      transition: "left 120ms",
+                      // translateX rather than an animated `left`: `left` is a
+                      // layout property, so every frame of the knob's travel
+                      // costs layout and paint, where a transform is composite
+                      // only. Identical 16px of travel (3 → 19).
+                      transform: updPrefs?.autoDownload ? "translateX(16px)" : "none",
+                      transition: "transform 120ms var(--ease-out)",
                     }}
                   />
                 </button>
@@ -12066,8 +12840,8 @@ function SettingsView({
             </Group>
           </div>
         ) : tab === "account" ? (
-          <div style={{ maxWidth: 720, margin: "0 auto" }}>
-            <h1 style={{ fontSize: 28, fontWeight: 600, letterSpacing: "-0.01em", margin: "0 0 28px" }}>Account</h1>
+          <div style={{ maxWidth: 760, margin: "0 auto" }}>
+            <h1 style={{ fontSize: 28, fontWeight: 600, letterSpacing: "var(--track-title)", lineHeight: 1.15, margin: "0 0 28px" }}>Account</h1>
             <div
               style={{
                 border: `1px solid ${colors.border}`,
@@ -12123,12 +12897,13 @@ function SettingsView({
                         style={{
                           position: "absolute",
                           top: 3,
-                          left: keepKey ? 19 : 3,
+                          left: 3,
                           width: 16,
                           height: 16,
                           borderRadius: "50%",
                           background: "#fff",
-                          transition: "left 120ms",
+                          transform: keepKey ? "translateX(16px)" : "none",
+                          transition: "transform 120ms var(--ease-out)",
                         }}
                       />
                     </button>
@@ -12163,8 +12938,8 @@ function SettingsView({
             </div>
           </div>
         ) : (
-        <div style={{ maxWidth: 720, margin: "0 auto" }}>
-          <h1 style={{ fontSize: 28, fontWeight: 600, letterSpacing: "-0.01em", margin: "0 0 28px" }}>Appearance</h1>
+        <div style={{ maxWidth: 760, margin: "0 auto" }}>
+          <h1 style={{ fontSize: 28, fontWeight: 600, letterSpacing: "var(--track-title)", lineHeight: 1.15, margin: "0 0 28px" }}>Appearance</h1>
 
           <div
             style={{
@@ -12178,16 +12953,7 @@ function SettingsView({
               <span>Dark theme</span>
               <button
                 onClick={() => onChange(DEFAULT_THEME)}
-                style={{
-                  background: "transparent",
-                  border: `1px solid ${colors.border}`,
-                  color: colors.dim,
-                  borderRadius: 8,
-                  padding: "5px 12px",
-                  fontSize: 12.5,
-                  cursor: "pointer",
-                  fontFamily: "inherit",
-                }}
+                style={btnSmallStyle}
               >
                 Reset to default
               </button>
@@ -12282,14 +13048,16 @@ function SettingsView({
                 }}
                 disabled={!importText.trim()}
                 style={{
-                  background: importText.trim() ? colors.accent : "var(--panel-2)",
-                  color: importText.trim() ? "var(--accent-fg)" : colors.dim,
-                  border: "none",
-                  borderRadius: 8,
-                  padding: "7px 16px",
-                  fontSize: 13,
+                  // The shared primary when it can act; a flat muted chip when
+                  // it cannot. The overrides that used to follow this spread
+                  // (radius 8, 7x16 padding, 13px) quietly undid the pill the
+                  // shared style defines, which is how a "shared" style stops
+                  // being shared.
+                  ...btnSmallStyle,
+                  ...(importText.trim()
+                    ? btnPrimaryStyle
+                    : { background: "var(--panel-2)", color: colors.dim }),
                   cursor: importText.trim() ? "pointer" : "default",
-                  fontFamily: "inherit",
                 }}
               >
                 Import
@@ -12489,7 +13257,7 @@ function Chevron({ open }: { open: boolean }) {
         display: "flex",
         color: colors.dim,
         transform: open ? "none" : "rotate(-90deg)",
-        transition: "transform 120ms",
+        transition: "transform 120ms var(--ease-out)",
         flexShrink: 0,
       }}
     >
@@ -12780,7 +13548,7 @@ function ChangelogModal({
       onMouseDown={(e) => {
         if (e.target === e.currentTarget) onClose();
       }}
-      style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)", display: "grid", placeItems: "center", zIndex: 100 }}
+      style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.45)", backdropFilter: "var(--scrim-blur)", WebkitBackdropFilter: "var(--scrim-blur)", display: "grid", placeItems: "center", zIndex: 100 }}
     >
       <div
         style={{
@@ -12864,15 +13632,63 @@ function GearIcon() {
   );
 }
 
+/**
+ * The boundary under a header — a soft edge rather than a rule.
+ *
+ * A 1px line at --gutter (#4c4c4c against this surface) is the brightest
+ * horizontal element on the screen, and it was drawing more attention than the
+ * content it was separating. This is the scroll-edge treatment instead: a
+ * translucent hairline that fades out at both ends, over a short downward wash
+ * that sits on the first few pixels of content. The eye reads a boundary
+ * without a hard rule being drawn anywhere.
+ *
+ * Overflows below its header on purpose, so the wash falls across the content
+ * rather than across the bar; the header therefore needs a stacking context of
+ * its own, or the next sibling paints over it. Inert to the pointer.
+ */
+function HeaderEdge() {
+  const hairline = "color-mix(in srgb, var(--fg) 9%, transparent)";
+  return (
+    <span
+      aria-hidden="true"
+      style={{
+        position: "absolute",
+        left: 0,
+        right: 0,
+        bottom: -14,
+        height: 14,
+        pointerEvents: "none",
+        backgroundImage: [
+          `linear-gradient(to right, transparent, ${hairline} 8%, ${hairline} 92%, transparent)`,
+          "linear-gradient(to bottom, rgba(0, 0, 0, 0.30), rgba(0, 0, 0, 0))",
+        ].join(", "),
+        backgroundSize: "100% 1px, 100% 100%",
+        backgroundRepeat: "no-repeat, no-repeat",
+        backgroundPosition: "top left, top left",
+      }}
+    />
+  );
+}
+
+// --chip, not an accent wash: every other surface in this chrome is a neutral
+// grey mixed from surface+ink, so an accent tint at 12% resolves to #2e1917 —
+// a warm maroon that is the only hue in the sidebar. The accent belongs in the
+// rail, where a saturated 2px marker is exactly what says "selected"; the fill
+// only needs to lift the row off the background, which is --chip's whole job.
 function SidebarAction({
   onClick,
   disabled,
   icon,
+  active,
   children,
 }: {
   onClick: () => void;
   disabled: boolean;
   icon: React.ReactNode;
+  /** Rows that lead somewhere you can still be — Scheduled — light up while
+   *  you are there, using the same rail as a selected chat. The plain actions
+   *  (New chat, Open project) never pass it: they do a thing and return. */
+  active?: boolean;
   children: React.ReactNode;
 }) {
   return (
@@ -12884,12 +13700,18 @@ function SidebarAction({
         alignItems: "center",
         gap: 10,
         width: "100%",
-        background: "transparent",
-        color: disabled ? colors.dim : "var(--fg-soft)",
+        background: active ? "var(--chip)" : "transparent",
+        boxShadow: active ? "inset 2px 0 0 0 var(--accent)" : "none",
+        fontWeight: active ? 500 : 400,
+        color: disabled ? colors.dim : active ? colors.fg : "var(--fg-soft)",
         border: "none",
         borderRadius: 8,
         padding: "8px 8px",
+        // Left at 14. An earlier pass took the whole sidebar to 13.5 to
+        // unify it; unified it did, but the sidebar went quiet with it.
+        // Hierarchy is carried by weight and the active rail instead.
         fontSize: 14,
+        letterSpacing: "var(--track-body)",
         cursor: disabled ? "default" : "pointer",
         textAlign: "left",
         fontFamily: "inherit",
@@ -12947,7 +13769,7 @@ function AssistantActions({ text, at }: { text: string; at?: number }) {
             color: colors.dim,
             fontSize: 12.5,
             opacity: hover ? 1 : 0,
-            transition: "opacity 120ms",
+            transition: "opacity 120ms var(--ease-out)",
             fontVariantNumeric: "tabular-nums",
           }}
         >
@@ -13005,11 +13827,19 @@ function SectionLabel({
   collapsed?: boolean;
   onToggle?: () => void;
 }) {
+  // An overline, not another row. At 13.5/500 these labels carried the same
+  // visual weight as the project and chat rows beneath them, so the sidebar
+  // read as one flat list with no hierarchy. Small, uppercase and tracked-out
+  // is the standard treatment precisely because it reads as a *category*
+  // rather than a destination — and the wide tracking is what keeps 10.5px
+  // uppercase legible.
   const base: React.CSSProperties = {
     color: colors.dim,
-    fontSize: 13.5,
-    fontWeight: 500,
-    padding: "14px 8px 6px",
+    fontSize: 11,
+    fontWeight: 600,
+    textTransform: "uppercase",
+    letterSpacing: "var(--track-overline)",
+    padding: "18px 8px 6px",
   };
   if (!onToggle) return <div style={base}>{children}</div>;
   return (
@@ -13035,7 +13865,7 @@ function SectionLabel({
           display: "inline-block",
           fontSize: 11,
           transform: collapsed ? "none" : "rotate(90deg)",
-          transition: "transform 120ms",
+          transition: "transform 120ms var(--ease-out)",
         }}
       >
         ›
@@ -13208,15 +14038,6 @@ function TerminalIcon({ size = 15 }: { size?: number } = {}) {
   );
 }
 
-function ImageIcon({ size = 15 }: { size?: number } = {}) {
-  return (
-    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" style={{ flexShrink: 0 }}>
-      <rect x="3" y="3" width="18" height="18" rx="2" />
-      <circle cx="9" cy="9" r="2" />
-      <path d="m21 15-3.1-3.1a2 2 0 0 0-2.8 0L6 21" />
-    </svg>
-  );
-}
 
 /** A big launcher row in the empty side panel: icon, label, right hint. */
 function LauncherRow({
@@ -13263,17 +14084,56 @@ function LauncherRow({
 }
 
 /** A row in the + button's popup: icon, label, optional dim description. */
+/** "Opens somewhere" — the quietest possible affordance, so a row that leads
+ *  to a panel is distinguishable from one that acts in place. */
+function MenuChevron() {
+  return (
+    <span style={{ color: colors.dim, display: "flex" }} aria-hidden="true">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+        <path d="m9 18 6-6-6-6" />
+      </svg>
+    </span>
+  );
+}
+
+/** Current state for a row that toggles rather than navigates. Says what IS,
+ *  not what clicking will do — the description already covers the action, and
+ *  a label that flips between "on" and "off" is the classic ambiguous toggle. */
+function StatePill({ on }: { on: boolean }) {
+  return (
+    <span
+      style={{
+        fontSize: 11,
+        fontWeight: 600,
+        letterSpacing: "var(--track-overline)",
+        textTransform: "uppercase",
+        padding: "3px 8px",
+        borderRadius: 999,
+        color: on ? "var(--accent-fg)" : colors.dim,
+        background: on ? colors.accent : "var(--chip)",
+      }}
+    >
+      {on ? "On" : "Off"}
+    </span>
+  );
+}
+
 function MenuItem({
   icon,
   label,
   desc,
   disabled,
+  trailing,
   onClick,
 }: {
   icon: React.ReactNode;
   label: string;
   desc?: string;
   disabled?: boolean;
+  /** Right-edge slot: a state chip, or a chevron for rows that open a panel.
+   *  At full width the right edge is otherwise dead space, and "does this go
+   *  somewhere or toggle something?" is exactly what it should answer. */
+  trailing?: React.ReactNode;
   onClick: () => void;
 }) {
   const [hover, setHover] = useState(false);
@@ -13283,6 +14143,9 @@ function MenuItem({
       onClick={onClick}
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
+      // A menu row is a full-width target, so the global press-scale would
+      // read as the menu itself moving. The hover fill is the feedback here.
+      data-nopress
       style={{
         display: "flex",
         alignItems: "center",
@@ -13291,21 +14154,40 @@ function MenuItem({
         background: hover && !disabled ? "var(--chip)" : "transparent",
         border: "none",
         borderRadius: 8,
-        padding: "8px 10px",
+        padding: "7px 10px",
         fontSize: 13.5,
+        letterSpacing: "var(--track-body)",
         color: disabled ? colors.dim : colors.fg,
         cursor: disabled ? "default" : "pointer",
         textAlign: "left",
         fontFamily: "inherit",
+        transition: "background 120ms ease",
       }}
     >
-      <span style={{ color: colors.dim, display: "flex", flexShrink: 0 }}>{icon}</span>
-      <span style={{ whiteSpace: "nowrap" }}>{label}</span>
+      {/* --fg-soft, not --dim: the icon names the row as much as the label
+          does, and at --dim it was the faintest thing in it. */}
+      <span
+        style={{
+          color: disabled ? colors.dim : "var(--fg-soft)",
+          display: "flex",
+          justifyContent: "center",
+          width: 18,
+          flexShrink: 0,
+        }}
+      >
+        {icon}
+      </span>
+      {/* Fixed column. Ragged labels give the descriptions a ragged left
+          edge too, which is what reads as clutter at this width. */}
+      <span style={{ whiteSpace: "nowrap", minWidth: 148, flexShrink: 0 }}>{label}</span>
       {desc && (
         <span
           style={{
+            flex: 1,
+            minWidth: 0,
             color: colors.dim,
             fontSize: 12.5,
+            letterSpacing: "var(--track-meta)",
             whiteSpace: "nowrap",
             overflow: "hidden",
             textOverflow: "ellipsis",
@@ -13314,13 +14196,18 @@ function MenuItem({
           {desc}
         </span>
       )}
+      {trailing && (
+        <span style={{ display: "flex", alignItems: "center", flexShrink: 0, marginLeft: 12 }}>
+          {trailing}
+        </span>
+      )}
     </button>
   );
 }
 
-function CheckIcon() {
+function CheckIcon({ size = 14 }: { size?: number } = {}) {
   return (
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
       <path d="M20 6 9 17l-5-5" />
     </svg>
   );
@@ -13420,7 +14307,13 @@ function ThreadRow({
       style={{
         display: "flex",
         alignItems: "center",
+        // The active row was a flat --chip fill, the same treatment hover and
+        // open popovers use — so "which chat am I in" competed with "what is
+        // my cursor over". An accent rail plus a tinted fill says *selected*
+        // in a way no neutral shade can, and the 2px inset keeps the text
+        // baseline aligned with the inactive rows above and below it.
         background: active ? "var(--chip)" : "transparent",
+        boxShadow: active ? "inset 2px 0 0 0 var(--accent)" : "none",
         borderRadius: 8,
         marginBottom: 1,
         paddingLeft: indent ? 25 : 0,
@@ -13439,7 +14332,11 @@ function ThreadRow({
           color: active ? colors.fg : "var(--fg-soft)",
           border: "none",
           padding: "8px 4px 8px 8px",
+          // Back at 14; the active state is carried by weight and the accent
+          // rail rather than by shrinking every inactive row.
           fontSize: 14,
+          fontWeight: active ? 500 : 400,
+          letterSpacing: "var(--track-body)",
           textAlign: "left",
           cursor: "pointer",
           fontFamily: "inherit",
@@ -13772,7 +14669,14 @@ function PermissionsPrompt({
         Permissions
       </div>
       <div style={{ fontSize: 14, fontWeight: 600, color: colors.fg, marginTop: 8 }}>{title}</div>
-      {approval.reason && <div style={{ color: colors.dim, fontSize: 13, marginTop: 4 }}>{approval.reason}</div>}
+      {approval.reason && (
+        // pre-wrap because a reason can now be a details block (the scheduled
+        // task card lists cadence, directory and the verbatim prompt) rather
+        // than always being one sentence.
+        <div style={{ color: colors.dim, fontSize: 13, marginTop: 4, lineHeight: 1.5, whiteSpace: "pre-wrap" }}>
+          {approval.reason}
+        </div>
+      )}
       <div style={{ display: "flex", justifyContent: "flex-end", alignItems: "center", gap: 10, marginTop: 14 }}>
         <button
           onClick={() => onDecide("decline")}
@@ -14030,12 +14934,8 @@ function StepsGroup({
               fontSize: 13.5,
               cursor: "pointer",
               fontFamily: "var(--font-ui)",
-              textDecoration: "underline",
-              textDecorationColor: "transparent",
-              transition: "text-decoration-color 120ms",
+              textDecoration: "none",
             }}
-            onMouseEnter={(e) => (e.currentTarget.style.textDecorationColor = colors.accent)}
-            onMouseLeave={(e) => (e.currentTarget.style.textDecorationColor = "transparent")}
           >
             {/* Inline emoji + name, the same shape sub-agent rows use. Kept
                 inside the button so the icon is part of the click target, and
@@ -14057,7 +14957,7 @@ function StepsGroup({
             cursor: "pointer",
             display: "inline-block",
             transform: expanded ? "rotate(90deg)" : "none",
-            transition: "transform 120ms",
+            transition: "transform 120ms var(--ease-out)",
             fontSize: 11,
             marginTop: 1,
           }}
@@ -14101,7 +15001,7 @@ function StepsGroup({
                     fontSize: 9,
                     display: "inline-block",
                     transform: itemOpen ? "rotate(90deg)" : "none",
-                    transition: "transform 120ms",
+                    transition: "transform 120ms var(--ease-out)",
                   }}
                 >
                   ▶

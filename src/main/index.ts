@@ -12,7 +12,7 @@ import {
 } from "electron";
 import type { MenuItemConstructorOptions } from "electron";
 import type { NativeImage } from "electron";
-import { isAbsolute, join, relative } from "node:path";
+import { dirname, isAbsolute, join, relative } from "node:path";
 import { homedir } from "node:os";
 import {
   closeSync,
@@ -46,6 +46,7 @@ import {
   validateSchedule,
   type RunStatus,
   type ScheduledTask,
+  type ScheduleSpec,
 } from "./scheduler";
 import { spawn as ptySpawn, type IPty } from "@lydell/node-pty";
 
@@ -804,6 +805,60 @@ const AGENT_BROWSER_TOOLS = [
 
 function agentBrowserTools(): typeof AGENT_BROWSER_TOOLS | undefined {
   return agentBrowserBin() ? AGENT_BROWSER_TOOLS : undefined;
+}
+
+// Scheduling, offered to the model as a dynamic tool — the same extension
+// point the browser uses, so no new machinery is involved.
+//
+// The schedule is taken as flat fields rather than the engine's tagged union.
+// A oneOf over four variants is exactly the shape models get wrong, and the
+// cost of guessing is a task that fires at the wrong time and is not noticed
+// for a week. Flat fields with one enum are far harder to misread, and
+// validateSchedule rebuilds the real union on this side.
+const SCHEDULE_TOOLS = [
+  {
+    type: "function",
+    name: "schedule_create",
+    description:
+      "Create a recurring scheduled task that runs on its own later. Use when the user asks for something repeating — a morning brief, a Friday summary, a watch on something that changes. The user is shown a card with the full details and must approve it before anything is armed, so propose it directly rather than asking in chat first. Each run starts a FRESH conversation with no memory of this one and runs read-only, so write the prompt as complete standing instructions: name the project, the paths and what to report. Do not use this for one-off work you can simply do now.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Short label, e.g. 'Daily brief'." },
+        prompt: {
+          type: "string",
+          description: "The full instruction for each run. Self-contained — the run cannot see this conversation.",
+        },
+        repeat: {
+          type: "string",
+          enum: ["daily", "weekdays", "weekly", "hourly"],
+          description: "weekdays = Mon–Fri.",
+        },
+        time: { type: "string", description: "Local time as HH:MM, 24-hour. Required for daily, weekdays and weekly." },
+        days: {
+          type: "array",
+          items: { type: "string", enum: ["MO", "TU", "WE", "TH", "FR", "SA", "SU"] },
+          description: "Required for weekly. Ignored otherwise.",
+        },
+        intervalHours: { type: "integer", description: "Required for hourly. 1–24." },
+      },
+      required: ["name", "prompt", "repeat"],
+    },
+  },
+];
+
+/**
+ * Every dynamic tool a conversation gets.
+ *
+ * Composed rather than returned from one source: agentBrowserTools() yields
+ * undefined when the CLI is absent, and while it was the only contributor that
+ * meant "no browser" and "no dynamic tools at all" were the same value. Adding
+ * a second family to that would have made scheduling silently disappear on any
+ * machine without agent-browser installed.
+ */
+function threadDynamicTools(): Record<string, unknown>[] | undefined {
+  const tools = [...SCHEDULE_TOOLS, ...(agentBrowserTools() ?? [])];
+  return tools.length ? (tools as Record<string, unknown>[]) : undefined;
 }
 
 function runAgentBrowser(args: string[], timeoutMs = 60_000): Promise<{ ok: boolean; out: string }> {
@@ -2625,6 +2680,19 @@ function createWindow(): void {
     if (/^https?:/.test(url) && !url.startsWith("http://localhost")) {
       e.preventDefault();
       void shell.openExternal(url);
+      return;
+    }
+    // Anything that is not this app and not an outward link is refused.
+    // Previously only http(s) was considered, which left file:// through — and
+    // a file:// navigation is exactly what a dropped file produces when no
+    // handler claims it. The renderer swallows those first (see main.tsx), so
+    // this is the second line rather than the first, but the failure it guards
+    // against is the app replacing itself with the contents of a dropped file
+    // and no way back short of reopening the window.
+    const own = process.env.ELECTRON_RENDERER_URL ?? `file://${join(__dirname, "../renderer/index.html")}`;
+    if (!/^https?:/.test(url) && url !== own) {
+      console.warn("[window] blocked navigation to", url.slice(0, 120));
+      e.preventDefault();
     }
   });
   if (process.env.ELECTRON_RENDERER_URL) {
@@ -3444,7 +3512,14 @@ function wireNotifications(): void {
       // adapt instead of the turn dying.
       if (msg.method === "item/tool/call") {
         const tool = String((params as { tool?: unknown }).tool ?? "");
-        void handleAgentBrowserCall(tool, (params as { arguments?: unknown }).arguments, approvalThread)
+        const args = (params as { arguments?: unknown }).arguments;
+        // Two families now, dispatched by prefix rather than by assuming the
+        // browser owns every dynamic tool.
+        const call =
+          tool.startsWith("schedule_")
+            ? handleScheduleToolCall(tool, args, approvalThread)
+            : handleAgentBrowserCall(tool, args, approvalThread);
+        void call
           .catch((err) => ({
             contentItems: [{ type: "inputText" as const, text: `tool crashed: ${String(err)}` }],
             success: false,
@@ -3499,6 +3574,62 @@ function wireNotifications(): void {
   );
 }
 
+// ── Where file dialogs open ─────────────────────────────────────────────
+// A picker that always starts from the same place makes the user re-walk the
+// same tree every time. macOS remembers per-app, not per-purpose, so
+// "Attach a file" and "Open a project" fought over one position; keying the
+// memory by purpose lets each reopen where that particular job left off.
+//
+// Deliberately NOT falling back to mainCwd for the project pickers: the whole
+// point of opening a project is that you are leaving the current one.
+
+type DialogKey = "project" | "projectLocation" | "attach" | "skills";
+
+function dialogDirsFile(): string {
+  return join(app.getPath("userData"), "dialog-dirs.json");
+}
+
+function loadDialogDirs(): Partial<Record<DialogKey, string>> {
+  try {
+    const parsed = JSON.parse(readFileSync(dialogDirsFile(), "utf8"));
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+/** The remembered directory, or undefined — a folder that has since been
+ *  moved or deleted must not be handed to the dialog, which would either
+ *  error or silently ignore it. */
+function lastDialogDir(key: DialogKey): string | undefined {
+  const dir = loadDialogDirs()[key];
+  if (!dir) return undefined;
+  try {
+    return statSync(dir).isDirectory() ? dir : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Remember where a pick happened.
+ *
+ * `asParent` is the difference between "choose a thing" and "choose a place".
+ * Picking the project /Work/unbiased-app should reopen at /Work, listing its
+ * siblings — reopening *inside* the project you just chose is never what you
+ * want next. Picking a location to create in is already the place, so it is
+ * stored as-is.
+ */
+function rememberDialogDir(key: DialogKey, chosen: string, asParent = true): void {
+  try {
+    const dir = asParent ? dirname(chosen) : chosen;
+    if (!statSync(dir).isDirectory()) return;
+    writeFileSync(dialogDirsFile(), JSON.stringify({ ...loadDialogDirs(), [key]: dir }, null, 2) + "\n");
+  } catch {
+    // Best effort — a picker that forgets is a small annoyance, not a failure.
+  }
+}
+
 // ── Scheduled tasks ─────────────────────────────────────────────────────
 // The clock. `scheduler.ts` owns the records and the calendar arithmetic;
 // this half owns the engine.
@@ -3517,6 +3648,126 @@ function wireNotifications(): void {
 
 function tasksDir(): string {
   return app.getPath("userData");
+}
+
+/** "Weekdays at 8:00 AM" — the same sentence the list shows, so the approval
+ *  card and the row the user lands on describe the schedule identically. */
+function describeSchedule(s: ScheduleSpec): string {
+  const clock = (time: string) => {
+    const m = /^(\d{1,2}):(\d{2})$/.exec(time);
+    if (!m) return time;
+    const h = Number(m[1]);
+    return `${h % 12 === 0 ? 12 : h % 12}:${m[2]} ${h < 12 ? "AM" : "PM"}`;
+  };
+  const names: Record<string, string> = {
+    MO: "Mon", TU: "Tue", WE: "Wed", TH: "Thu", FR: "Fri", SA: "Sat", SU: "Sun",
+  };
+  switch (s.type) {
+    case "hourly":
+      return s.intervalHours === 1 ? "Every hour" : `Every ${s.intervalHours} hours`;
+    case "daily":
+      return `Daily at ${clock(s.time)}`;
+    case "weekdays":
+      return `Weekdays at ${clock(s.time)}`;
+    case "weekly":
+      return `${s.days.map((d) => names[d] ?? d).join(", ")} at ${clock(s.time)}`;
+  }
+}
+
+/**
+ * The `schedule_create` dynamic tool.
+ *
+ * Nothing is written before the human says yes. The card carries the whole
+ * proposal — name, cadence, working directory and the verbatim prompt — because
+ * the prompt is the part that actually matters and the part the user never
+ * wrote: approving a task means approving text the model composed, which will
+ * run unattended on a schedule. Summarising it would defeat the point.
+ */
+async function handleScheduleToolCall(
+  tool: string,
+  rawArgs: unknown,
+  threadId: string | null,
+): Promise<DynamicToolResponse> {
+  const text = (t: string, ok: boolean): DynamicToolResponse => ({
+    contentItems: [{ type: "inputText", text: t }],
+    success: ok,
+  });
+  if (tool !== "schedule_create") return text(`Unknown scheduling tool ${tool}.`, false);
+
+  const a = (rawArgs && typeof rawArgs === "object" ? rawArgs : {}) as Record<string, unknown>;
+  const name = typeof a.name === "string" ? a.name.trim() : "";
+  const prompt = typeof a.prompt === "string" ? a.prompt.trim() : "";
+  if (!name) return text("A name is required.", false);
+  if (name.length > MAX_NAME_CHARS) return text(`Keep the name under ${MAX_NAME_CHARS} characters.`, false);
+  if (!prompt) return text("A prompt is required — say what each run should do.", false);
+  if (prompt.length > MAX_PROMPT_CHARS) {
+    return text(`Keep the instructions under ${MAX_PROMPT_CHARS} characters.`, false);
+  }
+
+  const repeat = typeof a.repeat === "string" ? a.repeat : "";
+  const raw =
+    repeat === "hourly"
+      ? { type: "hourly", intervalHours: a.intervalHours }
+      : repeat === "weekly"
+        ? { type: "weekly", days: a.days, time: a.time }
+        : { type: repeat, time: a.time };
+  const checked = validateSchedule(raw);
+  if ("error" in checked) return text(`${checked.error} (repeat was ${JSON.stringify(repeat)})`, false);
+
+  const existing = readTasks();
+  if (existing.length >= MAX_TASKS) return text(`The user is at the limit of ${MAX_TASKS} scheduled tasks.`, false);
+
+  // The run inherits the conversation's directory, so the card names it.
+  const cwd = mainCwd ?? defaultChatDir();
+  const cadence = describeSchedule(checked.schedule);
+  const decision = await requestLocalApproval(
+    threadId,
+    `Schedule "${name}" — ${cadence}`,
+    [
+      `Runs: ${cadence}`,
+      `In: ${cwd}`,
+      "Access: read-only, and it never asks for approval while running.",
+      "",
+      "It will run this each time:",
+      prompt,
+    ].join("\n"),
+  );
+  if (decision === "decline") {
+    return text("The user declined the scheduled task. Do not create it, and do not offer again unless asked.", false);
+  }
+
+  const now = new Date().toISOString();
+  const task: ScheduledTask = {
+    key: `st_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
+    name,
+    prompt,
+    schedule: checked.schedule,
+    enabled: true,
+    projectPath: mainCwd,
+    createdAt: now,
+    cursorAt: now,
+    lastRunAt: null,
+    lastStatus: null,
+    lastError: null,
+    lastThreadId: null,
+    missedAt: null,
+  };
+  const next = [...existing, task];
+  writeTasks(next);
+  send("scheduled:updated", { tasks: decorate(next) });
+
+  // A row in the transcript with a link through to the task itself — the user
+  // approved a proposal, so the result should be somewhere they can go and see,
+  // not just a sentence the model reports back.
+  const paneId = paneForThread(rootThreadOf(threadId)) ?? "main";
+  send("chat:scheduled-created", { paneId, key: task.key, name, cadence });
+
+  const due = dueAt(task);
+  return text(
+    `Created and armed "${name}" — ${cadence}. First run ${due.toLocaleString()}. ` +
+      "It is listed under Scheduled in the sidebar, where the user can pause, edit or run it now.",
+    true,
+  );
 }
 
 const SCHEDULE_TICK_MS = 30_000;
@@ -3863,7 +4114,7 @@ app.whenReady().then(async () => {
           // ignores params it does not know (verified against 0.147.0), so
           // this is safe either way — but see the note in HOW-IT-WORKS: a
           // version bump could start dropping them without any error.
-          dynamicTools: agentBrowserTools(),
+          dynamicTools: threadDynamicTools(),
           developerInstructions: APP_DEVELOPER_INSTRUCTIONS,
           experimentalRawEvents: true,
         })) as { thread: { id: string } };
@@ -3873,7 +4124,7 @@ app.whenReady().then(async () => {
           ...threadPolicy(),
           ephemeral: true,
           experimentalRawEvents: true,
-          dynamicTools: agentBrowserTools(),
+          dynamicTools: threadDynamicTools(),
           developerInstructions: APP_DEVELOPER_INSTRUCTIONS,
         })) as { thread: { id: string } };
       } else {
@@ -3897,7 +4148,7 @@ app.whenReady().then(async () => {
           cwd,
           // Model-driven browser automation (agent-browser CLI), when
           // installed — the calls come back as item/tool/call requests.
-          dynamicTools: agentBrowserTools(),
+          dynamicTools: threadDynamicTools(),
           developerInstructions: APP_DEVELOPER_INSTRUCTIONS,
           // Raw response items feed the sub-agent viewer (task text + spawn
           // instructions). Sub-threads inherit this from their parent.
@@ -4437,13 +4688,79 @@ app.whenReady().then(async () => {
     }
     return null;
   }
+  /**
+   * Trim an MCP icon's transparent padding.
+   *
+   * Servers ship icons on generous canvases: Figma's is 128x160 with a 52x76
+   * mark centred in it, so only 41% of the width is ink. Rendered at any size
+   * the glyph looks shrunken and mis-centred, because the box being centred is
+   * mostly nothing. Every attempt to fix that by growing the container just
+   * grows the padding with it.
+   *
+   * Cropping to the alpha bounding box makes the icon fill the space it is
+   * given, and makes servers with different padding conventions render at the
+   * same visual weight. Cached by source, since the list is re-fetched every
+   * time the panel opens and the bitmap never changes.
+   */
+  const iconTrimCache = new Map<string, string>();
+  function trimIcon(src: string): string {
+    const cached = iconTrimCache.get(src);
+    if (cached) return cached;
+    let out = src;
+    try {
+      const img = nativeImage.createFromDataURL(src);
+      const { width, height } = img.getSize();
+      if (width > 0 && height > 0) {
+        const bmp = img.toBitmap(); // BGRA, row-major
+        let minX = width, minY = height, maxX = -1, maxY = -1;
+        for (let y = 0; y < height; y++) {
+          for (let x = 0; x < width; x++) {
+            if (bmp[(y * width + x) * 4 + 3] <= 8) continue; // transparent
+            if (x < minX) minX = x;
+            if (x > maxX) maxX = x;
+            if (y < minY) minY = y;
+            if (y > maxY) maxY = y;
+          }
+        }
+        // Only worth doing when there is real padding to remove; a 1-2px
+        // margin is not worth re-encoding, and an empty image must not crop
+        // to nothing.
+        const w = maxX - minX + 1;
+        const h = maxY - minY + 1;
+        if (maxX >= 0 && (w < width * 0.9 || h < height * 0.9)) {
+          out = img.crop({ x: minX, y: minY, width: w, height: h }).toDataURL();
+        }
+      }
+    } catch {
+      // An icon we cannot decode is passed through untouched; the renderer
+      // filters what it will actually display anyway.
+    }
+    iconTrimCache.set(src, out);
+    return out;
+  }
+
   ipcMain.handle("mcp:list", async () => {
     const cfg = readMcpConfig();
     let connected: unknown[] = [];
     let error: string | null = null;
     try {
       const res = (await engine.request("mcpServerStatus/list", {})) as { data?: unknown[] };
-      connected = Array.isArray(res?.data) ? res.data : [];
+      connected = (Array.isArray(res?.data) ? res.data : []).map((srv) => {
+        const s = srv as { serverInfo?: { icons?: { src?: unknown }[] | null } | null };
+        const icons = s?.serverInfo?.icons;
+        if (!Array.isArray(icons) || icons.length === 0) return srv;
+        return {
+          ...s,
+          serverInfo: {
+            ...s.serverInfo,
+            icons: icons.map((ic) =>
+              typeof ic?.src === "string" && ic.src.startsWith("data:image/")
+                ? { ...ic, src: trimIcon(ic.src) }
+                : ic,
+            ),
+          },
+        };
+      });
     } catch (err) {
       error = err instanceof Error ? err.message : String(err);
     }
@@ -4728,9 +5045,10 @@ app.whenReady().then(async () => {
       properties: ["openFile", "openDirectory"],
       title: "Choose a skill folder or SKILL.md",
       buttonLabel: "Choose",
-      defaultPath: mainCwd ?? undefined,
+      defaultPath: lastDialogDir("skills") ?? mainCwd ?? undefined,
     });
     if (res.canceled || res.filePaths.length === 0) return { path: null };
+    rememberDialogDir("skills", res.filePaths[0]);
     return { path: res.filePaths[0] };
   });
 
@@ -5260,8 +5578,11 @@ app.whenReady().then(async () => {
       properties: ["openDirectory", "createDirectory"],
       title: "Choose where the project folder is created",
       buttonLabel: "Use this location",
+      defaultPath: lastDialogDir("projectLocation"),
     });
-    return { path: result.canceled || result.filePaths.length === 0 ? null : result.filePaths[0] };
+    if (result.canceled || result.filePaths.length === 0) return { path: null };
+    rememberDialogDir("projectLocation", result.filePaths[0], false);
+    return { path: result.filePaths[0] };
   });
 
   ipcMain.handle("project:choose", async () => {
@@ -5270,9 +5591,11 @@ app.whenReady().then(async () => {
       properties: ["openDirectory"],
       title: "Choose a project folder",
       buttonLabel: "Open project",
+      defaultPath: lastDialogDir("project"),
     });
     if (result.canceled || result.filePaths.length === 0) return { path: null, name: null };
     const path = result.filePaths[0];
+    rememberDialogDir("project", path);
     rememberProject(path);
     pendingCwd = path;
     mainCwd = path;
@@ -5480,33 +5803,56 @@ app.whenReady().then(async () => {
     }
   });
 
+  /** One attachment record from a path — folder, image (thumbnailed, sent as
+   *  localImage so the model sees pixels rather than binary in context), or a
+   *  plain file. Shared by the picker and by drag-and-drop. */
+  function describeAttachment(path: string): Record<string, unknown> {
+    const name = path.split("/").filter(Boolean).pop() ?? path;
+    try {
+      if (statSync(path).isDirectory()) return { path, name, kind: "folder" };
+    } catch {
+      // fall through to the generic file card
+    }
+    if (/\.(png|jpe?g|gif|webp|bmp)$/i.test(path)) {
+      const img = nativeImage.createFromPath(path);
+      if (!img.isEmpty()) return { path, name, kind: "image", thumb: thumbDataUrl(img) };
+    }
+    return { path, name, kind: "file" };
+  }
+
   ipcMain.handle("attach:choose", async () => {
     if (!win) return { attachments: [] };
     const result = await dialog.showOpenDialog(win, {
       properties: ["openFile", "openDirectory", "multiSelections"],
       title: "Attach files or folders",
       buttonLabel: "Attach",
-      defaultPath: mainCwd ?? undefined,
+      defaultPath: lastDialogDir("attach") ?? mainCwd ?? undefined,
     });
     if (result.canceled) return { attachments: [] };
-    return {
-      attachments: result.filePaths.map((path) => {
-        const name = path.split("/").filter(Boolean).pop() ?? path;
-        try {
-          if (statSync(path).isDirectory()) return { path, name, kind: "folder" };
-        } catch {
-          // fall through to the generic file card
-        }
-        // Picked image files render a thumbnail card and send as localImage
-        // (a mention would dump binary into context). Unreadable/exotic
-        // formats quietly stay plain files.
-        if (/\.(png|jpe?g|gif|webp|bmp)$/i.test(path)) {
-          const img = nativeImage.createFromPath(path);
-          if (!img.isEmpty()) return { path, name, kind: "image", thumb: thumbDataUrl(img) };
-        }
-        return { path, name, kind: "file" };
-      }),
-    };
+    if (result.filePaths[0]) rememberDialogDir("attach", result.filePaths[0]);
+    return { attachments: result.filePaths.map(describeAttachment) };
+  });
+
+  // Drag-and-drop lands here. The renderer can resolve a dropped File to a
+  // real path (webUtils) but cannot stat it or read an image off disk, so the
+  // classification has to happen on this side — and it is the SAME
+  // classification the picker uses, deliberately: a folder dragged in and a
+  // folder chosen from the dialog should arrive as the same kind of thing.
+  ipcMain.handle("attach:paths", (_e, p: { paths?: unknown }) => {
+    const paths = Array.isArray(p?.paths) ? p.paths.filter((x): x is string => typeof x === "string") : [];
+    // Only paths that exist. A drop can carry an item with no file behind it
+    // (a dragged selection, a web image), and webUtils hands back "" for those.
+    const real = paths.filter((path) => {
+      if (!path || !isAbsolute(path)) return false;
+      try {
+        statSync(path);
+        return true;
+      } catch {
+        return false;
+      }
+    });
+    if (real[0]) rememberDialogDir("attach", real[0]);
+    return { attachments: real.map(describeAttachment) };
   });
 
   ipcMain.handle("browser:open", (_e, p: { id: number; url?: string }) => {
@@ -6040,8 +6386,6 @@ app.whenReady().then(async () => {
       return { ok: false }; // a dropped click is not worth a dialog
     }
   });
-
-  ipcMain.handle("clipboard:has-image", () => !clipboard.readImage().isEmpty());
 
   // A copied/pasted image lives in the native clipboard; persist it to a
   // temp PNG so it can ride the next turn as a localImage input item.
