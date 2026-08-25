@@ -35,6 +35,18 @@ import { execFile, execFileSync, spawn as spawnProcess } from "node:child_proces
 import type { ChildProcess } from "node:child_process";
 import { get as httpGet } from "node:http";
 import { EngineClient, engineVersionFromUserAgent, type EngineStatus } from "./engine";
+import {
+  dueAt,
+  isDue,
+  loadTasks,
+  MAX_NAME_CHARS,
+  MAX_PROMPT_CHARS,
+  MAX_TASKS,
+  saveTasks,
+  validateSchedule,
+  type RunStatus,
+  type ScheduledTask,
+} from "./scheduler";
 import { spawn as ptySpawn, type IPty } from "@lydell/node-pty";
 
 const engine = new EngineClient();
@@ -3213,6 +3225,34 @@ function wireNotifications(): void {
     });
   });
 
+  // Scheduled runs. Their threads own no pane, so the main event switch above
+  // routes none of their traffic anywhere — this listener is the whole of it.
+  // Kept separate rather than folded into that switch: a scheduled thread has
+  // no pane, no transcript and no approval cards, and every branch in there
+  // begins by resolving one.
+  engine.on("notification", (msg: { method: string; params?: Record<string, unknown> }) => {
+    const params = msg.params ?? {};
+    const threadId = typeof params.threadId === "string" ? params.threadId : null;
+    if (!threadId) return;
+    const run = scheduledRuns.get(threadId);
+    if (!run) return;
+    if (msg.method === "item/agentMessage/delta") {
+      run.text += (params.delta as string) ?? "";
+      return;
+    }
+    if (msg.method === "turn/completed") {
+      const turn = params.turn as
+        | { status?: string; error?: { message?: string; additionalDetails?: string | null } | null }
+        | undefined;
+      const status: RunStatus =
+        turn?.status === "failed" ? "failed" : turn?.status === "interrupted" ? "interrupted" : "completed";
+      const error = turn?.error
+        ? [turn.error.message, turn.error.additionalDetails].filter(Boolean).join(" — ") || "unknown error"
+        : null;
+      run.settle({ status, error, text: run.text });
+    }
+  });
+
   engine.on(
     "server-request",
     (msg: { id: number | string; method: string; params?: Record<string, unknown> }) => {
@@ -3332,6 +3372,186 @@ function wireNotifications(): void {
   );
 }
 
+// ── Scheduled tasks ─────────────────────────────────────────────────────
+// The clock. `scheduler.ts` owns the records and the calendar arithmetic;
+// this half owns the engine.
+//
+// A scheduled run is an ordinary thread and an ordinary turn — the same path
+// a typed message takes — with two deliberate differences:
+//
+//   approvalPolicy: "never" + sandbox: "read-only"
+//
+// Nobody is watching at 8am. Under the interactive "ask" policy
+// (`on-request`) an escalation would raise an approval card into an empty
+// room and the turn would block on it until the app quit. `never` means the
+// engine stops asking: reads run, anything needing escalation fails and the
+// model adapts or reports. It is the one place in this app that deliberately
+// runs a turn no human is going to answer for.
+
+function tasksDir(): string {
+  return app.getPath("userData");
+}
+
+const SCHEDULE_TICK_MS = 30_000;
+/** A scheduled turn that has not finished in this long is abandoned. The
+ *  engine client has no per-request timeout, so without a cap here a wedged
+ *  run would hold its slot until the app quit. */
+const RUN_TIMEOUT_MS = 10 * 60_000;
+
+let scheduleTimer: NodeJS.Timeout | null = null;
+/** Runs in flight, by engine threadId, so the notification listener below can
+ *  accumulate their output without touching the main event switch. */
+const scheduledRuns = new Map<
+  string,
+  { key: string; text: string; settle: (r: { status: RunStatus; error: string | null; text: string }) => void }
+>();
+/** Guards against a slow run overlapping its own next tick. */
+const runningTaskKeys = new Set<string>();
+
+function readTasks(): ScheduledTask[] {
+  return loadTasks(tasksDir());
+}
+
+function writeTasks(tasks: ScheduledTask[]): void {
+  saveTasks(tasksDir(), tasks);
+}
+
+/** Patch one task in place on disk and tell the renderer. */
+function updateTask(key: string, patch: Partial<ScheduledTask>): ScheduledTask[] {
+  const tasks = readTasks().map((t) => (t.key === key ? { ...t, ...patch } : t));
+  writeTasks(tasks);
+  send("scheduled:updated", { tasks: decorate(tasks) });
+  return tasks;
+}
+
+/** Add the derived fields the renderer shows but should not compute: the next
+ *  firing, and whether a run is in flight right now. */
+function decorate(tasks: ScheduledTask[]): unknown[] {
+  return tasks.map((t) => ({
+    ...t,
+    nextDueAt: t.enabled ? dueAt(t).toISOString() : null,
+    running: runningTaskKeys.has(t.key),
+  }));
+}
+
+/**
+ * Run one task now. Resolves with the assistant's reply, or with the failure —
+ * a scheduled run never throws at its caller, because both callers (the tick
+ * and the Run now button) only want to record what happened.
+ */
+async function runScheduledTask(
+  task: ScheduledTask,
+  trigger: "schedule" | "manual",
+): Promise<{ status: RunStatus; error: string | null; text: string }> {
+  if (runningTaskKeys.has(task.key)) {
+    return { status: "failed", error: "already running", text: "" };
+  }
+  runningTaskKeys.add(task.key);
+  send("scheduled:run-state", { key: task.key, running: true });
+  let threadId: string | null = null;
+  try {
+    const cwd = task.projectPath && existsSync(task.projectPath) ? task.projectPath : defaultChatDir();
+    const started = (await engine.request("thread/start", {
+      approvalPolicy: "never",
+      sandbox: "read-only",
+      cwd,
+      developerInstructions: APP_DEVELOPER_INSTRUCTIONS,
+    })) as { thread: { id: string } };
+    threadId = started.thread.id;
+
+    const settled = new Promise<{ status: RunStatus; error: string | null; text: string }>((resolve) => {
+      scheduledRuns.set(threadId!, { key: task.key, text: "", settle: resolve });
+    });
+    const timeout = new Promise<{ status: RunStatus; error: string | null; text: string }>((resolve) =>
+      setTimeout(
+        () => resolve({ status: "failed", error: `timed out after ${RUN_TIMEOUT_MS / 60_000} minutes`, text: "" }),
+        RUN_TIMEOUT_MS,
+      ),
+    );
+
+    await engine.request("turn/start", {
+      threadId,
+      input: [{ type: "text", text: task.prompt }],
+      approvalPolicy: "never",
+      sandboxPolicy: { type: "readOnly" },
+    });
+
+    const outcome = await Promise.race([settled, timeout]);
+    const now = new Date().toISOString();
+    updateTask(task.key, {
+      cursorAt: now,
+      lastRunAt: now,
+      lastStatus: outcome.status,
+      lastError: outcome.error,
+      lastThreadId: threadId,
+      missedAt: null,
+    });
+    console.log(`[scheduled] ${trigger} run of "${task.name}" ${outcome.status}`);
+    return outcome;
+  } catch (err) {
+    const now = new Date().toISOString();
+    const message = err instanceof Error ? err.message : String(err);
+    updateTask(task.key, {
+      cursorAt: now,
+      lastRunAt: now,
+      lastStatus: "failed",
+      lastError: message,
+      lastThreadId: threadId,
+      missedAt: null,
+    });
+    return { status: "failed", error: message, text: "" };
+  } finally {
+    if (threadId) scheduledRuns.delete(threadId);
+    runningTaskKeys.delete(task.key);
+    send("scheduled:run-state", { key: task.key, running: false });
+  }
+}
+
+/**
+ * Anything that came due while the app was closed is marked missed, not run.
+ * Firing a backlog at launch is the wrong default — three days offline should
+ * not mean three turns spent the moment the window opens — so the cursor
+ * advances past the slot and the row offers Run now instead.
+ */
+function catchUpMissed(): void {
+  const now = new Date();
+  let changed = false;
+  const tasks = readTasks().map((t) => {
+    if (!isDue(t, now)) return t;
+    changed = true;
+    const missed = dueAt(t).toISOString();
+    console.log(`[scheduled] "${t.name}" came due at ${missed} while closed — marked missed`);
+    return { ...t, cursorAt: now.toISOString(), missedAt: missed };
+  });
+  if (changed) {
+    writeTasks(tasks);
+    send("scheduled:updated", { tasks: decorate(tasks) });
+  }
+}
+
+function scheduleTick(): void {
+  const now = new Date();
+  for (const task of readTasks()) {
+    if (!isDue(task, now) || runningTaskKeys.has(task.key)) continue;
+    void runScheduledTask(task, "schedule");
+  }
+}
+
+/** Called once the engine is connected — there is nothing to run a task with
+ *  before that, and the engine only starts after sign-in. */
+function startScheduler(): void {
+  if (scheduleTimer) return;
+  catchUpMissed();
+  scheduleTimer = setInterval(scheduleTick, SCHEDULE_TICK_MS);
+  // Anything due in the seconds between launch and the first tick.
+  scheduleTick();
+}
+
+function stopScheduler(): void {
+  if (scheduleTimer) clearInterval(scheduleTimer);
+  scheduleTimer = null;
+}
+
 let engineWired = false;
 async function startEngine(): Promise<void> {
   const engineDir = resolveEngineDir();
@@ -3378,6 +3598,9 @@ async function startEngine(): Promise<void> {
     engineVersion: engineVersionFromUserAgent(result.userAgent),
     codexHome: result.codexHome,
   });
+  // Only now is there something to run a task WITH. Idempotent, so a
+  // re-login after a sign-out simply resumes the existing timer.
+  startScheduler();
 }
 
 app.whenReady().then(async () => {
@@ -3464,6 +3687,9 @@ app.whenReady().then(async () => {
   // env-provided key can't be removed by us — report that so the UI can say so.
   ipcMain.handle("auth:logout", (_e, opts?: { removeKey?: boolean }) => {
     engine.stop();
+    // Without this the timer keeps firing against a dead engine, turning
+    // every scheduled task into a "engine not running" failure row.
+    stopScheduler();
     pushStatus({ state: "exited", code: null, detail: "signed out" });
     const envKey = !!process.env.UNBIASED_API_KEY?.trim();
     // Removing the stored key is now the user's choice (Settings → Account):
@@ -3606,6 +3832,118 @@ app.whenReady().then(async () => {
   });
 
   ipcMain.handle("usage:billing", () => readBilling());
+
+  // ── Scheduled tasks IPC ─────────────────────────────────────────────
+
+  ipcMain.handle("scheduled:list", () => ({
+    tasks: decorate(readTasks()),
+    // The panel says so plainly rather than letting tasks look armed while
+    // nothing can actually run them.
+    engineReady: lastStatus.state === "connected",
+  }));
+
+  ipcMain.handle(
+    "scheduled:save",
+    (
+      _e,
+      p: { key?: string | null; name: string; prompt: string; schedule: unknown; projectPath?: string | null },
+    ) => {
+      const name = (p.name ?? "").trim();
+      const prompt = (p.prompt ?? "").trim();
+      if (!name) return { ok: false, error: "Give the task a name." };
+      if (name.length > MAX_NAME_CHARS) return { ok: false, error: `Keep the name under ${MAX_NAME_CHARS} characters.` };
+      if (!prompt) return { ok: false, error: "Say what the task should do." };
+      if (prompt.length > MAX_PROMPT_CHARS) {
+        return { ok: false, error: `Keep the instructions under ${MAX_PROMPT_CHARS} characters.` };
+      }
+      const checked = validateSchedule(p.schedule);
+      if ("error" in checked) return { ok: false, error: checked.error };
+
+      const tasks = readTasks();
+      const existing = p.key ? tasks.find((t) => t.key === p.key) : undefined;
+      if (!existing && tasks.length >= MAX_TASKS) {
+        return { ok: false, error: `That's the limit of ${MAX_TASKS} scheduled tasks.` };
+      }
+      const projectPath = typeof p.projectPath === "string" && p.projectPath ? p.projectPath : null;
+      let next: ScheduledTask[];
+      if (existing) {
+        // Editing the schedule re-bases the cursor: leaving it where it was
+        // means a task moved from 8am to 9am can look overdue the moment it
+        // is saved, and fire immediately.
+        const rescheduled = JSON.stringify(existing.schedule) !== JSON.stringify(checked.schedule);
+        next = tasks.map((t) =>
+          t.key === existing.key
+            ? {
+                ...t,
+                name,
+                prompt,
+                schedule: checked.schedule,
+                projectPath,
+                ...(rescheduled ? { cursorAt: new Date().toISOString(), missedAt: null } : {}),
+              }
+            : t,
+        );
+      } else {
+        const now = new Date().toISOString();
+        next = [
+          ...tasks,
+          {
+            key: `st_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
+            name,
+            prompt,
+            schedule: checked.schedule,
+            enabled: true,
+            projectPath,
+            createdAt: now,
+            cursorAt: now,
+            lastRunAt: null,
+            lastStatus: null,
+            lastError: null,
+            lastThreadId: null,
+            missedAt: null,
+          },
+        ];
+      }
+      writeTasks(next);
+      const decorated = decorate(next);
+      send("scheduled:updated", { tasks: decorated });
+      return { ok: true, tasks: decorated };
+    },
+  );
+
+  ipcMain.handle("scheduled:set-enabled", (_e, p: { key: string; enabled: boolean }) => {
+    // Re-arming re-bases the cursor too — a task disabled for a week should
+    // not fire the instant it is switched back on.
+    const patch: Partial<ScheduledTask> = p.enabled
+      ? { enabled: true, cursorAt: new Date().toISOString(), missedAt: null }
+      : { enabled: false };
+    const tasks = updateTask(p.key, patch);
+    return { ok: true, tasks: decorate(tasks) };
+  });
+
+  ipcMain.handle("scheduled:delete", (_e, key: string) => {
+    const next = readTasks().filter((t) => t.key !== key);
+    writeTasks(next);
+    const decorated = decorate(next);
+    send("scheduled:updated", { tasks: decorated });
+    return { ok: true, tasks: decorated };
+  });
+
+  ipcMain.handle("scheduled:run-now", async (_e, key: string) => {
+    const task = readTasks().find((t) => t.key === key);
+    if (!task) return { ok: false, error: "That task no longer exists." };
+    if (lastStatus.state !== "connected") return { ok: false, error: "Sign in first — the engine isn't running." };
+    const outcome = await runScheduledTask(task, "manual");
+    return { ok: outcome.status === "completed", ...outcome };
+  });
+
+  // The run's transcript is a real thread; opening it is the existing
+  // threads:open path, so the panel only needs the id.
+  ipcMain.handle("scheduled:last-run", (_e, key: string) => {
+    const task = readTasks().find((t) => t.key === key);
+    if (!task) return { threadId: null };
+    return { threadId: task.lastThreadId, status: task.lastStatus, error: task.lastError, at: task.lastRunAt };
+  });
 
 
   // ── Resource + storage stats (Settings → Resources) ─────────────────
@@ -5661,6 +5999,7 @@ app.on("window-all-closed", () => {
     }
   }
   skillStages.clear();
+  stopScheduler();
   engine.stop();
   // The agent browser's daemon outlives us otherwise — close every session.
   const bin = agentBrowserBinCache;

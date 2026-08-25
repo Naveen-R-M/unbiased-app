@@ -71,6 +71,21 @@ contextBridge.exposeInMainWorld("unbiased", {
   skillsRemove: (path: string, cwd: string | null) => ipcRenderer.invoke("skills:remove", { path, cwd }),
   skillsFetch: (url: string) => ipcRenderer.invoke("skills:fetch", { url }),
   skillsLimits: () => ipcRenderer.invoke("skills:limits"),
+  scheduledList: () => ipcRenderer.invoke("scheduled:list"),
+  scheduledSave: (p: {
+    key?: string | null;
+    name: string;
+    prompt: string;
+    schedule: unknown;
+    projectPath?: string | null;
+  }) => ipcRenderer.invoke("scheduled:save", p),
+  scheduledSetEnabled: (key: string, enabled: boolean) =>
+    ipcRenderer.invoke("scheduled:set-enabled", { key, enabled }),
+  scheduledDelete: (key: string) => ipcRenderer.invoke("scheduled:delete", key),
+  scheduledRunNow: (key: string) => ipcRenderer.invoke("scheduled:run-now", key),
+  scheduledLastRun: (key: string) => ipcRenderer.invoke("scheduled:last-run", key),
+  onScheduledUpdated: (cb: (p: unknown) => void) => subscribe("scheduled:updated", cb),
+  onScheduledRunState: (cb: (p: unknown) => void) => subscribe("scheduled:run-state", cb),
   // A dropped File carries no usable path of its own in Electron 32+; only
   // this side can resolve one.
   pathForDroppedFile: (file: File) => {

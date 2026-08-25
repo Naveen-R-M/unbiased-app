@@ -399,6 +399,36 @@ type SubAgent = {
   paneId?: PaneId;
 };
 
+// Scheduled tasks. The schedule shapes mirror the engine's own
+// ScheduledTaskSchedule so records need no translation at either boundary;
+// src/main/scheduler.ts holds the authoritative copy and the validation.
+type Weekday = "MO" | "TU" | "WE" | "TH" | "FR" | "SA" | "SU";
+
+type ScheduleSpec =
+  | { type: "hourly"; intervalHours: number; days?: Weekday[] | null }
+  | { type: "daily"; time: string }
+  | { type: "weekdays"; time: string }
+  | { type: "weekly"; days: Weekday[]; time: string };
+
+/** A stored task plus the fields main derives for display. */
+type ScheduledTaskView = {
+  key: string;
+  name: string;
+  prompt: string;
+  schedule: ScheduleSpec;
+  enabled: boolean;
+  projectPath: string | null;
+  createdAt: string;
+  lastRunAt: string | null;
+  lastStatus: "completed" | "failed" | "interrupted" | null;
+  lastError: string | null;
+  lastThreadId: string | null;
+  /** Set when the schedule elapsed while the app was closed. */
+  missedAt: string | null;
+  nextDueAt: string | null;
+  running: boolean;
+};
+
 declare global {
   interface Window {
     unbiased: {
@@ -471,6 +501,27 @@ declare global {
       pathForDroppedFile: (file: File) => string;
       skillsFetch: (url: string) => Promise<SkillCheck>;
       skillsLimits: () => Promise<{ maxBytes: number; maxFiles: number; maxDownload: number; label: string }>;
+      scheduledList: () => Promise<{ tasks: ScheduledTaskView[]; engineReady: boolean }>;
+      scheduledSave: (p: {
+        key?: string | null;
+        name: string;
+        prompt: string;
+        schedule: ScheduleSpec;
+        projectPath?: string | null;
+      }) => Promise<{ ok: boolean; error?: string; tasks?: ScheduledTaskView[] }>;
+      scheduledSetEnabled: (key: string, enabled: boolean) => Promise<{ ok: boolean; tasks: ScheduledTaskView[] }>;
+      scheduledDelete: (key: string) => Promise<{ ok: boolean; tasks: ScheduledTaskView[] }>;
+      scheduledRunNow: (
+        key: string,
+      ) => Promise<{ ok: boolean; error?: string | null; status?: string; text?: string }>;
+      scheduledLastRun: (key: string) => Promise<{
+        threadId: string | null;
+        status?: string | null;
+        error?: string | null;
+        at?: string | null;
+      }>;
+      onScheduledUpdated: (cb: (p: { tasks: ScheduledTaskView[] }) => void) => () => void;
+      onScheduledRunState: (cb: (p: { key: string; running: boolean }) => void) => () => void;
       onApprovalCanceled: (cb: (p: { paneId: PaneId; requestId: string }) => void) => () => void;
       onApprovalRequest: (
         cb: (p: {
@@ -823,6 +874,18 @@ export function App() {
   const [showChangelog, setShowChangelog] = useState(false);
   const [mcpOpen, setMcpOpen] = useState(false);
   const [skillsOpen, setSkillsOpen] = useState(false);
+  const [scheduledOpen, setScheduledOpen] = useState(false);
+  // Badge on the nav row: how many tasks came due while the app was closed.
+  // Kept up here rather than inside the panel so it shows without opening it.
+  const [missedCount, setMissedCount] = useState(0);
+  useEffect(() => {
+    const count = (tasks: ScheduledTaskView[]) => setMissedCount(tasks.filter((t) => t.missedAt).length);
+    void window.unbiased.scheduledList().then((r) => count(r.tasks ?? []));
+    // Main marks missed tasks during catch-up, which happens when the engine
+    // connects — after this component first mounts — so a one-shot read here
+    // would always report zero on a cold launch.
+    return window.unbiased.onScheduledUpdated((p) => count(p.tasks ?? []));
+  }, []);
   // Unread until the user has opened the log at its current top version.
   // The releases repo wins when we have it; the bundled copy covers offline
   // and first run. Both are generated from CHANGELOG.md, so neither can drift.
@@ -2347,6 +2410,27 @@ export function App() {
           </SidebarAction>
           <SidebarAction onClick={() => void openProjectDialog()} disabled={false} icon={<FolderPlusIcon />}>
             Open project…
+          </SidebarAction>
+          <SidebarAction onClick={() => setScheduledOpen(true)} disabled={false} icon={<ClockIcon />}>
+            <span style={{ display: "flex", alignItems: "center", gap: 8, flex: 1, minWidth: 0 }}>
+              Scheduled
+              {missedCount > 0 && (
+                <span
+                  title={`${missedCount} scheduled ${missedCount === 1 ? "task" : "tasks"} came due while Unbiased was closed`}
+                  style={{
+                    background: colors.amber,
+                    color: "#1b1b1b",
+                    borderRadius: 999,
+                    fontSize: 11,
+                    fontWeight: 600,
+                    padding: "1px 6px",
+                    lineHeight: 1.5,
+                  }}
+                >
+                  {missedCount}
+                </span>
+              )}
+            </span>
           </SidebarAction>
         </div>
         <div style={{ flex: 1, overflowY: "auto", padding: "0 8px 12px" }}>
@@ -4444,6 +4528,16 @@ export function App() {
             </div>
           </div>
         </div>
+      )}
+      {scheduledOpen && (
+        <ScheduledPanel
+          defaultProject={activeProjectPath ?? null}
+          onOpenThread={(id) => {
+            setScheduledOpen(false);
+            void openThread(id);
+          }}
+          onClose={() => setScheduledOpen(false)}
+        />
       )}
       {mcpOpen && <McpPanel onClose={() => setMcpOpen(false)} />}
       {skillsOpen && (
@@ -9489,6 +9583,598 @@ function McpIcon({ size = 15 }: { size?: number }) {
  *  supervisor reads the config file only at launch, so a server the user just
  *  added is configured but not yet connected. Collapsing the two would either
  *  hide a real server or claim a pending one is live. */
+const WEEKDAY_ORDER: Weekday[] = ["MO", "TU", "WE", "TH", "FR", "SA", "SU"];
+const WEEKDAY_LABEL: Record<Weekday, string> = {
+  MO: "Mon", TU: "Tue", WE: "Wed", TH: "Thu", FR: "Fri", SA: "Sat", SU: "Sun",
+};
+
+/** "08:00" → "8:00 AM". The stored form stays 24-hour; only the reading of it
+ *  is localised, which keeps the record and the schedule maths unambiguous. */
+function clockLabel(time: string): string {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(time);
+  if (!m) return time;
+  const h = Number(m[1]);
+  const suffix = h < 12 ? "AM" : "PM";
+  const h12 = h % 12 === 0 ? 12 : h % 12;
+  return `${h12}:${m[2]} ${suffix}`;
+}
+
+function describeSchedule(s: ScheduleSpec): string {
+  switch (s.type) {
+    case "hourly": {
+      const every = s.intervalHours === 1 ? "Every hour" : `Every ${s.intervalHours} hours`;
+      return s.days?.length ? `${every} on ${s.days.map((d) => WEEKDAY_LABEL[d]).join(", ")}` : every;
+    }
+    case "daily":
+      return `Daily at ${clockLabel(s.time)}`;
+    case "weekdays":
+      return `Weekdays at ${clockLabel(s.time)}`;
+    case "weekly":
+      return `${s.days.map((d) => WEEKDAY_LABEL[d]).join(", ")} at ${clockLabel(s.time)}`;
+  }
+}
+
+/** Short relative stamp — "in 3h", "12m ago". Absolute times for a recurring
+ *  task read as noise; what matters is how far off the next run is. */
+function relativeTime(iso: string): string {
+  const delta = new Date(iso).getTime() - Date.now();
+  const ahead = delta >= 0;
+  const mins = Math.round(Math.abs(delta) / 60_000);
+  const text =
+    mins < 1 ? "now" : mins < 60 ? `${mins}m` : mins < 1440 ? `${Math.round(mins / 60)}h` : `${Math.round(mins / 1440)}d`;
+  if (text === "now") return "now";
+  return ahead ? `in ${text}` : `${text} ago`;
+}
+
+/** The three starters from the Codex task list, as one-click prefills. */
+const TASK_TEMPLATES: { name: string; schedule: ScheduleSpec; prompt: string; blurb: string }[] = [
+  {
+    name: "Daily brief",
+    schedule: { type: "weekdays", time: "08:00" },
+    blurb: "Start each weekday with a summary of what changed and what needs attention",
+    prompt:
+      "Summarise what changed in this project since yesterday: recent commits, open branches with uncommitted work, and anything that looks unfinished. Keep it to a short list I can read in a minute.",
+  },
+  {
+    name: "Weekly review",
+    schedule: { type: "weekly", days: ["FR"], time: "16:00" },
+    blurb: "Turn the week's work into a concise status update every Friday",
+    prompt:
+      "Review this week's commits and write a status update: what shipped, what is in progress, and what is blocked. Group it by theme rather than by commit.",
+  },
+  {
+    name: "Follow-up monitor",
+    schedule: { type: "weekdays", time: "09:00" },
+    blurb: "Review recent activity and flag anything that needs a decision",
+    prompt:
+      "Look through the project for things waiting on me: TODO and FIXME comments added recently, failing checks, and stale branches. Flag only what genuinely needs a decision.",
+  },
+];
+
+/**
+ * Scheduled tasks.
+ *
+ * Rendered as a panel rather than a whole-window route because that is what
+ * this app's other management surfaces are (MCP servers, Skills), and the nav
+ * stays visible behind it. The Codex screenshot this follows shows the same
+ * three regions: the search, the starter templates, and the list.
+ *
+ * Deliberately NOT built: the "Create with Codex" half of that screenshot's
+ * Create menu — describing a task in prose and having the agent derive the
+ * schedule. The templates below cover the same "get started without filling a
+ * form" intent without a round-trip that can fail.
+ */
+function ScheduledPanel({
+  defaultProject,
+  onOpenThread,
+  onClose,
+}: {
+  defaultProject: string | null;
+  onOpenThread: (threadId: string) => void;
+  onClose: () => void;
+}) {
+  const [tasks, setTasks] = useState<ScheduledTaskView[]>([]);
+  const [engineReady, setEngineReady] = useState(true);
+  const [loading, setLoading] = useState(true);
+  const [query, setQuery] = useState("");
+  const [notice, setNotice] = useState<string | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+
+  // Form state. `editing` is the key being edited, "" for a new task, or null
+  // when the form is closed.
+  const [editing, setEditing] = useState<string | null>(null);
+  const [fName, setFName] = useState("");
+  const [fPrompt, setFPrompt] = useState("");
+  const [fType, setFType] = useState<ScheduleSpec["type"]>("weekdays");
+  const [fTime, setFTime] = useState("08:00");
+  const [fDays, setFDays] = useState<Weekday[]>(["MO"]);
+  const [fInterval, setFInterval] = useState(3);
+  const [fProject, setFProject] = useState<string | null>(defaultProject);
+  const [formError, setFormError] = useState<string | null>(null);
+
+  const refresh = useCallback(() => {
+    void window.unbiased.scheduledList().then((r) => {
+      setTasks(r.tasks ?? []);
+      setEngineReady(r.engineReady);
+      setLoading(false);
+    });
+  }, []);
+  useEffect(refresh, [refresh]);
+  // A tick that fires while the panel is open, or a run finishing, should
+  // land without a manual refresh — this is the only signal a task ran.
+  useEffect(() => window.unbiased.onScheduledUpdated((p) => setTasks(p.tasks ?? [])), []);
+  useEffect(
+    () =>
+      window.unbiased.onScheduledRunState(({ key, running }) =>
+        setTasks((ts) => ts.map((t) => (t.key === key ? { ...t, running } : t))),
+      ),
+    [],
+  );
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (e.key !== "Escape") return;
+      // Escape backs out one layer at a time, matching the other panels.
+      if (confirmDelete) setConfirmDelete(null);
+      else if (editing !== null) closeForm();
+      else onClose();
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  });
+
+  function closeForm() {
+    setEditing(null);
+    setFormError(null);
+  }
+
+  function openNew(template?: (typeof TASK_TEMPLATES)[number]) {
+    setEditing("");
+    setFName(template?.name ?? "");
+    setFPrompt(template?.prompt ?? "");
+    const s = template?.schedule;
+    setFType(s?.type ?? "weekdays");
+    setFTime(s && "time" in s ? s.time : "08:00");
+    setFDays(s && s.type === "weekly" ? s.days : ["MO"]);
+    setFInterval(s && s.type === "hourly" ? s.intervalHours : 3);
+    setFProject(defaultProject);
+    setFormError(null);
+  }
+
+  function openEdit(t: ScheduledTaskView) {
+    setEditing(t.key);
+    setFName(t.name);
+    setFPrompt(t.prompt);
+    setFType(t.schedule.type);
+    setFTime("time" in t.schedule ? t.schedule.time : "08:00");
+    setFDays(t.schedule.type === "weekly" ? t.schedule.days : ["MO"]);
+    setFInterval(t.schedule.type === "hourly" ? t.schedule.intervalHours : 3);
+    setFProject(t.projectPath);
+    setFormError(null);
+  }
+
+  function buildSchedule(): ScheduleSpec {
+    if (fType === "hourly") return { type: "hourly", intervalHours: fInterval };
+    if (fType === "weekly") return { type: "weekly", days: fDays, time: fTime };
+    return { type: fType, time: fTime };
+  }
+
+  async function save() {
+    const res = await window.unbiased.scheduledSave({
+      key: editing || null,
+      name: fName,
+      prompt: fPrompt,
+      schedule: buildSchedule(),
+      projectPath: fProject,
+    });
+    if (!res.ok) {
+      setFormError(res.error ?? "Could not save.");
+      return;
+    }
+    if (res.tasks) setTasks(res.tasks);
+    closeForm();
+    setNotice(null);
+  }
+
+  async function runNow(key: string) {
+    setNotice(null);
+    const res = await window.unbiased.scheduledRunNow(key);
+    if (!res.ok) setNotice(res.error ?? "The run failed.");
+  }
+
+  const filtered = query.trim()
+    ? tasks.filter((t) => `${t.name} ${t.prompt}`.toLowerCase().includes(query.trim().toLowerCase()))
+    : tasks;
+
+  const inputStyle: React.CSSProperties = {
+    width: "100%",
+    boxSizing: "border-box",
+    minWidth: 0,
+    background: "var(--panel-2)",
+    color: colors.fg,
+    border: `1px solid ${colors.border}`,
+    borderRadius: 10,
+    padding: "10px 12px",
+    fontSize: 13.5,
+    fontFamily: "var(--font-ui)",
+    outline: "none",
+  };
+  const labelStyle: React.CSSProperties = {
+    color: colors.dim,
+    fontSize: 13,
+    lineHeight: 1.4,
+    marginBottom: 6,
+    display: "block",
+  };
+  const insetStyle: React.CSSProperties = {
+    background: "var(--panel-2)",
+    border: `1px solid ${colors.border}`,
+    borderRadius: 12,
+    marginTop: 16,
+    overflow: "hidden",
+  };
+  const ghostButton: React.CSSProperties = {
+    background: "transparent",
+    color: "var(--fg-soft)",
+    border: `1px solid ${colors.border}`,
+    borderRadius: 8,
+    padding: "5px 10px",
+    fontSize: 12.5,
+    cursor: "pointer",
+    fontFamily: "inherit",
+  };
+  const primaryButton: React.CSSProperties = {
+    background: colors.accent,
+    color: "var(--accent-fg)",
+    border: "none",
+    borderRadius: 9,
+    padding: "9px 16px",
+    fontSize: 13.5,
+    fontWeight: 600,
+    cursor: "pointer",
+    fontFamily: "inherit",
+  };
+
+  return (
+    <div
+      onClick={onClose}
+      style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)", display: "grid", placeItems: "center", zIndex: 100 }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          background: colors.panel,
+          border: `1px solid ${colors.border}`,
+          borderRadius: 18,
+          width: 620,
+          maxWidth: "calc(100vw - 48px)",
+          boxSizing: "border-box",
+          maxHeight: "84vh",
+          display: "flex",
+          flexDirection: "column",
+          overflow: "hidden",
+          boxShadow: "0 16px 48px rgba(0,0,0,0.55)",
+          fontFamily: "var(--font-ui)",
+        }}
+      >
+        <div style={{ padding: "24px 26px 0", flexShrink: 0 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 19, fontWeight: 600, color: colors.fg }}>
+            <span style={{ color: colors.accent, display: "flex" }}><ClockIcon size={18} /></span>
+            Scheduled tasks
+          </div>
+          <p style={{ color: colors.dim, fontSize: 14, lineHeight: 1.55, margin: "12px 0 0" }}>
+            Ask Pareto to run something on a schedule — a morning brief, a weekly
+            review, a watch on work in progress. Tasks run read-only and only
+            while Unbiased is open; anything that came due while it was closed
+            waits here for you.
+          </p>
+          {!engineReady && (
+            <div
+              style={{
+                marginTop: 14,
+                background: "var(--chip)",
+                border: `1px solid ${colors.border}`,
+                borderRadius: 10,
+                padding: "10px 12px",
+                color: colors.amber,
+                fontSize: 13,
+                lineHeight: 1.5,
+              }}
+            >
+              The engine isn't running, so nothing will fire. Sign in to arm these.
+            </div>
+          )}
+          <input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Search scheduled tasks"
+            aria-label="Search scheduled tasks"
+            style={{ ...inputStyle, marginTop: 16 }}
+          />
+        </div>
+
+        <div style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: "0 20px 4px 26px", scrollbarGutter: "stable" }}>
+          {loading && <div style={{ color: colors.dim, fontSize: 14, marginTop: 16 }}>Loading…</div>}
+
+          {notice && (
+            <div style={{ color: colors.err, fontSize: 13, lineHeight: 1.5, marginTop: 16 }}>{notice}</div>
+          )}
+
+          {/* The form, when open, replaces the list rather than sitting above
+              it — at 620 wide both at once needs scrolling to do anything. */}
+          {editing !== null ? (
+            <div style={{ marginTop: 18 }}>
+              <div style={{ fontSize: 15, fontWeight: 600, color: colors.fg, marginBottom: 14 }}>
+                {editing ? "Edit task" : "New task"}
+              </div>
+
+              <label style={labelStyle} htmlFor="st-name">Name</label>
+              <input
+                id="st-name"
+                value={fName}
+                onChange={(e) => setFName(e.target.value)}
+                placeholder="Daily brief"
+                style={inputStyle}
+              />
+
+              <label style={{ ...labelStyle, marginTop: 14 }} htmlFor="st-prompt">
+                What should Pareto do?
+              </label>
+              <textarea
+                id="st-prompt"
+                value={fPrompt}
+                onChange={(e) => setFPrompt(e.target.value)}
+                rows={5}
+                placeholder="Summarise what changed in this project since yesterday…"
+                style={{ ...inputStyle, resize: "vertical", lineHeight: 1.5 }}
+              />
+
+              <label style={{ ...labelStyle, marginTop: 14 }} htmlFor="st-type">Repeat</label>
+              <select
+                id="st-type"
+                value={fType}
+                onChange={(e) => setFType(e.target.value as ScheduleSpec["type"])}
+                style={inputStyle}
+              >
+                <option value="daily">Every day</option>
+                <option value="weekdays">Weekdays (Mon–Fri)</option>
+                <option value="weekly">Certain days</option>
+                <option value="hourly">Every few hours</option>
+              </select>
+
+              {fType === "hourly" ? (
+                <>
+                  <label style={{ ...labelStyle, marginTop: 14 }} htmlFor="st-interval">Hours between runs</label>
+                  <input
+                    id="st-interval"
+                    type="number"
+                    min={1}
+                    max={24}
+                    value={fInterval}
+                    onChange={(e) => setFInterval(Number(e.target.value))}
+                    style={inputStyle}
+                  />
+                </>
+              ) : (
+                <>
+                  <label style={{ ...labelStyle, marginTop: 14 }} htmlFor="st-time">Time</label>
+                  <input
+                    id="st-time"
+                    type="time"
+                    value={fTime}
+                    onChange={(e) => setFTime(e.target.value)}
+                    style={inputStyle}
+                  />
+                </>
+              )}
+
+              {fType === "weekly" && (
+                <>
+                  <span style={{ ...labelStyle, marginTop: 14 }}>Days</span>
+                  <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                    {WEEKDAY_ORDER.map((d) => {
+                      const on = fDays.includes(d);
+                      return (
+                        <button
+                          key={d}
+                          aria-pressed={on}
+                          onClick={() => setFDays((cur) => (on ? cur.filter((x) => x !== d) : [...cur, d]))}
+                          style={{
+                            background: on ? colors.accent : "transparent",
+                            color: on ? "var(--accent-fg)" : "var(--fg-soft)",
+                            border: `1px solid ${on ? colors.accent : colors.border}`,
+                            borderRadius: 8,
+                            padding: "6px 10px",
+                            fontSize: 12.5,
+                            cursor: "pointer",
+                            fontFamily: "inherit",
+                          }}
+                        >
+                          {WEEKDAY_LABEL[d]}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </>
+              )}
+
+              <div style={{ color: colors.dim, fontSize: 12.5, lineHeight: 1.5, marginTop: 14 }}>
+                {fProject ? `Runs in ${fProject}` : "Runs in your home directory — open a project first to scope it."}
+              </div>
+
+              {formError && (
+                <div style={{ color: colors.err, fontSize: 13, lineHeight: 1.5, marginTop: 12 }}>{formError}</div>
+              )}
+            </div>
+          ) : (
+            <>
+              {!loading && tasks.length === 0 && (
+                <div style={{ marginTop: 20 }}>
+                  <div style={{ color: colors.dim, fontSize: 13, fontWeight: 600, letterSpacing: 0.2 }}>
+                    Suggestions
+                  </div>
+                  <div style={insetStyle}>
+                    {TASK_TEMPLATES.map((t, i) => (
+                      <button
+                        key={t.name}
+                        onClick={() => openNew(t)}
+                        style={{
+                          display: "block",
+                          width: "100%",
+                          textAlign: "left",
+                          background: "transparent",
+                          border: "none",
+                          borderTop: i === 0 ? "none" : `1px solid ${colors.border}`,
+                          padding: "13px 14px",
+                          cursor: "pointer",
+                          fontFamily: "inherit",
+                        }}
+                      >
+                        <span style={{ display: "flex", alignItems: "baseline", gap: 8, flexWrap: "wrap" }}>
+                          <span style={{ color: colors.fg, fontSize: 14, fontWeight: 500 }}>{t.name}</span>
+                          <span style={{ color: colors.dim, fontSize: 12.5 }}>{describeSchedule(t.schedule)}</span>
+                        </span>
+                        <span style={{ display: "block", color: colors.dim, fontSize: 13, lineHeight: 1.5, marginTop: 4 }}>
+                          {t.blurb}
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {!loading && tasks.length > 0 && filtered.length === 0 && (
+                <div style={{ color: colors.dim, fontSize: 14, marginTop: 18 }}>
+                  Nothing matches “{query.trim()}”.
+                </div>
+              )}
+
+              {filtered.length > 0 && (
+                <div style={insetStyle}>
+                  {filtered.map((t, i) => (
+                    <div
+                      key={t.key}
+                      style={{
+                        borderTop: i === 0 ? "none" : `1px solid ${colors.border}`,
+                        padding: "13px 14px",
+                        opacity: t.enabled ? 1 : 0.6,
+                      }}
+                    >
+                      <div style={{ display: "flex", alignItems: "baseline", gap: 8, flexWrap: "wrap" }}>
+                        <span style={{ color: colors.fg, fontSize: 14, fontWeight: 500 }}>{t.name}</span>
+                        <span style={{ color: colors.dim, fontSize: 12.5 }}>{describeSchedule(t.schedule)}</span>
+                        {t.running && <span style={{ color: colors.accent, fontSize: 12.5 }}>running…</span>}
+                        {!t.running && t.missedAt && (
+                          <span style={{ color: colors.amber, fontSize: 12.5 }}>
+                            missed {relativeTime(t.missedAt)}
+                          </span>
+                        )}
+                        {!t.running && !t.missedAt && t.enabled && t.nextDueAt && (
+                          <span style={{ color: colors.dim, fontSize: 12.5 }}>next {relativeTime(t.nextDueAt)}</span>
+                        )}
+                        {!t.enabled && <span style={{ color: colors.dim, fontSize: 12.5 }}>paused</span>}
+                      </div>
+
+                      <div style={{ color: colors.dim, fontSize: 13, lineHeight: 1.5, marginTop: 4 }}>
+                        {t.prompt.length > 140 ? `${t.prompt.slice(0, 140)}…` : t.prompt}
+                      </div>
+
+                      {t.lastRunAt && (
+                        <div style={{ fontSize: 12.5, lineHeight: 1.5, marginTop: 6 }}>
+                          <span style={{ color: t.lastStatus === "completed" ? colors.ok : colors.err }}>
+                            {t.lastStatus === "completed" ? "Last run succeeded" : `Last run ${t.lastStatus}`}
+                          </span>
+                          <span style={{ color: colors.dim }}> · {relativeTime(t.lastRunAt)}</span>
+                          {t.lastError && <span style={{ color: colors.dim }}> · {t.lastError}</span>}
+                        </div>
+                      )}
+
+                      {confirmDelete === t.key ? (
+                        <div style={{ display: "flex", gap: 8, marginTop: 10, alignItems: "center" }}>
+                          <span style={{ color: colors.dim, fontSize: 12.5 }}>Delete this task?</span>
+                          <button
+                            onClick={() =>
+                              void window.unbiased.scheduledDelete(t.key).then((r) => {
+                                setTasks(r.tasks ?? []);
+                                setConfirmDelete(null);
+                              })
+                            }
+                            style={{ ...ghostButton, color: colors.err, borderColor: colors.err }}
+                          >
+                            Delete
+                          </button>
+                          <button onClick={() => setConfirmDelete(null)} style={ghostButton}>Keep</button>
+                        </div>
+                      ) : (
+                        <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
+                          <button
+                            onClick={() => void runNow(t.key)}
+                            disabled={t.running || !engineReady}
+                            style={{
+                              ...ghostButton,
+                              cursor: t.running || !engineReady ? "default" : "pointer",
+                              opacity: t.running || !engineReady ? 0.5 : 1,
+                            }}
+                          >
+                            {t.missedAt ? "Run missed now" : "Run now"}
+                          </button>
+                          <button
+                            onClick={() =>
+                              void window.unbiased.scheduledSetEnabled(t.key, !t.enabled).then((r) => setTasks(r.tasks ?? []))
+                            }
+                            style={ghostButton}
+                          >
+                            {t.enabled ? "Pause" : "Resume"}
+                          </button>
+                          {t.lastThreadId && (
+                            <button onClick={() => onOpenThread(t.lastThreadId!)} style={ghostButton}>
+                              Open last run
+                            </button>
+                          )}
+                          <button onClick={() => openEdit(t)} style={ghostButton}>Edit</button>
+                          <button onClick={() => setConfirmDelete(t.key)} style={ghostButton}>Delete</button>
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </>
+          )}
+        </div>
+
+        <div
+          style={{
+            flexShrink: 0,
+            display: "flex",
+            justifyContent: "flex-end",
+            gap: 10,
+            padding: "16px 26px 20px",
+            borderTop: `1px solid ${colors.border}`,
+          }}
+        >
+          {editing !== null ? (
+            <>
+              <button onClick={closeForm} style={{ ...ghostButton, padding: "9px 14px", fontSize: 13.5 }}>
+                Cancel
+              </button>
+              <button onClick={() => void save()} style={primaryButton}>
+                {editing ? "Save changes" : "Create task"}
+              </button>
+            </>
+          ) : (
+            <>
+              <button onClick={onClose} style={{ ...ghostButton, padding: "9px 14px", fontSize: 13.5 }}>
+                Close
+              </button>
+              <button onClick={() => openNew()} style={primaryButton}>New task</button>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function McpPanel({ onClose }: { onClose: () => void }) {
   const [connected, setConnected] = useState<McpConnected[]>([]);
   const [configured, setConfigured] = useState<McpServerConfig[]>([]);
@@ -12653,6 +13339,15 @@ function CloseIcon() {
     <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
       <path d="M18 6 6 18" />
       <path d="M6 6l12 12" />
+    </svg>
+  );
+}
+
+function ClockIcon({ size = 15 }: { size?: number } = {}) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" style={{ flexShrink: 0 }}>
+      <circle cx="12" cy="12" r="9" />
+      <path d="M12 7v5l3.5 2" />
     </svg>
   );
 }
