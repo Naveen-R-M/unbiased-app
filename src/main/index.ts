@@ -180,6 +180,34 @@ function cdpAlive(port: number): Promise<boolean> {
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/**
+ * Is the browser already listening on `port` one WE started?
+ *
+ * This distinction used to be guessed from `launched`: anything already
+ * listening was treated as the user's own browser. That is wrong after an
+ * unclean exit — our own managed Chrome outlives the app (window-all-closed
+ * never runs on SIGTERM), so the next launch adopted its own browser while
+ * believing it belonged to the user, which suppressed the mirror pane and
+ * made resetting a stale tab unsafe.
+ *
+ * Ownership is decided by the profile directory on the listening process's
+ * command line: only our Chrome runs with `agentChromeProfile()`. Wrong-way
+ * failures are safe — an unreadable answer means "not ours", which only ever
+ * makes us more conservative.
+ */
+function ownsChromeOnPort(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    execFile("lsof", ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-t"], { timeout: 4000 }, (err, pids) => {
+      const pid = String(pids ?? "").trim().split(/\s+/).filter(Boolean)[0];
+      if (err || !pid) return resolve(false);
+      execFile("ps", ["-p", pid, "-o", "command="], { timeout: 4000, maxBuffer: 1_000_000 }, (err2, cmd) => {
+        if (err2) return resolve(false);
+        resolve(String(cmd).includes(`--user-data-dir=${agentChromeProfile()}`));
+      });
+    });
+  });
+}
+
 /** Attach target for browser_connect: an already-debuggable browser if one is
  *  listening (including one the user started themselves), otherwise our own
  *  Chrome, launched here so the user never has to run a terminal command. */
@@ -260,6 +288,54 @@ async function launchAgentChrome(
 // Set when attached to a browser WE DID NOT LAUNCH: closing it would take
 // down tabs that are not ours. A browser this app started is ours to close.
 let browserAttachedExternal = false;
+
+// Whether the agent-browser CLI's session is bound to our Chrome yet.
+//
+// This is the fix for the two-browsers bug. `runAgentBrowser` passes no
+// --cdp/--session/--profile, so the CLI uses its own "default" session — and
+// an unbound default session launches its OWN Chrome in a throwaway temp
+// profile. Only browser_connect ever called ensureAgentChrome, so every other
+// tool (open, search, snapshot…) drove that temp browser while the Agent
+// browser pane mirrored port 9222 and showed a Chrome nobody was driving.
+// Binding once, before the first tool that needs a page, makes the pane and
+// the agent the same browser by construction.
+let browserSessionBound = false;
+
+/**
+ * Make sure the CLI is attached to a browser we can also mirror.
+ * Returns null on success, or the message to hand back to the model.
+ */
+async function ensureBrowserSession(): Promise<string | null> {
+  // A browser the user pointed us at is already attached and is not ours to
+  // re-target; leave it exactly as it is.
+  if (browserSessionBound || browserAttachedExternal) return null;
+  const ready = await ensureAgentChrome(AGENT_CHROME_PORT);
+  if (!ready.ok) {
+    return (
+      `Could not start a browser session: ${ready.error ?? "unknown error"}. ` +
+      "Use browser_search and public pages instead."
+    );
+  }
+  // Already listening and not ours: the user's own debuggable browser. Adopt
+  // it, but mark it external so we never close it or mirror it uninvited.
+  if (!ready.launched && !(await ownsChromeOnPort(AGENT_CHROME_PORT))) {
+    browserAttachedExternal = true;
+  }
+  const r = await runAgentBrowser(["connect", String(AGENT_CHROME_PORT)], 30_000);
+  // `connect` exits 0 even when discovery fails, so read the output.
+  if (!r.ok || /✗|failed|refused/i.test(r.out)) {
+    return `Could not attach to a browser on port ${AGENT_CHROME_PORT}: ${r.out || "no detail"}`;
+  }
+  browserSessionBound = true;
+  // A Chrome of OURS that we did not just launch is a leftover from a previous
+  // run, still parked on whatever it was last doing. Blank it, so the pane
+  // opens on this session's work instead of presenting a stale page as the
+  // agent's view. Never done to a browser that is not ours.
+  if (!ready.launched && !browserAttachedExternal) {
+    await runAgentBrowser(["open", "about:blank"], 20_000);
+  }
+  return null;
+}
 
 // ── Agent-browser mirror ─────────────────────────────────────────────
 // Shows the agent's Chrome inside the side panel: a minimal CDP client on the
@@ -540,6 +616,17 @@ function agentBrowserBin(): string | null {
     join(home, ".cargo", "bin", "agent-browser"),
   ];
   agentBrowserBinCache = candidates.find((p) => existsSync(p)) ?? null;
+  if (!agentBrowserBinCache) {
+    // Said once, loudly. Until now this returned null and agentBrowserTools()
+    // quietly declared nothing, so a machine without the CLI was
+    // indistinguishable from a model that ignored its browser — the whole
+    // capability vanished with no log line anywhere to say why.
+    console.warn(
+      "[browser] agent-browser not found — the browser_* tools will NOT be offered to the model.\n" +
+        `[browser] looked in: ${candidates.slice(0, 6).join(", ")}\n` +
+        "[browser] install it (e.g. `brew install agent-browser`) and restart the app.",
+    );
+  }
   return agentBrowserBinCache;
 }
 
@@ -575,6 +662,20 @@ const APP_DEVELOPER_INSTRUCTIONS = [
   "applies to private data too (their email, messages, dashboards): the card covers it. The one case",
   "to stop and ask is when a tool result says the browser profile is new and not signed in yet — then",
   "tell the user to sign in in the window that opened, and never ask them for a password yourself.",
+  // The browser. Same reasoning as delegation below, and the same fix: the
+  // browser_* tools were declared on every turn but never mentioned here, so
+  // asked to do something on the web the model would answer "I have no browser
+  // automation capability" and reach for the shell instead — running the
+  // agent-browser CLI itself, in its own session and its own signed-out temp
+  // profile, outside every gate and invisible to the Agent browser pane.
+  // Naming the capability is what stops that.
+  "You have a real browser: the browser_* tools drive a Chrome this app manages, and the user watches it",
+  "in the app's Agent browser tab. Reach for it on your own initiative whenever a task involves the web —",
+  "browser_search for anything public, and browser_connect FIRST for anything behind the user's own login",
+  "(their Slack, email, dashboards, admin panels). Never shell out to `agent-browser`, curl, or any other",
+  "command to browse: those run outside the app's permission and mirroring, so the user cannot see or",
+  "approve them. If a browser tool is genuinely absent from your tools, say the Agent browser is",
+  "unavailable rather than substituting a shell command for it.",
   // Delegation. The collaboration tools are available on every turn, but models
   // rarely reach for them unprompted — Claude Code and codex get "automatic"
   // sub-agents purely by saying when to delegate, so this does the same. The
@@ -707,7 +808,17 @@ function agentBrowserTools(): typeof AGENT_BROWSER_TOOLS | undefined {
 
 function runAgentBrowser(args: string[], timeoutMs = 60_000): Promise<{ ok: boolean; out: string }> {
   const bin = agentBrowserBin();
-  if (!bin) return Promise.resolve({ ok: false, out: "agent-browser is not installed" });
+  if (!bin)
+    return Promise.resolve({
+      ok: false,
+      // Actionable, because this text is what the model relays to the user. A
+      // bare "not installed" got paraphrased as "I have no browser", which is
+      // the wrong conclusion — the browser is missing, not absent by design.
+      out:
+        "The Agent browser is unavailable: the agent-browser CLI is not installed on this machine. " +
+        "Tell the user to install it (`brew install agent-browser`) and restart Unbiased. Do not try to " +
+        "browse with shell commands instead.",
+    });
   return new Promise((resolve) =>
     execFile(bin, args, { timeout: timeoutMs, maxBuffer: 4_000_000 }, (err, stdout, stderr) =>
       resolve({
@@ -960,6 +1071,13 @@ async function handleAgentBrowserCall(
   // fall out above, so this only fires for browsing that actually happens.
   // Still withheld for a browser the user already had open — auto-mirroring
   // someone's personal Chrome and its tabs stays opt-in.
+  // Every tool that needs a live page attaches first. browser_connect does its
+  // own (richer) attach, and browser_close must not resurrect a browser it is
+  // about to shut down.
+  if (tool !== "browser_connect" && tool !== "browser_close") {
+    const failure = await ensureBrowserSession();
+    if (failure) return text(failure, false);
+  }
   if (!browserAttachedExternal) send("agentmirror:activity", { tool });
   // Remember where the agent is going, so the mirror follows it rather than
   // whatever tab happens to sort first.
@@ -1059,8 +1177,13 @@ async function handleAgentBrowserCall(
         }
         return text(`Attach failed on ${connectArg}: ${r.out || "no detail"}`, false);
       }
-      // Only a browser we started is ours to close later.
-      browserAttachedExternal = !launched;
+      // Only a browser of OURS is ours to close later. Not the same as "we
+      // launched it this time": our managed Chrome survives an unclean exit,
+      // and treating that leftover as the user's browser is what suppressed
+      // the mirror pane for the rest of the session.
+      browserAttachedExternal =
+        "url" in target ? true : launched ? false : !(await ownsChromeOnPort(target.port));
+      browserSessionBound = true;
       if (launched && firstRun) {
         return text(
           "Attached to a freshly created Unbiased Chrome profile — a browser window is now open on the " +
@@ -1127,6 +1250,9 @@ async function handleAgentBrowserCall(
         managedChrome.kill();
         managedChrome = null;
       }
+      // The CLI session is no longer bound to anything; the next browser tool
+      // has to attach again rather than assuming a live page.
+      browserSessionBound = false;
       return text(r.out || "closed", r.ok);
     }
     case "browser_screenshot": {
@@ -1240,6 +1366,7 @@ function resetSubAgentState(): void {
   browserConnectGrants.clear();
   threadAccessModes.clear();
   browserAttachedExternal = false;
+  browserSessionBound = false;
 }
 
 /** Strip the engine's inter-agent envelope ("Message Type: …\nTask name: …\n
@@ -3726,6 +3853,19 @@ app.whenReady().then(async () => {
           threadId: panes.main.threadId,
           ephemeral: true,
           ...threadPolicy(),
+          // A fork copies CONVERSATION, not per-thread config: without these
+          // three a side chat had no browser tools, no app instructions and no
+          // raw item stream, so "use the agent browser" in a side chat was
+          // answered with "I don't have that tool" — correctly, because it
+          // didn't. Every sibling thread/start below passes the same three.
+          // `dynamicTools` and `experimentalRawEvents` are experimentalApi
+          // fields absent from ThreadForkParams in the schema; the engine
+          // ignores params it does not know (verified against 0.147.0), so
+          // this is safe either way — but see the note in HOW-IT-WORKS: a
+          // version bump could start dropping them without any error.
+          dynamicTools: agentBrowserTools(),
+          developerInstructions: APP_DEVELOPER_INSTRUCTIONS,
+          experimentalRawEvents: true,
         })) as { thread: { id: string } };
       } else if (paneId.startsWith("side")) {
         // No parent conversation yet: a plain scratch thread.
