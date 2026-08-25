@@ -1035,7 +1035,7 @@ export function App() {
       setActiveThreadId(null);
       setMainStarted(false);
       setMainReset((r2) => ({ entries: [], nonce: r2.nonce + 1 }));
-      resetSideView();
+      resetSideView(true);
       void refreshThreads();
       return;
     }
@@ -1110,7 +1110,7 @@ export function App() {
         setActiveThreadId(null);
         setMainStarted(false);
         setMainReset((r) => ({ entries: [], nonce: r.nonce + 1 }));
-        resetSideView();
+        resetSideView(true);
       }
     } else {
       await window.unbiased.removeProject(path);
@@ -1566,7 +1566,15 @@ export function App() {
     return true;
   }
 
-  function resetSideView() {
+  /** `fresh` = a clean-slate action (new chat, new/opened project, deleting
+   *  the active conversation): the whole side panel resets, browser tabs and
+   *  side chats included. They used to survive every reset ("the page you're
+   *  reading survives"), but a NEW chat opening with the previous chat's
+   *  browser page reads as a leak, not a feature. Conversation SWITCHES stay
+   *  non-fresh on purpose: a closed browser view cannot be restored later
+   *  (snapshots don't capture page state), so switching must not cost the
+   *  user their open page. */
+  function resetSideView(fresh = false) {
     setSideContexts({});
     setSideNonce((n) => n + 1);
     setOpenFiles([]);
@@ -1576,6 +1584,18 @@ export function App() {
     setTreeFiles({});
     setTerminalTabs([]); // the shells ran in the previous conversation's cwd
     setReviewOpen(false); // the diff reviewed the previous conversation's cwd
+    if (fresh) {
+      for (const id of browserTabsRef.current) void window.unbiased.closeBrowser(id);
+      setBrowserTabs([]);
+      setBrowserTitles({});
+      // Matching closeSideChat: the engine drops each ephemeral pane, so the
+      // fork of the previous conversation doesn't linger under the cap.
+      for (const id of sideChatsRef.current) void window.unbiased.resetSideChat(id);
+      setSideChats([]);
+      setPanelMode("launcher");
+      setSideOpenPersisted(false);
+      return;
+    }
     // The browser isn't cwd-bound — the page you're reading survives.
     const browsers = browserTabsRef.current;
     const chats = sideChatsRef.current;
@@ -1599,7 +1619,7 @@ export function App() {
     setActiveThreadId(null);
     setMainStarted(false);
     setMainReset((r) => ({ entries: [], nonce: r.nonce + 1 }));
-    resetSideView();
+    resetSideView(true);
   }
 
   async function openProjectDialog() {
@@ -1610,7 +1630,7 @@ export function App() {
     setActiveThreadId(null);
     setMainStarted(false);
     setMainReset((r) => ({ entries: [], nonce: r.nonce + 1 }));
-    resetSideView();
+    resetSideView(true);
     void refreshThreads(); // the project shows in the sidebar immediately
   }
 
@@ -1674,7 +1694,7 @@ export function App() {
       setActiveThreadId(null);
       setMainStarted(false);
       setMainReset((r) => ({ entries: [], nonce: r.nonce + 1 }));
-      resetSideView();
+      resetSideView(true);
     }
     void refreshThreads();
   }
