@@ -6,6 +6,33 @@ Format matters: `## <version> — <date>`, then `### <section>`, then `-` bullet
 
 Write for the person using the app, not the person who wrote the code.
 
+## 1.5.0 — August 25, 2026
+
+### New
+
+- Scheduled tasks. A **Scheduled** entry in the sidebar, where you can set Pareto to run something on its own — a weekday brief, a Friday summary, a watch on work in progress. Start from one of the suggestions or write your own. Tasks run read-only and only while Unbiased is open; anything that came due while it was closed waits for you as "missed" rather than firing a backlog the moment you launch. You can also just ask Pareto for something recurring in a conversation: it proposes the task, shows you a card with the schedule and the exact instructions it wrote, and creates it only if you approve.
+- Skills. A **Skills** entry in the **+** beside the message box, listing what Pareto knows how to do — for this project and everywhere — and letting you add more from a folder, a .zip or a link. What a skill ships is checked before anything is copied, and any scripts it carries are listed for you to see first.
+- Drag files, folders and images straight into a conversation. They attach exactly as they would from the **+** menu — folders as folders, images as images.
+
+### Improved
+
+- The interface had a pass over its motion and typography. Animations now use a proper curve instead of the browser default, so things feel like they respond rather than drift. Text sizes carry the right letter-spacing for their size, replies are held to a comfortable line length, and the sidebar reads as a hierarchy instead of one flat list. Buttons, selected rows and section labels look the same wherever you meet them.
+- Keyboard focus is finally visible. Every control used to remove the focus ring and put nothing back, so tabbing through the app showed you nothing at all.
+- Motion respects "Reduce motion". If you have it on in macOS accessibility settings, the decorative shimmer stops and things stop sliding; the indicators that tell you a turn is running stay, because those carry meaning.
+- MCP servers show their own logo instead of a coloured dot, and say **Connected** in words. Whether a server is connected was previously only distinguishable by colour.
+- Opening a project, attaching a file and adding a skill each reopen where you last were, instead of every picker starting from the same place and making you walk the same folders again.
+- The **+** menu is laid out in columns and split into what you add versus what Pareto can do, and plan mode shows whether it is on rather than only offering to turn it on.
+
+### Fixed
+
+- Annotating text in a side chat now highlights the excerpt. It had always shown the numbered badge with no colour behind it — the highlight was being registered under a name nothing could match.
+- The browser you watch is the browser the agent is using. The agent was driving a browser of its own while the Agent browser panel showed a different one, which is also why sites kept asking it to sign in; and asking for the agent browser in a *side* chat got "I don't have that tool", because a side chat was being given no tools at all.
+- Text on accent-coloured buttons is legible. The app was picking white where dark was nearly twice as readable, which put those labels below the accessibility minimum.
+- Copy and the time it landed are on every reply, not just the newest one.
+- Sub-agent rows keep their names after you reopen a conversation, instead of reverting to raw task names.
+- Starting a new chat gives you a fresh side panel, rather than the previous conversation's browser page still sitting there.
+- Dropping a file anywhere the app was not expecting one no longer blanks the window. It was treated as a navigation, which replaced the whole app with the file and lost everything you had open.
+
 ## 1.4.0 — August 24, 2026
 
 ### New
