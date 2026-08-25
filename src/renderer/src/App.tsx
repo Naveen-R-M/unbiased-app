@@ -534,6 +534,7 @@ declare global {
       onSubAgents: (cb: (p: { paneId: PaneId; agents: SubAgent[] }) => void) => () => void;
       onSubAgentDelta: (cb: (p: { threadId: string; delta: string }) => void) => () => void;
       onSubAgentActivity: (cb: (p: { threadId: string }) => void) => () => void;
+      onSubAgentRenames: (cb: (p: { paneId: PaneId; names: Record<string, string> }) => void) => () => void;
       onSubAgentEvent: (
         cb: (p: {
           paneId: PaneId;
@@ -7573,6 +7574,24 @@ function ChatPane({
         if (p.paneId !== paneId) return;
         producedRef.current = true;
         setEntries((es) => [...withoutTrailingPlaceholder(es), { kind: "assistant", text: p.text }]);
+      }),
+      window.unbiased.onSubAgentRenames((p) => {
+        if (p.paneId !== paneId) return;
+        // Nicknames recovered from the rollout after a reopen. Rows restored
+        // from the transcript still read as raw task names ("app_bridge_routing")
+        // because the live raw events that carry a nickname only flow for
+        // threads the engine STARTED — never for a resumed one. Retitle by the
+        // name the row currently shows, since the registry is empty after a
+        // restart and cannot supply thread ids to match on.
+        const names = p.names ?? {};
+        if (Object.keys(names).length === 0) return;
+        const retitle = (list: Entry[]): Entry[] =>
+          list.map((e) => {
+            if (e.kind === "agent" && e.name && names[e.name]) return { ...e, name: names[e.name] };
+            if (e.kind === "work") return { ...e, entries: retitle(e.entries) };
+            return e;
+          });
+        setEntries(retitle);
       }),
       window.unbiased.onSubAgentEvent((p) => {
         if (p.paneId !== paneId) return;

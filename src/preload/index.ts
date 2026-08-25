@@ -100,6 +100,7 @@ contextBridge.exposeInMainWorld("unbiased", {
   onSubAgents: (cb: (p: unknown) => void) => subscribe("chat:subagents", cb),
   onSubAgentDelta: (cb: (p: unknown) => void) => subscribe("chat:subagent-delta", cb),
   onSubAgentActivity: (cb: (p: unknown) => void) => subscribe("chat:subagent-activity", cb),
+  onSubAgentRenames: (cb: (p: unknown) => void) => subscribe("chat:subagent-renames", cb),
   onSubAgentEvent: (cb: (p: unknown) => void) => subscribe("chat:subagent-event", cb),
   onMessageBoundary: (cb: (p: unknown) => void) => subscribe("chat:message-boundary", cb),
   chooseProject: () => ipcRenderer.invoke("project:choose"),

@@ -1292,6 +1292,65 @@ function findRolloutFile(threadId: string): string | null {
  *  threads STARTED with experimentalRawEvents (resume/fork hardcode it off
  *  at 0.147.0), but the engine persists every agent_message to the rollout
  *  before emitting anything. */
+/** Sub-agent nicknames recovered from a thread's own rollout.
+ *
+ *  The engine assigns a nickname ("Singer", "Ramanujan") and reports it in the
+ *  spawn tool's OUTPUT. Live, that arrives as a raw response item — but raws
+ *  only flow for threads STARTED with experimentalRawEvents, and the engine
+ *  ignores the flag on resume. Measured against 0.147.0 across three separate
+ *  processes: start-with-flag emitted 6 raws for one turn, resume-with-flag 0,
+ *  resume-without 0. So a reopened conversation never learns the nicknames and
+ *  every sub-agent row keeps its raw task name ("app_bridge_routing").
+ *
+ *  The rollout has it, though: the same function_call_output is persisted as
+ *  `{"task_name":"/root/some_task","nickname":"Singer"}`. Same trick
+ *  rolloutMail already uses for inter-agent mail, for the same reason.
+ *
+ *  Returns task name (last path segment, matching the live path) → nickname. */
+const rolloutNicknameCache = new Map<string, { mtimeMs: number; size: number; names: Map<string, string> }>();
+function rolloutNicknames(threadId: string): Map<string, string> {
+  const file = findRolloutFile(threadId);
+  if (!file) return new Map();
+  let st;
+  try {
+    st = statSync(file);
+  } catch {
+    return new Map();
+  }
+  if (st.size > 8_000_000) return new Map(); // a parent rollout this big is not worth a full parse
+  const cached = rolloutNicknameCache.get(file);
+  if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size) return new Map(cached.names);
+  let raw: string;
+  try {
+    raw = readFileSync(file, "utf8");
+  } catch {
+    return new Map();
+  }
+  const names = new Map<string, string>();
+  for (const line of raw.split("\n")) {
+    // Cheap reject before JSON.parse: these files run to thousands of lines.
+    // Matched WITHOUT quotes on purpose — `output` is a JSON string, so the key
+    // is escaped in the raw line (\"nickname\") and a quoted probe matches
+    // nothing. The first cut of this rejected every line and silently found no
+    // nicknames at all; caught by running it against a real rollout.
+    if (!line.includes("nickname")) continue;
+    try {
+      const parsed = JSON.parse(line) as { payload?: { type?: string; output?: unknown } };
+      if (parsed.payload?.type !== "function_call_output") continue;
+      if (typeof parsed.payload.output !== "string") continue;
+      const out = JSON.parse(parsed.payload.output) as { task_name?: string; nickname?: string };
+      const task = out.task_name?.split("/").filter(Boolean).pop();
+      // Later spawns of the same task name win, matching the live path's
+      // "prefer the newest registration" rule.
+      if (task && out.nickname) names.set(task, out.nickname);
+    } catch {
+      // unparseable line — skip
+    }
+  }
+  rolloutNicknameCache.set(file, { mtimeMs: st.mtimeMs, size: st.size, names: new Map(names) });
+  return names;
+}
+
 const rolloutMailCache = new Map<string, { mtimeMs: number; size: number; mail: MailEntry[] }>();
 function rolloutMail(threadId: string, path: string | null): MailEntry[] {
   const file = findRolloutFile(threadId);
@@ -4771,6 +4830,44 @@ app.whenReady().then(async () => {
     // Everything that happened while this thread was backgrounded: the
     // partial assistant stream, approval requests the agent is blocked
     // on, and a turn failure nobody saw. Held items are consumed here.
+    // Nicknames from the rollout. Two jobs: seed pendingNicknames so a spawn
+    // made AFTER this open is named correctly, and retitle sub-agents already
+    // registered under their raw task name so existing rows stop reading
+    // "app_bridge_routing". Both are needed — the first alone leaves the
+    // transcript wrong, the second alone leaves the next spawn wrong.
+    const nicknames = rolloutNicknames(id);
+    if (nicknames.size > 0) {
+      for (const [task, nickname] of nicknames) {
+        let renamedOne = false;
+        for (const [subId, info] of subAgents) {
+          if (info.parent !== id || info.name !== task) continue;
+          info.name = nickname;
+          renamedOne = true;
+          const pane = paneForThread(id);
+          if (pane) {
+            send("chat:subagent-event", {
+              paneId: pane,
+              event: "renamed",
+              name: nickname,
+              path: info.path,
+              agentThreadId: subId,
+            });
+          }
+        }
+        // Nothing registered under that task yet — stash it for whenever the
+        // registration arrives, exactly as the live raw path does.
+        if (!renamedOne) pendingNicknames.set(`${id}:${task}`, nickname);
+      }
+      pushSubAgents(id);
+      // The registry is empty after an app restart, so the loop above renames
+      // nothing and the rows restored from the transcript keep their task
+      // names. The renderer still holds those rows, so hand it the whole map
+      // and let it retitle by name — that is the only path that works cold.
+      const pane = paneForThread(id);
+      if (pane) {
+        send("chat:subagent-renames", { paneId: pane, names: Object.fromEntries(nicknames) });
+      }
+    }
     const approvals = heldApprovals.get(id) ?? [];
     heldApprovals.delete(id);
     const failure = heldErrors.get(id) ?? null;
