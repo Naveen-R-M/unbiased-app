@@ -440,6 +440,8 @@ type ScheduledTaskView = {
   missedAt: string | null;
   nextDueAt: string | null;
   running: boolean;
+  /** The conversation a run is happening in, while it is happening. */
+  runningThreadId: string | null;
 };
 
 declare global {
@@ -472,7 +474,7 @@ declare global {
       onTurnStarted: (cb: (p: { paneId: PaneId; turnId: string | null }) => void) => () => void;
       onDelta: (cb: (p: { paneId: PaneId; delta: string }) => void) => () => void;
       onTurnCompleted: (
-        cb: (p: { paneId: PaneId; status: string; error?: string | null }) => void,
+        cb: (p: { paneId: PaneId; status: string; error?: string | null; narrated?: boolean }) => void,
       ) => () => void;
       onThreadActivity: (cb: (p: { threadId: string; running: boolean }) => void) => () => void;
       setAccessMode: (mode: AccessMode) => Promise<{ mode: string }>;
@@ -527,6 +529,7 @@ declare global {
       scheduledRunNow: (
         key: string,
       ) => Promise<{ ok: boolean; error?: string | null; status?: string; text?: string }>;
+      scheduledStop: (key: string) => Promise<{ ok: boolean; error?: string }>;
       scheduledLastRun: (key: string) => Promise<{
         threadId: string | null;
         status?: string | null;
@@ -7872,6 +7875,20 @@ function ChatPane({
               ...next,
               { kind: "assistant", text: `⚠ Turn failed${p.error ? `: ${p.error}` : "."}` },
             ];
+          } else if (p.narrated) {
+            // The turn produced progress narration and then yielded without
+            // writing an answer. The work generally DID happen — this is the
+            // "narrate and stop" mode — but nothing on screen said so, and a
+            // conversation that simply halts mid-task looks like a hang. Only
+            // fires when main positively saw commentary and never a final
+            // answer, so a provider that does not stamp phase stays quiet.
+            next = [
+              ...next,
+              {
+                kind: "assistant",
+                text: "⚠ The agent stopped after its progress notes without writing a final answer. Ask it to continue and it will pick up where it left off.",
+              },
+            ];
           } else if (p.status !== "interrupted" && !producedRef.current) {
             // "Completed" with zero output: the model returned an empty
             // completion. Indistinguishable from a hang unless we say so.
@@ -10347,9 +10364,10 @@ function ScheduledView({
                 }}
               >
                 Ask Pareto to run something on a schedule — a morning brief, a weekly
-                review, a watch on work in progress. Tasks run read-only and only while
-                Unbiased is open; anything that came due while it was closed waits here
-                for you.
+                review, a watch on work in progress. Tasks read files without changing
+                them and can drive the signed-in Agent browser, so they can act on sites
+                you are logged into. They run only while Unbiased is open; anything that
+                came due while it was closed waits here for you.
               </p>
             </div>
             {editing === null && (
@@ -10489,7 +10507,14 @@ function ScheduledView({
               )}
 
               <div style={{ color: colors.dim, fontSize: 12.5, lineHeight: 1.5, marginTop: 14 }}>
-                {fProject ? `Runs in ${fProject}` : "Runs in your home directory — open a project first to scope it."}
+                {/* A path is only worth showing when it means something. With no
+                    project the run happens in a scratch folder that holds
+                    nothing, so naming it just draws the eye to an irrelevance —
+                    and the old copy said "your home directory", which was not
+                    even where it ran. */}
+                {fProject
+                  ? `Reads files in ${fProject}`
+                  : "No project — nothing on disk is needed for this task."}
               </div>
 
               {formError && (
@@ -10693,20 +10718,43 @@ function ScheduledView({
                             </>
                           ) : (
                             <>
-                              <button
-                                onClick={() => void runNow(t.key)}
-                                disabled={t.running || !engineReady}
-                                style={{
-                                  ...ghostButton,
-                                  cursor: t.running || !engineReady ? "default" : "pointer",
-                                  opacity: t.running || !engineReady ? 0.5 : 1,
-                                }}
-                              >
-                                {t.missedAt ? "Run missed now" : "Run now"}
-                              </button>
-                              {t.lastThreadId && (
-                                <button onClick={() => onOpenThread(t.lastThreadId!)} style={ghostButton}>
-                                  Open last run
+                              {/* While a run is in flight the useful action is
+                                  stopping it, not starting another. Offering a
+                                  greyed-out "Run now" and nothing else left the
+                                  only live thing in the list unreachable. */}
+                              {t.running ? (
+                                <button
+                                  onClick={() =>
+                                    void window.unbiased.scheduledStop(t.key).then((r) => {
+                                      if (!r.ok) setNotice(r.error ?? "Could not stop the run.");
+                                    })
+                                  }
+                                  style={{ ...ghostButton, color: colors.amber }}
+                                >
+                                  Stop
+                                </button>
+                              ) : (
+                                <button
+                                  onClick={() => void runNow(t.key)}
+                                  disabled={!engineReady}
+                                  style={{
+                                    ...ghostButton,
+                                    cursor: engineReady ? "pointer" : "default",
+                                    opacity: engineReady ? 1 : 0.5,
+                                  }}
+                                >
+                                  {t.missedAt ? "Run missed now" : "Run now"}
+                                </button>
+                              )}
+                              {/* The live conversation while running, the
+                                  previous one otherwise — one button, because
+                                  "open the run" is one intention. */}
+                              {(t.runningThreadId ?? t.lastThreadId) && (
+                                <button
+                                  onClick={() => onOpenThread((t.runningThreadId ?? t.lastThreadId)!)}
+                                  style={ghostButton}
+                                >
+                                  {t.runningThreadId ? "Open run" : "Open last run"}
                                 </button>
                               )}
                               <button onClick={() => openEdit(t)} style={ghostButton}>Edit</button>

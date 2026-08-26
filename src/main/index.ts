@@ -694,6 +694,67 @@ const APP_DEVELOPER_INSTRUCTIONS = [
   "Keep it to the few agents the work genuinely needs. If an agent fails on a provider or stream",
   "error, spawn a FRESH agent with the same brief instead of re-sending instructions to the failed",
   "one — a retried thread accumulates every prior attempt and only gets more likely to fail.",
+  // Retry ceiling. A spawn_agent call whose ARGUMENTS come back rejected is a
+  // transport failure, not a payload the model can fix by reshaping: observed
+  // live, the arguments arrive empty (the model reports "task_name and message
+  // were both omitted" for calls it populated). Without a stated ceiling the
+  // model reads the parse error as its own mistake and reshapes forever — one
+  // review turn burned ~15 attempts and produced no delegation at all. Two
+  // strikes, then do the work directly, which is a perfectly good outcome.
+  // WORKAROUND (2026-08-26) — remove once the gateway is fixed.
+  //
+  // A spawn_agent brief containing ANY non-ASCII character arrives at the
+  // engine as an EMPTY arguments string. Isolated over six probes on one
+  // session:
+  //   28 chars, plain words                -> spawned
+  //   2,399 chars, plain words             -> spawned   (length is fine)
+  //   newline in the message               -> spawned   (escaping is fine)
+  //   double quotes in the message         -> spawned   (escaping is fine)
+  //   em dash (U+2014) in the message      -> FAILED
+  // Engine error: `failed to parse function arguments: EOF while parsing a
+  // value at line 1 column 0` — serde's message for zero bytes, so the payload
+  // is discarded rather than mangled.
+  //
+  // This bites hard because the model writes em dashes, curly quotes and
+  // ellipses naturally in prose, so almost any conversationally-worded brief
+  // fails while a terse one succeeds. That is exactly the pattern seen live:
+  // short exploration briefs delegated, PR-review briefs never did.
+  //
+  // Only the collab tools are affected. The app's own browser_* tools ride the
+  // wire as plain function tools and are unharmed, which points at the
+  // namespace flatten/split path rather than at tool calls generally.
+  "Keep every spawn_agent brief to plain ASCII. Line breaks, straight quotes and backticks are all",
+  "fine — the one thing that breaks is any character outside ASCII. Write a hyphen instead of an em",
+  "or en dash, straight quotes instead of curly ones, three dots instead of an ellipsis character,",
+  "the word \"to\" instead of an arrow, and no emoji or accented letters. This is a transport",
+  "limitation rather than a style preference: one non-ASCII character makes the whole brief arrive",
+  "as an empty payload and the spawn fails. Length is not a problem, so spell the task out in full.",
+  "If spawn_agent still rejects your ARGUMENTS — a parse error, or a complaint that required fields",
+  "are missing from a call you populated — retry ONCE with a plainer one-line brief, and if that",
+  "also fails, STOP delegating and do the work yourself in this conversation. Say in one line that",
+  "delegation was unavailable and get on with the task. Never spend a turn retrying it.",
+  // Slot hygiene. The engine is explicit that "completed agents remain open and
+  // count toward the concurrency limit until closed", and the cap is 5 per
+  // session (max_concurrent_threads_per_session). close_agent exists ONLY as a
+  // model tool — there is no client RPC for it, so the app cannot reclaim a
+  // slot on the model's behalf; asking here is the only lever there is.
+  // Without this, three sub-agents in one conversation permanently consume
+  // three of five slots, and a second round of delegation later in the same
+  // conversation fails with "agent thread limit reached".
+  "The order after delegating is fixed: collect every agent's report, WRITE YOUR FINAL ANSWER, and",
+  "only then call close_agent on each one. Closing is cleanup, never the last thing you do — a turn",
+  "that ends with progress narration and no answer has failed, however tidy the agents are. Never",
+  "close an agent whose report you have not read. A finished agent keeps occupying one of this",
+  "conversation's five slots until it is closed, so leaving them open means later delegation in the",
+  "same conversation stops working.",
+  // Align the model with the schema it was actually given. The engine's own
+  // spawn_agent text invites setting `model` ("set `model` only when an
+  // explicit override is needed"), but this app configures
+  // expose_spawn_agent_model_overrides = false, which removes that field from
+  // the schema — so following that advice sends a key the tool does not
+  // declare. Sub-agents inherit Pareto either way.
+  "Never set a `model` field on spawn_agent. This app does not offer model overrides, and",
+  "sub-agents already inherit the current model.",
 ].join(" ");
 
 const AGENT_BROWSER_TOOLS = [
@@ -923,6 +984,42 @@ function parseEvalJson(out: string): { title?: string; url?: string; snippet?: s
     }
   }
   return Array.isArray(value) ? (value as { title?: string }[]) : [];
+}
+
+/** Double-quoted phrases in a search query — the parts Bing is being asked to
+ *  match verbatim. Only runs of 3+ characters count, so a stray quote pair
+ *  cannot manufacture a phrase. */
+function quotedPhrases(query: string): string[] {
+  const out: string[] = [];
+  const re = /"([^"]{3,})"/g;
+  for (let m = re.exec(query); m; m = re.exec(query)) {
+    const phrase = m[1].trim();
+    if (phrase) out.push(phrase);
+  }
+  return out;
+}
+
+/** Comparable form for phrase matching. Punctuation has to go: Bing renders
+ *  its own dashes and drops colons from titles, so "Thomson: Continual" on the
+ *  page may well be "Thomson Continual" in the DOM. Letters, digits and single
+ *  spaces are the only parts that survive that reliably. */
+function searchNorm(s: string): string {
+  return s.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+/** Quoted phrases that appear in NO result. Bing silently relaxes an
+ *  exact-phrase query when nothing matches it — it drops the quotes, returns
+ *  broad keyword hits, and sets none of the markers it normally uses to say so
+ *  (#sp_requery, #sp_recourse, .b_no, "No results found for" all stay absent,
+ *  measured). So the only way to know is to check the results ourselves. */
+function unmatchedPhrases(query: string, rows: { title?: string; url?: string; snippet?: string }[]): string[] {
+  const phrases = quotedPhrases(query);
+  if (phrases.length === 0) return [];
+  const haystacks = rows.map((r) => searchNorm(`${r.title ?? ""} ${r.snippet ?? ""} ${r.url ?? ""}`));
+  return phrases.filter((phrase) => {
+    const needle = searchNorm(phrase);
+    return needle !== "" && !haystacks.some((h) => h.includes(needle));
+  });
 }
 
 /** Consent gate. Returns null when the call may proceed, else the refusal to
@@ -1186,8 +1283,25 @@ async function handleAgentBrowserCall(
       const list = rows
         .map((r, i) => `${i + 1}. ${r.title ?? "(untitled)"}\n   ${r.url ?? ""}\n   ${r.snippet ?? ""}`.trimEnd())
         .join("\n\n");
+      // A relaxed exact-phrase query is worse than an empty one: the results
+      // look confident and well-formed while answering a different question,
+      // and the `rows.length === 0` guard above never fires because Bing
+      // returns a full page of them. The dangerous case is an exact-title
+      // search used to check whether something exists — relaxation turns "no
+      // such thing" into ten plausible citations. Results are still returned
+      // (they are real pages, and a long phrase can be missing from a
+      // truncated snippet even on a genuine match), but the framing is
+      // corrected before the model reads them.
+      const unmatched = unmatchedPhrases(query, rows);
+      const warning =
+        unmatched.length === 0
+          ? ""
+          : `[warning] No result contains the exact phrase ${unmatched.map((p) => JSON.stringify(p)).join(" or ")}. ` +
+            "Bing drops quotes when a phrase has no matches and gives no signal that it did, so read this as " +
+            "\"no source found for that exact wording\" — do NOT cite these results as confirming the phrase " +
+            "exists. Open a result to check, or search again with distinctive keywords instead of a quoted phrase.\n\n";
       return text(
-        `Results for ${JSON.stringify(query)}:\n\n${list}\n\n[next] browser_open one of these URLs to read it, ` +
+        `${warning}Results for ${JSON.stringify(query)}:\n\n${list}\n\n[next] browser_open one of these URLs to read it, ` +
           "or browser_snapshot this results page to click a link. Cross-check anything important against a second source.",
         true,
       );
@@ -1370,6 +1484,13 @@ type SubAgentInfo = {
   closedAnnounced?: boolean;
 };
 const subAgents = new Map<string, SubAgentInfo>();
+
+// Per-turn message phases, cleared when a turn ends. A turn whose only
+// assistant output was commentary produced no answer — the app used to treat
+// every assistant message alike, so that was indistinguishable from a finished
+// reply and the conversation simply appeared to stop.
+const turnSawFinalAnswer = new Set<string>();
+const turnSawCommentary = new Set<string>();
 
 // Inter-agent mail TO a sub-agent, captured from rawResponseItem/completed
 // notifications (the engine emits one for every recorded item — the only
@@ -1609,6 +1730,56 @@ function rolloutMail(threadId: string, path: string | null): MailEntry[] {
   return out.slice();
 }
 
+/**
+ * Recover sub-agent nicknames from a thread's rollout and publish them.
+ *
+ * Extracted because reopening a conversation was the only thing that ran it,
+ * and that is not the only time it is needed. Nicknames normally arrive as raw
+ * response items, and the engine emits raws only for threads STARTED with
+ * experimentalRawEvents — a RESUMED conversation gets none. So an agent
+ * spawned after a resume kept its raw task name ("security_reviewer") even
+ * though the engine had already assigned it one ("Dalton"), because nothing
+ * re-read the rollout between the spawn and the end of the turn.
+ *
+ * Idempotent: it renames only entries still carrying the task name, so an
+ * agent already named by the live path is untouched. rolloutNicknames is
+ * cached on mtime+size, so calling this per turn is close to free.
+ */
+function applyRolloutNicknames(id: string): void {
+  const nicknames = rolloutNicknames(id);
+  if (nicknames.size === 0) return;
+  for (const [task, nickname] of nicknames) {
+    let renamedOne = false;
+    for (const [subId, info] of subAgents) {
+      if (info.parent !== id || info.name !== task) continue;
+      info.name = nickname;
+      renamedOne = true;
+      const pane = paneForThread(id);
+      if (pane) {
+        send("chat:subagent-event", {
+          paneId: pane,
+          event: "renamed",
+          name: nickname,
+          path: info.path,
+          agentThreadId: subId,
+        });
+      }
+    }
+    // Nothing registered under that task yet — stash it for whenever the
+    // registration arrives, exactly as the live raw path does.
+    if (!renamedOne) pendingNicknames.set(`${id}:${task}`, nickname);
+  }
+  pushSubAgents(id);
+  // The registry is empty after an app restart, so the loop above renames
+  // nothing and the rows restored from the transcript keep their task names.
+  // The renderer still holds those rows, so hand it the whole map and let it
+  // retitle by name — that is the only path that works cold.
+  const pane = paneForThread(id);
+  if (pane) {
+    send("chat:subagent-renames", { paneId: pane, names: Object.fromEntries(nicknames) });
+  }
+}
+
 function subAgentsForParent(parent: string): { threadId: string; name: string; path: string; status: string }[] {
   return [...subAgents.entries()]
     .filter(([, a]) => a.parent === parent)
@@ -1729,20 +1900,70 @@ function loadWorktrees(): Record<string, { project: string; branch: string }> {
   }
 }
 
+/**
+ * A readable worktree name, from the first thing asked of it.
+ *
+ * The old scheme was `<project>-<timestamp>`, which is unique and tells you
+ * nothing: a folder full of `unbiased-app-2026-08-19-0226` is unreadable at a
+ * glance. Four words of the opening message plus a short hash reads like
+ * `repository-exploration-11baed` — recognisable, and still collision-proof
+ * when two conversations open the same way.
+ */
+function worktreeName(seed: string): string {
+  const slug = seed
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 4)
+    .join("-")
+    .slice(0, 40)
+    .replace(/-+$/, "");
+  const hash = createHash("sha256").update(`${seed}${Date.now()}`).digest("hex").slice(0, 6);
+  return slug ? `${slug}-${hash}` : `session-${hash}`;
+}
+
+/**
+ * Keep a nested worktree out of `git status`, without touching a tracked file.
+ *
+ * `.gitignore` belongs to the repository and to everyone who clones it; adding
+ * an entry there would show up as a change the user did not make and would
+ * travel to their colleagues. `.git/info/exclude` is local to this checkout,
+ * which is exactly the scope of a directory this app created on this machine.
+ * `--git-common-dir` rather than `--git-dir` because the project may itself be
+ * a worktree, where the latter points at a per-worktree stub.
+ */
+function excludeFromGit(project: string, entry: string): void {
+  try {
+    const common = execFileSync("git", ["-C", project, "rev-parse", "--git-common-dir"], {
+      encoding: "utf8",
+      timeout: 10_000,
+    }).trim();
+    const gitDir = isAbsolute(common) ? common : join(project, common);
+    const file = join(gitDir, "info", "exclude");
+    const current = existsSync(file) ? readFileSync(file, "utf8") : "";
+    if (current.split("\n").some((line) => line.trim() === entry)) return;
+    mkdirSync(join(gitDir, "info"), { recursive: true });
+    const sep = current === "" || current.endsWith("\n") ? "" : "\n";
+    writeFileSync(file, `${current}${sep}${entry}\n`);
+  } catch {
+    // Best effort. An un-excluded worktree is untidy, not broken.
+  }
+}
+
 /** Create a fresh worktree for a conversation; null = fall back to local. */
-async function createWorktree(project: string): Promise<string | null> {
-  const stamp = new Date()
-    .toISOString()
-    .replace(/[:.]/g, "")
-    .slice(0, 15)
-    .replace("T", "-");
-  const dir = join(
-    app.getPath("userData"),
-    "worktrees",
-    `${project.split("/").filter(Boolean).pop()}-${stamp}`,
-  );
-  const branch = `pareto/${stamp}`;
-  mkdirSync(join(app.getPath("userData"), "worktrees"), { recursive: true });
+async function createWorktree(project: string, seed?: string): Promise<string | null> {
+  const name = worktreeName(seed ?? "");
+  // Inside the project, alongside how codex and Claude Code do it
+  // (.codex/worktrees, .claude/worktrees). Keeping them in the app's data
+  // folder meant a checkout of your repo living somewhere you would never
+  // look, with nothing but a JSON map tying it back.
+  const dir = join(project, ".unbiased", "worktrees", name);
+  const branch = `pareto/${name}`;
+  // The parent only — `git worktree add` refuses a target that already exists.
+  mkdirSync(join(project, ".unbiased", "worktrees"), { recursive: true });
+  excludeFromGit(project, ".unbiased/");
   const result = await new Promise<{ code: number; err: string }>((resolve) => {
     execFile(
       "git",
@@ -1781,6 +2002,9 @@ type WireThread = {
   preview?: string;
   createdAt?: string;
   cwd?: string;
+  /** Free-form classification the client set at thread/start, handed back
+   *  unchanged. Used to keep scheduled runs out of the sidebar. */
+  threadSource?: string | null;
   turns?: { items?: WireItem[]; startedAt?: number }[];
 };
 
@@ -3139,6 +3363,19 @@ function wireNotifications(): void {
       }
       case "item/started":
       case "item/completed": {
+        // Phase tracking, to catch a turn that narrates and then stops.
+        // `phase` distinguishes interim commentary from the terminal answer.
+        // The engine's own note says providers emit it inconsistently and None
+        // means UNKNOWN — so this only ever records what it positively sees,
+        // and the check at turn end stays silent unless it saw commentary and
+        // never saw a final answer.
+        if (msg.method === "item/completed" && threadId) {
+          const it = params.item as { type?: string; phase?: string | null } | undefined;
+          if (it?.type === "agentMessage") {
+            if (it.phase === "final_answer") turnSawFinalAnswer.add(threadId);
+            else if (it.phase === "commentary") turnSawCommentary.add(threadId);
+          }
+        }
         const item = params.item as
           | { type?: string; id?: string; status?: string; changes?: { path?: string }[] }
           | undefined;
@@ -3389,11 +3626,39 @@ function wireNotifications(): void {
             );
           }
           send("chat:thread-activity", { threadId, running: false });
+          // Nicknames, for the case where raws never arrive. The engine emits
+          // raw items only for threads STARTED with experimentalRawEvents, so
+          // a resumed conversation learns nothing from the live path — and a
+          // spawn made during that conversation kept its task name. By turn
+          // end the spawn's output is in the rollout, so read it from there.
+          // Runs for the ROOT: a sub-agent's own turn ending is also the
+          // moment its nickname becomes readable.
+          const nickRoot = rootThreadOf(threadId);
+          for (const info of subAgents.values()) {
+            if (info.parent !== nickRoot) continue;
+            applyRolloutNicknames(nickRoot);
+            break;
+          }
+        }
+        // A turn that only ever narrated: positively saw commentary, never a
+        // final answer. Reported as a status rather than an error, because the
+        // work usually DID happen — the agent just yielded without writing it
+        // up, and the user is otherwise left looking at a stopped screen with
+        // no idea anything is missing. Silent when phase was never stamped.
+        const narrated =
+          threadId !== null &&
+          turn?.status === "completed" &&
+          turnSawCommentary.has(threadId) &&
+          !turnSawFinalAnswer.has(threadId);
+        if (threadId) {
+          turnSawCommentary.delete(threadId);
+          turnSawFinalAnswer.delete(threadId);
         }
         if (!paneId) break;
         panes[paneId].turnId = null;
         send("chat:turn-completed", {
           paneId,
+          narrated,
           status: turn?.status ?? "completed",
           usage: turn?.usage ?? null,
           // A failed turn is invisible without this — surface the cause.
@@ -3646,6 +3911,11 @@ function rememberDialogDir(key: DialogKey, chosen: string, asParent = true): voi
 // model adapts or reports. It is the one place in this app that deliberately
 // runs a turn no human is going to answer for.
 
+/** Marks a thread as a scheduled run. Scheduled runs are output you review
+ *  from the Scheduled page, not conversations you are holding, so they stay
+ *  out of the sidebar — the same treatment sub-agent threads get. */
+const SCHEDULED_THREAD_SOURCE = "unbiased_scheduled_task";
+
 function tasksDir(): string {
   return app.getPath("userData");
 }
@@ -3726,7 +3996,9 @@ async function handleScheduleToolCall(
     [
       `Runs: ${cadence}`,
       `In: ${cwd}`,
-      "Access: read-only, and it never asks for approval while running.",
+      "Access: read-only files, and it never stops to ask while running.",
+      "It can use the signed-in Agent browser as you — so it can read and act on",
+      "sites you are logged into.",
       "",
       "It will run this each time:",
       prompt,
@@ -3743,7 +4015,11 @@ async function handleScheduleToolCall(
     prompt,
     schedule: checked.schedule,
     enabled: true,
-    projectPath: mainCwd,
+    // The scratch directory is not a project. Recording it as one is what
+    // made the form announce "Runs in /Users/naveen/Unbiased" for a task that
+    // never touches the filesystem — a real-looking path for a detail that
+    // does not apply.
+    projectPath: mainCwd && mainCwd !== defaultChatDir() ? mainCwd : null,
     createdAt: now,
     cursorAt: now,
     lastRunAt: null,
@@ -3783,11 +4059,19 @@ const scheduledRuns = new Map<
   string,
   { key: string; text: string; settle: (r: { status: RunStatus; error: string | null; text: string }) => void }
 >();
-/** Guards against a slow run overlapping its own next tick. */
-const runningTaskKeys = new Set<string>();
+/** Guards against a slow run overlapping its own next tick — and now also
+ *  carries WHAT is running, so the UI can open the live conversation and stop
+ *  it. Before this, a run in flight was a boolean: you could see that
+ *  something was happening and do nothing about it. */
+const runningTaskKeys = new Map<string, { threadId: string | null; turnId: string | null }>();
 
 function readTasks(): ScheduledTask[] {
-  return loadTasks(tasksDir());
+  // Older tasks stored the scratch directory as their project, because a plain
+  // chat's cwd IS the scratch directory. Normalise on read rather than
+  // migrating the file: the answer is derived, so it stays correct if the
+  // scratch location ever moves.
+  const scratch = defaultChatDir();
+  return loadTasks(tasksDir()).map((t) => (t.projectPath === scratch ? { ...t, projectPath: null } : t));
 }
 
 function writeTasks(tasks: ScheduledTask[]): void {
@@ -3809,6 +4093,8 @@ function decorate(tasks: ScheduledTask[]): unknown[] {
     ...t,
     nextDueAt: t.enabled ? dueAt(t).toISOString() : null,
     running: runningTaskKeys.has(t.key),
+    // The conversation this run is happening in, while it is happening.
+    runningThreadId: runningTaskKeys.get(t.key)?.threadId ?? null,
   }));
 }
 
@@ -3824,18 +4110,44 @@ async function runScheduledTask(
   if (runningTaskKeys.has(task.key)) {
     return { status: "failed", error: "already running", text: "" };
   }
-  runningTaskKeys.add(task.key);
+  runningTaskKeys.set(task.key, { threadId: null, turnId: null });
   send("scheduled:run-state", { key: task.key, running: true });
   let threadId: string | null = null;
   try {
     const cwd = task.projectPath && existsSync(task.projectPath) ? task.projectPath : defaultChatDir();
+    // Browser tools, but NOT schedule_create. Withholding every dynamic tool
+    // did make self-scheduling structurally impossible, and it also banned the
+    // browser — which is the whole point of most scheduled work (watch a page,
+    // update a status). Excluding just the scheduling tool keeps the property
+    // that matters and returns the capability that was never meant to go.
     const started = (await engine.request("thread/start", {
       approvalPolicy: "never",
       sandbox: "read-only",
       cwd,
       developerInstructions: APP_DEVELOPER_INSTRUCTIONS,
+      dynamicTools: agentBrowserTools(),
+      // Tag it so the sidebar can leave it out. threadSource is a free-form
+      // client string the engine hands straight back in thread/list, which
+      // beats keeping our own ledger of run ids: the answer travels with the
+      // thread, so it stays right for runs from previous app versions and
+      // needs no pruning.
+      threadSource: SCHEDULED_THREAD_SOURCE,
     })) as { thread: { id: string } };
     threadId = started.thread.id;
+    runningTaskKeys.set(task.key, { threadId, turnId: null });
+    // Push the live thread out immediately, so "Open run" works from the
+    // moment the run starts rather than only once it has finished.
+    send("scheduled:updated", { tasks: decorate(readTasks()) });
+
+    // Pre-authorise the browser for this run. ensureBrowserAllowed would
+    // otherwise raise a permission card into a conversation with no pane, and
+    // an unattended run has nobody to answer it — the request would sit in
+    // heldApprovals until the 10-minute cap killed the turn. The consent is
+    // real, it just happened earlier: creating the task showed the user a card
+    // carrying the verbatim prompt, and these tasks say "log into my Slack" in
+    // so many words.
+    browserConnectGrants.add(threadId);
+    browserNetGrants.add(threadId);
 
     const settled = new Promise<{ status: RunStatus; error: string | null; text: string }>((resolve) => {
       scheduledRuns.set(threadId!, { key: task.key, text: "", settle: resolve });
@@ -3847,12 +4159,15 @@ async function runScheduledTask(
       ),
     );
 
-    await engine.request("turn/start", {
+    const startedTurn = (await engine.request("turn/start", {
       threadId,
       input: [{ type: "text", text: task.prompt }],
       approvalPolicy: "never",
       sandboxPolicy: { type: "readOnly" },
-    });
+    })) as { turn?: { id?: string } };
+    // turn/interrupt requires BOTH ids, so a stop button is impossible
+    // without keeping this.
+    runningTaskKeys.set(task.key, { threadId, turnId: startedTurn.turn?.id ?? null });
 
     const outcome = await Promise.race([settled, timeout]);
     const now = new Date().toISOString();
@@ -3879,7 +4194,12 @@ async function runScheduledTask(
     });
     return { status: "failed", error: message, text: "" };
   } finally {
-    if (threadId) scheduledRuns.delete(threadId);
+    if (threadId) {
+      scheduledRuns.delete(threadId);
+      // Scoped to the run, not the session: a task's grant must not outlive it.
+      browserConnectGrants.delete(threadId);
+      browserNetGrants.delete(threadId);
+    }
     runningTaskKeys.delete(task.key);
     send("scheduled:run-state", { key: task.key, running: false });
   }
@@ -4133,7 +4453,7 @@ app.whenReady().then(async () => {
         // launched from) and the chat wrongly files under that project.
         let cwd = pendingCwd ?? defaultChatDir();
         if (pendingCwd && workMode === "worktree") {
-          const wt = await createWorktree(pendingCwd);
+          const wt = await createWorktree(pendingCwd, text);
           if (wt) cwd = wt;
         } else if (pendingCwd && typeof workMode === "object") {
           // A previously created worktree — validate it still exists and
@@ -4318,6 +4638,24 @@ app.whenReady().then(async () => {
     const decorated = decorate(next);
     send("scheduled:updated", { tasks: decorated });
     return { ok: true, tasks: decorated };
+  });
+
+  ipcMain.handle("scheduled:stop", async (_e, key: string) => {
+    const live = runningTaskKeys.get(key);
+    if (!live?.threadId || !live.turnId) {
+      // Between thread/start and turn/start there is a window with no turn to
+      // interrupt. Say so rather than reporting a stop that did not happen.
+      return { ok: false, error: live ? "The run has not started its turn yet — try again in a moment." : "That task is not running." };
+    }
+    try {
+      await engine.request("turn/interrupt", { threadId: live.threadId, turnId: live.turnId });
+      // The engine answers with turn/completed status "interrupted", which the
+      // scheduled-run listener settles — so the run records itself as
+      // interrupted through the normal path. Nothing to unwind here.
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
   });
 
   ipcMain.handle("scheduled:run-now", async (_e, key: string) => {
@@ -5430,10 +5768,23 @@ app.whenReady().then(async () => {
       projectMap.set(r.primary, []);
       for (const f of r.folders) folderToPrimary.set(f, r.primary);
     }
+    // Runs from before threadSource was set carry no tag, so their threads
+    // would still surface. The task records name the most recent one per task,
+    // which is exactly the set currently visible in Recents. Older untagged
+    // runs may still linger — deleting those rows once is the only cleanup.
+    const scheduledThreadIds = new Set(
+      readTasks()
+        .map((t) => t.lastThreadId)
+        .filter((x): x is string => typeof x === "string"),
+    );
     const worktrees = loadWorktrees();
     const threadProjectOverrides = loadThreadProjects();
     const recents: ThreadSummary[] = [];
     for (const t of result.data ?? []) {
+      // Scheduled runs are reachable from the Scheduled page (Open run / Open
+      // last run) and nowhere else. Two daily tasks would otherwise add ~60
+      // rows a month to Recents and bury the conversations the user started.
+      if (t.threadSource === SCHEDULED_THREAD_SOURCE || scheduledThreadIds.has(t.id)) continue;
       const summary: ThreadSummary = { id: t.id, title: threadTitle(t), createdAt: t.createdAt };
       // Explicit assignment wins, then worktree conversations group under
       // their parent project, then the thread's own cwd.
@@ -5615,7 +5966,28 @@ app.whenReady().then(async () => {
           thread: WireThread;
           cwd?: string;
         })
-      : ((await engine.request("thread/resume", { threadId: id, ...threadPolicy() })) as {
+      : ((await engine.request("thread/resume", {
+          threadId: id,
+          ...threadPolicy(),
+          // Re-declare everything a thread/start would. Tools are declared per
+          // session, not stored with the thread, so a resumed conversation had
+          // NO dynamic tools at all — reopening a chat silently cost it the
+          // agent browser and the scheduling tool, and the model discovered
+          // that mid-task ("there are no browser_connect tools available").
+          //
+          // Same omission as the side-chat fork, in the path I did not check
+          // when fixing that one. ThreadResumeParams accepts
+          // developerInstructions; dynamicTools and experimentalRawEvents are
+          // experimentalApi fields absent from the schema, and the engine
+          // ignores unknown params, so this cannot break a resume. Whether it
+          // HONOURS them on resume is unverified — experimentalRawEvents is
+          // known to be ignored here (measured for the sub-agent nicknames),
+          // so dynamicTools may be too. If it is, a reopened conversation
+          // needs a fresh thread to regain tools, not this.
+          dynamicTools: threadDynamicTools(),
+          developerInstructions: APP_DEVELOPER_INSTRUCTIONS,
+          experimentalRawEvents: true,
+        })) as {
           thread: WireThread;
           cwd?: string;
         });
@@ -5636,39 +6008,7 @@ app.whenReady().then(async () => {
     // registered under their raw task name so existing rows stop reading
     // "app_bridge_routing". Both are needed — the first alone leaves the
     // transcript wrong, the second alone leaves the next spawn wrong.
-    const nicknames = rolloutNicknames(id);
-    if (nicknames.size > 0) {
-      for (const [task, nickname] of nicknames) {
-        let renamedOne = false;
-        for (const [subId, info] of subAgents) {
-          if (info.parent !== id || info.name !== task) continue;
-          info.name = nickname;
-          renamedOne = true;
-          const pane = paneForThread(id);
-          if (pane) {
-            send("chat:subagent-event", {
-              paneId: pane,
-              event: "renamed",
-              name: nickname,
-              path: info.path,
-              agentThreadId: subId,
-            });
-          }
-        }
-        // Nothing registered under that task yet — stash it for whenever the
-        // registration arrives, exactly as the live raw path does.
-        if (!renamedOne) pendingNicknames.set(`${id}:${task}`, nickname);
-      }
-      pushSubAgents(id);
-      // The registry is empty after an app restart, so the loop above renames
-      // nothing and the rows restored from the transcript keep their task
-      // names. The renderer still holds those rows, so hand it the whole map
-      // and let it retitle by name — that is the only path that works cold.
-      const pane = paneForThread(id);
-      if (pane) {
-        send("chat:subagent-renames", { paneId: pane, names: Object.fromEntries(nicknames) });
-      }
-    }
+    applyRolloutNicknames(id);
     const approvals = heldApprovals.get(id) ?? [];
     heldApprovals.delete(id);
     const failure = heldErrors.get(id) ?? null;
