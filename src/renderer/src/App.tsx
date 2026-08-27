@@ -329,6 +329,9 @@ type McpServerConfig = {
   env?: Record<string, string>;
   url?: string;
   bearerTokenEnvVar?: string;
+  /** Set by the sign-in flow, never by the form. Declared so a later edit
+   *  round-trips it instead of quietly dropping the registration. */
+  oauthClientId?: string;
   startupTimeoutSec?: number;
   toolTimeoutSec?: number;
   enabledTools?: string[];
@@ -541,6 +544,7 @@ declare global {
       onScheduledCreated: (
         cb: (p: { paneId: PaneId; key: string; name: string; cadence: string }) => void,
       ) => () => void;
+      onScheduledOpenRun: (cb: (p: { threadId: string }) => void) => () => void;
       onApprovalCanceled: (cb: (p: { paneId: PaneId; requestId: string }) => void) => () => void;
       onApprovalRequest: (
         cb: (p: {
@@ -733,9 +737,10 @@ const btnSecondaryStyle: React.CSSProperties = {
   fontFamily: "inherit",
   padding: "10px 20px",
 };
-/** Row-level actions sit inside an inset group, so they step down a size. */
+/** Row-level actions sit inside an inset group, so they step down a size —
+ *  and step UP a shade, because the inset they rest on is --chip's twin. */
 const btnSmallStyle: React.CSSProperties = {
-  background: "var(--chip)",
+  background: "var(--chip-raised)",
   border: "none",
   borderRadius: 999,
   color: colors.fg,
@@ -841,6 +846,13 @@ function themeVars(t: ThemeConfig): Record<string, string> {
     "--panel": m(0.05),
     "--panel-2": m(0.09),
     "--chip": m(0.09),
+    // A control resting on an inset needs to sit ABOVE it. --chip and
+    // --panel-2 are the same 0.09 step, so a chip button dropped into an inset
+    // group rendered as bare text on an identically-shaded field — visible in
+    // the MCP panel and the Skills list both. This is the step up that makes a
+    // row action read as a control, and it scales with contrast like the rest
+    // of the ladder rather than being a fixed colour.
+    "--chip-raised": m(0.17),
     "--border": m(0.095),
     "--dim": mixHex(t.surface, t.ink, 0.52),
     // Between fg and dim: sidebar thread titles, Codex-style.
@@ -987,6 +999,11 @@ export function App() {
   const [mcpOpen, setMcpOpen] = useState(false);
   const [skillsOpen, setSkillsOpen] = useState(false);
   const [scheduledOpen, setScheduledOpen] = useState(false);
+  /** True while a full-page destination covers the chat. Sidebar rows key off
+   *  this rather than testing the flag directly, so adding a second such view
+   *  does not mean remembering to exclude it in three separate `active`
+   *  expressions — forgetting that leaves two rows lit at once. */
+  const pageOpen = scheduledOpen;
   /** Set when arriving from a "View task" link, so the row the agent just
    *  created is identifiable among the others rather than left to be found. */
   const [scheduledFocus, setScheduledFocus] = useState<string | null>(null);
@@ -1814,10 +1831,22 @@ export function App() {
   }
 
   const openSeqRef = useRef(0);
+  // Clicking a run's completion notification jumps straight to that run.
+  // Main has already focused the window; this is the half that decides what
+  // the user is looking at when it comes forward.
+  useEffect(
+    () =>
+      window.unbiased.onScheduledOpenRun(({ threadId }) => {
+        setScheduledOpen(false);
+        void openThread(threadId);
+      }),
+    [],
+  );
+
   async function openThread(id: string) {
-    // Leaving Scheduled is the same gesture as switching chats — clicking a
-    // destination in the nav. Both entry points clear it so the view never
-    // outlives the row that is lit.
+    // Leaving a full-page view is the same gesture as switching chats —
+    // clicking a destination in the nav. Both entry points clear them so the
+    // view never outlives the row that is lit.
     setScheduledOpen(false);
     if (id === activeThreadId) return;
     snapshotSideView();
@@ -2396,7 +2425,7 @@ export function App() {
    *  from there) — and neither may claim it while Scheduled, which is a
    *  destination of its own, is what you are actually looking at. */
   const litProject = (path: string) =>
-    !scheduledOpen && activeProject?.path === path && !activeThreadId;
+    !pageOpen && activeProject?.path === path && !activeThreadId;
   const inProject = activeProjectName !== null;
   // Git operations target the conversation's actual checkout — the
   // worktree when isolated, else the project directory. (Referenced by
@@ -2771,7 +2800,7 @@ export function App() {
                 <ThreadRow
                   key={t.id}
                   thread={t}
-                  active={!scheduledOpen && t.id === activeThreadId}
+                  active={!pageOpen && t.id === activeThreadId}
                   hovered={hoveredThreadId === t.id}
                   running={runningThreads.has(t.id)}
                   indent
@@ -2794,7 +2823,7 @@ export function App() {
             <ThreadRow
               key={t.id}
               thread={t}
-              active={!scheduledOpen && t.id === activeThreadId}
+              active={!pageOpen && t.id === activeThreadId}
               hovered={hoveredThreadId === t.id}
               running={runningThreads.has(t.id)}
               onHover={setHoveredThreadId}
@@ -2898,6 +2927,7 @@ export function App() {
         {scheduledOpen ? (
           <ScheduledView
             defaultProject={activeProjectPath ?? null}
+            projects={sidebar.projects}
             navOpen={navOpen}
             onToggleNav={toggleNav}
             focusKey={scheduledFocus}
@@ -10122,6 +10152,7 @@ const TASK_TEMPLATES: { name: string; schedule: ScheduleSpec; prompt: string; bl
  */
 function ScheduledView({
   defaultProject,
+  projects,
   onOpenThread,
   navOpen,
   onToggleNav,
@@ -10129,6 +10160,7 @@ function ScheduledView({
   onFocusHandled,
 }: {
   defaultProject: string | null;
+  projects: ProjectInfo[];
   onOpenThread: (threadId: string) => void;
   navOpen: boolean;
   onToggleNav: () => void;
@@ -10367,7 +10399,7 @@ function ScheduledView({
                 review, a watch on work in progress. Tasks read files without changing
                 them and can drive the signed-in Agent browser, so they can act on sites
                 you are logged into. They run only while Unbiased is open; anything that
-                came due while it was closed waits here for you.
+                came due while it was closed runs once when you next open it.
               </p>
             </div>
             {editing === null && (
@@ -10417,6 +10449,7 @@ function ScheduledView({
               <label style={labelStyle} htmlFor="st-name">Name</label>
               <input
                 id="st-name"
+                className="u-field"
                 value={fName}
                 onChange={(e) => setFName(e.target.value)}
                 placeholder="Daily brief"
@@ -10428,6 +10461,7 @@ function ScheduledView({
               </label>
               <textarea
                 id="st-prompt"
+                className="u-field"
                 value={fPrompt}
                 onChange={(e) => setFPrompt(e.target.value)}
                 rows={5}
@@ -10436,17 +10470,18 @@ function ScheduledView({
               />
 
               <label style={{ ...labelStyle, marginTop: 14 }} htmlFor="st-type">Repeat</label>
-              <select
+              <FieldSelect
                 id="st-type"
                 value={fType}
-                onChange={(e) => setFType(e.target.value as ScheduleSpec["type"])}
-                style={inputStyle}
-              >
-                <option value="daily">Every day</option>
-                <option value="weekdays">Weekdays (Mon–Fri)</option>
-                <option value="weekly">Certain days</option>
-                <option value="hourly">Every few hours</option>
-              </select>
+                onChange={(v) => setFType(v as ScheduleSpec["type"])}
+                triggerStyle={{ ...inputStyle, paddingRight: 34 }}
+                options={[
+                  { value: "daily", label: "Every day" },
+                  { value: "weekdays", label: "Weekdays (Mon–Fri)" },
+                  { value: "weekly", label: "Certain days" },
+                  { value: "hourly", label: "Every few hours" },
+                ]}
+              />
 
               {fType === "hourly" ? (
                 <>
@@ -10455,6 +10490,7 @@ function ScheduledView({
                   </label>
                   <input
                     id="st-interval"
+                    className="u-field"
                     type="number"
                     min={1}
                     max={24}
@@ -10466,13 +10502,7 @@ function ScheduledView({
               ) : (
                 <>
                   <label style={{ ...labelStyle, marginTop: 14 }} htmlFor="st-time">Time</label>
-                  <input
-                    id="st-time"
-                    type="time"
-                    value={fTime}
-                    onChange={(e) => setFTime(e.target.value)}
-                    style={inputStyle}
-                  />
+                  <FieldTime id="st-time" value={fTime} onChange={setFTime} style={inputStyle} />
                 </>
               )}
 
@@ -10506,16 +10536,32 @@ function ScheduledView({
                 </>
               )}
 
-              <div style={{ color: colors.dim, fontSize: 12.5, lineHeight: 1.5, marginTop: 14 }}>
-                {/* A path is only worth showing when it means something. With no
-                    project the run happens in a scratch folder that holds
-                    nothing, so naming it just draws the eye to an irrelevance —
-                    and the old copy said "your home directory", which was not
-                    even where it ran. */}
-                {fProject
-                  ? `Reads files in ${fProject}`
-                  : "No project — nothing on disk is needed for this task."}
-              </div>
+              {/* Where the run reads from, as a control rather than an
+                  announcement. It used to be a line of text stating whichever
+                  project the chat happened to sit in, which is the wrong shape
+                  twice over: a schedule outlives the conversation that created
+                  it, so inheriting silently is surprising, and a task aimed at
+                  a different repo had no way to say so from here. The inherited
+                  project is still the default — it is usually right — it just
+                  shows as a chosen value that can be changed. */}
+              <label style={{ ...labelStyle, marginTop: 14 }} htmlFor="st-project">Project</label>
+              <FieldSelect
+                id="st-project"
+                value={fProject ?? ""}
+                onChange={(v) => setFProject(v || null)}
+                triggerStyle={{ ...inputStyle, paddingRight: 34 }}
+                options={[
+                  { value: "", label: "None — nothing on disk is needed" },
+                  ...projects.map((p) => ({ value: p.path, label: p.name })),
+                  // A project the task still points at but which has left the
+                  // sidebar stays listed, or the select would silently reset it
+                  // to None on the next save.
+                  ...(fProject && !projects.some((p) => p.path === fProject)
+                    ? [{ value: fProject, label: fProject }]
+                    : []),
+                ]}
+              />
+
 
               {formError && (
                 <div style={{ color: colors.err, fontSize: 13, lineHeight: 1.5, marginTop: 12 }}>{formError}</div>
@@ -10964,7 +11010,6 @@ function McpPanel({ onClose }: { onClose: () => void }) {
   // A server starting or failing while the panel is open should be visible
   // without a manual refresh — this is the only signal that a server died.
   useEffect(() => window.unbiased.onMcpStatus(() => refresh()), [refresh]);
-
   const connectedNames = new Set(connected.map((c) => c.name.toLowerCase()));
   const pending = configured.filter((c) => !connectedNames.has(c.name.toLowerCase()));
 
@@ -11234,7 +11279,7 @@ function McpPanel({ onClose }: { onClose: () => void }) {
               {notice ??
                 `${pending.length} ${pending.length === 1 ? "server is" : "servers are"} waiting for a restart to connect.`}
             </span>
-            <button onClick={() => void apply()} disabled={applying} style={{ ...btnSmall, flexShrink: 0 }}>
+            <button onClick={() => void apply()} disabled={applying} className="u-chip" style={{ ...btnSmall, flexShrink: 0 }}>
               {applying ? "Restarting…" : "Restart engine"}
             </button>
           </div>
@@ -14134,6 +14179,349 @@ function LauncherRow({
 /** A row in the + button's popup: icon, label, optional dim description. */
 /** "Opens somewhere" — the quietest possible affordance, so a row that leads
  *  to a panel is distinguishable from one that acts in place. */
+/** The chevron a select gets once the native one is turned off. Same stroke
+ *  weight and size as MenuChevron — this is the app's chevron pointing down,
+ *  not a second chevron vocabulary. */
+function FieldChevron() {
+  return (
+    <span
+      style={{ color: colors.dim, display: "flex", position: "absolute", right: 12, top: "50%", transform: "translateY(-50%)", pointerEvents: "none" }}
+      aria-hidden="true"
+    >
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+        <path d="m6 9 6 6 6-6" />
+      </svg>
+    </span>
+  );
+}
+
+
+/** A select whose popup the app actually owns.
+ *
+ *  A native <select> is themeable everywhere except the one place that matters
+ *  most: the open list is drawn by the OS, in the system font on a system blue
+ *  highlight, and no CSS reaches it. Inside a dark themed panel that popup is
+ *  the only thing on screen that does not belong to the app.
+ *
+ *  So the trigger stays a styled box and the list becomes ours, in the same
+ *  vocabulary as the app's other menus (panel surface, 14 radius, 8 padding,
+ *  the 0.45 shadow). Keyboard behaviour is rebuilt rather than inherited,
+ *  because that is the part a custom select usually loses: arrows move,
+ *  Home/End jump, Enter and Space commit, Escape cancels, and the trigger
+ *  keeps focus throughout so the tab order is unchanged. */
+function FieldSelect({
+  id,
+  value,
+  options,
+  onChange,
+  triggerStyle,
+}: {
+  id: string;
+  value: string;
+  options: { value: string; label: string }[];
+  onChange: (value: string) => void;
+  triggerStyle: React.CSSProperties;
+}) {
+  const [open, setOpen] = useState(false);
+  const [active, setActive] = useState(0);
+  const wrapRef = useRef<HTMLDivElement | null>(null);
+  const listRef = useRef<HTMLDivElement | null>(null);
+  const selectedIndex = Math.max(0, options.findIndex((o) => o.value === value));
+  const current = options[selectedIndex];
+
+  useEffect(() => {
+    if (!open) return;
+    setActive(selectedIndex);
+    function onDown(e: MouseEvent) {
+      if (!wrapRef.current?.contains(e.target as Node)) setOpen(false);
+    }
+    document.addEventListener("mousedown", onDown);
+    return () => document.removeEventListener("mousedown", onDown);
+    // selectedIndex is read once on open on purpose: re-syncing it while the
+    // list is up would yank the highlight back under the user's arrow keys.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
+
+  // Keep the highlighted row in view when arrowing past the fold.
+  useEffect(() => {
+    if (!open) return;
+    listRef.current?.querySelector<HTMLElement>(`[data-idx="${active}"]`)?.scrollIntoView({ block: "nearest" });
+  }, [open, active]);
+
+  function commit(i: number) {
+    const opt = options[i];
+    if (opt) onChange(opt.value);
+    setOpen(false);
+  }
+
+  function onKeyDown(e: React.KeyboardEvent) {
+    if (!open) {
+      // Down/Up/Enter/Space all open a closed select, matching the native one.
+      if (["ArrowDown", "ArrowUp", "Enter", " "].includes(e.key)) {
+        e.preventDefault();
+        setOpen(true);
+      }
+      return;
+    }
+    if (e.key === "Escape") { e.preventDefault(); setOpen(false); return; }
+    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); commit(active); return; }
+    if (e.key === "ArrowDown") { e.preventDefault(); setActive((i) => Math.min(options.length - 1, i + 1)); return; }
+    if (e.key === "ArrowUp") { e.preventDefault(); setActive((i) => Math.max(0, i - 1)); return; }
+    if (e.key === "Home") { e.preventDefault(); setActive(0); return; }
+    if (e.key === "End") { e.preventDefault(); setActive(options.length - 1); return; }
+  }
+
+  return (
+    <div ref={wrapRef} style={{ position: "relative" }}>
+      <button
+        id={id}
+        type="button"
+        className="u-field"
+        role="combobox"
+        aria-expanded={open}
+        aria-haspopup="listbox"
+        aria-activedescendant={open ? `${id}-opt-${active}` : undefined}
+        data-nopress
+        onClick={() => setOpen((o) => !o)}
+        onKeyDown={onKeyDown}
+        style={{ ...triggerStyle, textAlign: "left", cursor: "pointer", display: "block" }}
+      >
+        {current?.label ?? ""}
+      </button>
+      <FieldChevron />
+      {open && (
+        <div
+          ref={listRef}
+          role="listbox"
+          data-popover
+          style={{
+            position: "absolute",
+            top: "calc(100% + 6px)",
+            left: 0,
+            right: 0,
+            maxHeight: 260,
+            overflowY: "auto",
+            background: colors.panel,
+            border: `1px solid ${colors.border}`,
+            borderRadius: 14,
+            padding: 8,
+            zIndex: 40,
+            boxShadow: "0 8px 24px rgba(0,0,0,0.45)",
+            // Grows out of the trigger rather than appearing from nothing:
+            // origin at the top edge, ease-out, inside the 150-250ms band a
+            // select needs to still read as instant.
+            transformOrigin: "top center",
+            animation: "unbiased-field-pop 150ms var(--ease-out)",
+          }}
+        >
+          {options.map((opt, i) => {
+            const isSelected = opt.value === value;
+            return (
+              <div
+                key={opt.value}
+                id={`${id}-opt-${i}`}
+                data-idx={i}
+                role="option"
+                aria-selected={isSelected}
+                onMouseEnter={() => setActive(i)}
+                onClick={() => commit(i)}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 8,
+                  padding: "7px 10px",
+                  borderRadius: 8,
+                  cursor: "pointer",
+                  fontSize: 13.5,
+                  letterSpacing: "var(--track-body)",
+                  // The highlight follows the keyboard AND the pointer, so
+                  // there is never a second, competing "current" row.
+                  background: i === active ? "var(--chip)" : "transparent",
+                  color: isSelected ? colors.accent : colors.fg,
+                }}
+              >
+                <span style={{ width: 14, display: "flex", flexShrink: 0, opacity: isSelected ? 1 : 0 }} aria-hidden="true">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M20 6 9 17l-5-5" />
+                  </svg>
+                </span>
+                <span style={{ flex: 1, minWidth: 0, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                  {opt.label}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** The time field, with the app's own picker panel.
+ *
+ *  Deliberately NOT a full replacement: the <input type="time"> stays, so
+ *  typing a time, the segment behaviour and the field's own keyboard handling
+ *  are untouched. Only Chrome's picker panel is swapped — it renders white
+ *  with a system-blue selection and is unreachable from CSS, which inside a
+ *  dark themed form is the one element that visibly is not ours.
+ *
+ *  Minutes are listed in full rather than in five-minute steps. Coarser
+ *  columns would look tidier and would quietly remove the ability to schedule
+ *  anything at 09:07. */
+function FieldTime({
+  id,
+  value,
+  onChange,
+  style,
+}: {
+  id: string;
+  value: string;
+  onChange: (value: string) => void;
+  style: React.CSSProperties;
+}) {
+  const [open, setOpen] = useState(false);
+  const wrapRef = useRef<HTMLDivElement | null>(null);
+  const panelRef = useRef<HTMLDivElement | null>(null);
+
+  const [hh, mm] = (value || "09:00").split(":").map((n) => Number(n) || 0);
+  const isPm = hh >= 12;
+  const hour12 = hh % 12 === 0 ? 12 : hh % 12;
+
+  function emit(h12: number, minute: number, pm: boolean) {
+    const h24 = pm ? (h12 === 12 ? 12 : h12 + 12) : h12 === 12 ? 0 : h12;
+    onChange(`${String(h24).padStart(2, "0")}:${String(minute).padStart(2, "0")}`);
+  }
+
+  useEffect(() => {
+    if (!open) return;
+    function onDown(e: MouseEvent) {
+      if (!wrapRef.current?.contains(e.target as Node)) setOpen(false);
+    }
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") setOpen(false);
+    }
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    // Land each column on its current value instead of at the top, so the
+    // panel opens showing where you already are.
+    panelRef.current?.querySelectorAll<HTMLElement>("[data-sel=\"1\"]").forEach((el) => el.scrollIntoView({ block: "center" }));
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+
+  const col: React.CSSProperties = {
+    maxHeight: 208,
+    overflowY: "auto",
+    display: "flex",
+    flexDirection: "column",
+    gap: 2,
+    padding: 4,
+    flex: 1,
+    minWidth: 0,
+  };
+  function cell(selected: boolean): React.CSSProperties {
+    return {
+      padding: "6px 8px",
+      borderRadius: 8,
+      cursor: "pointer",
+      fontSize: 13.5,
+      textAlign: "center",
+      fontVariantNumeric: "tabular-nums",
+      background: selected ? colors.accent : "transparent",
+      color: selected ? "var(--accent-fg)" : colors.fg,
+      flexShrink: 0,
+    };
+  }
+
+  return (
+    <div ref={wrapRef} style={{ position: "relative" }}>
+      <input
+        id={id}
+        className="u-field"
+        type="time"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        style={{ ...style, paddingRight: 34 }}
+      />
+      {/* The clock is a real button now that the native one is gone. */}
+      <button
+        type="button"
+        aria-label="Choose a time"
+        aria-expanded={open}
+        data-nopress
+        onClick={() => setOpen((o) => !o)}
+        style={{
+          position: "absolute",
+          right: 6,
+          top: "50%",
+          transform: "translateY(-50%)",
+          display: "flex",
+          alignItems: "center",
+          background: "transparent",
+          border: "none",
+          borderRadius: 8,
+          padding: 6,
+          color: open ? colors.accent : colors.dim,
+          cursor: "pointer",
+        }}
+      >
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <circle cx="12" cy="12" r="9" />
+          <path d="M12 7v5l3 2" />
+        </svg>
+      </button>
+      {open && (
+        <div
+          ref={panelRef}
+          data-popover
+          role="dialog"
+          aria-label="Choose a time"
+          style={{
+            position: "absolute",
+            top: "calc(100% + 6px)",
+            left: 0,
+            display: "flex",
+            gap: 4,
+            width: 232,
+            background: colors.panel,
+            border: `1px solid ${colors.border}`,
+            borderRadius: 14,
+            padding: 4,
+            zIndex: 40,
+            boxShadow: "0 8px 24px rgba(0,0,0,0.45)",
+            transformOrigin: "top left",
+            animation: "unbiased-field-pop 150ms var(--ease-out)",
+          }}
+        >
+          <div style={col}>
+            {Array.from({ length: 12 }, (_, i) => i + 1).map((h) => (
+              <div key={h} data-sel={h === hour12 ? "1" : "0"} onClick={() => emit(h, mm, isPm)} style={cell(h === hour12)}>
+                {String(h).padStart(2, "0")}
+              </div>
+            ))}
+          </div>
+          <div style={col}>
+            {Array.from({ length: 60 }, (_, i) => i).map((m) => (
+              <div key={m} data-sel={m === mm ? "1" : "0"} onClick={() => emit(hour12, m, isPm)} style={cell(m === mm)}>
+                {String(m).padStart(2, "0")}
+              </div>
+            ))}
+          </div>
+          <div style={{ ...col, flex: "0 0 58px", overflowY: "visible" }}>
+            {[false, true].map((pm) => (
+              <div key={String(pm)} data-sel={pm === isPm ? "1" : "0"} onClick={() => emit(hour12, mm, pm)} style={cell(pm === isPm)}>
+                {pm ? "PM" : "AM"}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function MenuChevron() {
   return (
     <span style={{ color: colors.dim, display: "flex" }} aria-hidden="true">

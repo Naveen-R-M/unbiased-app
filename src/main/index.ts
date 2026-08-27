@@ -6,6 +6,7 @@ import {
   ipcMain,
   Menu,
   nativeImage,
+  Notification,
   screen,
   shell,
   WebContentsView,
@@ -902,6 +903,11 @@ const SCHEDULE_TOOLS = [
           description: "Required for weekly. Ignored otherwise.",
         },
         intervalHours: { type: "integer", description: "Required for hourly. 1–24." },
+        projectPath: {
+          type: "string",
+          description:
+            "Absolute path to the project the run should work in. Omit to use this conversation's project, which is almost always right — pass it only when the user names a different one.",
+        },
       },
       required: ["name", "prompt", "repeat"],
     },
@@ -3987,8 +3993,20 @@ async function handleScheduleToolCall(
   const existing = readTasks();
   if (existing.length >= MAX_TASKS) return text(`The user is at the limit of ${MAX_TASKS} scheduled tasks.`, false);
 
-  // The run inherits the conversation's directory, so the card names it.
-  const cwd = mainCwd ?? defaultChatDir();
+  // An explicit path wins over the conversation's own, so "every morning,
+  // summarise what I did in ~/work/api" targets that repo rather than whatever
+  // project the chat happens to sit in. Checked here rather than at run time:
+  // a typo caught now is a sentence the model can fix, while the same typo
+  // found at 9am is a silent fallback to the wrong directory.
+  const asked = typeof a.projectPath === "string" ? a.projectPath.trim() : "";
+  if (asked) {
+    if (!isAbsolute(asked)) return text(`projectPath must be an absolute path (got ${JSON.stringify(asked)}).`, false);
+    if (!existsSync(asked)) return text(`No such directory: ${asked}`, false);
+    if (!statSync(asked).isDirectory()) return text(`${asked} is a file, not a directory.`, false);
+  }
+  // The run inherits the conversation's directory unless one was named, so
+  // the card names whichever it will actually use.
+  const cwd = asked || mainCwd || defaultChatDir();
   const cadence = describeSchedule(checked.schedule);
   const decision = await requestLocalApproval(
     threadId,
@@ -4019,7 +4037,7 @@ async function handleScheduleToolCall(
     // made the form announce "Runs in /Users/naveen/Unbiased" for a task that
     // never touches the filesystem — a real-looking path for a detail that
     // does not apply.
-    projectPath: mainCwd && mainCwd !== defaultChatDir() ? mainCwd : null,
+    projectPath: asked || (mainCwd && mainCwd !== defaultChatDir() ? mainCwd : null),
     createdAt: now,
     cursorAt: now,
     lastRunAt: null,
@@ -4180,6 +4198,7 @@ async function runScheduledTask(
       missedAt: null,
     });
     console.log(`[scheduled] ${trigger} run of "${task.name}" ${outcome.status}`);
+    if (trigger === "schedule") notifyScheduledRun(task, outcome, threadId);
     return outcome;
   } catch (err) {
     const now = new Date().toISOString();
@@ -4205,25 +4224,61 @@ async function runScheduledTask(
   }
 }
 
-/**
- * Anything that came due while the app was closed is marked missed, not run.
- * Firing a backlog at launch is the wrong default — three days offline should
- * not mean three turns spent the moment the window opens — so the cursor
- * advances past the slot and the row offers Run now instead.
- */
-function catchUpMissed(): void {
-  const now = new Date();
-  let changed = false;
-  const tasks = readTasks().map((t) => {
-    if (!isDue(t, now)) return t;
-    changed = true;
-    const missed = dueAt(t).toISOString();
-    console.log(`[scheduled] "${t.name}" came due at ${missed} while closed — marked missed`);
-    return { ...t, cursorAt: now.toISOString(), missedAt: missed };
+/** Tell the user a scheduled run finished. Without this the result only
+ *  exists inside the app: a run that fires while they are in another window
+ *  leaves no trace they would notice, which for the "have it ready before I
+ *  sit down" tasks these exist for is the difference between the feature
+ *  landing and not. Manual Run now is deliberately silent — they are already
+ *  looking at it. Clicking through opens the run itself. */
+function notifyScheduledRun(task: ScheduledTask, outcome: { status: RunStatus; error: string | null; text: string }, threadId: string | null): void {
+  if (!Notification.isSupported()) return;
+  const summary = outcome.text.replace(/\s+/g, " ").trim();
+  const body =
+    outcome.status === "completed"
+      ? summary.slice(0, 180) || "Finished with nothing to report."
+      : `${outcome.status === "interrupted" ? "Stopped" : "Failed"}${outcome.error ? `: ${outcome.error}` : ""}`;
+  const n = new Notification({ title: task.name, body, silent: false });
+  n.on("click", () => {
+    if (win) {
+      if (win.isMinimized()) win.restore();
+      win.show();
+      win.focus();
+    }
+    if (threadId) send("scheduled:open-run", { threadId });
   });
-  if (changed) {
-    writeTasks(tasks);
-    send("scheduled:updated", { tasks: decorate(tasks) });
+  n.show();
+}
+
+/**
+ * Anything that came due while the app was closed runs now, one at a time.
+ *
+ * This used to only MARK them missed, on the reasoning that three days
+ * offline should not cost three turns the moment the window opens. That
+ * reasoning was wrong about what these tasks are: a morning brief exists so
+ * the answer is waiting, and a row saying "Missed — Run now" just moves the
+ * work to the moment the user sits down, which is exactly what they wanted to
+ * avoid. Note that a backlog is bounded by TASKS, not by slots — a daily task
+ * missed for a week runs once, against today's state, because the prompt is
+ * standing instructions and the answer it wants is about now.
+ *
+ * Sequential on purpose: firing every missed task at once would put N engine
+ * threads in flight against a gateway that bills per call, at the least
+ * convenient moment (launch). missedAt stays set until the run settles, so
+ * the row reads "Missed" while it is catching up rather than looking idle.
+ */
+async function catchUpMissed(): Promise<void> {
+  const now = new Date();
+  const due = readTasks().filter((t) => isDue(t, now));
+  if (due.length === 0) return;
+  const marked = readTasks().map((t) =>
+    due.some((d) => d.key === t.key) ? { ...t, cursorAt: now.toISOString(), missedAt: dueAt(t).toISOString() } : t,
+  );
+  writeTasks(marked);
+  send("scheduled:updated", { tasks: decorate(marked) });
+  for (const task of due) {
+    if (runningTaskKeys.has(task.key)) continue;
+    console.log(`[scheduled] "${task.name}" was due while closed — running it now`);
+    await runScheduledTask(task, "schedule");
   }
 }
 
@@ -4239,7 +4294,7 @@ function scheduleTick(): void {
  *  before that, and the engine only starts after sign-in. */
 function startScheduler(): void {
   if (scheduleTimer) return;
-  catchUpMissed();
+  void catchUpMissed();
   scheduleTimer = setInterval(scheduleTick, SCHEDULE_TICK_MS);
   // Anything due in the seconds between launch and the first tick.
   scheduleTick();
@@ -5107,6 +5162,7 @@ app.whenReady().then(async () => {
     // must block saving.
     return { connected, configured: cfg.servers, error, configError: cfg.error };
   });
+  /** Must match mcp_oauth_callback_port in the engine's config template. */
   ipcMain.handle("mcp:save", (_e, payload: { servers: UserMcpServer[] }) => {
     const servers = Array.isArray(payload?.servers) ? payload.servers : [];
     // Writing over a file we could not read would discard servers the user
@@ -5900,7 +5956,15 @@ app.whenReady().then(async () => {
         primary = p.primary && folders.includes(p.primary) ? p.primary : folders[0];
       } else {
         const safe = name.replace(/[/\\]/g, "-");
-        primary = join(app.getPath("home"), safe);
+        // A project with no folder of its own belongs in the app's own
+        // workspace, not loose in the home directory. Dropping it at ~/<Name>
+        // scattered app-created folders among Documents, Downloads and the
+        // rest, where nothing marks them as ours and nothing groups them
+        // together. defaultChatDir() is the same ~/Unbiased the no-project
+        // chats already use, and it falls back to home if it cannot be made,
+        // so the old behaviour survives as the failure case rather than the
+        // default one.
+        primary = join(defaultChatDir(), safe);
         try {
           mkdirSync(primary, { recursive: true });
         } catch (err) {
@@ -5929,7 +5993,9 @@ app.whenReady().then(async () => {
       properties: ["openDirectory", "createDirectory"],
       title: "Choose where the project folder is created",
       buttonLabel: "Use this location",
-      defaultPath: lastDialogDir("projectLocation"),
+      // First run opens in the app's workspace, matching where a project with
+      // no chosen location is created. After that the last pick wins.
+      defaultPath: lastDialogDir("projectLocation") ?? defaultChatDir(),
     });
     if (result.canceled || result.filePaths.length === 0) return { path: null };
     rememberDialogDir("projectLocation", result.filePaths[0], false);
