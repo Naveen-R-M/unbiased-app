@@ -6,6 +6,25 @@ Format matters: `## <version> — <date>`, then `### <section>`, then `-` bullet
 
 Write for the person using the app, not the person who wrote the code.
 
+## 1.6.0 — August 27, 2026
+
+### New
+
+- Scheduled runs tell you when they finish. A notification with the task's name and the first line of its answer; clicking it opens the run. Anything that came due while Unbiased was closed now runs once when you next open it, rather than waiting as "missed" for you to press a button — a morning brief should be ready when you sit down, not start when you do. A task missed for a week still runs once, against today's state.
+- A scheduled task can name its own project. Ask for something recurring in a chat and it targets that project by default, or pick a different one on the form.
+
+### Improved
+
+- The dropdowns and the time picker on the scheduled form are drawn by the app. They were native controls, which is fine until they open — the list and the time panel came from the operating system, in its font on its blue highlight, and were the only thing on screen that did not belong here. Keyboard behaviour is unchanged: arrows, Home and End, Enter to choose, Escape to cancel, and typing a time still works. Minutes are listed in full, so 09:07 is still a time you can pick.
+- New projects created without choosing a folder are made inside **Unbiased** in your home folder, instead of loose alongside Documents and Downloads.
+
+### Fixed
+
+- Two conversations browsing at once no longer fight over one page. Each chat gets its own tab in the Agent browser, so asking one for your Slack messages and another for the news does what you would expect. They still share one browser, so you stay signed in to everything.
+- The Agent browser pane follows the conversation you are looking at. It could show another chat's page — you would ask about Slack and watch someone else's news feed scroll past. A chat that has not browsed yet now shows nothing rather than borrowing a page from one that has.
+- Switching conversations while a chat is working no longer closes its Agent browser. The pane is remembered per conversation and comes back when you return to it, and a chat browsing in the background no longer opens a pane in the chat you are reading.
+- Row buttons in the MCP and Skills lists were invisible. They were painted in exactly the shade of the panel behind them.
+
 ## 1.5.0 — August 25, 2026
 
 ### New
