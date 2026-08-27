@@ -6,6 +6,7 @@ import {
   ipcMain,
   Menu,
   nativeImage,
+  Notification,
   screen,
   shell,
   WebContentsView,
@@ -663,6 +664,18 @@ const APP_DEVELOPER_INSTRUCTIONS = [
   "applies to private data too (their email, messages, dashboards): the card covers it. The one case",
   "to stop and ask is when a tool result says the browser profile is new and not signed in yet — then",
   "tell the user to sign in in the window that opened, and never ask them for a password yourself.",
+  // Engine errors leak the engine. codex's not-logged-in error for an MCP
+  // server ends `Run \`codex mcp login <name>\``, and with nothing said here
+  // the model relayed it verbatim — a CLI this product does not ship, pointed
+  // at a CODEX_HOME it does not use. Observed live on a HoneyComb server the
+  // user had added. The instruction has to name the real affordance, because
+  // "do not say that" with no replacement just leaves the user stuck.
+  "This app runs on a modified engine, and some of its errors name tools that are not part of this",
+  "product. Never pass those on. In particular, if an MCP server reports that it is not logged in,",
+  "do NOT repeat any `codex ...` command: signing in lives in the app, under Settings then MCP",
+  "servers, where that server now shows a Sign in button. Say that instead. The same applies to any",
+  "other command an engine error suggests — describe what the user should do in Unbiased, and if",
+  "there is no way to do it in the app, say so plainly rather than inventing one.",
   // The browser. Same reasoning as delegation below, and the same fix: the
   // browser_* tools were declared on every turn but never mentioned here, so
   // asked to do something on the web the model would answer "I have no browser
@@ -902,6 +915,11 @@ const SCHEDULE_TOOLS = [
           description: "Required for weekly. Ignored otherwise.",
         },
         intervalHours: { type: "integer", description: "Required for hourly. 1–24." },
+        projectPath: {
+          type: "string",
+          description:
+            "Absolute path to the project the run should work in. Omit to use this conversation's project, which is almost always right — pass it only when the user names a different one.",
+        },
       },
       required: ["name", "prompt", "repeat"],
     },
@@ -3675,6 +3693,15 @@ function wireNotifications(): void {
   // server that fails to start is otherwise invisible: its tools simply never
   // appear, with nothing saying why.
   engine.on("notification", (msg: { method: string; params?: Record<string, unknown> }) => {
+    if (msg.method === "mcpServer/oauthLogin/completed") {
+      const p = msg.params ?? {};
+      send("mcp:login-done", {
+        name: typeof p.name === "string" ? p.name : "",
+        success: p.success === true,
+        error: typeof p.error === "string" ? p.error : null,
+      });
+      return;
+    }
     if (msg.method !== "mcpServer/startupStatus/updated") return;
     const p = msg.params ?? {};
     send("mcp:status", {
@@ -3987,8 +4014,20 @@ async function handleScheduleToolCall(
   const existing = readTasks();
   if (existing.length >= MAX_TASKS) return text(`The user is at the limit of ${MAX_TASKS} scheduled tasks.`, false);
 
-  // The run inherits the conversation's directory, so the card names it.
-  const cwd = mainCwd ?? defaultChatDir();
+  // An explicit path wins over the conversation's own, so "every morning,
+  // summarise what I did in ~/work/api" targets that repo rather than whatever
+  // project the chat happens to sit in. Checked here rather than at run time:
+  // a typo caught now is a sentence the model can fix, while the same typo
+  // found at 9am is a silent fallback to the wrong directory.
+  const asked = typeof a.projectPath === "string" ? a.projectPath.trim() : "";
+  if (asked) {
+    if (!isAbsolute(asked)) return text(`projectPath must be an absolute path (got ${JSON.stringify(asked)}).`, false);
+    if (!existsSync(asked)) return text(`No such directory: ${asked}`, false);
+    if (!statSync(asked).isDirectory()) return text(`${asked} is a file, not a directory.`, false);
+  }
+  // The run inherits the conversation's directory unless one was named, so
+  // the card names whichever it will actually use.
+  const cwd = asked || mainCwd || defaultChatDir();
   const cadence = describeSchedule(checked.schedule);
   const decision = await requestLocalApproval(
     threadId,
@@ -4019,7 +4058,7 @@ async function handleScheduleToolCall(
     // made the form announce "Runs in /Users/naveen/Unbiased" for a task that
     // never touches the filesystem — a real-looking path for a detail that
     // does not apply.
-    projectPath: mainCwd && mainCwd !== defaultChatDir() ? mainCwd : null,
+    projectPath: asked || (mainCwd && mainCwd !== defaultChatDir() ? mainCwd : null),
     createdAt: now,
     cursorAt: now,
     lastRunAt: null,
@@ -4180,6 +4219,7 @@ async function runScheduledTask(
       missedAt: null,
     });
     console.log(`[scheduled] ${trigger} run of "${task.name}" ${outcome.status}`);
+    if (trigger === "schedule") notifyScheduledRun(task, outcome, threadId);
     return outcome;
   } catch (err) {
     const now = new Date().toISOString();
@@ -4205,25 +4245,61 @@ async function runScheduledTask(
   }
 }
 
-/**
- * Anything that came due while the app was closed is marked missed, not run.
- * Firing a backlog at launch is the wrong default — three days offline should
- * not mean three turns spent the moment the window opens — so the cursor
- * advances past the slot and the row offers Run now instead.
- */
-function catchUpMissed(): void {
-  const now = new Date();
-  let changed = false;
-  const tasks = readTasks().map((t) => {
-    if (!isDue(t, now)) return t;
-    changed = true;
-    const missed = dueAt(t).toISOString();
-    console.log(`[scheduled] "${t.name}" came due at ${missed} while closed — marked missed`);
-    return { ...t, cursorAt: now.toISOString(), missedAt: missed };
+/** Tell the user a scheduled run finished. Without this the result only
+ *  exists inside the app: a run that fires while they are in another window
+ *  leaves no trace they would notice, which for the "have it ready before I
+ *  sit down" tasks these exist for is the difference between the feature
+ *  landing and not. Manual Run now is deliberately silent — they are already
+ *  looking at it. Clicking through opens the run itself. */
+function notifyScheduledRun(task: ScheduledTask, outcome: { status: RunStatus; error: string | null; text: string }, threadId: string | null): void {
+  if (!Notification.isSupported()) return;
+  const summary = outcome.text.replace(/\s+/g, " ").trim();
+  const body =
+    outcome.status === "completed"
+      ? summary.slice(0, 180) || "Finished with nothing to report."
+      : `${outcome.status === "interrupted" ? "Stopped" : "Failed"}${outcome.error ? `: ${outcome.error}` : ""}`;
+  const n = new Notification({ title: task.name, body, silent: false });
+  n.on("click", () => {
+    if (win) {
+      if (win.isMinimized()) win.restore();
+      win.show();
+      win.focus();
+    }
+    if (threadId) send("scheduled:open-run", { threadId });
   });
-  if (changed) {
-    writeTasks(tasks);
-    send("scheduled:updated", { tasks: decorate(tasks) });
+  n.show();
+}
+
+/**
+ * Anything that came due while the app was closed runs now, one at a time.
+ *
+ * This used to only MARK them missed, on the reasoning that three days
+ * offline should not cost three turns the moment the window opens. That
+ * reasoning was wrong about what these tasks are: a morning brief exists so
+ * the answer is waiting, and a row saying "Missed — Run now" just moves the
+ * work to the moment the user sits down, which is exactly what they wanted to
+ * avoid. Note that a backlog is bounded by TASKS, not by slots — a daily task
+ * missed for a week runs once, against today's state, because the prompt is
+ * standing instructions and the answer it wants is about now.
+ *
+ * Sequential on purpose: firing every missed task at once would put N engine
+ * threads in flight against a gateway that bills per call, at the least
+ * convenient moment (launch). missedAt stays set until the run settles, so
+ * the row reads "Missed" while it is catching up rather than looking idle.
+ */
+async function catchUpMissed(): Promise<void> {
+  const now = new Date();
+  const due = readTasks().filter((t) => isDue(t, now));
+  if (due.length === 0) return;
+  const marked = readTasks().map((t) =>
+    due.some((d) => d.key === t.key) ? { ...t, cursorAt: now.toISOString(), missedAt: dueAt(t).toISOString() } : t,
+  );
+  writeTasks(marked);
+  send("scheduled:updated", { tasks: decorate(marked) });
+  for (const task of due) {
+    if (runningTaskKeys.has(task.key)) continue;
+    console.log(`[scheduled] "${task.name}" was due while closed — running it now`);
+    await runScheduledTask(task, "schedule");
   }
 }
 
@@ -4239,7 +4315,7 @@ function scheduleTick(): void {
  *  before that, and the engine only starts after sign-in. */
 function startScheduler(): void {
   if (scheduleTimer) return;
-  catchUpMissed();
+  void catchUpMissed();
   scheduleTimer = setInterval(scheduleTick, SCHEDULE_TICK_MS);
   // Anything due in the seconds between launch and the first tick.
   scheduleTick();
@@ -4936,6 +5012,12 @@ app.whenReady().then(async () => {
     env?: Record<string, string>;
     url?: string;
     bearerTokenEnvVar?: string;
+    /** Absent means on. Off keeps the entry — and its OAuth registration —
+     *  while leaving it out of the engine's config. */
+    enabled?: boolean;
+    /** An OAuth client WE registered with the provider, so its consent screen
+     *  shows Unbiased rather than codex's dynamically-registered "Codex". */
+    oauthClientId?: string;
     startupTimeoutSec?: number;
     toolTimeoutSec?: number;
     enabledTools?: string[];
@@ -4967,6 +5049,19 @@ app.whenReady().then(async () => {
   // NOT authoritative: the engine revalidates before writing config.toml.
   // This copy exists only so the form can refuse a bad server immediately
   // instead of after an engine restart.
+  /** Persist the server list. Shared by the save handler and the OAuth
+   *  registration path, which must not lose the file it just read. */
+  function writeMcpConfig(servers: UserMcpServer[]): boolean {
+    try {
+      const tmp = `${mcpConfigPath()}.${process.pid}.tmp`;
+      writeFileSync(tmp, JSON.stringify({ servers }, null, 2), { mode: 0o600 });
+      renameSync(tmp, mcpConfigPath());
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   const MCP_NAME_RE = /^[A-Za-z0-9_-]+$/;
   const MCP_NAME_MAX = 24;
   function validateMcpServer(srv: UserMcpServer): string | null {
@@ -5107,6 +5202,554 @@ app.whenReady().then(async () => {
     // must block saving.
     return { connected, configured: cfg.servers, error, configError: cfg.error };
   });
+  /** Must match mcp_oauth_callback_port in the engine's config template. */
+  const MCP_CALLBACK_PORT = 45999;
+
+  /**
+   * The redirect URI codex will use for a given MCP server.
+   *
+   * Measured rather than assumed: the path is base64url of the first nine
+   * bytes of sha256(serverUrl), which reproduced codex's own value exactly for
+   * two unrelated URLs, and the same URL under two different server NAMES gave
+   * a byte-identical path — so it keys off the URL alone. The port half comes
+   * from mcp_oauth_callback_port, which the engine pins for this reason.
+   *
+   * This has to be exact. A registration declaring any other redirect URI is
+   * rejected at the authorize step, and the failure surfaces as an opaque
+   * provider error rather than anything naming the mismatch.
+   */
+  function mcpRedirectUri(serverUrl: string): string {
+    const digest = createHash("sha256").update(serverUrl).digest().subarray(0, 9);
+    const path = digest.toString("base64url");
+    return `http://127.0.0.1:${MCP_CALLBACK_PORT}/callback/${path}`;
+  }
+
+  /** One hop of OAuth metadata discovery. Returns null rather than throwing:
+   *  a provider that does not serve a document is a normal outcome here, not
+   *  an error worth surfacing. */
+  async function fetchJson(url: string): Promise<Record<string, unknown> | null> {
+    try {
+      const res = await fetch(url, { headers: { accept: "application/json" }, signal: AbortSignal.timeout(10_000) });
+      if (!res.ok) return null;
+      return (await res.json()) as Record<string, unknown>;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Find a provider's dynamic-registration endpoint, following RFC 9728 then
+   * RFC 8414. The MCP server advertises its authorization server; that server
+   * advertises where clients register.
+   */
+  async function discoverRegistrationEndpoint(serverUrl: string): Promise<string | null> {
+    const u = new URL(serverUrl);
+    // RFC 9728 puts the resource's path AFTER the well-known segment; the
+    // bare form is the fallback, and providers differ on which they serve.
+    const prm =
+      (await fetchJson(`${u.origin}/.well-known/oauth-protected-resource${u.pathname}`)) ??
+      (await fetchJson(`${u.origin}/.well-known/oauth-protected-resource`));
+    const servers = Array.isArray(prm?.authorization_servers) ? (prm!.authorization_servers as unknown[]) : [];
+    const issuer = typeof servers[0] === "string" ? (servers[0] as string) : u.origin;
+    const iss = new URL(issuer);
+    const meta =
+      (await fetchJson(`${iss.origin}/.well-known/oauth-authorization-server${iss.pathname === "/" ? "" : iss.pathname}`)) ??
+      (await fetchJson(`${iss.origin}/.well-known/oauth-authorization-server`)) ??
+      (await fetchJson(`${iss.origin}/.well-known/openid-configuration`));
+    const endpoint = meta?.registration_endpoint;
+    if (typeof endpoint !== "string" || !endpoint) return null;
+    // Credentials are about to be created here, so the hop must be protected.
+    // Loopback is allowed because a server on this machine never leaves it.
+    const e = new URL(endpoint);
+    const loopback = e.hostname === "localhost" || e.hostname === "127.0.0.1" || e.hostname === "::1";
+    if (e.protocol !== "https:" && !loopback) return null;
+    return endpoint;
+  }
+
+  /**
+   * Register US with the provider, as us.
+   *
+   * This is the whole point: codex's own dynamic registration sends
+   * client_name "Codex" and no logo at all, and neither is configurable. By
+   * registering first we choose both, and hand codex only the resulting
+   * client_id — at which point it skips its own registration entirely and runs
+   * the authorization against our client. Nothing is intercepted or spoofed;
+   * this is the provider's documented endpoint, and we are the client.
+   */
+  async function registerOAuthClient(serverUrl: string): Promise<{ clientId: string } | { error: string }> {
+    const endpoint = await discoverRegistrationEndpoint(serverUrl);
+    if (!endpoint) return { error: "This server does not offer dynamic client registration." };
+    const redirectUri = mcpRedirectUri(serverUrl);
+    try {
+      const res = await fetch(endpoint, {
+        method: "POST",
+        headers: { "content-type": "application/json", accept: "application/json" },
+        signal: AbortSignal.timeout(20_000),
+        body: JSON.stringify({
+          client_name: "Unbiased",
+          client_uri: "https://unbiased.ai",
+          // The site's 1024x1024 app icon, verified to resolve. A guessed
+          // /icon.png 404'd, and a logo_uri the provider cannot fetch renders
+          // as a broken-image placeholder on the consent screen — worse than
+          // sending none, because it looks like the app is malfunctioning at
+          // the exact moment it is asking to be trusted. The og image is a
+          // 1200x630 banner and the wrong shape for this.
+          logo_uri: "https://unbiased.ai/assets/unbiased-icon.png",
+          redirect_uris: [redirectUri],
+          grant_types: ["authorization_code", "refresh_token"],
+          response_types: ["code"],
+          // Native app, no secret to keep — the flow is PKCE-protected, and
+          // this matches what codex asks for so the client it receives is the
+          // shape it expects.
+          token_endpoint_auth_method: "none",
+          application_type: "native",
+        }),
+      });
+      const body = (await res.json().catch(() => null)) as Record<string, unknown> | null;
+      if (!res.ok) {
+        const detail = typeof body?.error_description === "string" ? body.error_description : `HTTP ${res.status}`;
+        return { error: `The provider refused the registration (${detail}).` };
+      }
+      const clientId = typeof body?.client_id === "string" ? body.client_id : "";
+      if (!clientId) return { error: "The provider returned no client_id." };
+      return { clientId };
+    } catch (err) {
+      return { error: err instanceof Error ? err.message : String(err) };
+    }
+  }
+
+  /**
+   * Sign in to an MCP server that wants OAuth.
+   *
+   * The engine has done this all along — codex implements the full OAuth 2.1
+   * flow with dynamic client registration, keyring storage and refresh — and
+   * the app simply never called it. What the user got instead was the
+   * engine's own not-logged-in error, which ends "Run `codex mcp login
+   * <name>`": a CLI this product does not ship, against a CODEX_HOME this
+   * product does not use. The model relayed that faithfully because it was
+   * the only instruction anyone had given it.
+   *
+   * The authorization URL opens in the user's normal browser, not the Agent
+   * browser: they are signing in as themselves, and the callback comes back
+   * to a loopback port the engine is already listening on.
+   */
+  /**
+   * The bundled connector catalogue.
+   *
+   * Read from the engine's own plugin directory rather than hardcoded here:
+   * the names, descriptions, categories and logos are already shipped with the
+   * pinned binary, and a hand-kept copy would drift the first time it moved.
+   *
+   * Filtered to remote servers with NO oauth block of their own. That is the
+   * exact set that supports on-the-spot registration, which is what lets us
+   * register as Unbiased instead of letting codex register as "Codex". The
+   * ones carrying a baked-in client_id (Slack) or an unsubstituted placeholder
+   * (the Google set, Airtable, Shopify, Zoom) are deliberately left out — they
+   * would either show someone else's name on the consent screen or fail
+   * outright, and a catalogue entry that cannot work is worse than no entry.
+   */
+  /**
+   * Connectors kept out of the catalogue because they cannot complete a
+   * sign-in here.
+   *
+   * The rule this enforces: an entry that cannot work is worse than no entry.
+   * A card that fails only after the user clicks Connect spends their trust to
+   * teach them the feature is unreliable.
+   *
+   * Measured, not assumed — every server in the catalogue was probed for an
+   * RFC 8414 registration_endpoint on 2026-08-27, and github is the sole
+   * member. Re-run that probe before adding or removing anything here; the
+   * providers can change their minds.
+   */
+  const CONNECTORS_WITHOUT_REGISTRATION: Record<string, string> = {
+    // api.githubcopilot.com publishes authorization-server metadata but no
+    // registration_endpoint, and codex's own fallback fails the same way
+    // ("Dynamic client registration not supported"). It needs an OAuth
+    // application registered by hand, so it belongs here until someone does
+    // that and supplies its client id.
+    github: "GitHub does not offer automatic sign-up",
+  };
+
+  function connectorCatalogueDir(): string {
+    return join(app.getPath("home"), ".unbiased", "app-engine", "home", ".tmp", "plugins", "plugins");
+  }
+
+  /** Load a logo the manifest names outright, e.g. "./assets/logo.png".
+   *  Kept inside the plugin directory: a path escaping it is a malformed
+   *  manifest, not a file to go and read. */
+  function connectorIconAt(dir: string, rel: string): string | null {
+    const full = join(dir, rel.replace(/^\.\//, ""));
+    if (!full.startsWith(dir)) return null;
+    try {
+      if (!statSync(full).isFile()) return null;
+      const b64 = readFileSync(full).toString("base64");
+      const mime = full.endsWith(".svg") ? "image/svg+xml" : "image/png";
+      const src = `data:${mime};base64,${b64}`;
+      return mime === "image/png" ? trimIcon(src) : src;
+    } catch {
+      return null;
+    }
+  }
+
+  /** A connector's logo, inlined so the renderer needs no file access. Prefers
+   *  a full-colour raster over the small monochrome marks, which are drawn for
+   *  a composer chip rather than a card. */
+  function connectorIcon(dir: string, name: string): string | null {
+    const assets = join(dir, "assets");
+    const prefer = [`${name}.png`, "logo.png", "app-icon.png", `${name}.svg`, "logo.svg"];
+    for (const file of prefer) {
+      const full = join(assets, file);
+      try {
+        if (!statSync(full).isFile()) continue;
+        const b64 = readFileSync(full).toString("base64");
+        const mime = file.endsWith(".svg") ? "image/svg+xml" : "image/png";
+        const src = `data:${mime};base64,${b64}`;
+        return mime === "image/png" ? trimIcon(src) : src;
+      } catch {
+        /* try the next candidate */
+      }
+    }
+    return null;
+  }
+
+  type Connector = {
+    name: string;
+    url: string;
+    displayName: string;
+    description: string;
+    longDescription: string;
+    developer: string | null;
+    version: string | null;
+    category: string;
+    capabilities: string[];
+    prompts: string[];
+    brandColor: string | null;
+    websiteUrl: string | null;
+    privacyUrl: string | null;
+    termsUrl: string | null;
+    supportUrl: string | null;
+    icon: string | null;
+    enabled: boolean;
+    /** What a hand-registered OAuth app must declare as its callback. Shown
+     *  rather than explained: it is unguessable, and one wrong character fails
+     *  at the authorize step with an error naming nothing useful. */
+    redirectUri: string;
+    /** A client id already configured for this connector, so the field shows
+     *  what is in effect rather than an empty box next to a working setup. */
+    clientId: string | null;
+  };
+
+  /**
+   * These entries are written for codex, and six of the sixteen say so in
+   * their own copy — "Manage issues, projects, and team workflows in Linear
+   * from Codex." Shipping that verbatim would reintroduce, in our own UI, the
+   * exact identity leak the OAuth work was about. The catalogue is read at
+   * runtime so it cannot be corrected at the source.
+   */
+  function deCodex(text: string): string {
+    return text.replace(/\bCodex\b/g, "Pareto");
+  }
+
+  function str(o: Record<string, unknown>, key: string): string | null {
+    const v = o[key];
+    return typeof v === "string" && v.trim() ? v.trim() : null;
+  }
+
+  function readConnectorCatalogue(): Connector[] {
+    const root = connectorCatalogueDir();
+    let entries: string[];
+    try {
+      entries = readdirSync(root);
+    } catch {
+      return [];
+    }
+    const out: Connector[] = [];
+    for (const entry of entries.sort()) {
+      const dir = join(root, entry);
+      let mcp: { mcpServers?: Record<string, Record<string, unknown>> };
+      try {
+        mcp = JSON.parse(readFileSync(join(dir, ".mcp.json"), "utf8"));
+      } catch {
+        continue;
+      }
+      for (const [name, srv] of Object.entries(mcp.mcpServers ?? {})) {
+        if (srv?.type !== "http" || typeof srv?.url !== "string") continue;
+        if (srv.oauth) continue; // pre-registered or placeholder — not ours to claim
+        if (CONNECTORS_WITHOUT_REGISTRATION[name]) continue;
+        if (!MCP_NAME_RE.test(name) || name.length > MCP_NAME_MAX) continue;
+        let iface: Record<string, unknown> = {};
+        let manifestVersion: string | null = null;
+        try {
+          const manifest = JSON.parse(readFileSync(join(dir, ".codex-plugin", "plugin.json"), "utf8")) as Record<string, unknown>;
+          iface = (manifest.interface ?? {}) as Record<string, unknown>;
+          manifestVersion = typeof manifest.version === "string" ? manifest.version : null;
+        } catch {
+          /* metadata is a nicety; the server is the substance */
+        }
+        // The manifest spells these with a capital URL — websiteURL, not
+        // websiteUrl. Reading the lowercase form returned null for all
+        // sixteen, silently, which is exactly how a link section ends up
+        // empty and nobody notices.
+        const prompts = Array.isArray(iface.defaultPrompt)
+          ? (iface.defaultPrompt as unknown[]).filter((x): x is string => typeof x === "string").map(deCodex)
+          : [];
+        const logo = str(iface, "logo");
+        out.push({
+          name,
+          url: srv.url,
+          displayName: str(iface, "displayName") ?? entry,
+          description: deCodex(str(iface, "shortDescription") ?? ""),
+          longDescription: deCodex(str(iface, "longDescription") ?? ""),
+          developer: str(iface, "developerName"),
+          version: manifestVersion,
+          category: str(iface, "category") ?? "Other",
+          capabilities: Array.isArray(iface.capabilities)
+            ? (iface.capabilities as unknown[]).filter((x): x is string => typeof x === "string")
+            : [],
+          prompts,
+          brandColor: str(iface, "brandColor"),
+          websiteUrl: str(iface, "websiteURL"),
+          privacyUrl: str(iface, "privacyPolicyURL"),
+          termsUrl: str(iface, "termsOfServiceURL"),
+          supportUrl: str(iface, "supportURL"),
+          // The manifest's own logo path wins; the filename guesses are only
+          // for the entries that declare none.
+          icon: (logo ? connectorIconAt(dir, logo) : null) ?? connectorIcon(dir, entry),
+          redirectUri: mcpRedirectUri(srv.url),
+          clientId: null,
+          enabled: true,
+        });
+      }
+    }
+    return out;
+  }
+
+  ipcMain.handle("connectors:list", async () => {
+    const catalogue = readConnectorCatalogue();
+    const configured = readMcpConfig().servers;
+    let status: Record<string, string> = {};
+    try {
+      const res = (await engine.request("mcpServerStatus/list", {})) as { data?: { name?: string; authStatus?: string }[] };
+      for (const srv of res?.data ?? []) {
+        if (typeof srv?.name === "string") status[srv.name] = typeof srv.authStatus === "string" ? srv.authStatus : "unknown";
+      }
+    } catch {
+      status = {};
+    }
+    return {
+      connectors: catalogue.map((c) => ({
+        ...c,
+        added: configured.some((sv) => sv.name === c.name),
+        authStatus: status[c.name] ?? null,
+        clientId: configured.find((sv) => sv.name === c.name)?.oauthClientId ?? null,
+        enabled: configured.find((sv) => sv.name === c.name)?.enabled !== false,
+      })),
+    };
+  });
+
+  /**
+   * Add a connector and sign in, in one motion.
+   *
+   * Registering our OAuth client BEFORE the restart is what makes this one
+   * restart rather than two: config.toml is rendered from mcp-servers.json at
+   * engine start, so the server entry and its client_id have to be on disk
+   * together before we bounce it.
+   */
+  ipcMain.handle("connectors:connect", async (_e, name: string) => {
+    const connector = readConnectorCatalogue().find((c) => c.name === name);
+    if (!connector) return { ok: false, error: "That connector is not in the catalogue." };
+    if (runningTurns.size > 0) return { ok: false, error: "Finish the running turn first — connecting restarts the engine." };
+    const cfg = readMcpConfig();
+    if (cfg.error) return { ok: false, error: cfg.error };
+    if (cfg.servers.some((sv) => sv.name === name)) return { ok: false, error: `${connector.displayName} is already added.` };
+
+    const reg = await registerOAuthClient(connector.url);
+    const entry: UserMcpServer = {
+      name: connector.name,
+      url: connector.url,
+      ...("clientId" in reg ? { oauthClientId: reg.clientId } : {}),
+    };
+    if (!writeMcpConfig([...cfg.servers, entry])) return { ok: false, error: "Could not save the server list." };
+    try {
+      await startEngine();
+    } catch (err) {
+      return { ok: false, error: `Added, but the engine did not restart: ${String(err)}` };
+    }
+    try {
+      const res = (await engine.request("mcpServer/oauth/login", { name })) as { authorizationUrl?: string };
+      const url = typeof res?.authorizationUrl === "string" ? res.authorizationUrl : "";
+      if (!url) return { ok: true, branded: "clientId" in reg, signIn: false };
+      await shell.openExternal(url);
+      return { ok: true, branded: "clientId" in reg, signIn: true };
+    } catch (err) {
+      // Added and connected, just not signed in — the MCP panel's Sign in
+      // button can finish the job, so this is not a failure of the add.
+      return {
+        ok: true,
+        branded: "clientId" in reg,
+        signIn: false,
+        error: friendlyMcpError(err instanceof Error ? err.message : String(err), connector.displayName),
+      };
+    }
+  });
+
+  /**
+   * Point a connector at an OAuth application the user registered themselves.
+   *
+   * The escape hatch for providers that do not offer automatic sign-up —
+   * GitHub is the one in the current catalogue. Adds the server if it is not
+   * there yet, so this works as a first action rather than requiring a failed
+   * Connect first.
+   */
+  ipcMain.handle("connectors:set-client-id", async (_e, payload: { name: string; clientId: string }) => {
+    const name = typeof payload?.name === "string" ? payload.name : "";
+    const clientId = typeof payload?.clientId === "string" ? payload.clientId.trim() : "";
+    const connector = readConnectorCatalogue().find((c) => c.name === name);
+    if (!connector) return { ok: false, error: "That connector is not in the catalogue." };
+    // Written verbatim into config.toml, so it is held to the same rule as
+    // every other value there.
+    if (/["\\]|[\u0000-\u001f]/.test(clientId)) {
+      return { ok: false, error: "A client ID cannot contain quotes or backslashes." };
+    }
+    if (runningTurns.size > 0) return { ok: false, error: "Finish the running turn first — this restarts the engine." };
+    const cfg = readMcpConfig();
+    if (cfg.error) return { ok: false, error: cfg.error };
+    const exists = cfg.servers.some((sv) => sv.name === name);
+    // An empty value clears it, which is the way back to automatic sign-up.
+    const next = exists
+      ? cfg.servers.map((sv) =>
+          sv.name === name ? { ...sv, ...(clientId ? { oauthClientId: clientId } : { oauthClientId: undefined }) } : sv,
+        )
+      : [...cfg.servers, { name, url: connector.url, ...(clientId ? { oauthClientId: clientId } : {}) }];
+    if (!writeMcpConfig(next)) return { ok: false, error: "Could not save the server list." };
+    try {
+      await startEngine();
+    } catch (err) {
+      return { ok: false, error: `Saved, but the engine did not restart: ${String(err)}` };
+    }
+    return { ok: true };
+  });
+
+  /**
+   * Switch a connector off without forgetting it.
+   *
+   * Off is NOT remove: removing discards the OAuth client the user approved in
+   * a browser, and reconnecting mints a new one at the provider. Off just
+   * leaves the server out of the engine's config.
+   *
+   * This is app-wide, not per-conversation. codex's thread/start does take a
+   * free-form `config` object, but it accepted a deliberately nonsensical key
+   * without complaint, so acceptance says nothing about whether an override is
+   * applied — and shipping a per-chat switch that silently does nothing would
+   * be worse than not having one.
+   */
+  ipcMain.handle("connectors:set-enabled", async (_e, payload: { name: string; enabled: boolean }) => {
+    const name = typeof payload?.name === "string" ? payload.name : "";
+    const enabled = payload?.enabled !== false;
+    if (runningTurns.size > 0) return { ok: false, error: "Finish the running turn first — this restarts the engine." };
+    const cfg = readMcpConfig();
+    if (cfg.error) return { ok: false, error: cfg.error };
+    if (!cfg.servers.some((sv) => sv.name === name)) return { ok: false, error: "That connector is not configured." };
+    const next = cfg.servers.map((sv) => (sv.name === name ? { ...sv, enabled } : sv));
+    if (!writeMcpConfig(next)) return { ok: false, error: "Could not save the server list." };
+    try {
+      await startEngine();
+    } catch (err) {
+      return { ok: false, error: `Saved, but the engine did not restart: ${String(err)}` };
+    }
+    return { ok: true };
+  });
+
+  ipcMain.handle("connectors:remove", async (_e, name: string) => {
+    if (runningTurns.size > 0) return { ok: false, error: "Finish the running turn first — this restarts the engine." };
+    const cfg = readMcpConfig();
+    if (cfg.error) return { ok: false, error: cfg.error };
+    if (!writeMcpConfig(cfg.servers.filter((sv) => sv.name !== name))) {
+      return { ok: false, error: "Could not save the server list." };
+    }
+    try {
+      await startEngine();
+    } catch (err) {
+      return { ok: false, error: `Removed, but the engine did not restart: ${String(err)}` };
+    }
+    return { ok: true };
+  });
+
+  /**
+   * Turn an engine error into something a person can act on.
+   *
+   * The raw form reaches the UI as `rpc error: {"code":-32603,"message":...}`,
+   * which is developer output wearing a user's clothes — and in the one case
+   * that actually happens, it is also misleading. "Registration failed" reads
+   * as a transient fault worth retrying; the truth is that the provider does
+   * not offer sign-up at all, so retrying is exactly the wrong response.
+   */
+  function friendlyMcpError(raw: string, displayName: string): string {
+    let message = raw;
+    const json = raw.match(/\{.*\}/s);
+    if (json) {
+      try {
+        const parsed = JSON.parse(json[0]) as { message?: unknown };
+        if (typeof parsed.message === "string") message = parsed.message;
+      } catch {
+        /* keep the raw text */
+      }
+    }
+    if (/dynamic client registration not supported/i.test(message)) {
+      return `${displayName} does not support signing in automatically — it needs an OAuth application registered with them by hand. Until then it cannot be connected here.`;
+    }
+    if (/no access token was provided/i.test(message)) {
+      return `${displayName} needs you to sign in before it will answer.`;
+    }
+    return message;
+  }
+
+  ipcMain.handle("mcp:login", async (_e, name: string) => {
+    if (typeof name !== "string" || !name) return { ok: false, error: "No server named." };
+    // Claim our own OAuth client before codex can register its own.
+    //
+    // Order matters and is not negotiable: codex only skips registration when
+    // a client_id is already in config.toml, and config.toml is regenerated
+    // from mcp-servers.json at engine START. So the id has to be stored and
+    // the engine restarted BEFORE the login call, or codex registers itself as
+    // "Codex" first and that is what the user sees.
+    const cfg = readMcpConfig();
+    const server = cfg.servers.find((sv) => sv.name === name);
+    let registered: string | null = null;
+    if (server?.url && !server.oauthClientId) {
+      const reg = await registerOAuthClient(server.url);
+      if ("clientId" in reg) {
+        const next = cfg.servers.map((sv) => (sv.name === name ? { ...sv, oauthClientId: reg.clientId } : sv));
+        const saved = writeMcpConfig(next);
+        if (saved) {
+          registered = reg.clientId;
+          if (runningTurns.size > 0) {
+            return { ok: false, error: "Finish the running turn first — signing in restarts the engine." };
+          }
+          try {
+            await startEngine();
+          } catch (err) {
+            return { ok: false, error: `Registered, but the engine did not restart: ${String(err)}` };
+          }
+        }
+      }
+      // A provider without dynamic registration, or one that refused, is not
+      // a dead end: codex falls back to registering itself. The sign-in still
+      // works; the consent screen just says Codex. Better to proceed and let
+      // the user decide than to block on branding.
+    }
+    try {
+      const res = (await engine.request("mcpServer/oauth/login", { name })) as { authorizationUrl?: string };
+      const url = typeof res?.authorizationUrl === "string" ? res.authorizationUrl : "";
+      if (!url) return { ok: false, error: "The engine did not return a sign-in link." };
+      await shell.openExternal(url);
+      return { ok: true, registered: registered !== null };
+    } catch (err) {
+      const label = readConnectorCatalogue().find((c) => c.name === name)?.displayName ?? name;
+      return { ok: false, error: friendlyMcpError(err instanceof Error ? err.message : String(err), label) };
+    }
+  });
+
   ipcMain.handle("mcp:save", (_e, payload: { servers: UserMcpServer[] }) => {
     const servers = Array.isArray(payload?.servers) ? payload.servers : [];
     // Writing over a file we could not read would discard servers the user
@@ -5900,7 +6543,15 @@ app.whenReady().then(async () => {
         primary = p.primary && folders.includes(p.primary) ? p.primary : folders[0];
       } else {
         const safe = name.replace(/[/\\]/g, "-");
-        primary = join(app.getPath("home"), safe);
+        // A project with no folder of its own belongs in the app's own
+        // workspace, not loose in the home directory. Dropping it at ~/<Name>
+        // scattered app-created folders among Documents, Downloads and the
+        // rest, where nothing marks them as ours and nothing groups them
+        // together. defaultChatDir() is the same ~/Unbiased the no-project
+        // chats already use, and it falls back to home if it cannot be made,
+        // so the old behaviour survives as the failure case rather than the
+        // default one.
+        primary = join(defaultChatDir(), safe);
         try {
           mkdirSync(primary, { recursive: true });
         } catch (err) {
@@ -5929,7 +6580,9 @@ app.whenReady().then(async () => {
       properties: ["openDirectory", "createDirectory"],
       title: "Choose where the project folder is created",
       buttonLabel: "Use this location",
-      defaultPath: lastDialogDir("projectLocation"),
+      // First run opens in the app's workspace, matching where a project with
+      // no chosen location is created. After that the last pick wins.
+      defaultPath: lastDialogDir("projectLocation") ?? defaultChatDir(),
     });
     if (result.canceled || result.filePaths.length === 0) return { path: null };
     rememberDialogDir("projectLocation", result.filePaths[0], false);

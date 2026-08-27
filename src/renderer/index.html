@@ -90,6 +90,86 @@
         transform: none;
       }
 
+      /* Small chip buttons. The press-scale is already global; what was
+         missing is the hover, which is what tells you the thing is a control
+         before you commit to clicking it. Same 150ms ease-out as the fields,
+         so the whole panel responds at one speed. */
+      .u-chip {
+        transition: background-color 150ms var(--ease-out);
+      }
+      .u-chip:hover:not(:disabled) {
+        background: color-mix(in srgb, var(--fg) 24%, transparent);
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .u-chip { transition: none; }
+      }
+
+      /* Form fields — selects and the time input.
+         These were the last place the OS showed through: a native select
+         chevron and Chrome's own clock button, both drawn in the platform's
+         colours rather than the app's, sitting inside a surface the app
+         styled. The controls are still native elements (they keep their
+         keyboard behaviour and the time input keeps its picker) — only the
+         chrome is replaced. */
+      .u-field {
+        /* Specific properties, not `all`: this element also animates nothing
+           else, and naming them keeps a future layout change from being
+           animated by accident. 150ms sits in the band where a select still
+           reads as instant. */
+        transition:
+          background-color 150ms var(--ease-out),
+          border-color 150ms var(--ease-out);
+      }
+      .u-field:hover:not(:disabled) {
+        background: var(--chip);
+        border-color: color-mix(in srgb, var(--fg) 16%, transparent);
+      }
+      /* The native chevron goes; the app draws its own, so the control
+         matches every other menu in the interface. */
+      select.u-field {
+        appearance: none;
+        -webkit-appearance: none;
+        cursor: pointer;
+      }
+      /* Chrome's clock button opens a white panel with a system-blue
+         selection that no stylesheet can reach — the same problem the native
+         select popup had. It is removed outright and the app supplies both
+         the button and the panel. The input itself stays native, so typing a
+         time still works exactly as it did. */
+      input[type="time"].u-field::-webkit-calendar-picker-indicator {
+        display: none;
+      }
+      input[type="time"].u-field::-webkit-datetime-edit,
+      input[type="time"].u-field::-webkit-datetime-edit-fields-wrapper {
+        padding: 0;
+      }
+      input[type="time"].u-field::-webkit-datetime-edit-hour-field,
+      input[type="time"].u-field::-webkit-datetime-edit-minute-field,
+      input[type="time"].u-field::-webkit-datetime-edit-ampm-field {
+        padding: 1px 3px;
+        border-radius: 4px;
+      }
+      /* The selected segment used to be Chrome's fixed blue, the one colour in
+         the form that no theme could reach. */
+      input[type="time"].u-field::-webkit-datetime-edit-hour-field:focus,
+      input[type="time"].u-field::-webkit-datetime-edit-minute-field:focus,
+      input[type="time"].u-field::-webkit-datetime-edit-ampm-field:focus {
+        background: var(--accent);
+        color: var(--accent-fg);
+        outline: none;
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .u-field { transition: none; }
+        /* The list still fades — that is comprehension, not decoration — it
+           just stops growing and moving. */
+        [role="listbox"] { animation: none !important; }
+      }
+      /* A field's edge is what separates it from the panel behind it, so it is
+         the first thing to strengthen when the user asks for more contrast. */
+      @media (prefers-contrast: more) {
+        .u-field { border-color: color-mix(in srgb, var(--fg) 42%, transparent); }
+      }
+
       /* Annotation tints (CSS Custom Highlight API).
          Two defects fixed here. The colour was the default accent hard-coded,
          so a custom accent never reached the tints — it now derives from
@@ -115,6 +195,14 @@
       @keyframes unbiased-pulse {
         0%, 100% { opacity: 1; }
         50% { opacity: 0.35; }
+      }
+      /* A select's list growing out of its trigger. Scale starts at 0.98 and
+         opacity at 0 — never scale(0), because nothing in the real world
+         appears from nothing, and the small offset is what makes it read as
+         the list arriving rather than blinking on. */
+      @keyframes unbiased-field-pop {
+        from { opacity: 0; transform: scale(0.98) translateY(-2px); }
+        to { opacity: 1; transform: scale(1) translateY(0); }
       }
       /* Compaction spinner. */
       @keyframes unbiased-spin {
