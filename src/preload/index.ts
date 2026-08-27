@@ -30,6 +30,9 @@ contextBridge.exposeInMainWorld("unbiased", {
   authValidate: (key?: string) => ipcRenderer.invoke("auth:validate", key),
   authLogin: (key?: string) => ipcRenderer.invoke("auth:login", { key }),
   authLogout: (removeKey?: boolean) => ipcRenderer.invoke("auth:logout", { removeKey }),
+  authDeviceStart: () => ipcRenderer.invoke("auth:device-start"),
+  authDeviceWait: () => ipcRenderer.invoke("auth:device-wait"),
+  authDeviceCancel: () => ipcRenderer.invoke("auth:device-cancel"),
 
   sendMessage: (paneId: string, text: string, attachments?: { name: string; path: string; kind?: string }[]) =>
     ipcRenderer.invoke("chat:send", { paneId, text, attachments }),

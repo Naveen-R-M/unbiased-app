@@ -163,10 +163,28 @@ conversation.
 
 ## Signing in
 
-The engine refuses to start without an API key, so the app gates on it: the
-login screen validates the key against the platform's `/api/cli/whoami`
-(free, no model call) and only then starts the engine with that key pinned
-into its environment. Sign out stops the engine and removes the stored key.
+The engine refuses to start without an API key, so the app gates on it. Two
+ways in:
+
+- **Sign in with your browser.** The app asks the platform for a one-time
+  code (the platform's RFC 8628 device authorization flow — see
+  `docs/partner-device-flow.md` in unbiased-platform), opens the platform's
+  `/activate` page in your own browser, where you already have a session,
+  and shows you the code to confirm there. Once you approve, the platform
+  mints a key for the workload you picked and the app collects it by polling;
+  the key itself never passes through the browser. The app is a registered
+  OAuth *public* client (`OAUTH_CLIENT_ID` in `src/main/index.ts`): the id
+  is public by design and your approval in the browser is what carries the
+  trust. `src/main/device-auth.ts` is the transport.
+- **Paste a key.** Create one in the dashboard and paste it in.
+
+Either way the key is validated against the platform's `/api/cli/whoami`
+(free, no model call) and only then is the engine started with that key
+pinned into its environment. Sign out stops the engine and removes the stored
+key.
+
+For development, `UNBIASED_PLATFORM_URL` points the app at a local platform
+and `UNBIASED_OAUTH_CLIENT_ID` overrides the client id.
 
 ## Releases and updates
 
