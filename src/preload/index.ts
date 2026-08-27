@@ -148,7 +148,8 @@ contextBridge.exposeInMainWorld("unbiased", {
   reviewCreatePr: (path: string) => ipcRenderer.invoke("review:create-pr", path),
   openExternal: (url: string) => ipcRenderer.invoke("browser:open-external", url),
   favicon: (host: string) => ipcRenderer.invoke("link:favicon", host),
-  agentMirrorStart: (p: { width: number; height: number; dpr: number }) => ipcRenderer.invoke("agentmirror:start", p),
+  agentMirrorStart: (p: { width: number; height: number; dpr: number; threadId?: string | null }) =>
+    ipcRenderer.invoke("agentmirror:start", p),
   agentMirrorStop: () => ipcRenderer.invoke("agentmirror:stop"),
   agentMirrorResize: (p: { width: number; height: number; dpr: number }) => ipcRenderer.invoke("agentmirror:resize", p),
   agentMirrorInput: (ev: unknown) => ipcRenderer.invoke("agentmirror:input", ev),

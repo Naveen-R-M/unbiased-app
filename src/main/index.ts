@@ -339,6 +339,95 @@ async function ensureBrowserSession(): Promise<string | null> {
   return null;
 }
 
+/**
+ * One browser tab per conversation.
+ *
+ * The session stays single and shared — that is deliberate, and it is what
+ * keeps the user's signed-in state working: an `--session` per chat would mean
+ * a separate Chrome with a separate profile, so every conversation would have
+ * to log in to X again, and the mirror would have no single port to watch.
+ * What was missing is the dimension below it. Two chats browsing at once both
+ * drove the one page: an open in one moved the page out from under the other,
+ * and a snapshot could return someone else's site.
+ *
+ * Keyed by the ROOT conversation, so a side chat and its sub-agents share the
+ * tab of the conversation they belong to rather than each spawning their own.
+ */
+const browserTabs = new Map<string, { label: string; targetId: string | null }>();
+
+/** A tab label is passed to the CLI as a ref, so it has to be a bare token.
+ *  Hashed rather than truncated: thread ids share long prefixes, and two
+ *  conversations colliding on a label would silently share a tab — the exact
+ *  bug this exists to fix. */
+function browserTabLabel(rootId: string): string {
+  return `chat-${createHash("sha256").update(rootId).digest("hex").slice(0, 10)}`;
+}
+
+/**
+ * Serialize browser work across conversations.
+ *
+ * Selecting a tab is STATEFUL — the CLI has no per-command tab flag, and each
+ * session simply remembers its active tab. So "select, then act" has to be
+ * atomic: without this, chat A selects, chat B selects, and A's command lands
+ * on B's page. The lock spans a whole tool call rather than a single command,
+ * because browser_search is an open/wait/eval/read sequence that must stay on
+ * one tab throughout.
+ */
+let browserOpChain: Promise<unknown> = Promise.resolve();
+function withBrowserLock<T>(fn: () => Promise<T>): Promise<T> {
+  // Chained on settle, not on success: one failed call must not wedge the
+  // queue for every conversation after it.
+  const run = browserOpChain.then(fn, fn);
+  browserOpChain = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  return run;
+}
+
+/** Learn a labelled tab's CDP target id, so the mirror can follow that exact
+ *  tab instead of guessing from URLs. */
+async function browserTabTargetId(label: string): Promise<string | null> {
+  const r = await runAgentBrowser(["tab", "list", "--json"]);
+  try {
+    const parsed = JSON.parse(r.out) as { data?: { tabs?: { label?: string | null; targetId?: string }[] } };
+    const hit = (parsed.data?.tabs ?? []).find((t) => t.label === label);
+    return typeof hit?.targetId === "string" ? hit.targetId : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Give this conversation its own tab and make it the active one. Returns null
+ *  on success, or the message to hand back to the model. */
+async function selectConversationTab(rootId: string): Promise<string | null> {
+  const label = browserTabLabel(rootId);
+  let entry = browserTabs.get(rootId);
+  if (!entry) {
+    const made = await runAgentBrowser(["tab", "new", "--label", label, "about:blank"], 30_000);
+    if (!made.ok) return `Could not open a browser tab for this conversation: ${made.out}`;
+    entry = { label, targetId: null };
+    browserTabs.set(rootId, entry);
+  }
+  // Selected explicitly and unconditionally, including right after creating
+  // it. `tab new` almost certainly activates what it opened, but "almost
+  // certainly" is not good enough here: if it ever does not, the command that
+  // follows lands on another conversation's page, which is the whole class of
+  // bug this exists to prevent.
+  const sel = await runAgentBrowser(["tab", label]);
+  if (!sel.ok || /tab_gone|not found/i.test(sel.out)) {
+    // Closed underneath us — by the user, or by a crash. Make a fresh one
+    // rather than let the CLI fall back to whatever tab is active.
+    const made = await runAgentBrowser(["tab", "new", "--label", label, "about:blank"], 30_000);
+    if (!made.ok) return `Could not reopen this conversation's browser tab: ${made.out}`;
+    entry.targetId = null;
+    const again = await runAgentBrowser(["tab", label]);
+    if (!again.ok) return `Could not select this conversation's browser tab: ${again.out}`;
+  }
+  if (!entry.targetId) entry.targetId = await browserTabTargetId(label);
+  return null;
+}
+
 // ── Agent-browser mirror ─────────────────────────────────────────────
 // Shows the agent's Chrome inside the side panel: a minimal CDP client on the
 // same 127.0.0.1 port agent-browser drives. Frames come from
@@ -359,6 +448,16 @@ let mirrorTargetId: string | null = null;
 // and the pane mirrored the wrong tab — so the agent's own navigation is the
 // authority on which tab to watch.
 let mirrorPreferredUrl: string | null = null;
+// The conversation the pane is SHOWING — not the one that happens to be
+// acting. Those are different, and conflating them is what put one chat's X
+// feed in another chat's pane: every browser tool call was overwriting a
+// global "preferred target", so whichever conversation browsed last won the
+// pane regardless of which chat the user had open.
+//
+// Stored as the conversation, resolved to a tab at tick time rather than once
+// at start: a chat that has not browsed yet has no tab, and its tab must be
+// picked up the moment it is created.
+let mirrorViewRoot: string | null = null;
 // Dimensions of the last frame Chrome sent, in page CSS pixels. Compared each
 // tick against the shape we asked for: if they drift — a dropped resize, or
 // another CDP client changing emulation — the mirror re-imposes its viewport
@@ -380,6 +479,14 @@ function originOf(u: string): string | null {
 function pickMirrorTarget(targets: CdpTarget[]): CdpTarget | null {
   const pages = targets.filter((t) => t.type === "page" && t.webSocketDebuggerUrl);
   const web = pages.filter((t) => t.url.startsWith("http://") || t.url.startsWith("https://"));
+  // A conversation owns exactly one tab, so when the pane is showing a
+  // conversation there is exactly one right answer — and if that tab does not
+  // exist yet, the right answer is NOTHING. The heuristics below used to be
+  // correct when every chat shared one page; with a tab each they actively
+  // mislead, because "any real web page" is now quite likely to be a
+  // different conversation's.
+  const viewTab = mirrorViewRoot ? browserTabs.get(mirrorViewRoot)?.targetId : null;
+  if (mirrorViewRoot) return (viewTab ? pages.find((t) => t.id === viewTab) : undefined) ?? null;
   const want = mirrorPreferredUrl;
   const wantOrigin = want ? originOf(want) : null;
   return (
@@ -1233,16 +1340,42 @@ async function handleAgentBrowserCall(
   // own (richer) attach, and browser_close must not resurrect a browser it is
   // about to shut down.
   if (tool !== "browser_connect" && tool !== "browser_close") {
-    const failure = await ensureBrowserSession();
+    // Inside the lock: browserSessionBound is read, then set after two awaits,
+    // so two conversations arriving together could both pass the guard and
+    // attach twice — launching or adopting a browser the other is already
+    // using. Harmless with one conversation, which is why it was fine before
+    // per-conversation tabs made concurrency the normal case.
+    const failure = await withBrowserLock(() => ensureBrowserSession());
     if (failure) return text(failure, false);
   }
-  if (!browserAttachedExternal) send("agentmirror:activity", { tool });
+  // Carries the conversation, so the pane only springs open for the chat the
+  // user is actually looking at. Without it a background chat's browsing
+  // popped the Agent browser onto whichever conversation was on screen.
+  if (!browserAttachedExternal) send("agentmirror:activity", { tool, threadId: rootThreadOf(threadId) });
   // Remember where the agent is going, so the mirror follows it rather than
   // whatever tab happens to sort first.
   if (tool === "browser_open") {
     const target = webUrlOrNull(str("url"));
     if (target) mirrorPreferredUrl = target;
   }
+  // Everything below runs against ONE tab, chosen for this conversation and
+  // held for the whole call. browser_connect and browser_close are excluded:
+  // they act on the session rather than a page, and close must not create a
+  // tab on its way to shutting the browser down.
+  const root = rootThreadOf(threadId);
+  const tabScoped = root !== null && tool !== "browser_connect" && tool !== "browser_close";
+  return withBrowserLock(async (): Promise<DynamicToolResponse> => {
+    if (tabScoped) {
+      const failure = await selectConversationTab(root);
+      if (failure) return text(failure, false);
+      // Deliberately does NOT steer the mirror. The pane follows the
+      // conversation the user is looking at; a call from a background chat
+      // must not drag the view onto its page.
+    }
+    return runBrowserTool();
+  });
+
+  async function runBrowserTool(): Promise<DynamicToolResponse> {
   switch (tool) {
     case "browser_open": {
       const url = webUrlOrNull(str("url"));
@@ -1428,6 +1561,11 @@ async function handleAgentBrowserCall(
       // The CLI session is no longer bound to anything; the next browser tool
       // has to attach again rather than assuming a live page.
       browserSessionBound = false;
+      // Every conversation's tab went with the browser. Keeping the registry
+      // would hand the next call a label that no longer exists, and the
+      // recovery path would then quietly create a tab in a browser we just
+      // told the user we had closed.
+      browserTabs.clear();
       return text(r.out || "closed", r.ok);
     }
     case "browser_screenshot": {
@@ -1445,6 +1583,7 @@ async function handleAgentBrowserCall(
     }
     default:
       return text(`unknown tool: ${tool}`, false);
+  }
   }
 }
 
@@ -1549,6 +1688,7 @@ function resetSubAgentState(): void {
   threadAccessModes.clear();
   browserAttachedExternal = false;
   browserSessionBound = false;
+  browserTabs.clear();
 }
 
 /** Strip the engine's inter-agent envelope ("Message Type: …\nTask name: …\n
@@ -6742,16 +6882,23 @@ app.whenReady().then(async () => {
     mirrorTimer.unref?.();
   }
 
-  ipcMain.handle("agentmirror:start", async (_e, p: { width: number; height: number; dpr: number }) => {
+  ipcMain.handle(
+    "agentmirror:start",
+    async (_e, p: { width: number; height: number; dpr: number; threadId?: string | null }) => {
     mirrorDesired = true;
     mirrorSize = {
       width: Number(p?.width) || 800,
       height: Number(p?.height) || 600,
       dpr: Math.min(3, Math.max(1, Number(p?.dpr) || 1)),
     };
+    // Which conversation's tab this pane is watching. Without it the mirror
+    // picks a tab by URL and, now that each chat has its own, can show the
+    // wrong chat browsing — the same crossed wires one layer up.
+    mirrorViewRoot = rootThreadOf(typeof p?.threadId === "string" ? p.threadId : null);
     mirrorSupervise();
     return mirrorTick();
-  });
+    },
+  );
   ipcMain.handle("agentmirror:stop", () => {
     mirrorDesired = false;
     if (mirrorTimer) {
@@ -6806,6 +6953,17 @@ app.whenReady().then(async () => {
     return { attachment: { name, path, kind: "image", thumb: thumbDataUrl(image) } };
   });
 
+  /** Close a deleted conversation's browser tab. Best-effort: the browser may
+   *  not be running, and a failure here must never block the delete. */
+  async function releaseConversationTab(rootId: string): Promise<void> {
+    const entry = browserTabs.get(rootId);
+    if (!entry) return;
+    browserTabs.delete(rootId);
+    if (browserSessionBound && !browserAttachedExternal) {
+      await withBrowserLock(() => runAgentBrowser(["tab", "close", entry.label], 15_000)).catch(() => undefined);
+    }
+  }
+
   ipcMain.handle("threads:delete", async (_e, id: string) => {
     // A running turn dies with its thread — stop it first so the engine
     // isn't left executing against a deleted conversation.
@@ -6846,6 +7004,7 @@ app.whenReady().then(async () => {
     heldApprovals.delete(id);
     heldErrors.delete(id);
     await engine.request("thread/delete", { threadId: id });
+    void releaseConversationTab(id);
     try {
       rmSync(transcriptFile(id), { force: true });
     } catch {

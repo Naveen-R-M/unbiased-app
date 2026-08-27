@@ -656,7 +656,12 @@ declare global {
       reviewCreatePr: (path: string) => Promise<{ ok: boolean; error?: string }>;
       openExternal: (url: string) => Promise<{ ok: boolean }>;
       favicon: (host: string) => Promise<{ dataUrl: string | null }>;
-      agentMirrorStart: (p: { width: number; height: number; dpr: number }) => Promise<{ ok: boolean; error?: string }>;
+      agentMirrorStart: (p: {
+        width: number;
+        height: number;
+        dpr: number;
+        threadId?: string | null;
+      }) => Promise<{ ok: boolean; error?: string }>;
       agentMirrorStop: () => Promise<{ ok: boolean }>;
       agentMirrorResize: (p: { width: number; height: number; dpr: number }) => Promise<{ ok: boolean }>;
       agentMirrorInput: (ev: Record<string, unknown>) => Promise<{ ok: boolean }>;
@@ -1709,6 +1714,13 @@ export function App() {
         filesTabs: number[];
         treeFiles: Record<number, OpenFileInfo | null>;
         reviewOpen: boolean;
+        // The Agent browser pane. It used to be the one side tab that was not
+        // remembered per conversation, so switching away closed it: a chat
+        // whose only pane was the browser failed the hasTabs check below, fell
+        // through to resetSideView, and had panelMode moved off it. Now that
+        // each conversation drives its own tab, the pane belongs to the
+        // conversation too.
+        agentMirrorOpen: boolean;
         panelMode: string;
         sideOpen: boolean;
       }
@@ -1733,6 +1745,7 @@ export function App() {
       filesTabs,
       treeFiles,
       reviewOpen,
+      agentMirrorOpen,
       panelMode,
       sideOpen,
     });
@@ -1743,7 +1756,11 @@ export function App() {
     const snap = sidePanelSnapshots.current.get(id);
     if (!snap) return false;
     const hasTabs =
-      snap.openAgents.length > 0 || snap.openFiles.length > 0 || snap.filesTabs.length > 0 || snap.reviewOpen;
+      snap.openAgents.length > 0 ||
+      snap.openFiles.length > 0 ||
+      snap.filesTabs.length > 0 ||
+      snap.reviewOpen ||
+      snap.agentMirrorOpen;
     if (!hasTabs) return false;
     setSideContexts({});
     setSideNonce((n) => n + 1);
@@ -1754,6 +1771,7 @@ export function App() {
     setFilesTabs(snap.filesTabs);
     setTreeFiles(snap.treeFiles);
     setReviewOpen(snap.reviewOpen);
+    setAgentMirrorOpen(snap.agentMirrorOpen);
     // A stale active key (e.g. a dropped terminal) falls back to the most
     // recent surviving tab via the strip's own effect.
     setPanelMode(snap.panelMode);
@@ -1782,6 +1800,7 @@ export function App() {
     if (fresh) {
       for (const id of browserTabsRef.current) void window.unbiased.closeBrowser(id);
       setBrowserTabs([]);
+      setAgentMirrorOpen(false);
       setBrowserTitles({});
       // Matching closeSideChat: the engine drops each ephemeral pane, so the
       // fork of the previous conversation doesn't linger under the cap.
@@ -1959,12 +1978,23 @@ export function App() {
   const [terminalTabs, setTerminalTabs] = useState<number[]>([]);
   // Singleton: one Chrome, one mirror — like the terminal, a LIVE tab.
   const [agentMirrorOpen, setAgentMirrorOpen] = useState(false);
+  // The activity subscription below is mounted once, so it cannot close over
+  // activeThreadId — it would compare against the value at mount forever.
+  const activeThreadIdRef = useRef<string | null>(null);
+  activeThreadIdRef.current = activeThreadId;
   useEffect(
     () =>
-      window.unbiased.onAgentMirrorActivity(() => {
+      window.unbiased.onAgentMirrorActivity((p) => {
         // Fires on every approved browser tool (main gates the attached-
         // external case), so the pane shows up whenever the agent starts
         // browsing — not only on the one launch per session.
+        //
+        // Scoped to the conversation on screen. A background chat browsing
+        // must not open a pane here: with one tab per conversation that pane
+        // would be showing work the user did not ask to watch, in a chat that
+        // is not doing it. Its own pane is restored when they switch to it.
+        const from = (p as { threadId?: string | null } | null)?.threadId ?? null;
+        if (from && activeThreadIdRef.current && from !== activeThreadIdRef.current) return;
         setAgentMirrorOpen((already) => {
           // Don't yank focus away from a tab the user is reading if the pane
           // is already there; just make sure it exists.
@@ -3960,7 +3990,11 @@ export function App() {
                 flexDirection: "column",
               }}
             >
-              <AgentMirrorPane active={panelMode === "agentmirror"} />
+              {/* The conversation this pane belongs to. Each chat now drives
+                  its own browser tab, so the mirror has to be told which one
+                  to watch — otherwise it picks by URL and can show a different
+                  chat browsing. */}
+              <AgentMirrorPane active={panelMode === "agentmirror"} threadId={activeThreadId} />
             </div>
           )}
           {browserTabs.map((id) => (
@@ -6429,7 +6463,7 @@ function SubAgentPane({ threadId, name, status }: { threadId: string; name: stri
  *  with clicks/scroll/typing forwarded back. object-fit:contain letterboxes
  *  the frame, so a click's pane coordinates must be mapped through the drawn
  *  rect to page coordinates or input lands in the wrong place. */
-function AgentMirrorPane({ active }: { active: boolean }) {
+function AgentMirrorPane({ active, threadId }: { active: boolean; threadId: string | null }) {
   const wrapRef = useRef<HTMLDivElement>(null);
   const imgRef = useRef<HTMLImageElement>(null);
   const [frame, setFrame] = useState<{ src: string; width: number; height: number } | null>(null);
@@ -6447,7 +6481,7 @@ function AgentMirrorPane({ active }: { active: boolean }) {
     const h = el?.clientHeight ?? 600;
     // devicePixelRatio: the pane is painted at w*dpr real pixels, so the
     // capture must match or the frame is upscaled and text goes soft.
-    void window.unbiased.agentMirrorStart({ width: w, height: h, dpr: window.devicePixelRatio || 1 });
+    void window.unbiased.agentMirrorStart({ width: w, height: h, dpr: window.devicePixelRatio || 1, threadId });
     // TRAILING debounce. The old version was leading-edge only: it sent the
     // first size it saw and dropped everything within 250ms after it. The pane
     // is still laying out at mount, so the size it sent was a half-height box
@@ -6476,7 +6510,9 @@ function AgentMirrorPane({ active }: { active: boolean }) {
       ro?.disconnect();
       void window.unbiased.agentMirrorStop();
     };
-  }, [active]);
+    // threadId included: switching conversations has to re-point the mirror,
+    // or the pane keeps streaming the tab of the chat you just left.
+  }, [active, threadId]);
 
   useEffect(() => {
     const offs = [
