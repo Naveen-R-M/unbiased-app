@@ -10411,6 +10411,7 @@ type ConnectorInfo = {
   redirectUri: string;
   clientId: string | null;
   enabled: boolean;
+  requiresClientId: boolean;
   added: boolean;
   authStatus: string | null;
 };
@@ -10814,7 +10815,7 @@ function ConnectorsView({ navOpen, onToggleNav }: { navOpen: boolean; onToggleNa
                         {busy === open.name ? "Working…" : "Remove"}
                       </button>
                     </>
-                  ) : (
+                  ) : open.requiresClientId && !open.clientId ? null : (
                     <button className="u-chip" onClick={() => void connect(open)} disabled={busy !== null} style={btnSmallStyle}>
                       {busy === open.name ? "Connecting…" : "Connect"}
                     </button>
@@ -10863,9 +10864,9 @@ function ConnectorsView({ navOpen, onToggleNav }: { navOpen: boolean; onToggleNa
                 Use your own OAuth app
               </h2>
               <p style={{ color: colors.dim, fontSize: 13.5, lineHeight: 1.55, margin: "0 0 14px", maxWidth: "62ch" }}>
-                Most connectors register Unbiased with the provider for you. Where that is not
-                offered, register an application yourself, give it this exact callback URL, and
-                paste its client ID here.
+                {open.requiresClientId
+                  ? `${open.displayName} offers no automatic sign-up, so this is the required setup, not an override: register an application with them, give it this exact callback URL, paste its client ID here, then sign in.`
+                  : "Most connectors register Unbiased with the provider for you. Where that is not offered, register an application yourself, give it this exact callback URL, and paste its client ID here."}
               </p>
               <label style={{ color: colors.dim, fontSize: 13, display: "block", marginBottom: 6 }}>Callback URL</label>
               <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 14 }}>
@@ -11120,6 +11121,17 @@ function ConnectorsView({ navOpen, onToggleNav }: { navOpen: boolean; onToggleNa
                               {busy === c.name ? "Working…" : "Remove"}
                             </button>
                           </>
+                        ) : c.requiresClientId && !c.clientId ? (
+                          // No client id yet, and the provider offers no
+                          // automatic sign-up — Connect would only fail. The
+                          // detail page holds the callback URL and the field.
+                          <button
+                            className="u-chip"
+                            onClick={() => setOpenName(c.name)}
+                            style={{ ...btnSmallStyle, fontSize: 12.5, padding: "5px 12px" }}
+                          >
+                            Set up…
+                          </button>
                         ) : (
                           <button
                             className="u-chip"

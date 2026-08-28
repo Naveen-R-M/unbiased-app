@@ -5898,6 +5898,18 @@ app.whenReady().then(async () => {
     github: "GitHub does not offer automatic sign-up",
   };
 
+  /**
+   * Connectors that work only with an OAuth application the user registers
+   * themselves — the provider offers no on-the-spot sign-up, and the client
+   * id the bundle ships belongs to someone else. Slack's is OpenAI's: use it
+   * and the consent screen says "ChatGPT (Local)" is requesting access to
+   * your workspace (measured). These appear in the catalogue as
+   * setup-required rather than being hidden, because "register an app and
+   * paste its id" is a real path the detail page already supports — hiding
+   * the entry just made the path undiscoverable.
+   */
+  const CONNECTORS_BRING_YOUR_OWN: Record<string, true> = { slack: true };
+
   function connectorCatalogueDir(): string {
     return join(app.getPath("home"), ".unbiased", "app-engine", "home", ".tmp", "plugins", "plugins");
   }
@@ -5962,6 +5974,9 @@ app.whenReady().then(async () => {
      *  rather than explained: it is unguessable, and one wrong character fails
      *  at the authorize step with an error naming nothing useful. */
     redirectUri: string;
+    /** The provider offers no automatic sign-up and the shipped client id is
+     *  someone else's — connecting requires the user's own registered app. */
+    requiresClientId: boolean;
     /** A client id already configured for this connector, so the field shows
      *  what is in effect rather than an empty box next to a working setup. */
     clientId: string | null;
@@ -6002,7 +6017,11 @@ app.whenReady().then(async () => {
       }
       for (const [name, srv] of Object.entries(mcp.mcpServers ?? {})) {
         if (srv?.type !== "http" || typeof srv?.url !== "string") continue;
-        if (srv.oauth) continue; // pre-registered or placeholder — not ours to claim
+        // A shipped oauth block is either a third party's client id or an
+        // unsubstituted placeholder — never ours to claim. Deliberately
+        // DROPPED even for the bring-your-own entries below: the user's own
+        // registration is the only identity these may use.
+        if (srv.oauth && !CONNECTORS_BRING_YOUR_OWN[name]) continue;
         if (CONNECTORS_WITHOUT_REGISTRATION[name]) continue;
         if (!MCP_NAME_RE.test(name) || name.length > MCP_NAME_MAX) continue;
         let iface: Record<string, unknown> = {};
@@ -6046,6 +6065,7 @@ app.whenReady().then(async () => {
           redirectUri: mcpRedirectUri(srv.url),
           clientId: null,
           enabled: true,
+          requiresClientId: !!CONNECTORS_BRING_YOUR_OWN[name],
         });
       }
     }
@@ -6086,6 +6106,15 @@ app.whenReady().then(async () => {
   ipcMain.handle("connectors:connect", async (_e, name: string) => {
     const connector = readConnectorCatalogue().find((c) => c.name === name);
     if (!connector) return { ok: false, error: "That connector is not in the catalogue." };
+    if (connector.requiresClientId) {
+      // No silent fallback here: with no registration endpoint, proceeding
+      // means codex registers nothing and the flow either fails or runs on a
+      // third party's identity. The detail page carries the setup.
+      return {
+        ok: false,
+        error: `${connector.displayName} needs an OAuth app of your own — open its page, register one with the callback shown there, and paste its client ID.`,
+      };
+    }
     if (runningTurns.size > 0) return { ok: false, error: "Finish the running turn first — connecting restarts the engine." };
     const cfg = readMcpConfig();
     if (cfg.error) return { ok: false, error: cfg.error };
