@@ -14,7 +14,7 @@ import {
 import type { MenuItemConstructorOptions } from "electron";
 import type { NativeImage } from "electron";
 import { dirname, isAbsolute, join, relative } from "node:path";
-import { homedir } from "node:os";
+import { homedir, hostname } from "node:os";
 import {
   closeSync,
   cpSync,
@@ -36,6 +36,7 @@ import { execFile, execFileSync, spawn as spawnProcess } from "node:child_proces
 import type { ChildProcess } from "node:child_process";
 import { get as httpGet } from "node:http";
 import { EngineClient, engineVersionFromUserAgent, type EngineStatus } from "./engine";
+import { pollDeviceToken, requestDeviceAuthorization } from "./device-auth";
 import {
   dueAt,
   isDue,
@@ -2537,7 +2538,16 @@ function skillRoots(): string[] {
 
 // UNBIASED_API_KEY (env) else ~/.unbiased/credentials.json; the login flow
 // writes the file and pins the key into the engine's launch env.
-const PLATFORM_BASE = "https://platform.unbiased.ai";
+// UNBIASED_PLATFORM_URL points a dev build at a local platform. Only the
+// platform calls here (whoami, billing, browser sign-in) follow it; the
+// engine's gateway URL is pinned by the supervisor and is not affected.
+const PLATFORM_BASE = (process.env.UNBIASED_PLATFORM_URL?.trim() || "https://platform.unbiased.ai").replace(/\/+$/, "");
+// The app's OAuth public client id, registered on the platform (unbiased-
+// platform docs/admin-api.md → Partners). Public by design — it ships in the
+// binary; the person's approval in their browser is what carries the trust.
+// Registered 2026-08-28 as partner "Unbiased" → client "Unbiased Desktop".
+// Empty disables browser sign-in and the login screen offers only paste-a-key.
+const OAUTH_CLIENT_ID = process.env.UNBIASED_OAUTH_CLIENT_ID?.trim() || "dhTH_VbRdB88tgW-m1HWiw";
 function credentialsPath(): string {
   return join(app.getPath("home"), ".unbiased", "credentials.json");
 }
@@ -4702,7 +4712,7 @@ app.whenReady().then(async () => {
 
   ipcMain.handle("auth:status", () => {
     const stored = readStoredKey();
-    return { hasKey: !!stored, source: stored?.source ?? null };
+    return { hasKey: !!stored, source: stored?.source ?? null, browserSignIn: !!OAUTH_CLIENT_ID };
   });
 
   // Validate a key (or the stored one) against the platform. Pure check —
@@ -4713,17 +4723,14 @@ app.whenReady().then(async () => {
     return whoamiValidate(k);
   });
 
-  // Sign in: validate, persist (unless the key comes from the environment),
-  // then (re)start the engine with it. Returns the whoami identity.
-  ipcMain.handle("auth:login", async (_e, payload: { key?: string }) => {
-    const fromEnv = process.env.UNBIASED_API_KEY?.trim();
-    const key = (payload?.key ?? fromEnv ?? readStoredKey()?.key ?? "").trim();
-    if (!key) return { ok: false, error: "No API key provided." };
+  // Validate, persist (unless the key comes from the environment), then
+  // (re)start the engine with it. Returns the whoami identity. The one path
+  // to a signed-in engine, whether the key was pasted or issued by the browser flow.
+  async function completeSignIn(key: string): Promise<WhoamiResult> {
     const who = await whoamiValidate(key);
     if (!who.ok) return who;
     // Only persist a user-entered key; an env key is the environment's to own.
-    const isEnvKey = key === fromEnv;
-    if (!isEnvKey) {
+    if (key !== process.env.UNBIASED_API_KEY?.trim()) {
       try {
         mkdirSync(join(app.getPath("home"), ".unbiased"), { recursive: true });
         writeFileSync(credentialsPath(), JSON.stringify({ apiKey: key }, null, 2), { mode: 0o600 });
@@ -4734,6 +4741,66 @@ app.whenReady().then(async () => {
     resetKnownSecrets();
     startEngine().catch((err) => pushStatus({ state: "exited", code: null, detail: String(err) }));
     return who;
+  }
+
+  ipcMain.handle("auth:login", async (_e, payload: { key?: string }) => {
+    const key = (payload?.key ?? process.env.UNBIASED_API_KEY?.trim() ?? readStoredKey()?.key ?? "").trim();
+    if (!key) return { ok: false, error: "No API key provided." };
+    return completeSignIn(key);
+  });
+
+  // ── Browser sign-in ─────────────────────────────────────────────────
+  // The platform's device authorization flow (src/main/device-auth.ts): ask
+  // for a code, open the person's own browser on the platform to confirm it,
+  // poll until the platform hands back a freshly minted key, then sign in
+  // with that key exactly as if it had been pasted. One flow at a time —
+  // starting another cancels the previous poll, so two loops never race to
+  // write credentials.
+  let deviceFlow: { controller: AbortController; result: Promise<WhoamiResult> } | null = null;
+
+  ipcMain.handle("auth:device-start", async () => {
+    if (!OAUTH_CLIENT_ID) return { ok: false, error: "Browser sign-in isn't available in this build." };
+    deviceFlow?.controller.abort();
+    const controller = new AbortController();
+    const started = await requestDeviceAuthorization({
+      baseUrl: PLATFORM_BASE,
+      clientId: OAUTH_CLIENT_ID,
+      // Display-only on the platform; it seeds the workload name when the
+      // person picks "new workload" there.
+      deviceName: hostname().replace(/\.local$/, ""),
+      signal: controller.signal,
+    });
+    if (!started.ok) return started;
+    const { grant } = started;
+    void shell.openExternal(grant.verificationUriComplete);
+    const result = pollDeviceToken({
+      baseUrl: PLATFORM_BASE,
+      clientId: OAUTH_CLIENT_ID,
+      grant,
+      signal: controller.signal,
+    }).then((token) => (token.ok ? completeSignIn(token.accessToken) : token));
+    deviceFlow = { controller, result };
+    return {
+      ok: true,
+      userCode: grant.userCode,
+      verificationUri: grant.verificationUri,
+      verificationUriComplete: grant.verificationUriComplete,
+      expiresIn: grant.expiresIn,
+    };
+  });
+
+  // Settles when the flow ends: signed in, declined, expired, or canceled.
+  ipcMain.handle("auth:device-wait", async () => {
+    const flow = deviceFlow;
+    if (!flow) return { ok: false, error: "No browser sign-in is in progress." };
+    const who = await flow.result;
+    if (deviceFlow === flow) deviceFlow = null;
+    return who;
+  });
+
+  ipcMain.handle("auth:device-cancel", () => {
+    deviceFlow?.controller.abort();
+    return { ok: true };
   });
 
   // Sign out: stop the engine and remove the stored credentials file. An

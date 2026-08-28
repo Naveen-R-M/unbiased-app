@@ -318,6 +318,12 @@ type WhoamiResult =
     }
   | { ok: false; error: string; code?: string; status?: number };
 
+/** What the browser sign-in shows while the platform waits for the person to
+ *  confirm the code there. */
+type DeviceStart =
+  | { ok: true; userCode: string; verificationUri: string; verificationUriComplete: string; expiresIn: number }
+  | { ok: false; error: string; code?: string };
+
 // An approval request replayed when a backgrounded conversation reopens
 // (same payload as the live chat:approval-request event, minus paneId).
 /** A user-added MCP server, as stored in ~/.unbiased/mcp-servers.json and read
@@ -460,10 +466,13 @@ declare global {
       onUpdateAvailable: (cb: (p: UpdateInfo) => void) => () => void;
       onUpdateProgress: (cb: (p: { phase: UpdatePhase; percent: number }) => void) => () => void;
       onUpdateError: (cb: (p: { message: string }) => void) => () => void;
-      authStatus: () => Promise<{ hasKey: boolean; source: "env" | "file" | null }>;
+      authStatus: () => Promise<{ hasKey: boolean; source: "env" | "file" | null; browserSignIn: boolean }>;
       authValidate: (key?: string) => Promise<WhoamiResult>;
       authLogin: (key?: string) => Promise<WhoamiResult>;
       authLogout: (removeKey?: boolean) => Promise<{ ok: boolean; envKeyRemains: boolean }>;
+      authDeviceStart: () => Promise<DeviceStart>;
+      authDeviceWait: () => Promise<WhoamiResult>;
+      authDeviceCancel: () => Promise<{ ok: boolean }>;
       sendMessage: (
         paneId: PaneId,
         text: string,
@@ -12310,12 +12319,15 @@ function AuthSplash() {
   );
 }
 
-/** The sign-in screen: paste a key, or continue with a found one. Validates
- *  against the platform's whoami (free, no model call) before letting the
- *  engine start. */
+/** The sign-in screen: sign in through the browser, paste a key, or continue
+ *  with a found one. Every path validates against the platform's whoami (free,
+ *  no model call) before letting the engine start. */
 function LoginView({ onSignedIn }: { onSignedIn: () => void }) {
-  const [phase, setPhase] = useState<"loading" | "found" | "manual">("loading");
+  const [phase, setPhase] = useState<"loading" | "found" | "manual" | "browser">("loading");
   const [source, setSource] = useState<"env" | "file" | null>(null);
+  // Offered only when this build carries a registered OAuth client id.
+  const [browserSignIn, setBrowserSignIn] = useState(false);
+  const [device, setDevice] = useState<Extract<DeviceStart, { ok: true }> | null>(null);
   const [foundIdentity, setFoundIdentity] = useState<WhoamiResult | null>(null);
   const [keyInput, setKeyInput] = useState("");
   const [busy, setBusy] = useState(false);
@@ -12330,6 +12342,7 @@ function LoginView({ onSignedIn }: { onSignedIn: () => void }) {
       const st = await window.unbiased.authStatus();
       if (!alive) return;
       setSource(st.source);
+      setBrowserSignIn(st.browserSignIn);
       if (st.hasKey) {
         const who = await window.unbiased.authValidate();
         if (!alive) return;
@@ -12358,6 +12371,12 @@ function LoginView({ onSignedIn }: { onSignedIn: () => void }) {
     setWarn(null);
     const who = await window.unbiased.authLogin(key);
     setBusy(false);
+    finishSignIn(who);
+  }
+
+  /** The shared tail of every sign-in path: refuse a non-granted org, warn
+   *  about a partial Pareto rollout, otherwise enter the app. */
+  function finishSignIn(who: WhoamiResult) {
     if (!who.ok) {
       setError(who.error);
       return;
@@ -12369,6 +12388,29 @@ function LoginView({ onSignedIn }: { onSignedIn: () => void }) {
     const w = rolloutWarning(who);
     if (w) setWarn(w); // shown briefly; we still proceed
     onSignedIn();
+  }
+
+  // The platform's device flow: main opens the browser on the platform, we
+  // show the code to confirm there, and main polls until a key is issued.
+  async function signInWithBrowser() {
+    setBusy(true);
+    setError(null);
+    setWarn(null);
+    const started = await window.unbiased.authDeviceStart();
+    if (!started.ok) {
+      setBusy(false);
+      setError(started.error);
+      return;
+    }
+    setDevice(started);
+    setPhase("browser");
+    const who = await window.unbiased.authDeviceWait();
+    setBusy(false);
+    setDevice(null);
+    setPhase("manual");
+    // Cancel is the person's own doing, not an error to report.
+    if (!who.ok && who.code === "canceled") return;
+    finishSignIn(who);
   }
 
   const cardStyle: React.CSSProperties = {
@@ -12411,7 +12453,7 @@ function LoginView({ onSignedIn }: { onSignedIn: () => void }) {
           <BrandMark size={38} />
           <div style={{ fontSize: 18, fontWeight: 600, marginTop: 14 }}>Sign in to Unbiased</div>
           <div style={{ fontSize: 13, color: colors.dim, marginTop: 4, textAlign: "center" }}>
-            Connect your Pareto API key to start.
+            {browserSignIn ? "Sign in with your browser, or paste an API key." : "Connect your Pareto API key to start."}
           </div>
         </div>
 
@@ -12465,13 +12507,38 @@ function LoginView({ onSignedIn }: { onSignedIn: () => void }) {
                 fontFamily: "inherit",
               }}
             >
-              Use a different key
+              {browserSignIn ? "Sign in a different way" : "Use a different key"}
             </button>
           </>
         )}
 
         {phase === "manual" && (
           <>
+            {browserSignIn && (
+              <>
+                <button
+                  disabled={busy}
+                  onClick={() => void signInWithBrowser()}
+                  style={{ ...primaryBtn(!busy), marginTop: 0 }}
+                >
+                  {busy ? "Opening your browser…" : "Sign in with your browser"}
+                </button>
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 10,
+                    margin: "18px 0 12px",
+                    color: colors.dim,
+                    fontSize: 12,
+                  }}
+                >
+                  <div style={{ flex: 1, height: 1, background: colors.border }} />
+                  or paste an API key
+                  <div style={{ flex: 1, height: 1, background: colors.border }} />
+                </div>
+              </>
+            )}
             <input
               type="password"
               value={keyInput}
@@ -12563,6 +12630,62 @@ function LoginView({ onSignedIn }: { onSignedIn: () => void }) {
                 </div>
               </div>
             )}
+          </>
+        )}
+
+        {phase === "browser" && device && (
+          <>
+            <div style={{ fontSize: 12.5, color: colors.dim, textAlign: "center", lineHeight: 1.5 }}>
+              We opened the Unbiased platform in your browser. Confirm this code there:
+            </div>
+            <div
+              style={{
+                margin: "14px 0",
+                padding: "14px 0",
+                textAlign: "center",
+                fontFamily: "var(--font-code)",
+                fontSize: 26,
+                fontWeight: 600,
+                letterSpacing: "0.12em",
+                border: `1px solid ${colors.border}`,
+                borderRadius: 12,
+                background: "var(--panel-2)",
+                userSelect: "text",
+              }}
+            >
+              {device.userCode}
+            </div>
+            <div style={{ fontSize: 12.5, color: colors.dim, textAlign: "center" }}>Waiting for your approval…</div>
+            <button
+              onClick={() => void window.unbiased.openExternal(device.verificationUriComplete)}
+              style={{
+                width: "100%",
+                background: "transparent",
+                border: "none",
+                color: colors.accent,
+                fontSize: 12.5,
+                cursor: "pointer",
+                marginTop: 14,
+                fontFamily: "inherit",
+              }}
+            >
+              Open the page again
+            </button>
+            <button
+              onClick={() => void window.unbiased.authDeviceCancel()}
+              style={{
+                width: "100%",
+                background: "transparent",
+                border: "none",
+                color: colors.dim,
+                fontSize: 12.5,
+                cursor: "pointer",
+                marginTop: 6,
+                fontFamily: "inherit",
+              }}
+            >
+              Cancel
+            </button>
           </>
         )}
 
