@@ -2545,8 +2545,9 @@ const PLATFORM_BASE = (process.env.UNBIASED_PLATFORM_URL?.trim() || "https://pla
 // The app's OAuth public client id, registered on the platform (unbiased-
 // platform docs/admin-api.md → Partners). Public by design — it ships in the
 // binary; the person's approval in their browser is what carries the trust.
+// Registered 2026-08-28 as partner "Unbiased" → client "Unbiased Desktop".
 // Empty disables browser sign-in and the login screen offers only paste-a-key.
-const OAUTH_CLIENT_ID = process.env.UNBIASED_OAUTH_CLIENT_ID?.trim() || "";
+const OAUTH_CLIENT_ID = process.env.UNBIASED_OAUTH_CLIENT_ID?.trim() || "dhTH_VbRdB88tgW-m1HWiw";
 function credentialsPath(): string {
   return join(app.getPath("home"), ".unbiased", "credentials.json");
 }
