@@ -84,6 +84,8 @@ contextBridge.exposeInMainWorld("unbiased", {
   scheduledDelete: (key: string) => ipcRenderer.invoke("scheduled:delete", key),
   scheduledRunNow: (key: string) => ipcRenderer.invoke("scheduled:run-now", key),
   scheduledStop: (key: string) => ipcRenderer.invoke("scheduled:stop", key),
+  scheduledTune: (p: { prompt: string; note: string; images: string[] }) =>
+    ipcRenderer.invoke("scheduled:tune", p),
   scheduledLastRun: (key: string) => ipcRenderer.invoke("scheduled:last-run", key),
   onScheduledUpdated: (cb: (p: unknown) => void) => subscribe("scheduled:updated", cb),
   onScheduledRunState: (cb: (p: unknown) => void) => subscribe("scheduled:run-state", cb),

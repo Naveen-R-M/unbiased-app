@@ -533,6 +533,11 @@ declare global {
         key: string,
       ) => Promise<{ ok: boolean; error?: string | null; status?: string; text?: string }>;
       scheduledStop: (key: string) => Promise<{ ok: boolean; error?: string }>;
+      scheduledTune: (p: {
+        prompt: string;
+        note: string;
+        images: string[];
+      }) => Promise<{ ok: boolean; proposal?: string; error?: string }>;
       scheduledLastRun: (key: string) => Promise<{
         threadId: string | null;
         status?: string | null;
@@ -666,7 +671,9 @@ declare global {
       agentMirrorResize: (p: { width: number; height: number; dpr: number }) => Promise<{ ok: boolean }>;
       agentMirrorInput: (ev: Record<string, unknown>) => Promise<{ ok: boolean }>;
       onAgentMirrorFrame: (cb: (p: { src: string; width: number; height: number }) => void) => () => void;
-      onAgentMirrorState: (cb: (p: { connected: boolean; url?: string; title?: string }) => void) => () => void;
+      onAgentMirrorState: (
+        cb: (p: { connected: boolean; url?: string; title?: string; reason?: string }) => void,
+      ) => () => void;
       onAgentMirrorActivity: (cb: (p: { tool: string }) => void) => () => void;
       changelogReleases: () => Promise<{ releases: ChangelogRelease[] }>;
       updatePrefs: () => Promise<{ autoDownload: boolean; version: string; lastCheckedAt: number | null }>;
@@ -999,11 +1006,19 @@ export function App() {
   useEffect(() => {
     document.documentElement.style.setProperty("--accent", theme.accent);
   }, [theme.accent]);
+  useEffect(() => {
+    // The body is outside the themed wrapper, so it keeps index.html's static
+    // dark unless told the live surface colour. Only visible if some layout
+    // escapes the root — at which point dark beats white.
+    document.body.style.background = theme.surface;
+  }, [theme.surface]);
   const [showSettings, setShowSettings] = useState(false);
   const [showChangelog, setShowChangelog] = useState(false);
   const [mcpOpen, setMcpOpen] = useState(false);
   const [skillsOpen, setSkillsOpen] = useState(false);
   const [scheduledOpen, setScheduledOpen] = useState(false);
+  /** The thread of a scheduled run that is going right now, if any. */
+  const [runningScheduledThread, setRunningScheduledThread] = useState<string | null>(null);
   /** True while a full-page destination covers the chat. Sidebar rows key off
    *  this rather than testing the flag directly, so adding a second such view
    *  does not mean remembering to exclude it in three separate `active`
@@ -1021,7 +1036,15 @@ export function App() {
     // Main marks missed tasks during catch-up, which happens when the engine
     // connects — after this component first mounts — so a one-shot read here
     // would always report zero on a cold launch.
-    return window.unbiased.onScheduledUpdated((p) => count(p.tasks ?? []));
+    return window.unbiased.onScheduledUpdated((p) => {
+      const tasks = p.tasks ?? [];
+      count(tasks);
+      // The Scheduled page is not a conversation, so it has no thread of its
+      // own to point the mirror at — which left the pane blank while a run was
+      // visibly browsing, and made "Open run" look like it STARTED the
+      // browser when it only re-pointed the view.
+      setRunningScheduledThread(tasks.find((t) => t.runningThreadId)?.runningThreadId ?? null);
+    });
   }, []);
   // Unread until the user has opened the log at its current top version.
   // The releases repo wins when we have it; the bundled copy covers offline
@@ -1532,6 +1555,8 @@ export function App() {
     entries: Entry[];
     nonce: number;
     resume?: { running: boolean; approvals: HeldApproval[] } | null;
+    runningTurnStart?: number | null;
+    runningTurnStartedAt?: number | null;
   }>({ entries: [], nonce: 0 });
   // sideOpen = the whole right panel is visible; sideChatEnabled = the chat
   // tab exists in it. Kept separate so opening a file/image preview doesn't
@@ -1882,11 +1907,52 @@ export function App() {
     // without losing anything.
     const cached = await window.unbiased.loadTranscript(id);
     if (stale()) return;
-    const cachedRichness = (cached.entries ?? []).reduce(
-      (n, e) => n + (e.kind === "work" ? Math.max(e.entries.length, 1) : 1),
-      0,
-    );
-    let entries = cached.entries && cachedRichness >= history.length ? cached.entries : history;
+    // Repair stale fold structure in the cache without discarding it. A pane
+    // opened mid-turn used to fold only what streamed after the open, so its
+    // saved transcript strands that turn's earlier narration between the user
+    // message and the work group. Those assistants can only be narration —
+    // a final answer always lands AFTER its turn's work group, and a
+    // narrate-only turn creates no group at all — so any unbroken run of
+    // assistant entries wedged between a user message and a work group moves
+    // inside the group. Content is untouched; only the grouping changes, and
+    // the next save persists the repaired shape.
+    if (cached.entries) {
+      const fixed: Entry[] = [];
+      let pendingSinceUser: Entry[] | null = null;
+      for (const e of cached.entries) {
+        if (e.kind === "user") {
+          if (pendingSinceUser) fixed.push(...pendingSinceUser);
+          pendingSinceUser = [];
+          fixed.push(e);
+        } else if (e.kind === "assistant" && pendingSinceUser) {
+          pendingSinceUser.push(e);
+        } else if (e.kind === "work" && pendingSinceUser && pendingSinceUser.length > 0) {
+          fixed.push({ ...e, entries: [...pendingSinceUser, ...e.entries] });
+          pendingSinceUser = null;
+        } else {
+          if (pendingSinceUser) fixed.push(...pendingSinceUser);
+          pendingSinceUser = null;
+          fixed.push(e);
+        }
+      }
+      if (pendingSinceUser) fixed.push(...pendingSinceUser);
+      cached.entries = fixed;
+    }
+    // Both sides counted the same way — a fold as its CONTENTS — or the
+    // comparison is rigged. History now arrives pre-folded (replay groups a
+    // turn's narration under "Worked" the way live completion does), so its
+    // raw length shrank; measured against that, every stale flat cache
+    // suddenly looked "richer" and won, pinning the exact stranded layout the
+    // fold was built to fix.
+    const richness = (list: Entry[] | null | undefined) =>
+      (list ?? []).reduce((n, e) => n + (e.kind === "work" ? Math.max(e.entries.length, 1) : 1), 0);
+    const cachedRichness = richness(cached.entries);
+    const historyRichness = richness(history as Entry[]);
+    // Strictly greater: at equal information, prefer the replay — it carries
+    // the corrected fold structure, and the cache may predate it. The cache
+    // still wins whenever it genuinely holds more (failure rows, annotation
+    // cards — renderer-only content history cannot reconstruct).
+    let entries = cached.entries && cachedRichness > historyRichness ? cached.entries : history;
     if (res.running && res.streamText) {
       // The reply is still streaming. Main accumulated the full partial
       // text; a shorter prefix of it may already sit in the cached
@@ -3994,7 +4060,10 @@ export function App() {
                   its own browser tab, so the mirror has to be told which one
                   to watch — otherwise it picks by URL and can show a different
                   chat browsing. */}
-              <AgentMirrorPane active={panelMode === "agentmirror"} threadId={activeThreadId} />
+              <AgentMirrorPane
+                active={panelMode === "agentmirror"}
+                threadId={scheduledOpen ? (runningScheduledThread ?? activeThreadId) : activeThreadId}
+              />
             </div>
           )}
           {browserTabs.map((id) => (
@@ -4037,13 +4106,66 @@ export function App() {
             onOpenSkills={() => setSkillsOpen(true)}
             emptyState={
               <div style={{ textAlign: "center", padding: "0 24px" }}>
-                <div style={{ color: colors.dim, display: "flex", justifyContent: "center", marginBottom: 10 }}>
-                  <ChatPlusIcon size={34} strokeWidth={1.5} />
+                {/* The mark sits in a soft well rather than floating — the
+                    same move the connector cards make with their logos. A
+                    bare 34px glyph in the middle of an empty pane read as
+                    leftover chrome, not as a deliberate empty state. */}
+                <div
+                  style={{
+                    width: 56,
+                    height: 56,
+                    margin: "0 auto 14px",
+                    borderRadius: "50%",
+                    background: "var(--panel-2)",
+                    display: "grid",
+                    placeItems: "center",
+                    color: "var(--fg-soft)",
+                  }}
+                >
+                  <ChatPlusIcon size={24} strokeWidth={1.5} />
                 </div>
-                <p style={{ fontSize: 16, fontWeight: 500, margin: 0 }}>Side chat</p>
-                <p style={{ color: colors.dim, marginTop: 6, fontSize: 13 }}>
-                  Shares this conversation’s context. Temporary — it resets when
-                  you switch conversations and disappears when you close the app.
+                <p
+                  style={{
+                    fontSize: 15.5,
+                    fontWeight: 600,
+                    letterSpacing: "var(--track-body)",
+                    color: colors.fg,
+                    margin: 0,
+                  }}
+                >
+                  Side chat
+                </p>
+                {/* Capped measure: uncapped, this sentence ran the full pane
+                    width as one ~100-character line — the one readability
+                    cost the app's own --measure token exists to prevent. Two
+                    sentences, two lines: what it IS, then how long it lives,
+                    with the lifetime quieter because it is the caveat, not
+                    the point. */}
+                <p
+                  style={{
+                    color: colors.dim,
+                    margin: "8px auto 0",
+                    fontSize: 13.5,
+                    lineHeight: 1.55,
+                    letterSpacing: "var(--track-body)",
+                    maxWidth: "38ch",
+                  }}
+                >
+                  Shares this conversation’s context.
+                </p>
+                <p
+                  style={{
+                    color: colors.dim,
+                    opacity: 0.75,
+                    margin: "4px auto 0",
+                    fontSize: 12.5,
+                    lineHeight: 1.55,
+                    letterSpacing: "var(--track-meta)",
+                    maxWidth: "38ch",
+                  }}
+                >
+                  Temporary — it resets when you switch conversations and
+                  disappears when you close the app.
                 </p>
               </div>
             }
@@ -6469,7 +6591,9 @@ function AgentMirrorPane({ active, threadId }: { active: boolean; threadId: stri
   const [frame, setFrame] = useState<{ src: string; width: number; height: number } | null>(null);
   const frameRef = useRef(frame);
   frameRef.current = frame;
-  const [status, setStatus] = useState<{ connected: boolean; url?: string }>({ connected: false });
+  const [status, setStatus] = useState<{ connected: boolean; url?: string; reason?: string }>({
+    connected: false,
+  });
   const lastMoveRef = useRef(0);
 
   // Start when this tab is shown, stop when hidden — no point streaming JPEGs
@@ -6517,7 +6641,9 @@ function AgentMirrorPane({ active, threadId }: { active: boolean; threadId: stri
   useEffect(() => {
     const offs = [
       window.unbiased.onAgentMirrorFrame((p) => setFrame(p)),
-      window.unbiased.onAgentMirrorState((p) => setStatus({ connected: p.connected, url: p.url })),
+      window.unbiased.onAgentMirrorState((p) =>
+        setStatus({ connected: p.connected, url: p.url, reason: p.reason }),
+      ),
     ];
     return () => offs.forEach((off) => off());
   }, []);
@@ -6601,7 +6727,11 @@ function AgentMirrorPane({ active, threadId }: { active: boolean; threadId: stri
           <img ref={imgRef} src={frame.src} draggable={false} style={{ width: "100%", height: "100%", objectFit: "contain", userSelect: "none" }} alt="" />
         ) : (
           <span style={{ color: colors.dim, fontSize: 13 }}>
-            {status.connected ? "Waiting for the first frame…" : "The agent browser is not open."}
+            {status.connected
+              ? "Waiting for the first frame…"
+              : status.reason === "no-tab"
+                ? "This conversation has not used the browser yet."
+                : "The agent browser is not open."}
           </span>
         )}
       </div>
@@ -7368,6 +7498,8 @@ function ChatPane({
     nonce: number;
     // Present when the conversation was reopened mid-turn.
     resume?: { running: boolean; approvals: HeldApproval[] } | null;
+    runningTurnStart?: number | null;
+    runningTurnStartedAt?: number | null;
   };
   contextChip?: string | { text: string; comment?: string; tag?: string; thumb?: string } | null;
   onContextClear?: () => void;
@@ -7767,8 +7899,14 @@ function ChatPane({
     // A reopened conversation may still be mid-turn: restore its busy
     // state and any approval requests the agent is blocked on.
     setBusy(!!reset.resume?.running);
-    turnStartIndexRef.current = reset.resume?.running ? reset.entries.length : null;
-    turnStartedAtRef.current = null;
+    // A conversation opened mid-turn: the fold at completion must reach back
+    // over the REPLAYED half of the running turn, not just what streams after
+    // this moment — otherwise its narration-so-far is stranded above the fold
+    // forever. Main reports where that turn's output starts in the replay.
+    turnStartIndexRef.current = reset.resume?.running
+      ? (reset.runningTurnStart ?? reset.entries.length)
+      : null;
+    turnStartedAtRef.current = reset.resume?.running ? (reset.runningTurnStartedAt ?? null) : null;
     for (const held of reset.resume?.approvals ?? []) applyApproval(held);
     // A restored step can only still be running if the thread is. Statuses are
     // persisted in the transcript, so a command that died as inProgress when
@@ -10222,6 +10360,14 @@ function ScheduledView({
   const [fInterval, setFInterval] = useState(3);
   const [fProject, setFProject] = useState<string | null>(defaultProject);
   const [formError, setFormError] = useState<string | null>(null);
+  // "Edit with Pareto": screenshots in, a rewritten prompt out — shown beside
+  // the current one, never applied without an explicit Accept.
+  const [tuneOpen, setTuneOpen] = useState(false);
+  const [tuneImages, setTuneImages] = useState<Attachment[]>([]);
+  const [tuneNote, setTuneNote] = useState("");
+  const [tuning, setTuning] = useState(false);
+  const [tuneProposal, setTuneProposal] = useState<string | null>(null);
+  const [tuneError, setTuneError] = useState<string | null>(null);
 
   const refresh = useCallback(() => {
     void window.unbiased.scheduledList().then((r) => {
@@ -10275,6 +10421,13 @@ function ScheduledView({
   function closeForm() {
     setEditing(null);
     setFormError(null);
+    // The tuning panel belongs to the form it was opened in — leaving it
+    // armed would show one task's screenshots on the next task's form.
+    setTuneOpen(false);
+    setTuneImages([]);
+    setTuneNote("");
+    setTuneProposal(null);
+    setTuneError(null);
   }
 
   function openNew(template?: (typeof TASK_TEMPLATES)[number]) {
@@ -10367,7 +10520,12 @@ function ScheduledView({
   const primaryButton = btnPrimaryStyle;
 
   return (
-    <div style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0 }}>
+    // minHeight: 0 is load-bearing. Without it this flex item's min-height is
+    // "auto" — its content size — so any page taller than the window grew the
+    // whole view past the 100vh root instead of letting the scroll container
+    // inside it scroll, and everything below the fold painted on the bare
+    // white body. Measured live: a 950px window, this div at 1084px.
+    <div style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0, minHeight: 0 }}>
       {/* The same chrome a conversation gets — sidebar toggle, then the title
           — so this reads as another place in the app rather than a mode you
           have been dropped into. No back button: the nav is right there, and
@@ -10504,6 +10662,220 @@ function ScheduledView({
                 placeholder="Summarise what changed in this project since yesterday…"
                 style={{ ...inputStyle, resize: "vertical", lineHeight: 1.5 }}
               />
+              {/* Screenshot-grounded prompt tuning. Born from a measured
+                  failure: a run flailed for ten minutes because its prompt
+                  described intent ("set the status") with no idea what the
+                  screen looks like. Screenshots become exact labels and a
+                  give-up rule. */}
+              {!tuneOpen && (
+                <button
+                  className="u-chip"
+                  onClick={() => {
+                    setTuneOpen(true);
+                    setTuneError(null);
+                  }}
+                  disabled={!fPrompt.trim()}
+                  style={{ ...btnSmallStyle, marginTop: 8, opacity: fPrompt.trim() ? 1 : 0.45 }}
+                  title={fPrompt.trim() ? "Refine these instructions with screenshots" : "Write a draft first"}
+                >
+                  Edit with Pareto
+                </button>
+              )}
+              {tuneOpen && tuneProposal === null && (
+                <div
+                  onDragOver={(e) => e.preventDefault()}
+                  onDrop={(e) => {
+                    e.preventDefault();
+                    const paths = Array.from(e.dataTransfer.files)
+                      .map((f) => window.unbiased.pathForDroppedFile(f))
+                      .filter(Boolean);
+                    if (!paths.length) return;
+                    void window.unbiased.attachPaths(paths).then((res) => {
+                      const imgs = (res.attachments ?? []).filter((a) => a.kind === "image");
+                      setTuneImages((list) => {
+                        const seen = new Set(list.map((a) => a.path));
+                        return [...list, ...imgs.filter((a) => !seen.has(a.path))].slice(0, 4);
+                      });
+                    });
+                  }}
+                  onPaste={(e) => {
+                    if (!e.clipboardData?.types.includes("Files")) return;
+                    e.preventDefault();
+                    void window.unbiased.clipboardImage().then(({ attachment }) => {
+                      if (attachment) setTuneImages((list) => [...list, attachment].slice(0, 4));
+                    });
+                  }}
+                  style={{
+                    marginTop: 10,
+                    background: "var(--panel-2)",
+                    borderRadius: 12,
+                    padding: 14,
+                  }}
+                >
+                  <div style={{ color: colors.fg, fontSize: 13.5, fontWeight: 500 }}>Refine with Pareto</div>
+                  <div style={{ color: colors.dim, fontSize: 12.5, lineHeight: 1.5, marginTop: 4 }}>
+                    Drop or paste screenshots of the exact screens this task works in — Pareto
+                    rewrites the instructions around what is actually there, and adds a rule to
+                    stop instead of flailing. You review the result before anything changes.
+                  </div>
+                  {tuneImages.length > 0 && (
+                    <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
+                      {tuneImages.map((a) => (
+                        <span
+                          key={a.path}
+                          style={{ position: "relative", width: 64, height: 44, borderRadius: 8, overflow: "hidden", background: "var(--chip)" }}
+                        >
+                          {a.thumb && <img src={a.thumb} alt={a.name} style={{ width: "100%", height: "100%", objectFit: "cover" }} />}
+                          <button
+                            aria-label={`Remove ${a.name}`}
+                            onClick={() => setTuneImages((l) => l.filter((x) => x.path !== a.path))}
+                            style={{
+                              position: "absolute",
+                              top: 2,
+                              right: 2,
+                              width: 16,
+                              height: 16,
+                              borderRadius: 8,
+                              border: "none",
+                              background: "rgba(0,0,0,0.6)",
+                              color: "#fff",
+                              fontSize: 10,
+                              lineHeight: "16px",
+                              padding: 0,
+                              cursor: "pointer",
+                            }}
+                          >
+                            ×
+                          </button>
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                  <input
+                    className="u-field"
+                    value={tuneNote}
+                    onChange={(e) => setTuneNote(e.target.value)}
+                    placeholder="Anything Pareto should know — e.g. the status dialog is behind the avatar menu"
+                    style={{ ...inputStyle, marginTop: 10 }}
+                  />
+                  {tuneError && (
+                    <div style={{ color: colors.err, fontSize: 12.5, lineHeight: 1.5, marginTop: 8 }}>{tuneError}</div>
+                  )}
+                  <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
+                    <button
+                      className="u-chip"
+                      disabled={tuning || (tuneImages.length === 0 && !tuneNote.trim())}
+                      onClick={() => {
+                        setTuning(true);
+                        setTuneError(null);
+                        void window.unbiased
+                          .scheduledTune({ prompt: fPrompt, note: tuneNote.trim(), images: tuneImages.map((a) => a.path) })
+                          .then((r) => {
+                            setTuning(false);
+                            if (r.ok && r.proposal) setTuneProposal(r.proposal);
+                            else setTuneError(r.error ?? "The rewrite failed.");
+                          });
+                      }}
+                      style={btnSmallStyle}
+                    >
+                      {tuning ? "Rewriting…" : "Propose rewrite"}
+                    </button>
+                    <button
+                      className="u-chip"
+                      disabled={tuning}
+                      onClick={() => {
+                        setTuneOpen(false);
+                        setTuneImages([]);
+                        setTuneNote("");
+                        setTuneError(null);
+                      }}
+                      style={btnSmallStyle}
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              )}
+              {tuneProposal !== null && (
+                <div style={{ marginTop: 10 }}>
+                  {/* Old and new side by side, because Accept rewrites a prompt
+                      the user tuned by hand — they should see exactly what
+                      they are trading before it happens. */}
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                    {(
+                      [
+                        ["Current", fPrompt],
+                        ["Proposed", tuneProposal],
+                      ] as const
+                    ).map(([label, text]) => (
+                      <div key={label} style={{ minWidth: 0 }}>
+                        <div
+                          style={{
+                            color: label === "Proposed" ? colors.accent : colors.dim,
+                            fontSize: 11,
+                            fontWeight: 600,
+                            textTransform: "uppercase",
+                            letterSpacing: "var(--track-overline)",
+                            marginBottom: 6,
+                          }}
+                        >
+                          {label}
+                        </div>
+                        <div
+                          style={{
+                            background: "var(--panel-2)",
+                            borderRadius: 12,
+                            padding: 12,
+                            fontSize: 12.5,
+                            lineHeight: 1.55,
+                            color: label === "Proposed" ? colors.fg : colors.dim,
+                            whiteSpace: "pre-wrap",
+                            maxHeight: 320,
+                            overflowY: "auto",
+                            wordBreak: "break-word",
+                          }}
+                        >
+                          {text}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                  <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+                    <button
+                      className="u-chip"
+                      onClick={() => {
+                        setFPrompt(tuneProposal);
+                        setTuneProposal(null);
+                        setTuneOpen(false);
+                        setTuneImages([]);
+                        setTuneNote("");
+                      }}
+                      style={{ ...btnSmallStyle, color: colors.accent }}
+                    >
+                      Use proposed
+                    </button>
+                    <button
+                      className="u-chip"
+                      onClick={() => setTuneProposal(null)}
+                      style={btnSmallStyle}
+                    >
+                      Back
+                    </button>
+                    <button
+                      className="u-chip"
+                      onClick={() => {
+                        setTuneProposal(null);
+                        setTuneOpen(false);
+                        setTuneImages([]);
+                        setTuneNote("");
+                      }}
+                      style={btnSmallStyle}
+                    >
+                      Discard
+                    </button>
+                  </div>
+                </div>
+              )}
 
               <label style={{ ...labelStyle, marginTop: 14 }} htmlFor="st-type">Repeat</label>
               <FieldSelect

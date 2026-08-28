@@ -355,6 +355,17 @@ async function ensureBrowserSession(): Promise<string | null> {
  */
 const browserTabs = new Map<string, { label: string; targetId: string | null }>();
 
+// Whose tab is currently ACTIVE in the CLI session. Selection is skipped when
+// it would be a no-op, and that is not an optimisation: `tab <label>` — even
+// re-selecting the tab that is already active — invalidates every ref the
+// last snapshot handed out. Measured: snapshot → tab <same> → click @ref
+// fails "Unknown ref"; snapshot → click works. Selecting before every call
+// therefore broke every snapshot-then-act sequence, which is the normal
+// shape of browser work. Only our own selections change the active tab (the
+// agent has no tab tools and the mirror binds by target id), so this tracker
+// cannot go stale.
+let browserActiveRoot: string | null = null;
+
 /** A tab label is passed to the CLI as a ref, so it has to be a bare token.
  *  Hashed rather than truncated: thread ids share long prefixes, and two
  *  conversations colliding on a label would silently share a tab — the exact
@@ -403,18 +414,28 @@ async function browserTabTargetId(label: string): Promise<string | null> {
 async function selectConversationTab(rootId: string): Promise<string | null> {
   const label = browserTabLabel(rootId);
   let entry = browserTabs.get(rootId);
+  // Same conversation as the last browser call: the tab is already active,
+  // and re-selecting it would throw away the refs its latest snapshot issued.
+  // "Active" here includes a popup the page itself opened — the CLI follows
+  // those (measured), and the conversation's work moves with it.
+  if (entry && browserActiveRoot === rootId) return null;
   if (!entry) {
     const made = await runAgentBrowser(["tab", "new", "--label", label, "about:blank"], 30_000);
     if (!made.ok) return `Could not open a browser tab for this conversation: ${made.out}`;
     entry = { label, targetId: null };
     browserTabs.set(rootId, entry);
   }
-  // Selected explicitly and unconditionally, including right after creating
-  // it. `tab new` almost certainly activates what it opened, but "almost
-  // certainly" is not good enough here: if it ever does not, the command that
-  // follows lands on another conversation's page, which is the whole class of
-  // bug this exists to prevent.
-  const sel = await runAgentBrowser(["tab", label]);
+  // Selected explicitly, including right after creating it. `tab new` almost
+  // certainly activates what it opened, but "almost certainly" is not good
+  // enough here: if it ever does not, the command that follows lands on
+  // another conversation's page, which is the whole class of bug this exists
+  // to prevent.
+  // Select by CDP target id when one is known, falling back to the label.
+  // The label marks the tab this conversation STARTED in; the target id
+  // tracks where its work actually lives now — a click that opened the
+  // workspace in a popup moves the work there, and re-selecting the labelled
+  // tab would strand the agent back on the page it already left.
+  const sel = await runAgentBrowser(["tab", entry.targetId ?? label]);
   if (!sel.ok || /tab_gone|not found/i.test(sel.out)) {
     // Closed underneath us — by the user, or by a crash. Make a fresh one
     // rather than let the CLI fall back to whatever tab is active.
@@ -424,6 +445,7 @@ async function selectConversationTab(rootId: string): Promise<string | null> {
     const again = await runAgentBrowser(["tab", label]);
     if (!again.ok) return `Could not select this conversation's browser tab: ${again.out}`;
   }
+  browserActiveRoot = rootId;
   if (!entry.targetId) entry.targetId = await browserTabTargetId(label);
   return null;
 }
@@ -596,7 +618,14 @@ async function mirrorStart(maxWidth: number, maxHeight: number): Promise<{ ok: b
     if (!res.ok) return { ok: false, error: `CDP list failed (${res.status})` };
     const targets = (await res.json()) as CdpTarget[];
     const page = pickMirrorTarget(targets);
-    if (!page) return { ok: false, error: "no page tab to mirror" };
+    if (!page) {
+      // Two different situations, and telling the user "the browser is not
+      // open" for the second one is simply false — the browser is open, this
+      // conversation just has no tab in it yet.
+      const hasPages = targets.some((t) => t.type === "page");
+      send("agentmirror:state", { connected: false, reason: hasPages ? "no-tab" : "no-browser" });
+      return { ok: false, error: hasPages ? "this conversation has no browser tab yet" : "no page tab to mirror" };
+    }
     mirrorTargetId = page.id ?? null;
 
     const ws = new WebSocket(page.webSocketDebuggerUrl!);
@@ -1372,7 +1401,28 @@ async function handleAgentBrowserCall(
       // conversation the user is looking at; a call from a background chat
       // must not drag the view onto its page.
     }
-    return runBrowserTool();
+    const result = await runBrowserTool();
+    // A click can open the real destination in a NEW tab — Slack's workspace
+    // "Launch" does — and the CLI follows it. Adopt that tab as the
+    // conversation's, or the registry (and with it the mirror, and any later
+    // re-select) stays pointed at the page the agent already left: the pane
+    // showed the workspace picker while the agent worked elsewhere.
+    if (tabScoped && (tool === "browser_click" || tool === "browser_press")) {
+      const entry = browserTabs.get(root);
+      if (entry) {
+        const r = await runAgentBrowser(["tab", "list", "--json"], 15_000);
+        try {
+          const parsed = JSON.parse(r.out) as { data?: { tabs?: { active?: boolean; targetId?: string }[] } };
+          const active = (parsed.data?.tabs ?? []).find((t) => t.active);
+          if (typeof active?.targetId === "string" && active.targetId !== entry.targetId) {
+            entry.targetId = active.targetId;
+          }
+        } catch {
+          /* adoption is best-effort; the click's own result already returned */
+        }
+      }
+    }
+    return result;
   });
 
   async function runBrowserTool(): Promise<DynamicToolResponse> {
@@ -1566,6 +1616,7 @@ async function handleAgentBrowserCall(
       // recovery path would then quietly create a tab in a browser we just
       // told the user we had closed.
       browserTabs.clear();
+      browserActiveRoot = null;
       return text(r.out || "closed", r.ok);
     }
     case "browser_screenshot": {
@@ -1689,6 +1740,7 @@ function resetSubAgentState(): void {
   browserAttachedExternal = false;
   browserSessionBound = false;
   browserTabs.clear();
+  browserActiveRoot = null;
 }
 
 /** Strip the engine's inter-agent envelope ("Message Type: …\nTask name: …\n
@@ -2151,7 +2203,7 @@ type WireThread = {
   /** Free-form classification the client set at thread/start, handed back
    *  unchanged. Used to keep scheduled runs out of the sidebar. */
   threadSource?: string | null;
-  turns?: { items?: WireItem[]; startedAt?: number }[];
+  turns?: { items?: WireItem[]; startedAt?: number; durationMs?: number }[];
 };
 
 // Projects the user has explicitly opened. Persisted so a project appears
@@ -2254,19 +2306,96 @@ function contentToText(content: unknown): string {
 }
 
 /** Flatten a resumed thread's turns into the renderer's entry list. */
-function threadToEntries(thread: WireThread): unknown[] {
+function threadToEntries(
+  thread: WireThread,
+  opts?: { runningLastTurn?: boolean },
+): { entries: unknown[]; runningTurnStart: number | null; runningTurnStartedAt: number | null } {
   const entries: unknown[] = [];
-  for (const turn of thread.turns ?? []) {
+  const turns = thread.turns ?? [];
+  // Where the in-flight turn's foldable output begins, and when the turn
+  // started. Without these, opening a conversation mid-turn stranded the
+  // replayed half of that turn outside the fold forever: the live fold at
+  // completion only reaches back to the moment the pane opened, so narration
+  // replayed from history sat bare above a "Worked" group covering just the
+  // tail — the exact split seen on a scheduled run opened via "Open run".
+  let runningTurnStart: number | null = null;
+  let runningTurnStartedAt: number | null = null;
+  for (let t = 0; t < turns.length; t++) {
+    const turn = turns[t];
+    // Per-turn bucket, folded when the turn (or a mid-turn user message)
+    // flushes it. The live path folds a completed turn's intermediate output
+    // under a "Worked" header at turn/completed — but a REOPENED conversation
+    // is rebuilt here, and this function used to replay everything flat, so
+    // the folds evaporated on reopen: every line of narration stood bare in
+    // the transcript with only the consecutive-command groups surviving
+    // (those fold at render time). Mirrors the live semantics exactly: the
+    // fold starts after the user message and the trailing assistant message
+    // stays outside. Duration is not in the wire history, so the header reads
+    // "Worked" rather than "Worked for Ns".
+    const bucket: unknown[] = [];
+    const durationS = typeof turn.durationMs === "number" ? turn.durationMs / 1000 : null;
+    const flush = (keepFinalOut: boolean): void => {
+      if (bucket.length === 0) return;
+      const last = bucket[bucket.length - 1] as { kind?: string; phase?: string | null } | undefined;
+      // The trailing assistant message always stays outside, even when its
+      // phase is commentary — live folding does the same, and a turn that
+      // narrated and stopped should still show SOMETHING rather than fold
+      // itself away entirely.
+      const finalMsg = keepFinalOut && last?.kind === "assistant" ? bucket.pop() : null;
+      // Fold when the bucket holds interim output: tool work where history
+      // kept any, or commentary-phase narration where it did not. A turn of
+      // plain messages with no phase info (older engines) stays flat — better
+      // a loose transcript than answers hidden behind a fold.
+      const didWork = bucket.some((e) => {
+        const x = e as { kind?: string; phase?: string | null };
+        return x.kind === "command" || x.kind === "agent" || (x.kind === "assistant" && x.phase === "commentary");
+      });
+      // The duration is the whole TURN's, so only the turn-closing flush may
+      // claim it — a steered turn flushes once per user interjection, and
+      // stamping each fragment with the full figure would show one turn's
+      // time twice.
+      if (didWork) entries.push({ kind: "work", duration: keepFinalOut ? durationS : null, entries: [...bucket] });
+      else entries.push(...bucket);
+      if (finalMsg) entries.push(finalMsg);
+      bucket.length = 0;
+    };
+    // A turn still running when the conversation reopens stays raw: its
+    // entries are still growing, and the live fold takes over at completion.
+    const foldThisTurn = !(opts?.runningLastTurn && t === turns.length - 1);
+    if (!foldThisTurn) {
+      runningTurnStart = entries.length;
+      const at = turn.startedAt;
+      // Epoch guard: below ~2001-09 in milliseconds means it is not an epoch-
+      // ms value — rather a seconds epoch or something else. A wrong unit here
+      // shows a 50-year duration on the fold, so unknown beats guessed.
+      runningTurnStartedAt = typeof at === "number" && at > 1e12 ? at : null;
+    }
     for (const item of turn.items ?? []) {
       switch (item.type) {
         case "userMessage":
+          // A user message (initial, or a mid-turn steer) never hides inside
+          // a fold — flush what came before it, folded, then show it.
+          flush(false);
           entries.push({ kind: "user", text: item.text ?? contentToText(item.content) });
+          // The running turn's fold starts after its user message, matching
+          // where the live path plants its start index on send.
+          if (!foldThisTurn) runningTurnStart = entries.length;
           break;
-        case "agentMessage":
-          entries.push({ kind: "assistant", text: item.text ?? "" });
+        case "agentMessage": {
+          // `phase` is the engine's own record of which messages were interim
+          // narration ("commentary") and which was the answer
+          // ("final_answer"). It is the ONLY signal that survives into
+          // history: thread/read returns no tool items at all — measured, a
+          // turn with 40+ tool calls replays as 1 user + 15 agent messages —
+          // so any fold keyed on "did work happen" sees nothing to fold and
+          // replays narration flat. That is exactly the reopened-transcript
+          // bug this fixes.
+          const m = item as { text?: string; phase?: string | null };
+          bucket.push({ kind: "assistant", text: m.text ?? "", phase: m.phase ?? null });
           break;
+        }
         case "commandExecution":
-          entries.push({
+          bucket.push({
             kind: "command",
             itemId: item.id ?? "unknown",
             command: item.command ?? "(command)",
@@ -2279,7 +2408,7 @@ function threadToEntries(thread: WireThread): unknown[] {
           const d = item as { id?: string; tool?: string; arguments?: unknown; status?: string; success?: boolean };
           const args = d.arguments && typeof d.arguments === "object" ? d.arguments : {};
           const argsText = Object.keys(args).length ? ` ${JSON.stringify(args)}` : "";
-          entries.push({
+          bucket.push({
             kind: "command",
             itemId: d.id ?? "unknown",
             command: `${d.tool ?? "tool"}${argsText}`.slice(0, 400),
@@ -2298,7 +2427,7 @@ function threadToEntries(thread: WireThread): unknown[] {
           };
           const margs = t.arguments && typeof t.arguments === "object" ? t.arguments : {};
           const margsText = Object.keys(margs).length ? ` ${JSON.stringify(margs)}` : "";
-          entries.push({
+          bucket.push({
             kind: "command",
             itemId: t.id ?? "unknown",
             command: `${t.server ?? "mcp"}.${t.tool ?? "tool"}${margsText}`.slice(0, 400),
@@ -2308,14 +2437,14 @@ function threadToEntries(thread: WireThread): unknown[] {
           break;
         }
         case "contextCompaction":
-          entries.push({ kind: "compaction" });
+          bucket.push({ kind: "compaction" });
           break;
         case "plan":
-          entries.push({ kind: "assistant", text: item.text ?? "" });
+          bucket.push({ kind: "assistant", text: item.text ?? "" });
           break;
         case "subAgentActivity": {
           const sub = item as { kind?: string; agentThreadId?: string; agentPath?: string };
-          entries.push({
+          bucket.push({
             kind: "agent",
             event: sub.kind ?? "started",
             name: (sub.agentPath ?? "").split("/").filter(Boolean).pop() ?? "agent",
@@ -2326,8 +2455,13 @@ function threadToEntries(thread: WireThread): unknown[] {
         }
       }
     }
+    if (foldThisTurn) flush(true);
+    else {
+      entries.push(...bucket);
+      bucket.length = 0;
+    }
   }
-  return entries;
+  return { entries, runningTurnStart, runningTurnStartedAt };
 }
 
 /** The engine binary ships beside the app (extraResources) in production;
@@ -4310,9 +4444,17 @@ async function runScheduledTask(
     const settled = new Promise<{ status: RunStatus; error: string | null; text: string }>((resolve) => {
       scheduledRuns.set(threadId!, { key: task.key, text: "", settle: resolve });
     });
-    const timeout = new Promise<{ status: RunStatus; error: string | null; text: string }>((resolve) =>
+    // `timedOut` rather than matching the message text: the interrupt below
+    // keys off this, and a reworded error would silently stop it firing.
+    const timeout = new Promise<{ status: RunStatus; error: string | null; text: string; timedOut?: boolean }>((resolve) =>
       setTimeout(
-        () => resolve({ status: "failed", error: `timed out after ${RUN_TIMEOUT_MS / 60_000} minutes`, text: "" }),
+        () =>
+          resolve({
+            status: "failed",
+            error: `timed out after ${RUN_TIMEOUT_MS / 60_000} minutes`,
+            text: "",
+            timedOut: true,
+          }),
         RUN_TIMEOUT_MS,
       ),
     );
@@ -4328,6 +4470,24 @@ async function runScheduledTask(
     runningTaskKeys.set(task.key, { threadId, turnId: startedTurn.turn?.id ?? null });
 
     const outcome = await Promise.race([settled, timeout]);
+    // A timeout that only settles OUR promise is not a limit — it stops the
+    // app watching while the agent keeps going. Observed: a run recorded as
+    // failed at the ten-minute cap carried on driving the user's signed-in
+    // Slack for minutes afterwards, invisible, because the bookkeeping and
+    // the engine had come apart. The turn has to actually be interrupted.
+    if ((outcome as { timedOut?: boolean }).timedOut) {
+      const live = runningTaskKeys.get(task.key);
+      if (live?.threadId && live.turnId) {
+        try {
+          await engine.request("turn/interrupt", { threadId: live.threadId, turnId: live.turnId });
+          console.log(`[scheduled] interrupted "${task.name}" at the ${RUN_TIMEOUT_MS / 60_000}-minute cap`);
+        } catch (err) {
+          // Worth saying loudly: the cap has failed to bite and something is
+          // still running with the user's sessions.
+          console.error(`[scheduled] could not interrupt "${task.name}" after timeout:`, err);
+        }
+      }
+    }
     const now = new Date().toISOString();
     updateTask(task.key, {
       cursorAt: now,
@@ -4834,6 +4994,167 @@ app.whenReady().then(async () => {
     send("scheduled:updated", { tasks: decorated });
     return { ok: true, tasks: decorated };
   });
+
+  /**
+   * Rewrite a task's prompt with the model, grounded in screenshots.
+   *
+   * Exists because of a measured failure, not as a nicety: the Slack task
+   * flailed for ten minutes — seventy-plus blind keypresses — because its
+   * prompt said "set your status" without knowing what that UI looks like.
+   * Screenshots turned into exact labels and stop rules are the repair.
+   *
+   * Design rules, each load-bearing:
+   *  - AUGMENT, never replace. Wholesale rewrites drop the constraints the
+   *    user tuned by hand (required phrases, tone). The instructions demand
+   *    the user's intent and exact required wording survive verbatim.
+   *  - Proposed, never applied. This returns text; the form shows old vs new
+   *    and the user accepts or discards. A prompt that runs unattended for
+   *    months must never change to something nobody read.
+   *  - Ephemeral thread. Tuning is authoring-time tooling — it must not
+   *    leave a conversation in the sidebar or survive a restart.
+   *  - Interrupt on timeout, learned the hard way: a cap that only stops the
+   *    app watching leaves the engine running invisibly.
+   */
+  ipcMain.handle(
+    "scheduled:tune",
+    async (_e, payload: { prompt?: string; note?: string; images?: string[] }) => {
+      const prompt = typeof payload?.prompt === "string" ? payload.prompt.trim() : "";
+      const note = typeof payload?.note === "string" ? payload.note.trim() : "";
+      const images = Array.isArray(payload?.images) ? payload.images.filter((x): x is string => typeof x === "string") : [];
+      if (!prompt) return { ok: false, error: "There is no prompt to improve yet — write a draft first." };
+      if (images.length === 0 && !note) {
+        return { ok: false, error: "Add a screenshot or a note — something for Pareto to work from." };
+      }
+      if (images.length > 4) return { ok: false, error: "Four screenshots at most — pick the ones that show the exact screens involved." };
+      for (const img of images) {
+        if (!isAbsolute(img) || !existsSync(img) || !statSync(img).isFile()) {
+          return { ok: false, error: `Not a readable image file: ${img}` };
+        }
+        if (!/\.(png|jpe?g|gif|webp)$/i.test(img)) {
+          return { ok: false, error: `${img} is not an image (png, jpg, gif or webp).` };
+        }
+      }
+
+      const instructions = [
+        "You are refining the standing instructions for a scheduled, unattended agent run. The",
+        "current instructions are below, along with screenshots of the exact interface the run",
+        "works in" + (note ? " and a note from the user" : "") + ".",
+        "",
+        "Rewrite the instructions so a fresh agent with NO memory of this conversation can follow",
+        "them mechanically. Rules, all of them binding:",
+        "- AUGMENT rather than replace: keep the user's intent, tone and every required phrase or",
+        "  constraint from the current instructions verbatim. You are adding precision, not voice.",
+        "- Ground every UI step in what the screenshots actually show: name the exact visible",
+        "  labels, buttons and menus. Never invent an element that is not in a screenshot.",
+        "- Make it self-contained: each run remembers nothing from previous runs.",
+        "- State what success looks like, concretely, so the run knows when it is done.",
+        "- State when to give up: if a step has not worked after three attempts, stop and report",
+        "  what was on screen instead of trying variations. This rule must appear in the rewrite.",
+        "- Plain text only. No markdown headings.",
+        `- HARD LENGTH BUDGET: the rewritten instructions must be under ${MAX_PROMPT_CHARS} characters`,
+        "  in total. Precision beats coverage: fold repeated caveats into one rule, and spend the",
+        "  budget on the exact labels and stop conditions rather than restating the same warning",
+        "  per step.",
+        "",
+        "Reply with ONLY the rewritten instructions between the markers, nothing else:",
+        "<<<PROMPT",
+        "(rewritten instructions here)",
+        "PROMPT>>>",
+        "",
+        "Current instructions:",
+        "---",
+        prompt,
+        "---",
+        note ? `User's note: ${note}` : "",
+      ]
+        .filter(Boolean)
+        .join("\n");
+
+      let threadId: string | null = null;
+      try {
+        const started = (await engine.request("thread/start", {
+          // Ephemeral: authoring-time tooling, not a conversation — it must
+          // not appear in the sidebar or persist a rollout.
+          ephemeral: true,
+          approvalPolicy: "never",
+          sandbox: "read-only",
+          cwd: defaultChatDir(),
+          threadSource: "unbiased_prompt_tuner",
+        })) as { thread: { id: string } };
+        threadId = started.thread.id;
+
+        const TUNE_TIMEOUT_MS = 3 * 60_000;
+        const runTurn = async (input: unknown[]): Promise<{ ok: true; text: string } | { ok: false; error: string }> => {
+          const settled = new Promise<{ status: RunStatus; error: string | null; text: string }>((resolve) => {
+            scheduledRuns.set(threadId!, { key: `tune:${threadId}`, text: "", settle: resolve });
+          });
+          const timeout = new Promise<{ status: RunStatus; error: string | null; text: string; timedOut?: boolean }>(
+            (resolve) => setTimeout(() => resolve({ status: "failed", error: "timed out", text: "", timedOut: true }), TUNE_TIMEOUT_MS),
+          );
+          const startedTurn = (await engine.request("turn/start", {
+            threadId,
+            input,
+            approvalPolicy: "never",
+            sandboxPolicy: { type: "readOnly" },
+          })) as { turn?: { id?: string } };
+          const outcome = await Promise.race([settled, timeout]);
+          if ((outcome as { timedOut?: boolean }).timedOut && startedTurn.turn?.id) {
+            await engine.request("turn/interrupt", { threadId: threadId!, turnId: startedTurn.turn.id }).catch(() => undefined);
+            return { ok: false, error: "Pareto took too long — try again with fewer screenshots." };
+          }
+          if (outcome.status !== "completed") return { ok: false, error: outcome.error ?? "The rewrite did not finish." };
+          return { ok: true, text: outcome.text };
+        };
+        const extract = (raw: string): string => {
+          // The markers make extraction unambiguous; a reply without them is
+          // treated as the whole answer rather than discarded, since a model
+          // that ignored the framing may still have written a usable prompt.
+          const m = raw.match(/<<<PROMPT\s*([\s\S]*?)\s*PROMPT>>>/);
+          return (m ? m[1] : raw).trim();
+        };
+
+        const first = await runTurn([
+          { type: "text", text: instructions },
+          ...images.map((path) => ({ type: "localImage", path })),
+        ]);
+        if (!first.ok) return first;
+        let proposal = extract(first.text);
+        if (!proposal) return { ok: false, error: "Pareto returned nothing usable." };
+        if (proposal.length > MAX_PROMPT_CHARS) {
+          // One automatic compression pass on the same thread rather than an
+          // error. The old behaviour told the user "try asking for something
+          // tighter" — through a UI with no way to ask. The model wrote the
+          // oversized draft; the model can shorten it, and the thread still
+          // holds the screenshots and rules it wrote it from.
+          const second = await runTurn([
+            {
+              type: "text",
+              text:
+                `Your rewrite is ${proposal.length} characters; the hard limit is ${MAX_PROMPT_CHARS}. ` +
+                "Compress it to fit: merge repeated caveats into single rules, keep every exact UI label, " +
+                "the required phrases, the success definition and the stop-after-three-attempts rule. " +
+                "Reply with ONLY the compressed instructions between the same <<<PROMPT and PROMPT>>> markers.",
+            },
+          ]);
+          if (second.ok) {
+            const compressed = extract(second.text);
+            if (compressed) proposal = compressed;
+          }
+        }
+        if (proposal.length > MAX_PROMPT_CHARS) {
+          return {
+            ok: false,
+            error: `Even compressed, the rewrite is ${proposal.length} characters against a limit of ${MAX_PROMPT_CHARS}. Trim the current instructions first, or tune one section at a time.`,
+          };
+        }
+        return { ok: true, proposal };
+      } catch (err) {
+        return { ok: false, error: err instanceof Error ? err.message : String(err) };
+      } finally {
+        if (threadId) scheduledRuns.delete(threadId);
+      }
+    },
+  );
 
   ipcMain.handle("scheduled:stop", async (_e, key: string) => {
     const live = runningTaskKeys.get(key);
@@ -6222,7 +6543,14 @@ app.whenReady().then(async () => {
     // History replays raw engine content — same redaction as live events.
     return redactSecrets({
       id,
-      entries: threadToEntries(result.thread),
+      ...(() => {
+        const replay = threadToEntries(result.thread, { runningLastTurn: running });
+        return {
+          entries: replay.entries,
+          runningTurnStart: replay.runningTurnStart,
+          runningTurnStartedAt: replay.runningTurnStartedAt,
+        };
+      })(),
       running,
       streamText: bgStream.get(id) ?? "",
       approvals,
@@ -6286,7 +6614,7 @@ app.whenReady().then(async () => {
         // A turn without startedAt can't be classified — keep it rather
         // than silently dropping the agent's replies.
         if (spawnAt !== null && turn.startedAt != null && t < spawnAt) continue; // forked parent history
-        const entries = threadToEntries({ ...result.thread, turns: [turn] }).filter(
+        const entries = threadToEntries({ ...result.thread, turns: [turn] }).entries.filter(
           (e) => (e as { kind?: string }).kind !== "user",
         );
         if (entries.length === 0) continue;
@@ -6959,6 +7287,7 @@ app.whenReady().then(async () => {
     const entry = browserTabs.get(rootId);
     if (!entry) return;
     browserTabs.delete(rootId);
+    if (browserActiveRoot === rootId) browserActiveRoot = null;
     if (browserSessionBound && !browserAttachedExternal) {
       await withBrowserLock(() => runAgentBrowser(["tab", "close", entry.label], 15_000)).catch(() => undefined);
     }

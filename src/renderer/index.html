@@ -8,7 +8,9 @@
       content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:"
     />
   </head>
-  <body style="margin: 0">
+  <!-- Painted dark so a layout escape shows as dark space rather than a white
+       flashbang; the app's theme repaints it to the live surface colour. -->
+  <body style="margin: 0; background: #141414">
     <style>
       /* Motion tokens. The built-in CSS easings are too weak to read as
          intentional: `ease` spends its first frames barely moving, which is
