@@ -6,6 +6,21 @@ Format matters: `## <version> — <date>`, then `### <section>`, then `-` bullet
 
 Write for the person using the app, not the person who wrote the code.
 
+## 1.7.0 — August 28, 2026
+
+### New
+
+- **Edit with Pareto** on scheduled tasks. Drop screenshots of the exact screens a task works in — the Slack status dialog, the workspace picker — and Pareto rewrites the task's instructions around what is actually there: the real button labels, what success looks like, and a rule to stop and report instead of flailing when something will not click. The rewrite appears beside your current instructions and changes nothing until you accept it. If the first draft runs long it compresses itself to fit, rather than failing with a size error.
+
+### Fixed
+
+- Reopening a conversation no longer scatters it. The "Worked for…" grouping used to exist only while you watched live; reopen the chat and every line of interim narration stood bare with only the final answer among them. Reopened conversations now fold the same way — with the real duration on the header — and transcripts saved in the old scattered shape repair themselves when opened.
+- The Agent browser works again after the 1.6.0 tab change. Selecting a conversation's tab quietly threw away everything the last page snapshot knew, so the agent would look at a page and then fail to click anything on it — a scheduled run lost its whole task to this. Also handled: sites that open your destination in a new tab (Slack's workspace **Launch** does) — the conversation now follows its work there, and so does the pane.
+- A scheduled run that hits its ten-minute limit is now actually stopped. Before, the app only *recorded* the timeout and looked away while the run kept going with your signed-in sessions.
+- On the Scheduled page, the Agent browser pane now shows the run that is browsing. It used to claim "the agent browser is not open" while a run visibly worked — and clicking Open run looked like it *started* the browser. It also now says "this conversation has not used the browser yet" when that is the truth.
+- Content taller than the window on the Scheduled page spilled out of the app onto a bare white page bottom. Contained, and the page behind the app is dark now regardless.
+- The side chat's empty state got the design pass: a proper mark, readable line lengths, and the "temporary" caveat set quieter than the definition.
+
 ## 1.6.0 — August 27, 2026
 
 ### New
