@@ -4585,10 +4585,39 @@ async function handleMemoryToolCall(
     success: ok,
   });
   const dir = memoryDirForThread(threadId);
+  // Plan mode promises a read-only turn and enforces it with a hard sandbox
+  // override — but these tools run app-side, outside that sandbox, so the
+  // promise is only as good as this check. Refusing in prose (rather than
+  // withholding the tools) because tools are declared per THREAD while plan
+  // mode toggles per TURN: there is nothing to withdraw mid-conversation.
+  if (planMode) {
+    return text(
+      "Plan mode is read-only, so memory cannot be changed right now. Say what you would save and " +
+        "the user can turn plan mode off if they want it kept.",
+      false,
+    );
+  }
 
   if (tool === "memory_forget") {
-    const name = ((rawArgs as Record<string, unknown>)?.name ?? "") as string;
-    const r = deleteMemoryNote(dir, typeof name === "string" ? name.trim() : "");
+    const rawName = (rawArgs as Record<string, unknown>)?.name;
+    const name = typeof rawName === "string" ? rawName.trim() : "";
+    // The one destructive operation in the feature: no trash, no undo, and
+    // the note may be one another conversation relies on. It is also the
+    // half a "Saved memory" row cannot cover after the fact — so it asks
+    // first, the way schedule_create does.
+    const decision = await requestLocalApproval(
+      threadId,
+      `Forget memory "${name}"`,
+      [
+        `Deletes ${join(dir, `${name}.md`)}`,
+        "",
+        "Future conversations in this project will no longer see it. This cannot be undone.",
+      ].join("\n"),
+    );
+    if (decision === "decline") {
+      return text("The user declined. Keep the memory and do not offer to remove it again unless asked.", false);
+    }
+    const r = deleteMemoryNote(dir, name);
     return "error" in r ? text(r.error, false) : text(`Forgot "${name}". It will not appear in future conversations.`, true);
   }
   if (tool !== "memory_save") return text(`Unknown memory tool ${tool}.`, false);
@@ -4607,10 +4636,17 @@ async function handleMemoryToolCall(
   const saved = saveMemoryNote(dir, note);
   if ("error" in saved) return text(saved.error, false);
 
-  // A visible row in the transcript, the scheduled-created pattern: no
-  // approval gate, so every write must at least be seen where it happened.
-  const paneId = paneForThread(rootThreadOf(threadId)) ?? "main";
-  send("chat:memory-saved", { paneId, name: note.name, description: note.description, path: saved.path });
+  // A visible row in the transcript: no approval gate on saves, so the write
+  // must at least be seen where it happened. Delivered ONLY to the pane that
+  // owns this thread — the `?? "main"` fallback the schedule handler uses is
+  // wrong here, because a thread with no pane (a backgrounded conversation)
+  // would drop its row into whatever chat happens to be on screen, and the
+  // main pane persists its transcript, so the foreign row would be saved
+  // into that unrelated conversation for good.
+  const paneId = paneForThread(rootThreadOf(threadId));
+  if (paneId) {
+    send("chat:memory-saved", { paneId, name: note.name, description: note.description, path: saved.path });
+  }
 
   return text(
     `Saved "${note.name}" to this project's memory (${saved.path}). Future conversations in this ` +
@@ -4704,10 +4740,17 @@ async function runScheduledTask(
       approvalPolicy: "never",
       sandbox: "read-only",
       cwd,
+      // The run READS memory (its index rides these instructions) but cannot
+      // WRITE it. Giving an unattended run memory tools looked right — runs
+      // share no conversation, so a note is their only way to tell the next
+      // run — but it hands a context that never asks for approval, that
+      // browses attacker-controlled pages with pre-granted access (see the
+      // grants below), and that nobody is watching, a channel that persists
+      // into the developer instructions of EVERY future conversation in this
+      // project. That is durable prompt injection, and no amount of
+      // after-the-fact visibility fixes it: there is no one there to see it.
       developerInstructions: developerInstructionsFor(cwd),
-      // Memory too: a run that discovers something ("the dashboard moved")
-      // has no other way to tell the next run — runs share no conversation.
-      dynamicTools: [...MEMORY_TOOLS, ...(agentBrowserTools() ?? [])],
+      dynamicTools: agentBrowserTools(),
       // Tag it so the sidebar can leave it out. threadSource is a free-form
       // client string the engine hands straight back in thread/list, which
       // beats keeping our own ledger of run ids: the answer travels with the
