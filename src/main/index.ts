@@ -6290,8 +6290,12 @@ app.whenReady().then(async () => {
         else if (res.reason !== "unchanged") console.log(`[connectors] catalogue refresh skipped: ${res.reason}`);
         return;
       }
+      const changed = current?.publishedAt !== res.catalogue.publishedAt;
       catalogueCache = res.catalogue;
       catalogueLoaded = true;
+      // Only when it actually differs: a push on every refresh would reload
+      // the page's list for nothing several times a session.
+      if (changed) send("connectors:changed", { publishedAt: res.catalogue.publishedAt });
       try {
         writeFileSync(
           cataloguePath(),
@@ -6442,15 +6446,23 @@ app.whenReady().then(async () => {
 
   ipcMain.handle("connectors:list", async () => {
     // Opening the page is the natural moment to pick up a newly published
-    // connector. Awaited, but bounded by the fetch's own timeout, and a
-    // failure simply leaves the cached list in place.
-    await refreshCatalogue();
+    // connector — but NOT at the cost of making the page wait on the network.
+    // Awaiting this put a "Loading…" in front of the user on every visit, for
+    // as long as the fetch took. The cached catalogue is what renders; the
+    // refresh runs behind it and announces itself if anything changed.
+    void refreshCatalogue();
     await wakeManagedPlugins();
     const catalogue = readConnectorCatalogue();
     const configured = readMcpConfig().servers;
     let status: Record<string, string> = {};
     try {
-      const res = (await engine.request("mcpServerStatus/list", {})) as { data?: { name?: string; authStatus?: string }[] };
+      // Bounded: this is the last thing between the user and the page, and an
+      // engine busy probing a dead server should cost a missing "Connected"
+      // badge for a moment, not a page that will not paint.
+      const res = (await Promise.race([
+        engine.request("mcpServerStatus/list", {}),
+        new Promise((resolve) => setTimeout(() => resolve({ data: [] }), 2_500)),
+      ])) as { data?: { name?: string; authStatus?: string }[] };
       for (const srv of res?.data ?? []) {
         if (typeof srv?.name === "string") status[srv.name] = typeof srv.authStatus === "string" ? srv.authStatus : "unknown";
       }

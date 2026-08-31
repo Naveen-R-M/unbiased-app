@@ -570,6 +570,7 @@ declare global {
         name: string,
       ) => Promise<{ ok: boolean; error?: string; branded?: boolean; signIn?: boolean }>;
       connectorsRemove: (name: string) => Promise<{ ok: boolean; error?: string }>;
+      onConnectorsChanged: (cb: () => void) => () => void;
       connectorsSetClientId: (
         name: string,
         clientId: string,
@@ -10641,9 +10642,17 @@ function ConnectorsPanel({ onClose, onOpenFull }: { onClose: () => void; onOpenF
   );
 }
 
+/**
+ * The last list this session rendered, kept outside the component so leaving
+ * the page and coming back shows it instantly. Re-mounting used to start from
+ * an empty list and a "Loading…", even though the answer had not changed.
+ */
+let connectorsCache: ConnectorInfo[] = [];
+
 function ConnectorsView({ navOpen, onToggleNav }: { navOpen: boolean; onToggleNav: () => void }) {
-  const [items, setItems] = useState<ConnectorInfo[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [items, setItems] = useState<ConnectorInfo[]>(connectorsCache);
+  // Only the very first visit of a session has nothing to show.
+  const [loading, setLoading] = useState(connectorsCache.length === 0);
   const [busy, setBusy] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [openName, setOpenName] = useState<string | null>(null);
@@ -10654,10 +10663,14 @@ function ConnectorsView({ navOpen, onToggleNav }: { navOpen: boolean; onToggleNa
 
   const refresh = useCallback(async () => {
     const r = await window.unbiased.connectorsList();
-    setItems(r.connectors ?? []);
+    connectorsCache = r.connectors ?? [];
+    setItems(connectorsCache);
     setLoading(false);
   }, []);
   useEffect(() => void refresh(), [refresh]);
+  // The catalogue is fetched in the background now, so the page has to be told
+  // when a refresh actually brought something new.
+  useEffect(() => window.unbiased.onConnectorsChanged(() => void refresh()), [refresh]);
   // Sign-in finishes in the browser, so nothing in this window knows it
   // happened until the engine says so. Without this the card sits on
   // "Waiting…" after a successful approval.

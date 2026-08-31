@@ -100,6 +100,12 @@ contextBridge.exposeInMainWorld("unbiased", {
   connectorsRemove: (name: string) => ipcRenderer.invoke("connectors:remove", name),
   connectorsSetEnabled: (name: string, enabled: boolean) =>
     ipcRenderer.invoke("connectors:set-enabled", { name, enabled }),
+  /** Fires only when a catalogue refresh brought something new. */
+  onConnectorsChanged: (cb: () => void) => {
+    const h = () => cb();
+    ipcRenderer.on("connectors:changed", h);
+    return () => ipcRenderer.removeListener("connectors:changed", h);
+  },
   connectorsSetClientId: (name: string, clientId: string, clientSecret?: string) =>
     ipcRenderer.invoke("connectors:set-client-id", { name, clientId, clientSecret }),
   onMcpLoginDone: (cb: (p: unknown) => void) => subscribe("mcp:login-done", cb),
