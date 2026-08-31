@@ -6293,8 +6293,11 @@ function BrowserPane({ browserId }: { browserId: number }) {
  *  The final message stays outside, always visible. */
 function WorkedGroup({ duration, children }: { duration: number | null; children: React.ReactNode }) {
   const [open, setOpen] = useState(false);
+  // No bottom margin: the answer that follows sets the gap (renderBlock
+  // tightens its top margin after a fold), so the header sits WITH its
+  // answer instead of floating between two turns.
   return (
-    <div style={{ margin: "14px 0" }}>
+    <div style={{ margin: "14px 0 0" }}>
       <button
         onClick={() => setOpen((o) => !o)}
         aria-expanded={open}
@@ -6309,10 +6312,15 @@ function WorkedGroup({ duration, children }: { duration: number | null; children
           width: "fit-content",
           background: "transparent",
           border: "none",
-          padding: "2px 0 4px",
+          padding: "2px 0 2px",
           color: colors.dim,
-          fontSize: 12.5,
-          letterSpacing: "var(--track-meta)",
+          // Set like the answer it introduces — same size, leading and
+          // tracking — so the fold reads as a quiet line of the same voice
+          // rather than a caption in a different one. Colour alone carries
+          // the hierarchy.
+          fontSize: 15.5,
+          lineHeight: 1.7,
+          letterSpacing: "var(--track-body)",
           cursor: "pointer",
           fontFamily: "inherit",
         }}
@@ -8254,6 +8262,10 @@ function ChatPane({
                   ...(finalMsg ? [finalMsg] : []),
                   ...memoryRows,
                 ];
+              } else if (memoryRows.length > 0 && finalMsg) {
+                // A turn with nothing to fold (the save WAS the work) still
+                // puts the receipt after the answer rather than above it.
+                next = [...next.slice(0, start), ...foldable, finalMsg, ...memoryRows];
               }
             }
           }
@@ -8772,7 +8784,14 @@ function ChatPane({
   // isLast to be TRUE; now that every settled reply shows one, the group's
   // intermediate narration has to be excluded explicitly or each line of it
   // sprouts a copy button.
-  const renderBlock = (block: DisplayBlock, isLast = false, nested = false): React.ReactNode => {
+  const renderBlock = (
+    block: DisplayBlock,
+    isLast = false,
+    nested = false,
+    /** This block directly follows a "Worked for Ns" fold — the answer it
+     *  introduces pulls up against it instead of taking full turn spacing. */
+    afterWork = false,
+  ): React.ReactNode => {
     if (block.kind === "steps") {
       return (
         <StepsGroup key={`s${block.key}`} items={block.items} statusLabel={statusLabel} decide={decide} />
@@ -8940,7 +8959,7 @@ function ChatPane({
         <div
           key={block.key}
           style={{
-            margin: "22px 0",
+            margin: afterWork ? "2px 0 22px" : "22px 0",
             lineHeight: 1.7,
             fontSize: 15.5,
             color: "var(--fg-msg)",
@@ -9146,7 +9165,11 @@ function ChatPane({
               {b.n}
             </span>
           ))}
-          {toDisplayBlocks(entries).map((b, i, arr) => renderBlock(b, i === arr.length - 1))}
+          {toDisplayBlocks(entries).map((b, i, arr) => {
+            const prev = arr[i - 1];
+            const afterWork = prev?.kind === "entry" && prev.entry.kind === "work";
+            return renderBlock(b, i === arr.length - 1, false, afterWork);
+          })}
           {compacting && (
             <div style={{ display: "flex", justifyContent: "flex-start", margin: "10px 0" }}>
               <div
