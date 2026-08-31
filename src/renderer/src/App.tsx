@@ -3335,79 +3335,6 @@ export function App() {
                         </button>
                       </div>
                     )}
-                    {envMemories && envMemories.length > 0 && (
-                      <>
-                        <EnvRow
-                          icon={<LightbulbIcon />}
-                          label="Agent memory"
-                          right={
-                            <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                              <span style={{ color: colors.dim, fontVariantNumeric: "tabular-nums" }}>
-                                {envMemories.length}
-                              </span>
-                              <Chevron open={envSection === "memory"} />
-                            </span>
-                          }
-                          onClick={() => setEnvSection((s) => (s === "memory" ? null : "memory"))}
-                        />
-                        {envSection === "memory" && (
-                          <div style={{ padding: "0 0 4px 12px", maxHeight: 220, overflowY: "auto" }}>
-                            {envMemories.map((m) => (
-                              <button
-                                key={m.name}
-                                onClick={() => {
-                                  setEnvOpen(false);
-                                  void openFileInPanel(m.path);
-                                }}
-                                title={m.path}
-                                style={{
-                                  display: "flex",
-                                  alignItems: "baseline",
-                                  gap: 8,
-                                  width: "100%",
-                                  background: "transparent",
-                                  border: "none",
-                                  borderRadius: 8,
-                                  padding: "6px 10px",
-                                  fontSize: 12.5,
-                                  cursor: "pointer",
-                                  textAlign: "left",
-                                  fontFamily: "inherit",
-                                }}
-                              >
-                                <span style={{ color: colors.accent, flexShrink: 0 }}>{m.name}</span>
-                                <span
-                                  style={{
-                                    color: colors.dim,
-                                    flex: 1,
-                                    minWidth: 0,
-                                    whiteSpace: "nowrap",
-                                    overflow: "hidden",
-                                    textOverflow: "ellipsis",
-                                  }}
-                                >
-                                  {m.description}
-                                </span>
-                                {m.thisThread && (
-                                  <span
-                                    style={{
-                                      color: colors.dim,
-                                      fontSize: 11,
-                                      border: `1px solid ${colors.border}`,
-                                      borderRadius: 5,
-                                      padding: "1px 6px",
-                                      flexShrink: 0,
-                                    }}
-                                  >
-                                    this chat
-                                  </span>
-                                )}
-                              </button>
-                            ))}
-                          </div>
-                        )}
-                      </>
-                    )}
                     <div style={{ borderTop: `1px solid ${colors.border}`, margin: "6px 4px" }} />
                     <EnvRow icon={<CommitIcon />} label="Commit or push" onClick={() => void envCommitPush()} />
                     <EnvRow icon={<PrIcon />} label="Create pull request" onClick={() => void envCreatePr()} />
@@ -3416,9 +3343,88 @@ export function App() {
                     )}
                     </>
                   )}
-                  {subAgentsList.length > 0 && (
+                  {/* Standalone, NOT inside the inProject block: plain chats
+                      (~/Unbiased) have a memory store too, and hiding it there
+                      is how a saved note becomes untraceable. */}
+                  {envMemories && envMemories.length > 0 && (
                     <>
                       {inProject && <div style={{ borderTop: `1px solid ${colors.border}`, margin: "6px 4px" }} />}
+                      <EnvRow
+                        icon={<LightbulbIcon />}
+                        label="Memory"
+                        right={
+                          <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                            <span style={{ color: colors.dim, fontVariantNumeric: "tabular-nums" }}>
+                              {envMemories.length}
+                            </span>
+                            <Chevron open={envSection === "memory"} />
+                          </span>
+                        }
+                        onClick={() => setEnvSection((s) => (s === "memory" ? null : "memory"))}
+                      />
+                      {envSection === "memory" && (
+                        <div style={{ padding: "0 0 4px 12px", maxHeight: 220, overflowY: "auto" }}>
+                          {envMemories.map((m) => (
+                            <button
+                              key={m.name}
+                              onClick={() => {
+                                setEnvOpen(false);
+                                void openFileInPanel(m.path);
+                              }}
+                              title={m.path}
+                              style={{
+                                display: "flex",
+                                alignItems: "baseline",
+                                gap: 8,
+                                width: "100%",
+                                background: "transparent",
+                                border: "none",
+                                borderRadius: 8,
+                                padding: "6px 10px",
+                                fontSize: 12.5,
+                                cursor: "pointer",
+                                textAlign: "left",
+                                fontFamily: "inherit",
+                              }}
+                            >
+                              <span style={{ color: colors.accent, flexShrink: 0 }}>{m.name}</span>
+                              <span
+                                style={{
+                                  color: colors.dim,
+                                  flex: 1,
+                                  minWidth: 0,
+                                  whiteSpace: "nowrap",
+                                  overflow: "hidden",
+                                  textOverflow: "ellipsis",
+                                }}
+                              >
+                                {m.description}
+                              </span>
+                              {m.thisThread && (
+                                <span
+                                  style={{
+                                    color: colors.dim,
+                                    fontSize: 11,
+                                    border: `1px solid ${colors.border}`,
+                                    borderRadius: 5,
+                                    padding: "1px 6px",
+                                    flexShrink: 0,
+                                  }}
+                                >
+                                  this chat
+                                </span>
+                              )}
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </>
+                  )}
+                  {subAgentsList.length > 0 && (
+                    <>
+                      {(inProject || (envMemories?.length ?? 0) > 0) && (
+                        <div style={{ borderTop: `1px solid ${colors.border}`, margin: "6px 4px" }} />
+                      )}
                       <div style={{ color: colors.dim, fontSize: 12.5, padding: "4px 10px 8px" }}>Subagents</div>
                       {subAgentsList.map((a) => (
                         <button
@@ -3469,9 +3475,9 @@ export function App() {
                       ))}
                     </>
                   )}
-                  {!inProject && subAgentsList.length === 0 && (
+                  {!inProject && subAgentsList.length === 0 && (envMemories?.length ?? 0) === 0 && (
                     <div style={{ color: colors.dim, fontSize: 12.5, padding: "4px 10px 8px", lineHeight: 1.4 }}>
-                      Sub-agents spawned in this chat will appear here.
+                      Sub-agents spawned in this chat, and memories the agent saves, will appear here.
                     </div>
                   )}
                 </div>
@@ -8818,38 +8824,33 @@ function ChatPane({
     }
     if (e.kind === "memory") {
       // Memory saves are not gated on approval, so this row is the
-      // accountability: the write is visible where it happened, and the name
-      // opens the note itself in the side panel.
+      // accountability: the write is visible where it happened, and clicking
+      // it opens the note itself in the side panel. Same shape and register
+      // as the sub-agent lifecycle rows ("Created 🍄 Singer") — the
+      // note's identity lives in the tooltip and the opened file.
       return (
-        <div
-          key={block.key}
-          style={{ display: "flex", alignItems: "center", gap: 8, margin: "14px 0", fontSize: 13 }}
-        >
-          <span style={{ color: colors.accent, display: "flex" }}>
+        <div key={block.key} style={{ margin: "14px 0" }}>
+          <button
+            onClick={onOpenFile ? () => onOpenFile(e.path) : undefined}
+            title={`${e.name} — ${e.description}`}
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 8,
+              background: "transparent",
+              border: "none",
+              padding: 0,
+              color: colors.dim,
+              fontSize: 13.5,
+              cursor: onOpenFile ? "pointer" : "default",
+              fontFamily: "inherit",
+            }}
+          >
             <LightbulbIcon />
-          </span>
-          <span style={{ color: colors.dim }}>
-            Saved memory{" "}
-            {onOpenFile ? (
-              <button
-                onClick={() => onOpenFile(e.path)}
-                style={{
-                  background: "transparent",
-                  border: "none",
-                  padding: 0,
-                  color: colors.accent,
-                  fontSize: 13,
-                  cursor: "pointer",
-                  fontFamily: "inherit",
-                }}
-              >
-                {e.name}
-              </button>
-            ) : (
-              <span style={{ color: colors.fg }}>{e.name}</span>
-            )}{" "}
-            — {e.description}
-          </span>
+            <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              Saved <span style={{ color: "var(--fg-soft)" }}>Memory</span>
+            </span>
+          </button>
         </div>
       );
     }
