@@ -8265,26 +8265,25 @@ function ChatPane({
               const last = turnEntries[turnEntries.length - 1];
               const finalMsg = last?.kind === "assistant" ? last : null;
               const work = finalMsg ? turnEntries.slice(0, -1) : turnEntries;
-              // Memory receipts move BELOW the final answer instead of into
-              // the fold: folded they vanish, and left above the answer they
-              // sit redundantly next to the steps header that already says
-              // "Saved memory". The receipt belongs with the result.
               const memoryRows = work.filter((e) => e.kind === "memory");
-              const foldable = work.filter((e) => e.kind !== "memory");
+              // Receipts already attached to narration that is about to be
+              // folded away are hoisted out — a receipt inside a collapsed
+              // fold is a write nobody sees.
+              const receipts = [
+                ...work.flatMap((e) => (e.kind === "assistant" ? (e.memories ?? []) : [])),
+                ...memoryRows.map((m) => ({ name: m.name, description: m.description, path: m.path })),
+              ];
+              const foldable = work
+                .filter((e) => e.kind !== "memory")
+                .map((e) => (e.kind === "assistant" && e.memories ? { ...e, memories: undefined } : e));
               const didWork = foldable.some((e) => e.kind === "agent" || e.kind === "command");
               // Receipts move ONTO the answer, so they render inside it —
               // under the text, above the copy row. Folded they would vanish;
               // left loose above the answer they duplicated the steps header
               // that already says "Saved memory".
               const answer: Entry | null =
-                finalMsg && memoryRows.length > 0
-                  ? {
-                      ...finalMsg,
-                      memories: [
-                        ...(finalMsg.memories ?? []),
-                        ...memoryRows.map((m) => ({ name: m.name, description: m.description, path: m.path })),
-                      ],
-                    }
+                finalMsg && receipts.length > 0
+                  ? { ...finalMsg, memories: [...(finalMsg.memories ?? []), ...receipts] }
                   : finalMsg;
               if (didWork && foldable.length > 0) {
                 const duration = workStartedAt !== null ? (Date.now() - workStartedAt) / 1000 : null;
@@ -8296,7 +8295,7 @@ function ChatPane({
                   // nothing): the loose rows stay, so the write is still seen.
                   ...(answer ? [] : memoryRows),
                 ];
-              } else if (answer && memoryRows.length > 0) {
+              } else if (answer && receipts.length > 0) {
                 next = [...next.slice(0, start), ...foldable, answer];
               }
             }
@@ -8433,10 +8432,22 @@ function ChatPane({
       window.unbiased.onMemorySaved((p) => {
         if (p.paneId !== paneId) return;
         producedRef.current = true;
-        setEntries((es) => [
-          ...withoutTrailingPlaceholder(es),
-          { kind: "memory", name: p.name, description: p.description, path: p.path },
-        ]);
+        const receipt = { name: p.name, description: p.description, path: p.path };
+        setEntries((es) => {
+          const cleaned = withoutTrailingPlaceholder(es);
+          const last = cleaned[cleaned.length - 1];
+          // This event can land either side of turn/completed — measured both
+          // ways — so the receipt attaches to whatever text is already
+          // written rather than trusting arrival order. Attaching to mid-turn
+          // narration is safe: the fold hoists receipts onto the final answer.
+          if (last?.kind === "assistant" && last.text) {
+            return [
+              ...cleaned.slice(0, -1),
+              { ...last, memories: [...(last.memories ?? []), receipt] },
+            ];
+          }
+          return [...cleaned, { kind: "memory", ...receipt }];
+        });
       }),
       window.unbiased.onCompaction((p) => {
         if (p.paneId !== paneId) return;
