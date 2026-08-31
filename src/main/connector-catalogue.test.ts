@@ -154,15 +154,13 @@ test("the baked-in key is a real ed25519 public key", () => {
   assert.equal(verifyCatalogue("x", "AAAA", CATALOGUE_PUBLIC_KEY), false); // exercises the parse path
 });
 
-test("the published hosts are https, and the live one leads", () => {
+test("the published hosts are https, with the CDN leading and raw as fallback", () => {
   assert.ok(CATALOGUE_URLS.length >= 2, "keep a fallback host");
   for (const u of CATALOGUE_URLS) assert.match(u, /^https:\/\//);
-  // GitHub raw is what serves today; the domain is the planned move. Flip both
-  // this assertion and the order in CATALOGUE_URLS when DNS is live.
-  assert.match(CATALOGUE_URLS[0], /^https:\/\/raw\.githubusercontent\.com\//);
+  assert.match(CATALOGUE_URLS[0], /^https:\/\/connectors\.unbiased\.ai\//);
   assert.ok(
-    CATALOGUE_URLS.some((u) => u.startsWith("https://connectors.unbiased.ai/")),
-    "keep the domain listed so it works the moment it resolves",
+    CATALOGUE_URLS.some((u) => u.startsWith("https://raw.githubusercontent.com/")),
+    "keep raw as the fallback: same signed bytes, different host",
   );
 });
 
@@ -173,11 +171,11 @@ test("a dead primary host falls through to the fallback", async () => {
       asked.push(String(url));
       // primary is down; fallback serves an unsigned payload, which must still
       // be refused — the point here is only that the walk continued.
-      if (String(url).includes("raw.githubusercontent.com")) throw new Error("ENOTFOUND");
+      if (String(url).includes("connectors.unbiased.ai")) throw new Error("ENOTFOUND");
       return new Response(JSON.stringify({ schema: CATALOGUE_SCHEMA, connectors: [] }), { status: 200 });
     }) as unknown as typeof fetch,
   });
-  assert.ok(asked.some((u) => u.includes("connectors.unbiased.ai")), "must try the fallback host");
+  assert.ok(asked.some((u) => u.includes("raw.githubusercontent.com")), "must try the fallback host");
   assert.equal(res.ok, false);
 });
 
@@ -283,4 +281,21 @@ test("the walk stops on a rollback instead of shopping hosts", async () => {
   });
   assert.deepEqual(res, { ok: false, reason: "rollback" });
   assert.equal(asked.filter((u) => !u.endsWith(".sig")).length, 1, `asked: ${asked.join(", ")}`);
+});
+
+test("a payload served with the trailing newline it is published with still verifies", async () => {
+  // The regression that reached production: dist/catalogue.json ends with a
+  // newline, the signature does not cover it, and a host that serves the file
+  // faithfully would otherwise fail every verification.
+  const real = realSigned();
+  if (!real) return;
+  const published = JSON.parse(real.text).publishedAt as string;
+  const res = await fetchCatalogue(null, {
+    url: "https://x.example/c.json",
+    current: null,
+    now: () => new Date(Date.parse(published) + 60_000).toISOString(),
+    fetch: (async (u: string | URL) =>
+      new Response(String(u).endsWith(".sig") ? real.sig + "\n" : real.text + "\n", { status: 200 })) as unknown as typeof fetch,
+  });
+  assert.equal(res.ok, true, `served-with-newline payload must verify (got ${res.ok ? "" : res.reason})`);
 });

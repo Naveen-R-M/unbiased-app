@@ -35,21 +35,20 @@ MCowBQYDK2VwAyEAx0p2lW2s2PuiHXD0dMyqFqg9/3+ZV5bXnkTCPNiKNLk=
 /**
  * Where to look, in order.
  *
- * GitHub raw leads because that is what is actually serving today;
- * connectors.unbiased.ai is listed second and ready for the moment Pages and
- * DNS are set up, at which point the two swap. Trying a host that does not
- * resolve costs a DNS failure per refresh, which is why the live one goes
- * first rather than the aspirational one.
+ * connectors.unbiased.ai leads: CloudFront over a private S3 origin, published
+ * by the catalogue repo's own pipeline. GitHub raw stays second as a fallback
+ * for a DNS or CDN outage — it serves the same signed bytes from the same
+ * commit, so having two hosts costs nothing in safety and buys uptime.
  *
- * Neither host is trusted: the signature is what is checked, so a second
- * source costs nothing in safety and buys uptime. An override replaces both
- * (used by the local end-to-end test).
+ * Neither host is trusted. The signature is what is checked, which is exactly
+ * why a fallback is free: a host that serves the wrong thing is rejected, not
+ * believed. An override replaces both (used by the local end-to-end test).
  */
 export const CATALOGUE_URLS: string[] = process.env.UNBIASED_CATALOGUE_URL?.trim()
   ? [process.env.UNBIASED_CATALOGUE_URL.trim()]
   : [
-      "https://raw.githubusercontent.com/circuitandchisel/unbiased-connectors/main/dist/catalogue.json",
       "https://connectors.unbiased.ai/catalogue.json",
+      "https://raw.githubusercontent.com/circuitandchisel/unbiased-connectors/main/dist/catalogue.json",
     ];
 
 const MAX_PAYLOAD_BYTES = 4 * 1024 * 1024;
@@ -255,7 +254,11 @@ export async function fetchCatalogue(etag: string | null, deps: FetchDeps = {}):
     });
     if (res.status === 304) return { ok: false, reason: "unchanged" };
     if (!res.ok) return { ok: false, reason: "http" };
-    const text = await res.text();
+    // Trimmed because the signature covers the payload WITHOUT a trailing
+    // newline, while the published file ends with one — as a text file should.
+    // A local test server that trimmed on the way out hid this until the real
+    // CDN served the bytes honestly and every verification failed.
+    const text = (await res.text()).trim();
     // The signature is a sibling of whatever URL the payload came from, so a
     // developer override points both at the same place.
     const sigRes = await f(`${base}.sig`, { signal: AbortSignal.timeout(timeout) });
