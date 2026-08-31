@@ -8239,13 +8239,20 @@ function ChatPane({
               const last = turnEntries[turnEntries.length - 1];
               const finalMsg = last?.kind === "assistant" ? last : null;
               const work = finalMsg ? turnEntries.slice(0, -1) : turnEntries;
-              const didWork = work.some((e) => e.kind === "agent" || e.kind === "command");
-              if (didWork && work.length > 0) {
+              // Memory receipts move BELOW the final answer instead of into
+              // the fold: folded they vanish, and left above the answer they
+              // sit redundantly next to the steps header that already says
+              // "Saved memory". The receipt belongs with the result.
+              const memoryRows = work.filter((e) => e.kind === "memory");
+              const foldable = work.filter((e) => e.kind !== "memory");
+              const didWork = foldable.some((e) => e.kind === "agent" || e.kind === "command");
+              if (didWork && foldable.length > 0) {
                 const duration = workStartedAt !== null ? (Date.now() - workStartedAt) / 1000 : null;
                 next = [
                   ...next.slice(0, start),
-                  { kind: "work", duration, entries: work },
+                  { kind: "work", duration, entries: foldable },
                   ...(finalMsg ? [finalMsg] : []),
+                  ...memoryRows,
                 ];
               }
             }
