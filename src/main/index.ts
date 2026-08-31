@@ -50,6 +50,14 @@ import {
   type ScheduledTask,
   type ScheduleSpec,
 } from "./scheduler";
+import {
+  deleteMemoryNote,
+  loadMemoryNotes,
+  projectMemoryDir,
+  renderMemorySection,
+  saveMemoryNote,
+  validateMemory,
+} from "./memory";
 import { spawn as ptySpawn, type IPty } from "@lydell/node-pty";
 
 const engine = new EngineClient();
@@ -895,6 +903,16 @@ const APP_DEVELOPER_INSTRUCTIONS = [
   "sub-agents already inherit the current model.",
 ].join(" ");
 
+/** The instructions a thread actually gets: the static block above plus the
+ *  project's memory index, when it has one. Computed per thread START — the
+ *  index a running conversation sees is a snapshot, same as Claude Code's
+ *  per-session index, refreshed on the next thread/start or resume. */
+function developerInstructionsFor(cwd: string | null): string {
+  const dir = memoryDirForCwd(cwd);
+  const section = renderMemorySection(loadMemoryNotes(dir), dir);
+  return section ? `${APP_DEVELOPER_INSTRUCTIONS}\n\n${section}` : APP_DEVELOPER_INSTRUCTIONS;
+}
+
 const AGENT_BROWSER_TOOLS = [
   {
     type: "function",
@@ -1051,6 +1069,62 @@ const SCHEDULE_TOOLS = [
   },
 ];
 
+// Memory, offered as a dynamic tool the same way scheduling is. The saved
+// note only ever becomes prompt text in later threads, so unlike
+// schedule_create there is no approval card — visibility comes from the
+// "Saved memory" transcript row instead, and memory_forget bounds a mistake.
+const MEMORY_TOOLS = [
+  {
+    type: "function",
+    name: "memory_save",
+    description:
+      "Save a durable note to this project's persistent memory so FUTURE conversations start knowing it. " +
+      "Save: corrections and preferences the user states, project facts not written down anywhere, and " +
+      "hard-won lessons — each with its Why. Do NOT save things the repo or git history already records, " +
+      "or details that only matter to this conversation. Saving an existing name updates that note — " +
+      "that is how you edit one.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: {
+          type: "string",
+          description: "Short kebab-case slug, e.g. 'release-needs-em-dash'. Reusing a name overwrites that note.",
+        },
+        description: {
+          type: "string",
+          description:
+            "ONE sentence: what this says and when to reach for it. This line is all a future " +
+            "conversation sees before deciding to read the note — a vague one makes the memory " +
+            "invisible forever.",
+        },
+        type: {
+          type: "string",
+          enum: ["user", "feedback", "project", "reference"],
+          description: "user = who the user is/preferences; feedback = guidance they gave; project = facts about this project; reference = pointers to external resources.",
+        },
+        content: {
+          type: "string",
+          description: "The note body, markdown. The fact, then **Why:** (the evidence behind it), then **How to apply:**.",
+        },
+      },
+      required: ["name", "description", "type", "content"],
+    },
+  },
+  {
+    type: "function",
+    name: "memory_forget",
+    description:
+      "Delete one note from this project's persistent memory, by its exact name from the memory index. " +
+      "Use when a memory turns out wrong or obsolete — a wrong note re-read by every future conversation " +
+      "is worse than none.",
+    inputSchema: {
+      type: "object",
+      properties: { name: { type: "string", description: "The note's exact name from the index." } },
+      required: ["name"],
+    },
+  },
+];
+
 /**
  * Every dynamic tool a conversation gets.
  *
@@ -1061,7 +1135,7 @@ const SCHEDULE_TOOLS = [
  * machine without agent-browser installed.
  */
 function threadDynamicTools(): Record<string, unknown>[] | undefined {
-  const tools = [...SCHEDULE_TOOLS, ...(agentBrowserTools() ?? [])];
+  const tools = [...SCHEDULE_TOOLS, ...MEMORY_TOOLS, ...(agentBrowserTools() ?? [])];
   return tools.length ? (tools as Record<string, unknown>[]) : undefined;
 }
 
@@ -1994,6 +2068,29 @@ function pushSubAgents(parent: string): void {
 // The active main conversation's working directory — file references in
 // chat resolve against it. Kept in sync with thread starts/resumes.
 let mainCwd: string | null = null;
+
+// threadId → the cwd it was started with. mainCwd only tracks the active
+// main pane, but memory writes arrive from scheduled runs and side threads
+// too, and a note saved by a background run must land in ITS project's
+// store, not whichever conversation happens to be frontmost.
+const threadCwds = new Map<string, string>();
+
+const memoryRoot = () => join(homedir(), ".unbiased", "memory");
+
+/** The memory directory a thread reads and writes. Worktree conversations
+ *  resolve to their PROJECT's store — keying by cwd would give every
+ *  worktree an amnesiac private notebook (matches observed Claude Code
+ *  behavior: a worktree session uses the main project's memory). */
+function memoryDirForCwd(cwd: string | null): string {
+  const at = cwd || defaultChatDir();
+  const project = loadWorktrees()[at]?.project ?? at;
+  return projectMemoryDir(memoryRoot(), project);
+}
+
+function memoryDirForThread(threadId: string | null): string {
+  const root = threadId ? rootThreadOf(threadId) : null;
+  return memoryDirForCwd((root && threadCwds.get(root)) || mainCwd);
+}
 
 // Where the NEXT fresh main chat's thread will live. null = home directory
 // (a plain chat, listed under Recents). Set by the project picker or by
@@ -4068,11 +4165,12 @@ function wireNotifications(): void {
       if (msg.method === "item/tool/call") {
         const tool = String((params as { tool?: unknown }).tool ?? "");
         const args = (params as { arguments?: unknown }).arguments;
-        // Two families now, dispatched by prefix rather than by assuming the
-        // browser owns every dynamic tool.
-        const call =
-          tool.startsWith("schedule_")
-            ? handleScheduleToolCall(tool, args, approvalThread)
+        // Three families now, dispatched by prefix rather than by assuming
+        // the browser owns every dynamic tool.
+        const call = tool.startsWith("schedule_")
+          ? handleScheduleToolCall(tool, args, approvalThread)
+          : tool.startsWith("memory_")
+            ? handleMemoryToolCall(tool, args, approvalThread)
             : handleAgentBrowserCall(tool, args, approvalThread);
         void call
           .catch((err) => ({
@@ -4348,6 +4446,51 @@ async function handleScheduleToolCall(
   );
 }
 
+// ── Memory tools (model-initiated) ──────────────────────────────────────
+async function handleMemoryToolCall(
+  tool: string,
+  rawArgs: unknown,
+  threadId: string | null,
+): Promise<DynamicToolResponse> {
+  const text = (t: string, ok: boolean): DynamicToolResponse => ({
+    contentItems: [{ type: "inputText", text: t }],
+    success: ok,
+  });
+  const dir = memoryDirForThread(threadId);
+
+  if (tool === "memory_forget") {
+    const name = ((rawArgs as Record<string, unknown>)?.name ?? "") as string;
+    const r = deleteMemoryNote(dir, typeof name === "string" ? name.trim() : "");
+    return "error" in r ? text(r.error, false) : text(`Forgot "${name}". It will not appear in future conversations.`, true);
+  }
+  if (tool !== "memory_save") return text(`Unknown memory tool ${tool}.`, false);
+
+  const checked = validateMemory(rawArgs);
+  if ("error" in checked) return text(checked.error, false);
+  // Redact before persisting, not just at display: a leaked secret in a note
+  // would otherwise round-trip into every future thread's instructions. The
+  // display boundary (send/redactSecrets) cannot catch it later because the
+  // engine reads the file straight from disk.
+  const note = redactSecrets({
+    ...checked.note,
+    originThreadId: threadId ? rootThreadOf(threadId) : null,
+    modified: new Date().toISOString(),
+  });
+  const saved = saveMemoryNote(dir, note);
+  if ("error" in saved) return text(saved.error, false);
+
+  // A visible row in the transcript, the scheduled-created pattern: no
+  // approval gate, so every write must at least be seen where it happened.
+  const paneId = paneForThread(rootThreadOf(threadId)) ?? "main";
+  send("chat:memory-saved", { paneId, name: note.name, description: note.description, path: saved.path });
+
+  return text(
+    `Saved "${note.name}" to this project's memory (${saved.path}). Future conversations in this ` +
+      "project will see its description in their index.",
+    true,
+  );
+}
+
 const SCHEDULE_TICK_MS = 30_000;
 /** A scheduled turn that has not finished in this long is abandoned. The
  *  engine client has no per-request timeout, so without a cap here a wedged
@@ -4426,8 +4569,10 @@ async function runScheduledTask(
       approvalPolicy: "never",
       sandbox: "read-only",
       cwd,
-      developerInstructions: APP_DEVELOPER_INSTRUCTIONS,
-      dynamicTools: agentBrowserTools(),
+      developerInstructions: developerInstructionsFor(cwd),
+      // Memory too: a run that discovers something ("the dashboard moved")
+      // has no other way to tell the next run — runs share no conversation.
+      dynamicTools: [...MEMORY_TOOLS, ...(agentBrowserTools() ?? [])],
       // Tag it so the sidebar can leave it out. threadSource is a free-form
       // client string the engine hands straight back in thread/list, which
       // beats keeping our own ledger of run ids: the answer travels with the
@@ -4436,6 +4581,7 @@ async function runScheduledTask(
       threadSource: SCHEDULED_THREAD_SOURCE,
     })) as { thread: { id: string } };
     threadId = started.thread.id;
+    threadCwds.set(threadId, cwd); // memory_save from this run targets ITS project
     runningTaskKeys.set(task.key, { threadId, turnId: null });
     // Push the live thread out immediately, so "Open run" works from the
     // moment the run starts rather than only once it has finished.
@@ -4857,7 +5003,7 @@ app.whenReady().then(async () => {
           // this is safe either way — but see the note in HOW-IT-WORKS: a
           // version bump could start dropping them without any error.
           dynamicTools: threadDynamicTools(),
-          developerInstructions: APP_DEVELOPER_INSTRUCTIONS,
+          developerInstructions: developerInstructionsFor(mainCwd),
           experimentalRawEvents: true,
         })) as { thread: { id: string } };
       } else if (paneId.startsWith("side")) {
@@ -4867,7 +5013,7 @@ app.whenReady().then(async () => {
           ephemeral: true,
           experimentalRawEvents: true,
           dynamicTools: threadDynamicTools(),
-          developerInstructions: APP_DEVELOPER_INSTRUCTIONS,
+          developerInstructions: developerInstructionsFor(mainCwd),
         })) as { thread: { id: string } };
       } else {
         // Explicit default when no project is chosen — left implicit, the
@@ -4891,7 +5037,7 @@ app.whenReady().then(async () => {
           // Model-driven browser automation (agent-browser CLI), when
           // installed — the calls come back as item/tool/call requests.
           dynamicTools: threadDynamicTools(),
-          developerInstructions: APP_DEVELOPER_INSTRUCTIONS,
+          developerInstructions: developerInstructionsFor(cwd),
           // Raw response items feed the sub-agent viewer (task text + spawn
           // instructions). Sub-threads inherit this from their parent.
           experimentalRawEvents: true,
@@ -4899,6 +5045,10 @@ app.whenReady().then(async () => {
         mainCwd = (started as { cwd?: string }).cwd ?? cwd;
       }
       pane.threadId = started.thread.id;
+      // Side/fork threads inherit the main conversation's cwd; the main
+      // branch just set mainCwd above. Recorded so a memory_save from any of
+      // them resolves to the right project's store.
+      threadCwds.set(started.thread.id, mainCwd ?? defaultChatDir());
       threadAccessModes.set(started.thread.id, accessMode);
       created = true;
     }
@@ -5736,6 +5886,26 @@ app.whenReady().then(async () => {
   });
 
   // ---- Skills ------------------------------------------------------------
+  // ── Memory ──────────────────────────────────────────────────────────
+  // The Environment popover's "Agent memory" section: every note in the
+  // thread's project store, with a flag for the ones this conversation
+  // saved (matched on the originThreadId provenance stamp).
+  ipcMain.handle("memory:list", (_e, threadId?: string | null) => {
+    const tid = typeof threadId === "string" ? threadId : null;
+    const dir = memoryDirForThread(tid);
+    const root = tid ? rootThreadOf(tid) : null;
+    return redactSecrets({
+      dir,
+      memories: loadMemoryNotes(dir).map((n) => ({
+        name: n.name,
+        description: n.description,
+        type: n.type,
+        path: join(dir, `${n.name}.md`),
+        thisThread: !!root && n.originThreadId === root,
+      })),
+    });
+  });
+
   ipcMain.handle("skills:list", async (_e, payload?: { cwd?: string | null }) => {
     // cwds drives the PROJECT tier. codex does not walk up parent directories,
     // so the path passed here must be the exact folder holding .codex/skills —
@@ -6579,13 +6749,21 @@ app.whenReady().then(async () => {
           // so dynamicTools may be too. If it is, a reopened conversation
           // needs a fresh thread to regain tools, not this.
           dynamicTools: threadDynamicTools(),
-          developerInstructions: APP_DEVELOPER_INSTRUCTIONS,
+          // The thread's cwd is only known once the resume RETURNS, so the
+          // memory index rides along when this app session has seen the
+          // thread before, and is omitted on a cold reopen — no section
+          // beats injecting some other project's memory (mainCwd still
+          // points at the conversation being left).
+          developerInstructions: threadCwds.has(id)
+            ? developerInstructionsFor(threadCwds.get(id) ?? null)
+            : APP_DEVELOPER_INSTRUCTIONS,
           experimentalRawEvents: true,
         })) as {
           thread: WireThread;
           cwd?: string;
         });
     mainCwd = result.cwd ?? result.thread.cwd ?? null;
+    if (mainCwd) threadCwds.set(id, mainCwd); // memory_save now targets the right project
     // An unanswered browser card on the conversation we are leaving would
     // otherwise block its tool call — and therefore its turn — forever.
     settleLocalApprovals(panes.main.threadId);
