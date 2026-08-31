@@ -1214,6 +1214,24 @@ const MEMORY_TOOLS = [
   },
 ];
 
+/** The step card's label for a dynamic tool call — used by both the live
+ *  notification path and history replay, so a call renders identically on
+ *  resume. Most tools show their raw arguments (short and informative:
+ *  `browser_search {"query":…}`), but the memory tools carry a whole note
+ *  body as arguments, and a JSON dump of it reads as debug output. Name the
+ *  action and the note instead — the content is one click away on the
+ *  "Saved Memory" row. */
+function dynamicToolCommandText(tool: string | undefined, rawArgs: unknown): string {
+  const args = rawArgs && typeof rawArgs === "object" ? (rawArgs as Record<string, unknown>) : {};
+  const t = tool ?? "tool";
+  if (t === "memory_save" || t === "memory_forget") {
+    const name = typeof args.name === "string" && args.name.trim() ? args.name.trim() : "memory";
+    return `${t === "memory_save" ? "save memory" : "forget memory"} · ${name}`;
+  }
+  const argsText = Object.keys(args).length ? ` ${JSON.stringify(args)}` : "";
+  return `${t}${argsText}`.slice(0, 400);
+}
+
 /**
  * Every dynamic tool a conversation gets.
  *
@@ -2593,12 +2611,10 @@ function threadToEntries(
           break;
         case "dynamicToolCall": {
           const d = item as { id?: string; tool?: string; arguments?: unknown; status?: string; success?: boolean };
-          const args = d.arguments && typeof d.arguments === "object" ? d.arguments : {};
-          const argsText = Object.keys(args).length ? ` ${JSON.stringify(args)}` : "";
           bucket.push({
             kind: "command",
             itemId: d.id ?? "unknown",
-            command: `${d.tool ?? "tool"}${argsText}`.slice(0, 400),
+            command: dynamicToolCommandText(d.tool, d.arguments),
             status: d.success === false ? "failed" : (d.status ?? "completed"),
           });
           break;
@@ -3936,16 +3952,14 @@ function wireNotifications(): void {
         if (item?.type === "commandExecution") {
           send("chat:command", { paneId, phase, item });
         } else if (item?.type === "dynamicToolCall") {
-          // Browser-tool calls render as command-style cards.
+          // Dynamic tool calls render as command-style cards.
           const d = item as { id?: string; tool?: string; arguments?: unknown; status?: string; success?: boolean };
-          const args = d.arguments && typeof d.arguments === "object" ? d.arguments : {};
-          const argsText = Object.keys(args).length ? ` ${JSON.stringify(args)}` : "";
           send("chat:command", {
             paneId,
             phase,
             item: {
               id: d.id,
-              command: `${d.tool ?? "tool"}${argsText}`.slice(0, 400),
+              command: dynamicToolCommandText(d.tool, d.arguments),
               // A started call is in progress — defaulting to "completed"
               // showed a green "done" for a page still loading.
               status:
