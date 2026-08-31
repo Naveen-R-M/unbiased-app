@@ -34,6 +34,7 @@ import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import { startSecretProxy, type SecretConnector } from "./oauth-proxy";
 import {
+  CATALOGUE_CACHE_VERSION,
   fetchCatalogueFromAnyHost,
   parseCatalogue,
   type Catalogue,
@@ -6259,10 +6260,19 @@ app.whenReady().then(async () => {
     if (catalogueLoaded) return catalogueCache;
     catalogueLoaded = true;
     try {
-      const raw = JSON.parse(readFileSync(cataloguePath(), "utf8")) as { payload?: string; etag?: string | null };
+      const raw = JSON.parse(readFileSync(cataloguePath(), "utf8")) as {
+        payload?: string;
+        etag?: string | null;
+        cacheVersion?: number;
+      };
+      // Discard a cache written by a build that parsed fewer fields than this
+      // one. Otherwise its next revalidation is a 304, the stale copy stands,
+      // and the new field stays invisible until the publisher happens to
+      // change something.
+      if (raw?.cacheVersion !== CATALOGUE_CACHE_VERSION) return (catalogueCache = null);
       // The cache stores the VERIFIED payload text and re-parses it, rather
-      // than storing parsed objects: one parser, one set of rules, no way for
-      // a hand-edited cache to introduce a shape the parser would reject.
+      // than storing parsed objects: one parser, one set of rules, and a build
+      // that learns a new field recovers it from the original bytes.
       if (typeof raw?.payload === "string") {
         catalogueCache = parseCatalogue(raw.payload, typeof raw.etag === "string" ? raw.etag : null, new Date().toISOString());
       }
@@ -6303,12 +6313,11 @@ app.whenReady().then(async () => {
       try {
         writeFileSync(
           cataloguePath(),
+          // The payload verbatim — re-serialising the parsed form is what made
+          // a new field unrecoverable from an existing cache.
           JSON.stringify({
-            payload: JSON.stringify({
-              schema: res.catalogue.schema,
-              publishedAt: res.catalogue.publishedAt,
-              connectors: res.catalogue.connectors,
-            }),
+            cacheVersion: CATALOGUE_CACHE_VERSION,
+            payload: res.catalogue.raw,
             etag: res.catalogue.etag,
           }),
           { mode: 0o600 },

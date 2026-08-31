@@ -23,6 +23,17 @@ import { createPublicKey, verify } from "node:crypto";
 export const CATALOGUE_SCHEMA = 1;
 
 /**
+ * Bumped whenever THIS app learns to read a field it used to ignore.
+ *
+ * The cache is keyed on it, so a cache written by an older build is discarded
+ * rather than trusted. Without this, an ETag revalidation returns 304, the
+ * stale cache is kept, and the new field never appears until the publisher
+ * happens to change something — which is exactly what happened when
+ * `comingSoon` shipped.
+ */
+export const CATALOGUE_CACHE_VERSION = 2;
+
+/**
  * Signing key for the catalogue, from unbiased-connectors. Rotating it strands
  * installed apps on their bundled fallback until they update, which is why the
  * repo treats keygen as a one-time act.
@@ -84,6 +95,11 @@ export type CatalogueEntry = {
 
 export type Catalogue = {
   schema: number;
+  /** The exact verified bytes this was parsed from. Cached as-is, so a future
+   *  build that understands more fields recovers them by re-parsing rather
+   *  than being stuck with whatever the build that fetched it happened to
+   *  keep. */
+  raw: string;
   /** When the maintainer built and signed this payload. Inside the signed
    *  bytes, so it cannot be forged or stripped in transit. */
   publishedAt: string;
@@ -179,7 +195,7 @@ export function parseCatalogue(text: string, etag: string | null, now: string): 
     });
   }
   if (!connectors.length) return null; // an empty catalogue is a broken publish
-  return { schema: CATALOGUE_SCHEMA, publishedAt, connectors, etag, fetchedAt: now };
+  return { schema: CATALOGUE_SCHEMA, raw: text, publishedAt, connectors, etag, fetchedAt: now };
 }
 
 export function verifyCatalogue(text: string, signatureB64: string, publicKeyPem = CATALOGUE_PUBLIC_KEY): boolean {

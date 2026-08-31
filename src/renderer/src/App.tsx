@@ -11170,18 +11170,12 @@ function ConnectorsView({ navOpen, onToggleNav }: { navOpen: boolean; onToggleNa
                       </div>
                       <div style={{ display: "flex", alignItems: "center", gap: 8 }} onClick={(e) => e.stopPropagation()}>
                         {c.comingSoon ? (
-                          // A badge rather than a disabled button: a greyed
-                          // "Sign in" invites clicking and explains nothing.
-                          <span
-                            style={{
-                              color: colors.dim,
-                              fontSize: 12.5,
-                              fontWeight: 500,
-                              border: `1px solid ${colors.border}`,
-                              borderRadius: 999,
-                              padding: "3px 10px",
-                            }}
-                          >
+                          // Plain text, not a pill: a pill's own padding pushed
+                          // the words in from the card's text column, so it
+                          // read as indented against the description above it.
+                          // Nothing here is actionable, so nothing needs the
+                          // affordance of a chip.
+                          <span style={{ color: colors.dim, fontSize: 12.5, fontWeight: 500, padding: "3px 0" }}>
                             Coming soon
                           </span>
                         ) : c.added ? (
