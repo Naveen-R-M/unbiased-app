@@ -96,6 +96,21 @@ contextBridge.exposeInMainWorld("unbiased", {
   onScheduledOpenRun: (cb: (p: unknown) => void) => subscribe("scheduled:open-run", cb),
   memoryList: (threadId: string | null) => ipcRenderer.invoke("memory:list", threadId),
   onMemorySaved: (cb: (p: unknown) => void) => subscribe("chat:memory-saved", cb),
+  mcpLogin: (name: string) => ipcRenderer.invoke("mcp:login", name),
+  connectorsList: () => ipcRenderer.invoke("connectors:list"),
+  connectorsConnect: (name: string) => ipcRenderer.invoke("connectors:connect", name),
+  connectorsRemove: (name: string) => ipcRenderer.invoke("connectors:remove", name),
+  connectorsSetEnabled: (name: string, enabled: boolean) =>
+    ipcRenderer.invoke("connectors:set-enabled", { name, enabled }),
+  /** Fires only when a catalogue refresh brought something new. */
+  onConnectorsChanged: (cb: () => void) => {
+    const h = () => cb();
+    ipcRenderer.on("connectors:changed", h);
+    return () => ipcRenderer.removeListener("connectors:changed", h);
+  },
+  connectorsSetClientId: (name: string, clientId: string, clientSecret?: string) =>
+    ipcRenderer.invoke("connectors:set-client-id", { name, clientId, clientSecret }),
+  onMcpLoginDone: (cb: (p: unknown) => void) => subscribe("mcp:login-done", cb),
   // A dropped File carries no usable path of its own in Electron 32+; only
   // this side can resolve one.
   pathForDroppedFile: (file: File) => {
