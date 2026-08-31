@@ -3363,7 +3363,7 @@ export function App() {
                         onClick={() => setEnvSection((s) => (s === "memory" ? null : "memory"))}
                       />
                       {envSection === "memory" && (
-                        <div style={{ padding: "0 0 4px 12px", maxHeight: 220, overflowY: "auto" }}>
+                        <div style={{ padding: "0 0 4px 12px", maxHeight: 260, overflowY: "auto" }}>
                           {envMemories.map((m) => (
                             <button
                               key={m.name}
@@ -3373,9 +3373,7 @@ export function App() {
                               }}
                               title={m.path}
                               style={{
-                                display: "flex",
-                                alignItems: "baseline",
-                                gap: 8,
+                                display: "block",
                                 width: "100%",
                                 background: "transparent",
                                 border: "none",
@@ -3387,33 +3385,47 @@ export function App() {
                                 fontFamily: "inherit",
                               }}
                             >
-                              <span style={{ color: colors.accent, flexShrink: 0 }}>{m.name}</span>
+                              <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                                <span
+                                  style={{
+                                    color: colors.accent,
+                                    flex: 1,
+                                    minWidth: 0,
+                                    whiteSpace: "nowrap",
+                                    overflow: "hidden",
+                                    textOverflow: "ellipsis",
+                                  }}
+                                >
+                                  {m.name}
+                                </span>
+                                {m.thisThread && (
+                                  <span
+                                    style={{
+                                      color: colors.dim,
+                                      fontSize: 11,
+                                      border: `1px solid ${colors.border}`,
+                                      borderRadius: 5,
+                                      padding: "1px 6px",
+                                      flexShrink: 0,
+                                    }}
+                                  >
+                                    this chat
+                                  </span>
+                                )}
+                              </span>
+                              {/* The description is the note's whole summary —
+                                  wrapped in full, never ellipsized: truncating
+                                  it is what made the row read as "CH…". */}
                               <span
                                 style={{
+                                  display: "block",
                                   color: colors.dim,
-                                  flex: 1,
-                                  minWidth: 0,
-                                  whiteSpace: "nowrap",
-                                  overflow: "hidden",
-                                  textOverflow: "ellipsis",
+                                  lineHeight: 1.45,
+                                  paddingTop: 2,
                                 }}
                               >
                                 {m.description}
                               </span>
-                              {m.thisThread && (
-                                <span
-                                  style={{
-                                    color: colors.dim,
-                                    fontSize: 11,
-                                    border: `1px solid ${colors.border}`,
-                                    borderRadius: 5,
-                                    padding: "1px 6px",
-                                    flexShrink: 0,
-                                  }}
-                                >
-                                  this chat
-                                </span>
-                              )}
                             </button>
                           ))}
                         </div>
