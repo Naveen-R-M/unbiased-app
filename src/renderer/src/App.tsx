@@ -443,6 +443,11 @@ type ScheduledTaskView = {
   createdAt: string;
   lastRunAt: string | null;
   lastStatus: "completed" | "failed" | "interrupted" | null;
+  /** The agent's own verdict on whether the TASK got done. A completed turn
+   *  whose verdict is "failed" is a failed run; a missing verdict is neither
+   *  claimed as success nor as failure. */
+  lastVerdict: "done" | "failed" | null;
+  lastVerdictNote: string | null;
   lastError: string | null;
   lastThreadId: string | null;
   /** Set when the schedule elapsed while the app was closed. */
@@ -559,6 +564,20 @@ declare global {
         cb: (p: { paneId: PaneId; key: string; name: string; cadence: string }) => void,
       ) => () => void;
       onScheduledOpenRun: (cb: (p: { threadId: string }) => void) => () => void;
+      mcpLogin: (name: string) => Promise<{ ok: boolean; error?: string }>;
+      connectorsList: () => Promise<{ connectors: ConnectorInfo[] }>;
+      connectorsConnect: (
+        name: string,
+      ) => Promise<{ ok: boolean; error?: string; branded?: boolean; signIn?: boolean }>;
+      connectorsRemove: (name: string) => Promise<{ ok: boolean; error?: string }>;
+      onConnectorsChanged: (cb: () => void) => () => void;
+      connectorsSetClientId: (
+        name: string,
+        clientId: string,
+        clientSecret?: string,
+      ) => Promise<{ ok: boolean; error?: string }>;
+      connectorsSetEnabled: (name: string, enabled: boolean) => Promise<{ ok: boolean; error?: string }>;
+      onMcpLoginDone: (cb: (p: { name: string; success: boolean; error: string | null }) => void) => () => void;
       onApprovalCanceled: (cb: (p: { paneId: PaneId; requestId: string }) => void) => () => void;
       onApprovalRequest: (
         cb: (p: {
@@ -1024,15 +1043,17 @@ export function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [showChangelog, setShowChangelog] = useState(false);
   const [mcpOpen, setMcpOpen] = useState(false);
+  const [connectorsPanelOpen, setConnectorsPanelOpen] = useState(false);
   const [skillsOpen, setSkillsOpen] = useState(false);
   const [scheduledOpen, setScheduledOpen] = useState(false);
   /** The thread of a scheduled run that is going right now, if any. */
   const [runningScheduledThread, setRunningScheduledThread] = useState<string | null>(null);
+  const [connectorsOpen, setConnectorsOpen] = useState(false);
   /** True while a full-page destination covers the chat. Sidebar rows key off
-   *  this rather than testing the flag directly, so adding a second such view
-   *  does not mean remembering to exclude it in three separate `active`
-   *  expressions — forgetting that leaves two rows lit at once. */
-  const pageOpen = scheduledOpen;
+   *  this rather than testing each flag: with one flag per view, adding a view
+   *  meant remembering to exclude it in three separate `active` expressions,
+   *  and forgetting left two rows lit at once. */
+  const pageOpen = scheduledOpen || connectorsOpen;
   /** Set when arriving from a "View task" link, so the row the agent just
    *  created is identifiable among the others rather than left to be found. */
   const [scheduledFocus, setScheduledFocus] = useState<string | null>(null);
@@ -1862,6 +1883,7 @@ export function App() {
   // destructive actions still wait.
   async function newChat(project?: { name: string; path: string }) {
     setScheduledOpen(false);
+    setConnectorsOpen(false);
     snapshotSideView();
     await window.unbiased.detachThread(project?.path);
     setActiveProject(project ?? null);
@@ -1891,6 +1913,7 @@ export function App() {
     () =>
       window.unbiased.onScheduledOpenRun(({ threadId }) => {
         setScheduledOpen(false);
+        setConnectorsOpen(false);
         void openThread(threadId);
       }),
     [],
@@ -1901,6 +1924,7 @@ export function App() {
     // clicking a destination in the nav. Both entry points clear them so the
     // view never outlives the row that is lit.
     setScheduledOpen(false);
+    setConnectorsOpen(false);
     if (id === activeThreadId) return;
     snapshotSideView();
     // Two quick clicks race their awaits — only the latest open may commit.
@@ -2672,7 +2696,21 @@ export function App() {
             Open project…
           </SidebarAction>
           <SidebarAction
-            onClick={() => setScheduledOpen(true)}
+            onClick={() => {
+              setScheduledOpen(false);
+              setConnectorsOpen(true);
+            }}
+            disabled={false}
+            active={connectorsOpen}
+            icon={<PlugIcon />}
+          >
+            Connectors
+          </SidebarAction>
+          <SidebarAction
+            onClick={() => {
+              setConnectorsOpen(false);
+              setScheduledOpen(true);
+            }}
             disabled={false}
             active={scheduledOpen}
             icon={<ClockIcon />}
@@ -3029,7 +3067,9 @@ export function App() {
         {/* Scheduled tasks lives in the content area, not over it and not
             instead of the whole window: the nav stays put and you leave the
             way you leave a chat — by clicking somewhere else in it. */}
-        {scheduledOpen ? (
+        {connectorsOpen ? (
+          <ConnectorsView navOpen={navOpen} onToggleNav={toggleNav} />
+        ) : scheduledOpen ? (
           <ScheduledView
             defaultProject={activeProjectPath ?? null}
             projects={sidebar.projects}
@@ -3039,6 +3079,7 @@ export function App() {
             onFocusHandled={() => setScheduledFocus(null)}
             onOpenThread={(id) => {
               setScheduledOpen(false);
+              setConnectorsOpen(false);
               void openThread(id);
             }}
           />
@@ -3704,6 +3745,7 @@ export function App() {
             setScheduledOpen(true);
           }}
           onOpenMcp={() => setMcpOpen(true)}
+          onOpenConnectors={() => setConnectorsPanelOpen(true)}
           onOpenSkills={() => setSkillsOpen(true)}
           onBusyChange={(b) => {
             setMainBusy(b);
@@ -4112,6 +4154,7 @@ export function App() {
             planMode={planMode}
             onTogglePlanMode={togglePlanMode}
             onOpenMcp={() => setMcpOpen(true)}
+            onOpenConnectors={() => setConnectorsPanelOpen(true)}
             onOpenSkills={() => setSkillsOpen(true)}
             emptyState={
               <div style={{ textAlign: "center", padding: "0 24px" }}>
@@ -4905,6 +4948,15 @@ export function App() {
         </div>
       )}
       {mcpOpen && <McpPanel onClose={() => setMcpOpen(false)} />}
+      {connectorsPanelOpen && (
+        <ConnectorsPanel
+          onClose={() => setConnectorsPanelOpen(false)}
+          onOpenFull={() => {
+            setScheduledOpen(false);
+            setConnectorsOpen(true);
+          }}
+        />
+      )}
       {skillsOpen && (
         <SkillsPanel cwd={activeProjectPath ?? null} onClose={() => setSkillsOpen(false)} />
       )}
@@ -7498,6 +7550,7 @@ function ChatPane({
   onOpenAgent,
   onOpenScheduled,
   onOpenMcp,
+  onOpenConnectors,
   onOpenSkills,
 }: {
   paneId: PaneId;
@@ -7545,6 +7598,7 @@ function ChatPane({
   /** Open the Scheduled view focused on a task the agent just created. */
   onOpenScheduled?: (key: string) => void;
   onOpenMcp?: () => void;
+  onOpenConnectors?: () => void;
   onOpenSkills?: () => void;
 }) {
   const [entries, setEntries] = useState<Entry[]>(reset.entries);
@@ -9084,6 +9138,20 @@ function ChatPane({
                   onOpenSkills?.();
                 }}
               />
+              {/* Above MCP deliberately. Both reach the same machinery, but
+                  this is the front door — pick a service, sign in — and MCP is
+                  the escape hatch for a server you type in yourself. Ordering
+                  them the other way puts the advanced form first. */}
+              <MenuItem
+                icon={<PlugIcon />}
+                label="Connectors"
+                desc="Connect Linear, Notion, Figma and more"
+                trailing={<MenuChevron />}
+                onClick={() => {
+                  setPlusOpen(false);
+                  onOpenConnectors?.();
+                }}
+              />
               <MenuItem
                 icon={<McpIcon />}
                 label="MCP"
@@ -10333,6 +10401,818 @@ const TASK_TEMPLATES: { name: string; schedule: ScheduleSpec; prompt: string; bl
  * rather than a layout, so the starter templates carry the "begin without a
  * form" intent instead.
  */
+type ConnectorInfo = {
+  name: string;
+  url: string;
+  displayName: string;
+  description: string;
+  longDescription: string;
+  developer: string | null;
+  version: string | null;
+  category: string;
+  capabilities: string[];
+  prompts: string[];
+  brandColor: string | null;
+  websiteUrl: string | null;
+  privacyUrl: string | null;
+  termsUrl: string | null;
+  supportUrl: string | null;
+  icon: string | null;
+  redirectUri: string;
+  clientId: string | null;
+  enabled: boolean;
+  requiresClientId: boolean;
+  requiresSecret: boolean;
+  scopes: string[];
+  added: boolean;
+  authStatus: string | null;
+};
+
+/** One labelled fact in a connector's Information table. Rendered only when
+ *  there is something to say — an empty row reads as missing data rather than
+ *  as a field this connector does not use. */
+function InfoRow({ label, children }: { label: string; children: React.ReactNode }) {
+  if (children === null || children === undefined || children === "") return null;
+  return (
+    <div style={{ display: "flex", gap: 16, padding: "9px 0", borderTop: `1px solid ${colors.border}` }}>
+      <span style={{ color: colors.dim, fontSize: 13.5, width: 130, flexShrink: 0 }}>{label}</span>
+      <span style={{ color: colors.fg, fontSize: 13.5, minWidth: 0, wordBreak: "break-word" }}>{children}</span>
+    </div>
+  );
+}
+
+/**
+ * The connector catalogue.
+ *
+ * Only the servers that support on-the-spot registration appear here, which is
+ * what lets the consent screen say Unbiased rather than Codex. Connecting is
+ * one action rather than three — add the server, claim our OAuth client, sign
+ * in — because the intermediate states are ours to manage, not the user's to
+ * understand.
+ */
+/**
+ * The connectors modal, opened from the composer's + menu.
+ *
+ * Same shell as MCP and Skills — scrim, 18-radius card, inset group, pinned
+ * footer — because it is the same kind of thing: a quick look at what Pareto
+ * can reach, with one switch per row. Anything beyond switching (adding,
+ * signing in, reading the detail) hands off to the full page rather than
+ * growing a second, smaller version of it here.
+ */
+function ConnectorsPanel({ onClose, onOpenFull }: { onClose: () => void; onOpenFull: () => void }) {
+  const [items, setItems] = useState<ConnectorInfo[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [shown, setShown] = useState(false);
+  useEffect(() => {
+    const t = setTimeout(() => setShown(true), 10);
+    return () => clearTimeout(t);
+  }, []);
+
+  const refresh = useCallback(async () => {
+    const r = await window.unbiased.connectorsList();
+    setItems((r.connectors ?? []).filter((c) => c.added));
+    setLoading(false);
+  }, []);
+  useEffect(() => void refresh(), [refresh]);
+
+  async function toggle(c: ConnectorInfo) {
+    setNotice(null);
+    setBusy(c.name);
+    const res = await window.unbiased.connectorsSetEnabled(c.name, !c.enabled);
+    setBusy(null);
+    if (!res.ok) setNotice(res.error ?? "Could not change it.");
+    void refresh();
+  }
+
+  const insetStyle: React.CSSProperties = {
+    background: "var(--panel-2)",
+    borderRadius: 14,
+    padding: "4px 16px",
+    marginTop: 16,
+  };
+
+  return (
+    <div
+      data-popover
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="connectors-panel-title"
+      style={{
+        position: "fixed",
+        inset: 0,
+        background: "rgba(0,0,0,0.45)",
+        backdropFilter: "var(--scrim-blur)",
+        WebkitBackdropFilter: "var(--scrim-blur)",
+        display: "grid",
+        placeItems: "center",
+        zIndex: 100,
+        opacity: shown ? 1 : 0,
+        transition: "opacity 180ms var(--ease-out)",
+      }}
+      onClick={onClose}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        data-popover
+        style={{
+          transform: shown ? "scale(1)" : "scale(0.98)",
+          transition: "transform 180ms var(--ease-out)",
+          background: colors.panel,
+          border: `1px solid ${colors.border}`,
+          borderRadius: 18,
+          width: 560,
+          maxWidth: "calc(100vw - 48px)",
+          maxHeight: "calc(100vh - 96px)",
+          display: "flex",
+          flexDirection: "column",
+          boxShadow: "0 24px 60px rgba(0,0,0,0.55)",
+        }}
+      >
+        <div style={{ overflowY: "auto", padding: "26px 26px 4px" }}>
+          <h2
+            id="connectors-panel-title"
+            style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 19, fontWeight: 600, letterSpacing: "var(--track-title)", margin: 0, color: colors.fg }}
+          >
+            <span style={{ color: colors.accent, display: "flex" }}>
+              <PlugIcon />
+            </span>
+            Connectors
+          </h2>
+          <p style={{ color: colors.dim, fontSize: 14, lineHeight: 1.55, margin: "10px 0 0" }}>
+            The services Pareto can reach. Turning one off leaves it signed in — it just stops
+            offering its tools. This applies to every chat, not only this one.
+          </p>
+
+          {notice && (
+            <div style={{ marginTop: 16, color: colors.amber, fontSize: 13.5, lineHeight: 1.5 }}>{notice}</div>
+          )}
+
+          {loading && <div style={{ color: colors.dim, fontSize: 14, marginTop: 18 }}>Loading…</div>}
+          {!loading && items.length === 0 && (
+            <div style={{ color: colors.dim, fontSize: 14, lineHeight: 1.55, marginTop: 18 }}>
+              No connectors yet. Add one to let Pareto reach the tools you use.
+            </div>
+          )}
+
+          {items.length > 0 && (
+            <div style={insetStyle}>
+              {items.map((c, i) => (
+                <div
+                  key={c.name}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 14,
+                    padding: "13px 0",
+                    borderTop: i > 0 ? `1px solid ${colors.border}` : "none",
+                  }}
+                >
+                  <span style={{ width: 26, height: 26, flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", opacity: c.enabled ? 1 : 0.4 }}>
+                    {c.icon ? (
+                      <img src={c.icon} alt="" style={{ maxWidth: 26, maxHeight: 26 }} />
+                    ) : (
+                      <span style={{ color: colors.dim, fontSize: 14, fontWeight: 600 }}>{c.displayName.slice(0, 1)}</span>
+                    )}
+                  </span>
+                  <span style={{ minWidth: 0, flex: 1 }}>
+                    <div style={{ fontSize: 14.5, fontWeight: 500, color: c.enabled ? colors.fg : colors.dim, letterSpacing: "var(--track-body)" }}>
+                      {c.displayName}
+                    </div>
+                    <div style={{ fontSize: 13, color: colors.dim, marginTop: 3, lineHeight: 1.45, letterSpacing: "var(--track-meta)" }}>
+                      {c.authStatus === "oAuth" ? "Signed in" : "Needs sign-in"}
+                    </div>
+                  </span>
+                  {/* The same ring-with-a-tick the scheduled list uses for the
+                      same job, so "on" reads identically in both places. */}
+                  <button
+                    onClick={() => void toggle(c)}
+                    disabled={busy !== null}
+                    aria-pressed={c.enabled}
+                    title={c.enabled ? `Turn ${c.displayName} off` : `Turn ${c.displayName} on`}
+                    style={{
+                      width: 18,
+                      height: 18,
+                      flexShrink: 0,
+                      display: "grid",
+                      placeItems: "center",
+                      borderRadius: "50%",
+                      border: `1.5px solid ${c.enabled ? colors.accent : colors.border}`,
+                      background: c.enabled ? colors.accent : "transparent",
+                      color: "var(--accent-fg)",
+                      cursor: "pointer",
+                      padding: 0,
+                    }}
+                  >
+                    {c.enabled && <CheckIcon size={11} />}
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        <div
+          style={{
+            flexShrink: 0,
+            display: "flex",
+            justifyContent: "flex-end",
+            gap: 12,
+            padding: "16px 26px 22px",
+            borderTop: `1px solid ${colors.border}`,
+          }}
+        >
+          <button onClick={onClose} style={btnSecondaryStyle}>
+            Close
+          </button>
+          <button
+            onClick={() => {
+              onClose();
+              onOpenFull();
+            }}
+            style={btnPrimaryStyle}
+          >
+            <PlugIcon />
+            Browse connectors
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * The last list this session rendered, kept outside the component so leaving
+ * the page and coming back shows it instantly. Re-mounting used to start from
+ * an empty list and a "Loading…", even though the answer had not changed.
+ */
+let connectorsCache: ConnectorInfo[] = [];
+
+function ConnectorsView({ navOpen, onToggleNav }: { navOpen: boolean; onToggleNav: () => void }) {
+  const [items, setItems] = useState<ConnectorInfo[]>(connectorsCache);
+  // Only the very first visit of a session has nothing to show.
+  const [loading, setLoading] = useState(connectorsCache.length === 0);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [openName, setOpenName] = useState<string | null>(null);
+  const noticeRef = useRef<HTMLDivElement | null>(null);
+  const [clientIdDraft, setClientIdDraft] = useState("");
+  const [clientSecretDraft, setClientSecretDraft] = useState("");
+  const [copied, setCopied] = useState(false);
+
+  const refresh = useCallback(async () => {
+    const r = await window.unbiased.connectorsList();
+    connectorsCache = r.connectors ?? [];
+    setItems(connectorsCache);
+    setLoading(false);
+  }, []);
+  useEffect(() => void refresh(), [refresh]);
+  // The catalogue is fetched in the background now, so the page has to be told
+  // when a refresh actually brought something new.
+  useEffect(() => window.unbiased.onConnectorsChanged(() => void refresh()), [refresh]);
+  // Sign-in finishes in the browser, so nothing in this window knows it
+  // happened until the engine says so. Without this the card sits on
+  // "Waiting…" after a successful approval.
+  useEffect(
+    () =>
+      window.unbiased.onMcpLoginDone(({ name, success, error }) => {
+        setBusy((cur) => (cur === name ? null : cur));
+        if (!success) setNotice(`Sign-in did not complete. ${error ?? ""}`.trim());
+        void refresh();
+      }),
+    [refresh],
+  );
+
+  async function connect(c: ConnectorInfo) {
+    setNotice(null);
+    setBusy(c.name);
+    const res = await window.unbiased.connectorsConnect(c.name);
+    setBusy(null);
+    if (!res.ok) {
+      setNotice(res.error ?? `Could not connect ${c.displayName}.`);
+    } else if (res.signIn) {
+      // Worth saying which name they are about to see: the whole point of the
+      // registration step is invisible otherwise.
+      setNotice(
+        res.branded
+          ? `Approve ${c.displayName} in your browser — it will ask on behalf of Unbiased.`
+          : `Approve ${c.displayName} in your browser.`,
+      );
+    } else {
+      setNotice(`${c.displayName} was added. Use Sign in under MCP servers to finish.`);
+    }
+    void refresh();
+  }
+
+  async function signIn(c: ConnectorInfo) {
+    setNotice(null);
+    setBusy(c.name);
+    const res = await window.unbiased.mcpLogin(c.name);
+    if (!res.ok) {
+      setBusy(null);
+      setNotice(res.error ?? `Could not start sign-in for ${c.displayName}.`);
+      return;
+    }
+    setNotice(`Approve ${c.displayName} in your browser.`);
+  }
+
+  async function saveClientId(c: ConnectorInfo) {
+    setNotice(null);
+    setBusy(c.name);
+    const res = await window.unbiased.connectorsSetClientId(c.name, clientIdDraft.trim(), clientSecretDraft.trim());
+    setBusy(null);
+    setNotice(res.ok ? `Saved. Sign in to ${c.displayName} to use it.` : (res.error ?? "Could not save it."));
+    void refresh();
+  }
+
+  async function remove(c: ConnectorInfo) {
+    setNotice(null);
+    setBusy(c.name);
+    const res = await window.unbiased.connectorsRemove(c.name);
+    setBusy(null);
+    if (!res.ok) setNotice(res.error ?? "Could not remove it.");
+    void refresh();
+  }
+
+  // The notice lives at the top of a long scrolling page, so a failure raised
+  // from a card three screens down was invisible — which is indistinguishable
+  // from the button doing nothing. Reported as exactly that.
+  useEffect(() => {
+    if (notice) noticeRef.current?.scrollIntoView({ block: "center", behavior: "smooth" });
+  }, [notice]);
+
+  const open = openName ? (items.find((c) => c.name === openName) ?? null) : null;
+  useEffect(() => {
+    setClientIdDraft(open?.clientId ?? "");
+    // The secret is never echoed back from the config — an empty field on a
+    // saved connector means "unchanged", not "missing".
+    setClientSecretDraft("");
+    setCopied(false);
+  }, [openName, open?.clientId]);
+
+  const groups = Array.from(
+    items.reduce((m, c) => {
+      const list = m.get(c.category) ?? [];
+      list.push(c);
+      m.set(c.category, list);
+      return m;
+    }, new Map<string, ConnectorInfo[]>()),
+  ).sort((a, b) => a[0].localeCompare(b[0]));
+
+  return (
+    <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", height: "100%" }}>
+      <header
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 10,
+          padding: "10px 16px",
+          flexShrink: 0,
+          position: "relative",
+          zIndex: 2,
+        }}
+      >
+        <HeaderEdge />
+        <IconButton title={navOpen ? "Hide sidebar" : "Show sidebar"} onClick={onToggleNav}>
+          <PanelIcon />
+        </IconButton>
+        <span style={{ fontSize: 14, fontWeight: 500, color: colors.fg, letterSpacing: "var(--track-body)" }}>
+          Connectors
+        </span>
+      </header>
+
+      <div style={{ flex: 1, minHeight: 0, overflowY: "auto" }}>
+        <div style={{ maxWidth: 760, margin: "0 auto", padding: "40px 24px 64px" }}>
+          {open ? (
+            <>
+              {/* Breadcrumb rather than a back arrow: it names where "back"
+                  goes, and doubles as the label for a page whose title is the
+                  connector rather than the section. */}
+              <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13.5, marginBottom: 26 }}>
+                <button
+                  onClick={() => setOpenName(null)}
+                  data-nopress
+                  style={{ background: "none", border: "none", padding: 0, color: colors.dim, fontSize: 13.5, cursor: "pointer", fontFamily: "inherit" }}
+                >
+                  Connectors
+                </button>
+                <span style={{ color: colors.dim, display: "flex" }}><MenuChevron /></span>
+                <span style={{ color: colors.fg }}>{open.displayName}</span>
+              </div>
+
+              <div style={{ display: "flex", alignItems: "flex-start", gap: 18 }}>
+                <span
+                  style={{
+                    width: 56,
+                    height: 56,
+                    flexShrink: 0,
+                    borderRadius: 14,
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    // A brand colour is a wash behind the mark, never the mark
+                    // itself — several logos are already full-colour and would
+                    // fight it.
+                    background: open.brandColor
+                      ? `color-mix(in srgb, ${open.brandColor} 18%, transparent)`
+                      : "var(--panel-2)",
+                  }}
+                >
+                  {open.icon ? (
+                    <img src={open.icon} alt="" style={{ maxWidth: 34, maxHeight: 34 }} />
+                  ) : (
+                    <span style={{ color: colors.dim, fontSize: 22, fontWeight: 600 }}>{open.displayName.slice(0, 1)}</span>
+                  )}
+                </span>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <h1 style={{ fontSize: 26, fontWeight: 600, letterSpacing: "var(--track-title)", lineHeight: 1.2, margin: 0, color: colors.fg }}>
+                    {open.displayName}
+                  </h1>
+                  <p style={{ color: colors.dim, fontSize: 14.5, lineHeight: 1.5, margin: "6px 0 0" }}>{open.description}</p>
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0, marginTop: 4 }}>
+                  {open.added ? (
+                    <>
+                      {open.authStatus !== "oAuth" && (
+                        <button className="u-chip" onClick={() => void signIn(open)} disabled={busy !== null} style={btnSmallStyle}>
+                          {busy === open.name ? "Waiting…" : "Sign in"}
+                        </button>
+                      )}
+                      <button className="u-chip" onClick={() => void remove(open)} disabled={busy === open.name} style={btnSmallStyle}>
+                        {busy === open.name ? "Working…" : "Remove"}
+                      </button>
+                    </>
+                  ) : open.requiresClientId && !open.clientId ? null : (
+                    <button className="u-chip" onClick={() => void connect(open)} disabled={busy !== null} style={btnSmallStyle}>
+                      {busy === open.name ? "Connecting…" : "Connect"}
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {open.added && open.authStatus === "oAuth" && (
+                <div style={{ marginTop: 14, fontSize: 12.5, fontWeight: 500, color: colors.ok }}>Connected</div>
+              )}
+
+              {open.prompts.length > 0 && (
+                <div style={{ marginTop: 28, display: "flex", flexDirection: "column", gap: 8 }}>
+                  {open.prompts.map((q) => (
+                    <div
+                      key={q}
+                      style={{
+                        background: "var(--panel-2)",
+                        borderRadius: 12,
+                        padding: "12px 14px",
+                        color: colors.fg,
+                        fontSize: 13.5,
+                        lineHeight: 1.5,
+                        display: "flex",
+                        gap: 10,
+                      }}
+                    >
+                      <span style={{ color: colors.dim, flexShrink: 0 }}>{open.displayName}</span>
+                      <span style={{ minWidth: 0 }}>{q}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {open.longDescription && (
+                <p style={{ color: colors.dim, fontSize: 14.5, lineHeight: 1.6, margin: "28px 0 0", maxWidth: "62ch" }}>
+                  {open.longDescription}
+                </p>
+              )}
+
+              {/* The escape hatch for a provider that will not register us
+                  automatically. The callback is shown rather than described
+                  because it is unguessable, and one wrong character fails at
+                  the authorize step with an error that names nothing useful. */}
+              <h2 style={{ fontSize: 17, fontWeight: 600, letterSpacing: "var(--track-title)", margin: "34px 0 6px", color: colors.fg }}>
+                Use your own OAuth app
+              </h2>
+              <p style={{ color: colors.dim, fontSize: 13.5, lineHeight: 1.55, margin: "0 0 14px", maxWidth: "62ch" }}>
+                {open.requiresClientId
+                  ? `${open.displayName} offers no automatic sign-up, so this is the required setup, not an override: register an application with them, give it this exact callback URL, paste its client ID here, then sign in.`
+                  : "Most connectors register Unbiased with the provider for you. Where that is not offered, register an application yourself, give it this exact callback URL, and paste its client ID here."}
+              </p>
+              <label style={{ color: colors.dim, fontSize: 13, display: "block", marginBottom: 6 }}>Callback URL</label>
+              <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 14 }}>
+                <code
+                  style={{
+                    flex: 1,
+                    minWidth: 0,
+                    background: "var(--panel-2)",
+                    border: `1px solid ${colors.border}`,
+                    borderRadius: 10,
+                    padding: "10px 12px",
+                    fontSize: 12.5,
+                    fontFamily: "var(--font-code)",
+                    color: colors.fg,
+                    overflowX: "auto",
+                    whiteSpace: "nowrap",
+                  }}
+                >
+                  {open.redirectUri}
+                </code>
+                <button
+                  className="u-chip"
+                  style={btnSmallStyle}
+                  onClick={() => {
+                    void navigator.clipboard.writeText(open.redirectUri);
+                    setCopied(true);
+                  }}
+                >
+                  {copied ? "Copied" : "Copy"}
+                </button>
+              </div>
+              {open.requiresSecret && (
+                <>
+                  <label htmlFor="cn-secret" style={{ color: colors.dim, fontSize: 13, display: "block", marginBottom: 6 }}>
+                    Client secret
+                  </label>
+                  <input
+                    id="cn-secret"
+                    className="u-field"
+                    type="password"
+                    value={clientSecretDraft}
+                    onChange={(e) => setClientSecretDraft(e.target.value)}
+                    placeholder={open.clientId ? "Saved — enter again only to change it" : "GOCSPX-…"}
+                    style={{
+                      width: "100%",
+                      boxSizing: "border-box",
+                      background: "var(--panel-2)",
+                      color: colors.fg,
+                      border: `1px solid ${colors.border}`,
+                      borderRadius: 10,
+                      padding: "10px 12px",
+                      fontSize: 13.5,
+                      fontFamily: "var(--font-ui)",
+                      outline: "none",
+                      marginBottom: 14,
+                    }}
+                  />
+                </>
+              )}
+              <label htmlFor="cn-clientid" style={{ color: colors.dim, fontSize: 13, display: "block", marginBottom: 6 }}>
+                Client ID
+              </label>
+              <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                <input
+                  id="cn-clientid"
+                  className="u-field"
+                  value={clientIdDraft}
+                  onChange={(e) => setClientIdDraft(e.target.value)}
+                  placeholder="Leave empty to go back to automatic sign-up"
+                  style={{
+                    flex: 1,
+                    minWidth: 0,
+                    boxSizing: "border-box",
+                    background: "var(--panel-2)",
+                    color: colors.fg,
+                    border: `1px solid ${colors.border}`,
+                    borderRadius: 10,
+                    padding: "10px 12px",
+                    fontSize: 13.5,
+                    fontFamily: "var(--font-ui)",
+                    outline: "none",
+                  }}
+                />
+                <button
+                  className="u-chip"
+                  style={btnSmallStyle}
+                  disabled={busy !== null || clientIdDraft.trim() === (open.clientId ?? "")}
+                  onClick={() => void saveClientId(open)}
+                >
+                  {busy === open.name ? "Saving…" : "Save"}
+                </button>
+              </div>
+
+              <h2 style={{ fontSize: 17, fontWeight: 600, letterSpacing: "var(--track-title)", margin: "34px 0 4px", color: colors.fg }}>
+                Information
+              </h2>
+              <div>
+                <InfoRow label="Capabilities">{open.capabilities.join(", ")}</InfoRow>
+                <InfoRow label="Developer">{open.developer}</InfoRow>
+                <InfoRow label="Category">{open.category}</InfoRow>
+                <InfoRow label="Version">{open.version}</InfoRow>
+                <InfoRow label="Server">{open.url}</InfoRow>
+                {([["Website", open.websiteUrl], ["Privacy Policy", open.privacyUrl], ["Terms of Service", open.termsUrl], ["Support", open.supportUrl]] as const).map(
+                  ([label, href]) =>
+                    href ? (
+                      <InfoRow key={label} label={label}>
+                        <a
+                          href={href}
+                          onClick={(e) => {
+                            e.preventDefault();
+                            void window.unbiased.openExternal(href);
+                          }}
+                          style={{ color: colors.accent, textDecoration: "none" }}
+                        >
+                          {href.replace(/^https?:\/\//, "").replace(/\/$/, "")}
+                        </a>
+                      </InfoRow>
+                    ) : null,
+                )}
+              </div>
+            </>
+          ) : (
+          <>
+          <h1
+            style={{
+              fontSize: 30,
+              fontWeight: 600,
+              letterSpacing: "var(--track-title)",
+              lineHeight: 1.15,
+              margin: 0,
+              color: colors.fg,
+            }}
+          >
+            Connectors
+          </h1>
+          <p style={{ color: colors.dim, fontSize: 14.5, lineHeight: 1.55, margin: "10px 0 0", maxWidth: "58ch" }}>
+            Give Pareto access to the tools you already use. Connecting opens that service in
+            your browser to ask your permission — it asks as Unbiased, and you can revoke it
+            there at any time.
+          </p>
+
+          {notice && (
+            <div
+              ref={noticeRef}
+              style={{
+                marginTop: 18,
+                background: "var(--panel-2)",
+                borderLeft: `2px solid ${colors.accent}`,
+                borderRadius: 10,
+                padding: "10px 12px",
+                color: colors.fg,
+                fontSize: 13.5,
+                lineHeight: 1.5,
+              }}
+            >
+              {notice}
+            </div>
+          )}
+
+          {loading && <div style={{ color: colors.dim, fontSize: 14, marginTop: 24 }}>Loading…</div>}
+          {!loading && items.length === 0 && (
+            <div style={{ color: colors.dim, fontSize: 14, lineHeight: 1.55, marginTop: 24 }}>
+              No connectors are available. The catalogue ships with the engine, so this usually
+              means it has not finished starting.
+            </div>
+          )}
+
+          {groups.map(([category, list]) => (
+            <div key={category} style={{ marginTop: 30 }}>
+              <div
+                style={{
+                  color: colors.dim,
+                  fontSize: 11,
+                  fontWeight: 600,
+                  textTransform: "uppercase",
+                  letterSpacing: "var(--track-overline)",
+                  marginBottom: 10,
+                }}
+              >
+                {category}
+              </div>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(232px, 1fr))", gap: 12 }}>
+                {list.map((c) => {
+                  const signedIn = c.added && c.authStatus === "oAuth";
+                  return (
+                    <div
+                      key={c.name}
+                      role="button"
+                      tabIndex={0}
+                      onClick={() => setOpenName(c.name)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.preventDefault();
+                          setOpenName(c.name);
+                        }
+                      }}
+                      style={{
+                        background: "var(--panel-2)",
+                        borderRadius: 14,
+                        padding: 14,
+                        display: "flex",
+                        flexDirection: "column",
+                        gap: 10,
+                        minWidth: 0,
+                        cursor: "pointer",
+                      }}
+                    >
+                      <div style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0 }}>
+                        <span
+                          style={{
+                            width: 28,
+                            height: 28,
+                            flexShrink: 0,
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "center",
+                          }}
+                        >
+                          {c.icon ? (
+                            <img src={c.icon} alt="" style={{ maxWidth: 28, maxHeight: 28 }} />
+                          ) : (
+                            <span style={{ color: colors.dim, fontSize: 15, fontWeight: 600 }}>
+                              {c.displayName.slice(0, 1)}
+                            </span>
+                          )}
+                        </span>
+                        <span
+                          style={{
+                            fontSize: 14.5,
+                            fontWeight: 500,
+                            color: colors.fg,
+                            letterSpacing: "var(--track-body)",
+                            minWidth: 0,
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                            whiteSpace: "nowrap",
+                          }}
+                        >
+                          {c.displayName}
+                        </span>
+                      </div>
+                      <div style={{ color: colors.dim, fontSize: 13, lineHeight: 1.45, flex: 1 }}>
+                        {c.description}
+                      </div>
+                      <div style={{ display: "flex", alignItems: "center", gap: 8 }} onClick={(e) => e.stopPropagation()}>
+                        {c.added ? (
+                          <>
+                            {/* Only the connected state is stated. "Needs
+                                sign-in" sat beside a button labelled Sign in,
+                                so it said nothing the button did not — and at
+                                card width it wrapped to two lines and squeezed
+                                the actions. The spacer keeps them right-aligned
+                                either way. */}
+                            {signedIn ? (
+                              <span style={{ color: colors.ok, fontSize: 12.5, fontWeight: 500, flex: 1 }}>Connected</span>
+                            ) : (
+                              <span style={{ flex: 1 }} />
+                            )}
+                            {/* A card can land here whenever the sign-in did
+                                not finish — the browser was closed, consent was
+                                declined, a token expired. Saying "Needs
+                                sign-in" while offering only Remove left the one
+                                state the user can act on with no way to act. */}
+                            {!signedIn && (
+                              <button
+                                className="u-chip"
+                                onClick={() => void signIn(c)}
+                                disabled={busy !== null}
+                                style={{ ...btnSmallStyle, fontSize: 12.5, padding: "5px 12px" }}
+                              >
+                                {busy === c.name ? "Waiting…" : "Sign in"}
+                              </button>
+                            )}
+                            <button
+                              className="u-chip"
+                              onClick={() => void remove(c)}
+                              disabled={busy === c.name}
+                              style={{ ...btnSmallStyle, fontSize: 12.5, padding: "5px 12px" }}
+                            >
+                              {busy === c.name ? "Working…" : "Remove"}
+                            </button>
+                          </>
+                        ) : c.requiresClientId && !c.clientId ? (
+                          // No client id yet, and the provider offers no
+                          // automatic sign-up — Connect would only fail. The
+                          // detail page holds the callback URL and the field.
+                          <button
+                            className="u-chip"
+                            onClick={() => setOpenName(c.name)}
+                            style={{ ...btnSmallStyle, fontSize: 12.5, padding: "5px 12px" }}
+                          >
+                            Set up…
+                          </button>
+                        ) : (
+                          <button
+                            className="u-chip"
+                            onClick={() => void connect(c)}
+                            disabled={busy !== null}
+                            style={{ ...btnSmallStyle, fontSize: 12.5, padding: "5px 12px", opacity: busy && busy !== c.name ? 0.45 : 1 }}
+                          >
+                            {busy === c.name ? "Connecting…" : "Connect"}
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          ))}
+          </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function ScheduledView({
   defaultProject,
   projects,
@@ -11142,11 +12022,29 @@ function ScheduledView({
                           </div>
                           {t.lastRunAt && (
                             <div style={{ fontSize: 12.5, lineHeight: 1.5, marginTop: 3 }}>
-                              <span style={{ color: t.lastStatus === "completed" ? colors.ok : colors.err }}>
-                                {t.lastStatus === "completed" ? "Last run succeeded" : `Last run ${t.lastStatus}`}
-                              </span>
+                              {(() => {
+                                // Three states, not two. "Succeeded" is now
+                                // claimed only when the agent says the work
+                                // got done — a clean turn that reported "Slack
+                                // status was not updated" used to read as a
+                                // success, which is the one thing a status
+                                // line must never do.
+                                const done = t.lastStatus === "completed" && t.lastVerdict === "done";
+                                const reportedFail = t.lastStatus === "completed" && t.lastVerdict === "failed";
+                                const label = done
+                                  ? "Last run succeeded"
+                                  : reportedFail
+                                    ? "Last run failed"
+                                    : t.lastStatus === "completed"
+                                      ? "Last run finished"
+                                      : `Last run ${t.lastStatus}`;
+                                const color = done ? colors.ok : t.lastStatus === "completed" && !reportedFail ? colors.dim : colors.err;
+                                return <span style={{ color }}>{label}</span>;
+                              })()}
                               <span style={{ color: colors.dim }}> · {relativeTime(t.lastRunAt)}</span>
-                              {t.lastError && <span style={{ color: colors.dim }}> · {t.lastError}</span>}
+                              {(t.lastVerdictNote || t.lastError) && (
+                                <span style={{ color: colors.dim }}> · {t.lastVerdictNote ?? t.lastError}</span>
+                              )}
                             </div>
                           )}
                         </div>
@@ -11393,6 +12291,7 @@ function McpPanel({ onClose }: { onClose: () => void }) {
   const [adding, setAdding] = useState(false);
   const [applying, setApplying] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
+  const [signingIn, setSigningIn] = useState<string | null>(null);
   const [confirm, setConfirm] = useState<{ name: string; connected: boolean } | null>(null);
   // Entry transition. A modal is an occasional, deliberate interruption, so it
   // earns motion where the + menu did not — but it is still under the 300ms
@@ -11427,6 +12326,30 @@ function McpPanel({ onClose }: { onClose: () => void }) {
   // A server starting or failing while the panel is open should be visible
   // without a manual refresh — this is the only signal that a server died.
   useEffect(() => window.unbiased.onMcpStatus(() => refresh()), [refresh]);
+  // The browser hands back to a loopback port the engine listens on, so the
+  // only signal the app gets is this notification — hence a "Waiting…" state
+  // rather than a spinner tied to the IPC call, which returns the moment the
+  // browser opens.
+  useEffect(
+    () =>
+      window.unbiased.onMcpLoginDone(({ name, success, error }) => {
+        setSigningIn((cur) => (cur === name ? null : cur));
+        setNotice(success ? `Signed in to ${name}.` : `Could not sign in to ${name}. ${error ?? ""}`.trim());
+        void refresh();
+      }),
+    [refresh],
+  );
+
+  async function signIn(name: string) {
+    setNotice(null);
+    setSigningIn(name);
+    const res = await window.unbiased.mcpLogin(name);
+    if (!res.ok) {
+      setSigningIn(null);
+      setNotice(res.error ?? "Could not start sign-in.");
+    }
+  }
+
   const connectedNames = new Set(connected.map((c) => c.name.toLowerCase()));
   const pending = configured.filter((c) => !connectedNames.has(c.name.toLowerCase()));
 
@@ -11610,12 +12533,15 @@ function McpPanel({ onClose }: { onClose: () => void }) {
                   detail:
                     `${toolCount} ${toolCount === 1 ? "tool" : "tools"}` +
                     (srv.serverInfo?.version ? ` · v${srv.serverInfo.version}` : "") +
-                    (srv.authStatus && srv.authStatus !== "unsupported" && srv.authStatus !== "unknown"
-                      ? ` · ${srv.authStatus}`
-                      : ""),
+                    // Deliberately no authStatus here. It rendered the raw
+                    // engine enum — "notLoggedIn" — in a row of prose, and the
+                    // one state a user can act on now carries a Sign in button
+                    // that says it in words.
+                    "",
                   removable: configured.some((c) => c.name === srv.name),
                   name: srv.name,
                   info: srv.serverInfo,
+                  needsAuth: srv.authStatus === "notLoggedIn",
                 };
               }),
               ...pending.map((srv) => ({
@@ -11629,6 +12555,7 @@ function McpPanel({ onClose }: { onClose: () => void }) {
                 // Nothing to show yet: icons arrive at initialize, and a
                 // pending server has not connected.
                 info: null as McpConnected["serverInfo"],
+                needsAuth: false,
               })),
             ].map((row, i) => (
               <div
@@ -11665,6 +12592,21 @@ function McpPanel({ onClose }: { onClose: () => void }) {
                     {row.detail ? ` · ${row.detail}` : ""}
                   </div>
                 </span>
+                {/* A server that connected but has not been signed into is
+                    the one row where "Connected" is misleading — it has no
+                    tools and cannot get any. Without this button the only
+                    instruction available was the engine's own, which names a
+                    CLI this app does not ship. */}
+                {row.needsAuth && (
+                  <button
+                    onClick={() => void signIn(row.name)}
+                    disabled={signingIn === row.name}
+                    className="u-chip"
+                    style={{ ...btnSmall, flexShrink: 0 }}
+                  >
+                    {signingIn === row.name ? "Waiting…" : "Sign in"}
+                  </button>
+                )}
                 {row.removable && (
                   <IconDangerButton
                     label={`Remove ${row.name}`}
@@ -15193,6 +16135,19 @@ function CloseIcon() {
     <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
       <path d="M18 6 6 18" />
       <path d="M6 6l12 12" />
+    </svg>
+  );
+}
+
+/** Connectors. A plug, drawn at the same 16px/1.7 stroke as the rest of the
+ *  sidebar set so it sits level with New chat and Scheduled. */
+function PlugIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M9 2v6" />
+      <path d="M15 2v6" />
+      <path d="M6 8h12v3a6 6 0 0 1-6 6 6 6 0 0 1-6-6V8Z" />
+      <path d="M12 17v5" />
     </svg>
   );
 }
