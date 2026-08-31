@@ -17051,24 +17051,33 @@ function MemoryReceipt({
 }) {
   return (
     <button
+      // u-chip gives the hover the app's other chips have; the press-scale is
+      // global. A pill says "control" before the pointer arrives — which this
+      // needs, being the one way into the note it is announcing.
+      className={onOpen ? "u-chip" : undefined}
       onClick={onOpen ? () => onOpen(path) : undefined}
       title={`${name} — ${description}`}
       style={{
-        display: "flex",
+        display: "inline-flex",
         alignItems: "center",
-        gap: 8,
-        background: "transparent",
-        border: "none",
-        padding: 0,
+        gap: 7,
+        background: "var(--chip)",
+        border: `1px solid ${colors.border}`,
+        borderRadius: 999,
+        padding: "5px 12px 5px 10px",
         color: colors.dim,
-        fontSize: 13.5,
+        fontSize: 13,
+        lineHeight: 1.2,
         cursor: onOpen ? "pointer" : "default",
         fontFamily: "inherit",
+        maxWidth: "100%",
       }}
     >
-      <LightbulbIcon />
+      <span style={{ display: "flex", flexShrink: 0 }}>
+        <LightbulbIcon />
+      </span>
       <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-        Saved <span style={{ color: "var(--fg-soft)" }}>Memory</span>
+        Saved <span style={{ color: "var(--fg-soft)", fontWeight: 500 }}>Memory</span>
       </span>
     </button>
   );
