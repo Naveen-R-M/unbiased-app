@@ -6217,6 +6217,10 @@ app.whenReady().then(async () => {
     requiresClientId: boolean;
     /** The provider's token exchange demands a client secret too (Google). */
     requiresSecret: boolean;
+    /** Listed, but not connectable yet — the provider-side app is not ready. */
+    comingSoon: boolean;
+    /** Provider-specific setup guidance, from the catalogue. */
+    setupNote: string | null;
     scopes: string[];
     /** A client id already configured for this connector, so the field shows
      *  what is in effect rather than an empty box next to a working setup. */
@@ -6345,6 +6349,8 @@ app.whenReady().then(async () => {
       enabled: true,
       requiresClientId: e.requiresClientId,
       requiresSecret: e.requiresSecret,
+      comingSoon: e.comingSoon,
+      setupNote: e.setupNote,
       scopes: e.scopes,
     };
   }
@@ -6433,6 +6439,10 @@ app.whenReady().then(async () => {
           enabled: true,
           requiresClientId: !!CONNECTORS_BRING_YOUR_OWN[name],
           requiresSecret: !!CONNECTORS_BRING_YOUR_OWN[name]?.secret,
+          // Only the published catalogue carries this; the bundled fallback
+          // is a last resort and offers everything it knows.
+          comingSoon: false,
+          setupNote: null,
           // The bundled manifest's scope list travels with the connector so a
           // saved registration asks Google for exactly what the server needs.
           scopes: Array.isArray(srv.scopes)
@@ -6505,6 +6515,8 @@ app.whenReady().then(async () => {
     if (cfg.error) return { ok: false, error: cfg.error };
     if (cfg.servers.some((sv) => sv.name === name)) return { ok: false, error: `${connector.displayName} is already added.` };
 
+    if (connector.comingSoon)
+      return { ok: false, error: `${connector.displayName} isn't available yet.` };
     const reg = await registerOAuthClient(connector.url);
     if (!("clientId" in reg)) {
       // No silent Codex-branded fallback. It was originally "a working

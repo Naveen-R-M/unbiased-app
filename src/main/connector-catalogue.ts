@@ -73,7 +73,12 @@ export type CatalogueEntry = {
   icon: string | null;
   requiresClientId: boolean;
   requiresSecret: boolean;
-  /** Present = documented but not offered, with the reason. */
+  /** Shown, but with no actions: the provider-side setup is not finished, so
+   *  offering a button would only produce a failure the user cannot fix. */
+  comingSoon: boolean;
+  /** What the user must register, and where, when setup is required. */
+  setupNote: string | null;
+  /** Present = documented but not offered at all, with the reason. */
   unavailable: string | null;
 };
 
@@ -168,6 +173,8 @@ export function parseCatalogue(text: string, etag: string | null, now: string): 
       icon: safeIcon(c.icon),
       requiresClientId,
       requiresSecret: c.requiresSecret === true,
+      comingSoon: c.comingSoon === true,
+      setupNote: str(c.setupNote, 600),
       unavailable: str(c.unavailable, 400),
     });
   }
