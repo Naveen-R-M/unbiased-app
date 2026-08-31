@@ -41,7 +41,16 @@ type CommandItem = {
 type Entry =
   | { kind: "user"; text: string; annotations?: SentAnnotation[] }
   | { kind: "compaction" }
-  | { kind: "assistant"; text: string; interrupted?: boolean; at?: number }
+  | {
+      kind: "assistant";
+      text: string;
+      interrupted?: boolean;
+      at?: number;
+      /** Memory receipts for the turn this answer ended. They ride ON the
+       *  answer so they render inside it — above the copy row, and outside
+       *  the text that row copies. */
+      memories?: { name: string; description: string; path: string }[];
+    }
   // Sub-agent lifecycle row in the transcript flow (Codex-style
   // "Created an agent" / "Closed an agent" markers).
   | { kind: "agent"; event: string; name: string; path?: string; agentThreadId?: string; prompt?: string | null }
@@ -8263,18 +8272,32 @@ function ChatPane({
               const memoryRows = work.filter((e) => e.kind === "memory");
               const foldable = work.filter((e) => e.kind !== "memory");
               const didWork = foldable.some((e) => e.kind === "agent" || e.kind === "command");
+              // Receipts move ONTO the answer, so they render inside it —
+              // under the text, above the copy row. Folded they would vanish;
+              // left loose above the answer they duplicated the steps header
+              // that already says "Saved memory".
+              const answer: Entry | null =
+                finalMsg && memoryRows.length > 0
+                  ? {
+                      ...finalMsg,
+                      memories: [
+                        ...(finalMsg.memories ?? []),
+                        ...memoryRows.map((m) => ({ name: m.name, description: m.description, path: m.path })),
+                      ],
+                    }
+                  : finalMsg;
               if (didWork && foldable.length > 0) {
                 const duration = workStartedAt !== null ? (Date.now() - workStartedAt) / 1000 : null;
                 next = [
                   ...next.slice(0, start),
                   { kind: "work", duration, entries: foldable },
-                  ...(finalMsg ? [finalMsg] : []),
-                  ...memoryRows,
+                  ...(answer ? [answer] : []),
+                  // No answer to carry them (a turn that saved and then said
+                  // nothing): the loose rows stay, so the write is still seen.
+                  ...(answer ? [] : memoryRows),
                 ];
-              } else if (memoryRows.length > 0 && finalMsg) {
-                // A turn with nothing to fold (the save WAS the work) still
-                // puts the receipt after the answer rather than above it.
-                next = [...next.slice(0, start), ...foldable, finalMsg, ...memoryRows];
+              } else if (answer && memoryRows.length > 0) {
+                next = [...next.slice(0, start), ...foldable, answer];
               }
             }
           }
@@ -8878,34 +8901,12 @@ function ChatPane({
       );
     }
     if (e.kind === "memory") {
-      // Memory saves are not gated on approval, so this row is the
-      // accountability: the write is visible where it happened, and clicking
-      // it opens the note itself in the side panel. Same shape and register
-      // as the sub-agent lifecycle rows ("Created 🍄 Singer") — the
-      // note's identity lives in the tooltip and the opened file.
+      // The live row, shown while the turn is still running. On completion
+      // the receipt moves onto the answer (see the turn/completed fold), so
+      // this standalone form survives only for turns that never answer.
       return (
         <div key={block.key} style={{ margin: "14px 0" }}>
-          <button
-            onClick={onOpenFile ? () => onOpenFile(e.path) : undefined}
-            title={`${e.name} — ${e.description}`}
-            style={{
-              display: "flex",
-              alignItems: "center",
-              gap: 8,
-              background: "transparent",
-              border: "none",
-              padding: 0,
-              color: colors.dim,
-              fontSize: 13.5,
-              cursor: onOpenFile ? "pointer" : "default",
-              fontFamily: "inherit",
-            }}
-          >
-            <LightbulbIcon />
-            <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-              Saved <span style={{ color: "var(--fg-soft)" }}>Memory</span>
-            </span>
-          </button>
+          <MemoryReceipt name={e.name} description={e.description} path={e.path} onOpen={onOpenFile} />
         </div>
       );
     }
@@ -8984,6 +8985,14 @@ function ChatPane({
             {e.text}
           </Markdown>
           {e.interrupted && <div style={{ color: colors.dim, fontSize: 12, marginTop: 4 }}>— stopped</div>}
+          {/* Receipts sit between the answer and its action row: below the
+              thing they are about, above the copy button — and outside the
+              text that button copies, which takes e.text alone. */}
+          {e.memories?.map((m) => (
+            <div key={m.path} style={{ marginTop: 12 }}>
+              <MemoryReceipt {...m} onOpen={onOpenFile} />
+            </div>
+          ))}
           {/* Every settled reply gets its action row, not just the newest one:
               wanting to copy an answer from earlier in a conversation is at
               least as common as copying the last one, and the timestamp is the
@@ -17010,6 +17019,45 @@ const closeAgentMirrorRef: { current: (() => void) | null } = { current: null };
 function isBrowserStep(e: CommandEntry): boolean {
   const c = e.command ?? "";
   return c.startsWith("browser_") || c.startsWith("Browse the web") || c.startsWith("Use a signed-in browser session");
+}
+
+/** "Saved Memory" — the receipt for an ungated write. Same register as the
+ *  sub-agent lifecycle rows; the note's identity is in the tooltip and one
+ *  click away in the side panel. */
+function MemoryReceipt({
+  name,
+  description,
+  path,
+  onOpen,
+}: {
+  name: string;
+  description: string;
+  path: string;
+  onOpen?: (path: string) => void;
+}) {
+  return (
+    <button
+      onClick={onOpen ? () => onOpen(path) : undefined}
+      title={`${name} — ${description}`}
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 8,
+        background: "transparent",
+        border: "none",
+        padding: 0,
+        color: colors.dim,
+        fontSize: 13.5,
+        cursor: onOpen ? "pointer" : "default",
+        fontFamily: "inherit",
+      }}
+    >
+      <LightbulbIcon />
+      <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+        Saved <span style={{ color: "var(--fg-soft)" }}>Memory</span>
+      </span>
+    </button>
+  );
 }
 
 const isMemoryStep = (e: CommandEntry): boolean => {
