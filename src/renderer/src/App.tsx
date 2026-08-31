@@ -16973,6 +16973,26 @@ function isBrowserStep(e: CommandEntry): boolean {
   return c.startsWith("browser_") || c.startsWith("Browse the web") || c.startsWith("Use a signed-in browser session");
 }
 
+/** Header label for a steps group made ENTIRELY of memory operations — those
+ *  groups say what they did ("Saved memory") instead of the generic
+ *  "Worked · 1 step". Keyed on the main process's step text (`save memory ·
+ *  <name>`), the same trick isBrowserStep uses. Mixed groups return null and
+ *  keep the count, so a memory step buried in real work is not overclaimed. */
+function memoryStepsLabel(items: CommandEntry[]): string | null {
+  if (!items.length) return null;
+  let saves = 0;
+  let forgets = 0;
+  for (const e of items) {
+    const c = e.command ?? "";
+    if (c.startsWith("save memory")) saves++;
+    else if (c.startsWith("forget memory")) forgets++;
+    else return null;
+  }
+  if (forgets === 0) return saves === 1 ? "Saved memory" : `Saved ${saves} memories`;
+  if (saves === 0) return forgets === 1 ? "Forgot memory" : `Forgot ${forgets} memories`;
+  return `Updated memory · ${items.length} steps`;
+}
+
 function StepsGroup({
   items,
   statusLabel,
@@ -17002,17 +17022,25 @@ function StepsGroup({
 
   // Browser work says so, and says it about a thing the user can go look at.
   const browsing = items.some(isBrowserStep);
+  // Same courtesy for memory-only groups: name the action, not the count.
+  const memoryLabel = memoryStepsLabel(items);
   const summary = needsApproval
     ? { text: "Needs your approval", color: colors.fg, verb: null as string | null }
     : running
-      ? { text: browsing ? "Using" : "Working…", color: colors.amber, verb: browsing ? "Using" : null }
+      ? {
+          text: browsing ? "Using" : memoryLabel ? "Updating memory…" : "Working…",
+          color: colors.amber,
+          verb: browsing ? "Using" : null,
+        }
       : browsing
         ? { text: "Used", color: failed ? colors.err : colors.dim, verb: "Used" }
-        : {
-            text: `Worked · ${items.length} step${items.length === 1 ? "" : "s"}${failed ? " · issues" : ""}`,
-            color: failed ? colors.err : colors.dim,
-            verb: null,
-          };
+        : memoryLabel
+          ? { text: `${memoryLabel}${failed ? " · issues" : ""}`, color: failed ? colors.err : colors.dim, verb: null }
+          : {
+              text: `Worked · ${items.length} step${items.length === 1 ? "" : "s"}${failed ? " · issues" : ""}`,
+              color: failed ? colors.err : colors.dim,
+              verb: null,
+            };
 
   return (
     <div style={{ margin: "14px 0" }}>
