@@ -443,6 +443,11 @@ type ScheduledTaskView = {
   createdAt: string;
   lastRunAt: string | null;
   lastStatus: "completed" | "failed" | "interrupted" | null;
+  /** The agent's own verdict on whether the TASK got done. A completed turn
+   *  whose verdict is "failed" is a failed run; a missing verdict is neither
+   *  claimed as success nor as failure. */
+  lastVerdict: "done" | "failed" | null;
+  lastVerdictNote: string | null;
   lastError: string | null;
   lastThreadId: string | null;
   /** Set when the schedule elapsed while the app was closed. */
@@ -565,7 +570,11 @@ declare global {
         name: string,
       ) => Promise<{ ok: boolean; error?: string; branded?: boolean; signIn?: boolean }>;
       connectorsRemove: (name: string) => Promise<{ ok: boolean; error?: string }>;
-      connectorsSetClientId: (name: string, clientId: string) => Promise<{ ok: boolean; error?: string }>;
+      connectorsSetClientId: (
+        name: string,
+        clientId: string,
+        clientSecret?: string,
+      ) => Promise<{ ok: boolean; error?: string }>;
       connectorsSetEnabled: (name: string, enabled: boolean) => Promise<{ ok: boolean; error?: string }>;
       onMcpLoginDone: (cb: (p: { name: string; success: boolean; error: string | null }) => void) => () => void;
       onApprovalCanceled: (cb: (p: { paneId: PaneId; requestId: string }) => void) => () => void;
@@ -10412,6 +10421,8 @@ type ConnectorInfo = {
   clientId: string | null;
   enabled: boolean;
   requiresClientId: boolean;
+  requiresSecret: boolean;
+  scopes: string[];
   added: boolean;
   authStatus: string | null;
 };
@@ -10638,6 +10649,7 @@ function ConnectorsView({ navOpen, onToggleNav }: { navOpen: boolean; onToggleNa
   const [openName, setOpenName] = useState<string | null>(null);
   const noticeRef = useRef<HTMLDivElement | null>(null);
   const [clientIdDraft, setClientIdDraft] = useState("");
+  const [clientSecretDraft, setClientSecretDraft] = useState("");
   const [copied, setCopied] = useState(false);
 
   const refresh = useCallback(async () => {
@@ -10695,7 +10707,7 @@ function ConnectorsView({ navOpen, onToggleNav }: { navOpen: boolean; onToggleNa
   async function saveClientId(c: ConnectorInfo) {
     setNotice(null);
     setBusy(c.name);
-    const res = await window.unbiased.connectorsSetClientId(c.name, clientIdDraft.trim());
+    const res = await window.unbiased.connectorsSetClientId(c.name, clientIdDraft.trim(), clientSecretDraft.trim());
     setBusy(null);
     setNotice(res.ok ? `Saved. Sign in to ${c.displayName} to use it.` : (res.error ?? "Could not save it."));
     void refresh();
@@ -10720,6 +10732,9 @@ function ConnectorsView({ navOpen, onToggleNav }: { navOpen: boolean; onToggleNa
   const open = openName ? (items.find((c) => c.name === openName) ?? null) : null;
   useEffect(() => {
     setClientIdDraft(open?.clientId ?? "");
+    // The secret is never echoed back from the config — an empty field on a
+    // saved connector means "unchanged", not "missing".
+    setClientSecretDraft("");
     setCopied(false);
   }, [openName, open?.clientId]);
 
@@ -10898,6 +10913,34 @@ function ConnectorsView({ navOpen, onToggleNav }: { navOpen: boolean; onToggleNa
                   {copied ? "Copied" : "Copy"}
                 </button>
               </div>
+              {open.requiresSecret && (
+                <>
+                  <label htmlFor="cn-secret" style={{ color: colors.dim, fontSize: 13, display: "block", marginBottom: 6 }}>
+                    Client secret
+                  </label>
+                  <input
+                    id="cn-secret"
+                    className="u-field"
+                    type="password"
+                    value={clientSecretDraft}
+                    onChange={(e) => setClientSecretDraft(e.target.value)}
+                    placeholder={open.clientId ? "Saved — enter again only to change it" : "GOCSPX-…"}
+                    style={{
+                      width: "100%",
+                      boxSizing: "border-box",
+                      background: "var(--panel-2)",
+                      color: colors.fg,
+                      border: `1px solid ${colors.border}`,
+                      borderRadius: 10,
+                      padding: "10px 12px",
+                      fontSize: 13.5,
+                      fontFamily: "var(--font-ui)",
+                      outline: "none",
+                      marginBottom: 14,
+                    }}
+                  />
+                </>
+              )}
               <label htmlFor="cn-clientid" style={{ color: colors.dim, fontSize: 13, display: "block", marginBottom: 6 }}>
                 Client ID
               </label>
@@ -11966,11 +12009,29 @@ function ScheduledView({
                           </div>
                           {t.lastRunAt && (
                             <div style={{ fontSize: 12.5, lineHeight: 1.5, marginTop: 3 }}>
-                              <span style={{ color: t.lastStatus === "completed" ? colors.ok : colors.err }}>
-                                {t.lastStatus === "completed" ? "Last run succeeded" : `Last run ${t.lastStatus}`}
-                              </span>
+                              {(() => {
+                                // Three states, not two. "Succeeded" is now
+                                // claimed only when the agent says the work
+                                // got done — a clean turn that reported "Slack
+                                // status was not updated" used to read as a
+                                // success, which is the one thing a status
+                                // line must never do.
+                                const done = t.lastStatus === "completed" && t.lastVerdict === "done";
+                                const reportedFail = t.lastStatus === "completed" && t.lastVerdict === "failed";
+                                const label = done
+                                  ? "Last run succeeded"
+                                  : reportedFail
+                                    ? "Last run failed"
+                                    : t.lastStatus === "completed"
+                                      ? "Last run finished"
+                                      : `Last run ${t.lastStatus}`;
+                                const color = done ? colors.ok : t.lastStatus === "completed" && !reportedFail ? colors.dim : colors.err;
+                                return <span style={{ color }}>{label}</span>;
+                              })()}
                               <span style={{ color: colors.dim }}> · {relativeTime(t.lastRunAt)}</span>
-                              {t.lastError && <span style={{ color: colors.dim }}> · {t.lastError}</span>}
+                              {(t.lastVerdictNote || t.lastError) && (
+                                <span style={{ color: colors.dim }}> · {t.lastVerdictNote ?? t.lastError}</span>
+                              )}
                             </div>
                           )}
                         </div>

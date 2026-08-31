@@ -29,6 +29,93 @@ export type ScheduleSpec =
 
 export type RunStatus = "completed" | "failed" | "interrupted";
 
+/**
+ * Did the TASK succeed, as opposed to the turn finishing?
+ *
+ * These are different questions and the list used to answer the wrong one: a
+ * run whose final message was "Slack status was not updated" still showed
+ * "Last run succeeded", because the agent had worked, reported honestly, and
+ * ended its turn cleanly. Nothing in the transport can tell the two apart —
+ * only the agent knows whether the thing got done — so the run asks for a
+ * verdict and this parses it.
+ */
+export type RunVerdict = "done" | "failed";
+
+/**
+ * Appended to a scheduled prompt at run time (never stored, so the user's own
+ * prompt stays theirs). Deliberately one rigid line: a sentence to classify
+ * would need a second model call to read.
+ */
+export const VERDICT_CONTRACT = `
+
+---
+Scheduled run. Begin your FINAL message with one line, exactly one of:
+STATUS: succeeded
+STATUS: failed
+Then, on the following lines, your normal explanation of what happened.
+
+Judge the status by whether the work above was actually accomplished, not by
+whether you finished trying. Blocked, a page that never loaded, a sign-in
+required, an app that would not open, nothing found to act on — all of those
+are "failed", and the explanation is the part that matters.`;
+
+/** How much of the explanation the task list shows before the run itself. */
+const NOTE_CHARS = 160;
+
+/**
+ * Read the status line out of a final message.
+ *
+ * Prefers the FIRST line, because the contract asks the agent to lead with it
+ * — and leading means a status quoted mid-prose cannot outrank the real one.
+ * Falls back to the last match anywhere, which covers a model that appends
+ * its verdict at the end instead, and keeps runs recorded under the older
+ * TASK_RESULT wording readable.
+ *
+ * The note is the reason on the status line if there is one, otherwise the
+ * opening of the explanation that follows it — which in practice is the
+ * sentence a person actually wants in the list ("Slack status was not
+ * updated.").
+ */
+export function parseRunVerdict(text: string): { verdict: RunVerdict | null; note: string | null } {
+  if (typeof text !== "string" || !text) return { verdict: null, note: null };
+  const clean = (v: string) => v.replace(/[*_`]+/g, "").trim();
+  const LINE = /^[\s>*_`#-]*(?:status|task[_\s-]*result)\s*[:\-]\s*(succeeded|success|succeed|done|ok|failed|failure|fail|error)\b[\s:\-\u2013\u2014]*(.*)$/i;
+  const failed = /^(failed|failure|fail|error)$/i;
+
+  const lines = text.split(/\r?\n/);
+  const matches: { i: number; word: string; rest: string }[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const m = LINE.exec(clean(lines[i]));
+    if (m) matches.push({ i, word: m[1].toLowerCase(), rest: clean(m[2] ?? "") });
+  }
+  if (!matches.length) return { verdict: null, note: null };
+
+  // The first non-empty line is where the contract puts it; otherwise take the
+  // last one stated.
+  const firstContentIdx = lines.findIndex((l) => clean(l) !== "");
+  const chosen = matches.find((m) => m.i === firstContentIdx) ?? matches[matches.length - 1];
+
+  let note = chosen.rest;
+  if (!note) {
+    // The explanation beneath the status line, up to the first blank-line
+    // boundary — one paragraph, not the whole report.
+    const after: string[] = [];
+    for (let i = chosen.i + 1; i < lines.length; i++) {
+      const l = clean(lines[i]);
+      if (!l) {
+        if (after.length) break;
+        continue;
+      }
+      if (LINE.test(l)) break;
+      after.push(l);
+    }
+    note = after.join(" ");
+  }
+  note = note.replace(/\s+/g, " ").trim();
+  if (note.length > NOTE_CHARS) note = note.slice(0, NOTE_CHARS - 1).trimEnd() + "\u2026";
+  return { verdict: failed.test(chosen.word) ? "failed" : "done", note: note || null };
+}
+
 export type ScheduledTask = {
   key: string;
   name: string;
@@ -46,6 +133,11 @@ export type ScheduledTask = {
   /** Last real execution. null until the task has actually run once. */
   lastRunAt: string | null;
   lastStatus: RunStatus | null;
+  /** The agent's own verdict on the last run. null when the run never got far
+   *  enough to give one, or when it did not follow the contract — reported as
+   *  "finished" rather than guessed at either way. */
+  lastVerdict: RunVerdict | null;
+  lastVerdictNote: string | null;
   lastError: string | null;
   lastThreadId: string | null;
   /** Set when the schedule came due while the app was closed. Cleared by the
@@ -219,6 +311,10 @@ export function loadTasks(userDataDir: string): ScheduledTask[] {
         r.lastStatus === "completed" || r.lastStatus === "failed" || r.lastStatus === "interrupted"
           ? r.lastStatus
           : null,
+      // Tasks written before the verdict existed simply have none, which reads
+      // as "finished" in the list rather than as a claim either way.
+      lastVerdict: r.lastVerdict === "done" || r.lastVerdict === "failed" ? r.lastVerdict : null,
+      lastVerdictNote: typeof r.lastVerdictNote === "string" ? r.lastVerdictNote : null,
       lastError: typeof r.lastError === "string" ? r.lastError : null,
       lastThreadId: typeof r.lastThreadId === "string" ? r.lastThreadId : null,
       missedAt: typeof r.missedAt === "string" ? r.missedAt : null,

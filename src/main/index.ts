@@ -32,6 +32,14 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
+import { startSecretProxy, type SecretConnector } from "./oauth-proxy";
+import {
+  fetchCatalogueFromAnyHost,
+  parseCatalogue,
+  type Catalogue,
+  type CatalogueEntry,
+} from "./connector-catalogue";
+import type { Server as HttpServer } from "node:http";
 import { execFile, execFileSync, spawn as spawnProcess } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
 import { get as httpGet } from "node:http";
@@ -44,8 +52,10 @@ import {
   MAX_NAME_CHARS,
   MAX_PROMPT_CHARS,
   MAX_TASKS,
+  parseRunVerdict,
   saveTasks,
   validateSchedule,
+  VERDICT_CONTRACT,
   type RunStatus,
   type ScheduledTask,
   type ScheduleSpec,
@@ -485,7 +495,22 @@ let mirrorViewRoot: string | null = null;
 // tick against the shape we asked for: if they drift — a dropped resize, or
 // another CDP client changing emulation — the mirror re-imposes its viewport
 // instead of letterboxing until someone drags the pane.
+/** Set when the connector IPC is wired; a no-op before then, because the
+ *  engine can start before that scope exists. */
+let refreshCatalogueAtStartup: () => void = () => {};
+
 let mirrorLastFrame: { width: number; height: number } | null = null;
+/** The viewport WE last imposed. Frames are compared against this rather than
+ *  against a freshly computed one, so a correction in flight is not mistaken
+ *  for a second problem. */
+let mirrorWantVp: { width: number; height: number } | null = null;
+let mirrorMismatchSince = 0;
+let mirrorCorrectAt = 0;
+let mirrorCorrecting = false;
+/** How long a wrong-shaped frame may be withheld while a correction lands.
+ *  Past this the pane shows it anyway: a briefly odd mirror beats a frozen
+ *  one, and if the correction cannot succeed the user should see reality. */
+const MIRROR_SHAPE_GRACE_MS = 2_000;
 
 type CdpTarget = { id?: string; type: string; url: string; title?: string; webSocketDebuggerUrl?: string };
 
@@ -573,7 +598,46 @@ async function mirrorApplyViewport(
     deviceScaleFactor: scale,
     mobile: false,
   });
+  mirrorWantVp = { width: vp.width, height: vp.height };
   return { ...vp, scale };
+}
+
+/** Is this frame shaped like the viewport we asked for? */
+function mirrorShapeWrong(got: { width: number; height: number } | null): boolean {
+  if (!got || !mirrorWantVp) return false;
+  return Math.abs(got.width - mirrorWantVp.width) > 2 || Math.abs(got.height - mirrorWantVp.height) > 2;
+}
+
+/**
+ * Re-impose our viewport on the mirrored tab.
+ *
+ * Something else changes it out from under us: the agent-browser CLI drives
+ * the same tab and sets its own metrics for snapshots, and Chrome drops an
+ * override on some navigations. The old code only noticed on the 1.5s
+ * supervisor tick, which is precisely the "resizes for a moment" the pane
+ * showed. Called from the frame handler now, so a stray shape is corrected on
+ * the very next frame, with a cooldown so a burst of odd frames cannot turn
+ * into a burst of overrides (each of which would itself cause a reflow).
+ */
+async function mirrorCorrectViewport(): Promise<void> {
+  if (mirrorCorrecting || !mirrorWs) return;
+  const now = Date.now();
+  if (now - mirrorCorrectAt < 600) return;
+  mirrorCorrecting = true;
+  mirrorCorrectAt = now;
+  try {
+    const vp = await mirrorApplyViewport(mirrorSize.width, mirrorSize.height, mirrorSize.dpr);
+    await mirrorCall("Page.startScreencast", {
+      format: "jpeg",
+      quality: 85,
+      ...mirrorFrameBounds(vp),
+      everyNthFrame: 1,
+    });
+  } catch {
+    /* the supervisor tick retries */
+  } finally {
+    mirrorCorrecting = false;
+  }
 }
 
 /** Screencast bounds in the SAME pixels the frame is rendered in. */
@@ -586,6 +650,8 @@ function mirrorFrameBounds(vp: { width: number; height: number; scale: number })
 
 function mirrorTeardown(notify: boolean): void {
   mirrorLastFrame = null;
+  mirrorWantVp = null;
+  mirrorMismatchSince = 0;
   const ws = mirrorWs;
   // Hand the tab back at its natural size — the agent keeps using it after the
   // pane closes, and leaving our pane's shape imposed on it would be rude.
@@ -663,6 +729,16 @@ async function mirrorStart(maxWidth: number, maxHeight: number): Promise<{ ok: b
         // Ack immediately or Chrome stops sending after a handful of frames.
         void mirrorCall("Page.screencastFrameAck", { sessionId }).catch(() => {});
         mirrorLastFrame = { width: metadata.deviceWidth, height: metadata.deviceHeight };
+        if (mirrorShapeWrong(mirrorLastFrame)) {
+          if (!mirrorMismatchSince) mirrorMismatchSince = Date.now();
+          void mirrorCorrectViewport();
+          // Withhold the transitional frame: the renderer sizes the image from
+          // these dimensions, so forwarding one is what makes the pane visibly
+          // jump. The previous good frame stays on screen instead.
+          if (Date.now() - mirrorMismatchSince < MIRROR_SHAPE_GRACE_MS) return;
+        } else {
+          mirrorMismatchSince = 0;
+        }
         send("agentmirror:frame", {
           src: `data:image/jpeg;base64,${data}`,
           width: metadata.deviceWidth,
@@ -4011,6 +4087,19 @@ function wireNotifications(): void {
       run.text += (params.delta as string) ?? "";
       return;
     }
+    // Take the finished message from the item itself. Deltas alone were not
+    // enough: a run whose STATUS line was plainly in the transcript settled
+    // with empty text, so the status went unparsed and the row read
+    // "finished" — the engine does not always stream a message it delivers
+    // whole. The LAST final_answer wins; commentary is narration, and a
+    // multi-message turn ends on the answer.
+    if (msg.method === "item/completed") {
+      const it = params.item as { type?: string; text?: string; phase?: string | null } | undefined;
+      if (it?.type === "agentMessage" && typeof it.text === "string" && it.text.trim()) {
+        if (it.phase === "final_answer" || !run.finalText) run.finalText = it.text;
+      }
+      return;
+    }
     if (msg.method === "turn/completed") {
       const turn = params.turn as
         | { status?: string; error?: { message?: string; additionalDetails?: string | null } | null }
@@ -4020,7 +4109,8 @@ function wireNotifications(): void {
       const error = turn?.error
         ? [turn.error.message, turn.error.additionalDetails].filter(Boolean).join(" — ") || "unknown error"
         : null;
-      run.settle({ status, error, text: run.text });
+      // Prefer the delivered final message; fall back to the streamed buffer.
+      run.settle({ status, error, text: run.finalText || run.text });
     }
   });
 
@@ -4347,6 +4437,8 @@ async function handleScheduleToolCall(
     cursorAt: now,
     lastRunAt: null,
     lastStatus: null,
+    lastVerdict: null,
+    lastVerdictNote: null,
     lastError: null,
     lastThreadId: null,
     missedAt: null,
@@ -4378,9 +4470,16 @@ const RUN_TIMEOUT_MS = 10 * 60_000;
 let scheduleTimer: NodeJS.Timeout | null = null;
 /** Runs in flight, by engine threadId, so the notification listener below can
  *  accumulate their output without touching the main event switch. */
+/** finalText: the last delivered agentMessage (the answer). text: the streamed
+ *  accumulation, kept as a fallback for engines/turns that only stream. */
 const scheduledRuns = new Map<
   string,
-  { key: string; text: string; settle: (r: { status: RunStatus; error: string | null; text: string }) => void }
+  {
+    key: string;
+    text: string;
+    finalText: string;
+    settle: (r: { status: RunStatus; error: string | null; text: string }) => void;
+  }
 >();
 /** Guards against a slow run overlapping its own next tick — and now also
  *  carries WHAT is running, so the UI can open the live conversation and stop
@@ -4473,7 +4572,7 @@ async function runScheduledTask(
     browserNetGrants.add(threadId);
 
     const settled = new Promise<{ status: RunStatus; error: string | null; text: string }>((resolve) => {
-      scheduledRuns.set(threadId!, { key: task.key, text: "", settle: resolve });
+      scheduledRuns.set(threadId!, { key: task.key, text: "", finalText: "", settle: resolve });
     });
     // `timedOut` rather than matching the message text: the interrupt below
     // keys off this, and a reworded error would silently stop it firing.
@@ -4492,7 +4591,9 @@ async function runScheduledTask(
 
     const startedTurn = (await engine.request("turn/start", {
       threadId,
-      input: [{ type: "text", text: task.prompt }],
+      // The contract rides along at run time and is never stored, so the
+      // prompt the user wrote (and tunes) stays exactly theirs.
+      input: [{ type: "text", text: task.prompt + VERDICT_CONTRACT }],
       approvalPolicy: "never",
       sandboxPolicy: { type: "readOnly" },
     })) as { turn?: { id?: string } };
@@ -4520,15 +4621,23 @@ async function runScheduledTask(
       }
     }
     const now = new Date().toISOString();
+    // Only a completed turn can carry a meaningful verdict; a failure or an
+    // interrupt is already the outcome.
+    const verdict = outcome.status === "completed" ? parseRunVerdict(outcome.text) : { verdict: null, note: null };
     updateTask(task.key, {
       cursorAt: now,
       lastRunAt: now,
       lastStatus: outcome.status,
+      lastVerdict: verdict.verdict,
+      lastVerdictNote: verdict.note,
       lastError: outcome.error,
       lastThreadId: threadId,
       missedAt: null,
     });
-    console.log(`[scheduled] ${trigger} run of "${task.name}" ${outcome.status}`);
+    console.log(
+      `[scheduled] ${trigger} run of "${task.name}" ${outcome.status}` +
+        (verdict.verdict ? ` (agent reported: ${verdict.verdict}${verdict.note ? ` - ${verdict.note}` : ""})` : ""),
+    );
     if (trigger === "schedule") notifyScheduledRun(task, outcome, threadId);
     return outcome;
   } catch (err) {
@@ -4538,6 +4647,8 @@ async function runScheduledTask(
       cursorAt: now,
       lastRunAt: now,
       lastStatus: "failed",
+      lastVerdict: null,
+      lastVerdictNote: null,
       lastError: message,
       lastThreadId: threadId,
       missedAt: null,
@@ -4564,9 +4675,11 @@ async function runScheduledTask(
 function notifyScheduledRun(task: ScheduledTask, outcome: { status: RunStatus; error: string | null; text: string }, threadId: string | null): void {
   if (!Notification.isSupported()) return;
   const summary = outcome.text.replace(/\s+/g, " ").trim();
+  const reported = outcome.status === "completed" ? parseRunVerdict(outcome.text) : { verdict: null, note: null };
   const body =
     outcome.status === "completed"
-      ? summary.slice(0, 180) || "Finished with nothing to report."
+      ? (reported.verdict === "failed" ? `Didn't finish the job: ${reported.note ?? "see the run"}. ` : "") +
+          (summary.slice(0, 180) || "Finished with nothing to report.")
       : `${outcome.status === "interrupted" ? "Stopped" : "Failed"}${outcome.error ? `: ${outcome.error}` : ""}`;
   const n = new Notification({ title: task.name, body, silent: false });
   n.on("click", () => {
@@ -4637,7 +4750,59 @@ function stopScheduler(): void {
 }
 
 let engineWired = false;
+/** One running proxy per secret-bearing connector, keyed by name. */
+const secretProxies = new Map<string, { server: HttpServer; fingerprint: string }>();
+
+/**
+ * Reconcile the secret proxies with the config. Runs before every engine
+ * start because the plugin files codex is about to read point at these ports
+ * — a proxy that comes up after codex dials is a connection refused, and one
+ * left running for a removed connector keeps a dead secret in memory.
+ */
+async function syncSecretProxies(): Promise<void> {
+  let servers: { name?: string; url?: string; oauthClientId?: string; oauthClientSecret?: string; enabled?: boolean }[] = [];
+  try {
+    const raw = JSON.parse(readFileSync(join(app.getPath("home"), ".unbiased", "mcp-servers.json"), "utf8")) as {
+      servers?: typeof servers;
+    };
+    servers = raw.servers ?? [];
+  } catch {
+    servers = [];
+  }
+  const wanted = new Map<string, SecretConnector>();
+  for (const sv of servers) {
+    if (!sv.name || !sv.url || !sv.oauthClientId || !sv.oauthClientSecret) continue;
+    if (sv.enabled === false) continue;
+    wanted.set(sv.name, { name: sv.name, upstreamUrl: sv.url, clientId: sv.oauthClientId, clientSecret: sv.oauthClientSecret });
+  }
+  for (const [name, live] of secretProxies) {
+    const want = wanted.get(name);
+    const fingerprint = want ? `${want.upstreamUrl}|${want.clientId}|${want.clientSecret}` : "";
+    if (!want || live.fingerprint !== fingerprint) {
+      live.server.close();
+      secretProxies.delete(name);
+    }
+  }
+  for (const [name, want] of wanted) {
+    if (secretProxies.has(name)) continue;
+    try {
+      const server = await startSecretProxy(want, {
+        // Status and grant type only — never the form body, which carries the
+        // authorization code, the refresh token and the secret itself.
+        log: (msg) => console.log(`[oauth-proxy:${name}] ${msg}`),
+      });
+      secretProxies.set(name, { server, fingerprint: `${want.upstreamUrl}|${want.clientId}|${want.clientSecret}` });
+    } catch (err) {
+      console.error(`[oauth-proxy] could not start for ${name}:`, err);
+    }
+  }
+}
+
 async function startEngine(): Promise<void> {
+  await syncSecretProxies();
+  // Fire-and-forget: the page refreshes on open anyway, and nothing about
+  // starting the engine should wait on GitHub.
+  void refreshCatalogueAtStartup();
   const engineDir = resolveEngineDir();
   const bin = join(engineDir, "unbiased-app-engine");
   if (!existsSync(bin)) {
@@ -5052,6 +5217,8 @@ app.whenReady().then(async () => {
             cursorAt: now,
             lastRunAt: null,
             lastStatus: null,
+            lastVerdict: null,
+            lastVerdictNote: null,
             lastError: null,
             lastThreadId: null,
             missedAt: null,
@@ -5174,7 +5341,7 @@ app.whenReady().then(async () => {
         const TUNE_TIMEOUT_MS = 3 * 60_000;
         const runTurn = async (input: unknown[]): Promise<{ ok: true; text: string } | { ok: false; error: string }> => {
           const settled = new Promise<{ status: RunStatus; error: string | null; text: string }>((resolve) => {
-            scheduledRuns.set(threadId!, { key: `tune:${threadId}`, text: "", settle: resolve });
+            scheduledRuns.set(threadId!, { key: `tune:${threadId}`, text: "", finalText: "", settle: resolve });
           });
           const timeout = new Promise<{ status: RunStatus; error: string | null; text: string; timedOut?: boolean }>(
             (resolve) => setTimeout(() => resolve({ status: "failed", error: "timed out", text: "", timedOut: true }), TUNE_TIMEOUT_MS),
@@ -5546,6 +5713,10 @@ app.whenReady().then(async () => {
     /** An OAuth client WE registered with the provider, so its consent screen
      *  shows Unbiased rather than codex's dynamically-registered "Codex". */
     oauthClientId?: string;
+    /** Providers whose token exchange needs a secret (Google). Its presence
+     *  routes the server through the engine's managed-plugin path. */
+    oauthClientSecret?: string;
+    scopes?: string[];
     startupTimeoutSec?: number;
     toolTimeoutSec?: number;
     enabledTools?: string[];
@@ -5747,7 +5918,16 @@ app.whenReady().then(async () => {
    * provider error rather than anything naming the mismatch.
    */
   function mcpRedirectUri(serverUrl: string): string {
-    const digest = createHash("sha256").update(serverUrl).digest().subarray(0, 9);
+    // Hashed AFTER URL normalization, because that is what codex hashes: its
+    // Rust Url type always renders an empty path as "/", so a pathless server
+    // like https://mcp.stripe.com becomes https://mcp.stripe.com/ before the
+    // digest. Hashing the raw string registered a callback the provider then
+    // rejected at authorize time as "not registered" — measured on Stripe,
+    // where the failing redirect matched the normalized form exactly. URLs
+    // with a real path (Slack's /mcp) are unchanged by this, which is why
+    // they worked and hid the bug.
+    const normalized = new URL(serverUrl).toString();
+    const digest = createHash("sha256").update(normalized).digest().subarray(0, 9);
     const path = digest.toString("base64url");
     return `http://127.0.0.1:${MCP_CALLBACK_PORT}/callback/${path}`;
   }
@@ -5770,13 +5950,18 @@ app.whenReady().then(async () => {
    * RFC 8414. The MCP server advertises its authorization server; that server
    * advertises where clients register.
    */
-  async function discoverRegistrationEndpoint(serverUrl: string): Promise<string | null> {
+  async function discoverRegistrationEndpoint(
+    serverUrl: string,
+  ): Promise<{ endpoint: string; scopes: string[] } | null> {
     const u = new URL(serverUrl);
     // RFC 9728 puts the resource's path AFTER the well-known segment; the
     // bare form is the fallback, and providers differ on which they serve.
     const prm =
       (await fetchJson(`${u.origin}/.well-known/oauth-protected-resource${u.pathname}`)) ??
       (await fetchJson(`${u.origin}/.well-known/oauth-protected-resource`));
+    const scopes = Array.isArray(prm?.scopes_supported)
+      ? (prm!.scopes_supported as unknown[]).filter((x): x is string => typeof x === "string")
+      : [];
     const servers = Array.isArray(prm?.authorization_servers) ? (prm!.authorization_servers as unknown[]) : [];
     const issuer = typeof servers[0] === "string" ? (servers[0] as string) : u.origin;
     const iss = new URL(issuer);
@@ -5791,7 +5976,7 @@ app.whenReady().then(async () => {
     const e = new URL(endpoint);
     const loopback = e.hostname === "localhost" || e.hostname === "127.0.0.1" || e.hostname === "::1";
     if (e.protocol !== "https:" && !loopback) return null;
-    return endpoint;
+    return { endpoint, scopes };
   }
 
   /**
@@ -5805,10 +5990,11 @@ app.whenReady().then(async () => {
    * this is the provider's documented endpoint, and we are the client.
    */
   async function registerOAuthClient(serverUrl: string): Promise<{ clientId: string } | { error: string }> {
-    const endpoint = await discoverRegistrationEndpoint(serverUrl);
-    if (!endpoint) return { error: "This server does not offer dynamic client registration." };
+    const discovered = await discoverRegistrationEndpoint(serverUrl);
+    if (!discovered) return { error: "This server does not offer dynamic client registration." };
+    const { endpoint } = discovered;
     const redirectUri = mcpRedirectUri(serverUrl);
-    try {
+    const attempt = async (scope: string | null) => {
       const res = await fetch(endpoint, {
         method: "POST",
         headers: { "content-type": "application/json", accept: "application/json" },
@@ -5831,16 +6017,40 @@ app.whenReady().then(async () => {
           // shape it expects.
           token_endpoint_auth_method: "none",
           application_type: "native",
+          ...(scope ? { scope } : {}),
         }),
       });
       const body = (await res.json().catch(() => null)) as Record<string, unknown> | null;
-      if (!res.ok) {
-        const detail = typeof body?.error_description === "string" ? body.error_description : `HTTP ${res.status}`;
-        return { error: `The provider refused the registration (${detail}).` };
+      return { res, body };
+    };
+    // Scope negotiation, widest first. Providers disagree fatally in BOTH
+    // directions: Hydra-style registrars (Higgsfield) refuse an AUTHORIZE for
+    // any scope the client was not registered with, so registering without
+    // scopes bricks the sign-in — while Stripe's registrar refuses the
+    // REGISTRATION itself for scopes it does not support ("Not supported:
+    // openid, profile, email, offline_access"). So: try the provider's
+    // advertised set plus the OIDC quartet; on a scope complaint fall back to
+    // the advertised set alone; then to no scope field at all, which is the
+    // pre-negotiation behaviour that Stripe accepted.
+    const wide = [...new Set([...discovered.scopes, "openid", "profile", "email", "offline_access"])].join(" ");
+    const advertised = discovered.scopes.join(" ");
+    const ladder = [...new Set([wide || null, advertised || null, null])];
+    try {
+      let lastDetail = "";
+      for (const scope of ladder) {
+        const { res, body } = await attempt(scope);
+        if (res.ok) {
+          const clientId = typeof body?.client_id === "string" ? body.client_id : "";
+          if (!clientId) return { error: "The provider returned no client_id." };
+          return { clientId };
+        }
+        lastDetail = typeof body?.error_description === "string" ? body.error_description : `HTTP ${res.status}`;
+        const scopeComplaint = /scope|not supported/i.test(
+          `${body?.error ?? ""} ${body?.error_description ?? ""}`,
+        );
+        if (!scopeComplaint) break; // a different failure — narrowing scopes will not help
       }
-      const clientId = typeof body?.client_id === "string" ? body.client_id : "";
-      if (!clientId) return { error: "The provider returned no client_id." };
-      return { clientId };
+      return { error: `The provider refused the registration (${lastDetail}).` };
     } catch (err) {
       return { error: err instanceof Error ? err.message : String(err) };
     }
@@ -5896,6 +6106,27 @@ app.whenReady().then(async () => {
     // application registered by hand, so it belongs here until someone does
     // that and supplies its client id.
     github: "GitHub does not offer automatic sign-up",
+    // Removed at the user's request after its provider rejected codex's scope
+    // request. Possibly fixable now that registration negotiates scopes —
+    // delete this line to let it back into the catalogue and find out.
+    higgsfield: "Higgsfield's OAuth rejects the engine's scope request",
+    // Gmail's MCP endpoint is gated behind Google's Workspace Developer
+    // Preview Program: after a fully successful OAuth sign-in (proxied
+    // authorize + secret-injected token exchange, both confirmed working), the
+    // first tool call still answers "requires that your Google Cloud project
+    // is enrolled". Enrollment is per-project, accepts Workspace accounts
+    // only, and preview terms are pre-GA. Everything the connector needs on
+    // OUR side works; the gate is entirely Google's, so the card would only
+    // spend the user's trust. Delete this line once the API reaches GA.
+    gmail: "Gmail's API is limited to Google's Workspace Developer Preview",
+    // Removed with Gmail. Same provider, same preview-gated MCP endpoints, and
+    // the same per-project enrollment that accepts Workspace accounts only —
+    // so the setup cost lands on every user for a connector that may refuse
+    // them at the first tool call. The engine's managed-plugin path and the
+    // app's secret-injecting proxy stay in place and tested: re-listing these
+    // is deleting two lines, once Google's APIs are generally available.
+    "google-calendar": "Google Calendar's MCP API is preview-gated",
+    "google-drive": "Google Drive's MCP API is preview-gated",
   };
 
   /**
@@ -5908,7 +6139,14 @@ app.whenReady().then(async () => {
    * paste its id" is a real path the detail page already supports — hiding
    * the entry just made the path undiscoverable.
    */
-  const CONNECTORS_BRING_YOUR_OWN: Record<string, true> = { slack: true };
+  const CONNECTORS_BRING_YOUR_OWN: Record<string, { secret?: boolean }> = {
+    slack: {},
+    // `secret: true` routes a connector through the engine's managed-plugin
+    // path and the app's secret-injecting proxy — built and tested for the
+    // Google trio, which is currently not offered (see the map above). The
+    // machinery is provider-agnostic and stays ready for the next provider
+    // whose token exchange demands a client secret.
+  };
 
   function connectorCatalogueDir(): string {
     return join(app.getPath("home"), ".unbiased", "app-engine", "home", ".tmp", "plugins", "plugins");
@@ -5977,6 +6215,9 @@ app.whenReady().then(async () => {
     /** The provider offers no automatic sign-up and the shipped client id is
      *  someone else's — connecting requires the user's own registered app. */
     requiresClientId: boolean;
+    /** The provider's token exchange demands a client secret too (Google). */
+    requiresSecret: boolean;
+    scopes: string[];
     /** A client id already configured for this connector, so the field shows
      *  what is in effect rather than an empty box next to a working setup. */
     clientId: string | null;
@@ -5998,7 +6239,112 @@ app.whenReady().then(async () => {
     return typeof v === "string" && v.trim() ? v.trim() : null;
   }
 
+  /** Where the last verified catalogue is kept, so the Connectors page works
+   *  offline and on first launch after an update. */
+  function cataloguePath(): string {
+    return join(app.getPath("home"), ".unbiased", "connector-catalogue.json");
+  }
+
+  let catalogueCache: Catalogue | null = null;
+  // Exposed to startEngine, which lives outside this scope.
+  refreshCatalogueAtStartup = () => void refreshCatalogue();
+  let catalogueLoaded = false;
+  let catalogueRefreshing: Promise<void> | null = null;
+
+  function loadCachedCatalogue(): Catalogue | null {
+    if (catalogueLoaded) return catalogueCache;
+    catalogueLoaded = true;
+    try {
+      const raw = JSON.parse(readFileSync(cataloguePath(), "utf8")) as { payload?: string; etag?: string | null };
+      // The cache stores the VERIFIED payload text and re-parses it, rather
+      // than storing parsed objects: one parser, one set of rules, no way for
+      // a hand-edited cache to introduce a shape the parser would reject.
+      if (typeof raw?.payload === "string") {
+        catalogueCache = parseCatalogue(raw.payload, typeof raw.etag === "string" ? raw.etag : null, new Date().toISOString());
+      }
+    } catch {
+      catalogueCache = null;
+    }
+    return catalogueCache;
+  }
+
+  /**
+   * Refresh from the catalogue repo. Never throws and never blocks the caller
+   * on a slow network: a failure leaves the previous copy in place, which is
+   * the whole point — a bad publish or an offline morning degrades to
+   * yesterday's list, not to an empty page.
+   */
+  async function refreshCatalogue(): Promise<void> {
+    if (catalogueRefreshing) return catalogueRefreshing;
+    catalogueRefreshing = (async () => {
+      const current = loadCachedCatalogue();
+      const res = await fetchCatalogueFromAnyHost(current?.etag ?? null);
+      if (!res.ok) {
+        if (res.reason !== "unchanged") console.log(`[connectors] catalogue refresh skipped: ${res.reason}`);
+        return;
+      }
+      catalogueCache = res.catalogue;
+      catalogueLoaded = true;
+      try {
+        writeFileSync(
+          cataloguePath(),
+          JSON.stringify({ payload: JSON.stringify({ schema: res.catalogue.schema, connectors: res.catalogue.connectors }), etag: res.catalogue.etag }),
+          { mode: 0o600 },
+        );
+      } catch (err) {
+        console.log(`[connectors] could not cache the catalogue: ${String(err)}`);
+      }
+      console.log(`[connectors] catalogue updated: ${res.catalogue.connectors.length} entries`);
+    })().finally(() => {
+      catalogueRefreshing = null;
+    });
+    return catalogueRefreshing;
+  }
+
+  /** A published entry, in the shape the rest of the app already speaks. */
+  function connectorFromCatalogue(e: CatalogueEntry): Connector {
+    return {
+      name: e.name,
+      url: e.url,
+      displayName: e.displayName,
+      description: e.description,
+      longDescription: e.longDescription,
+      developer: e.developer,
+      version: null,
+      category: e.category,
+      capabilities: e.capabilities,
+      prompts: e.prompts,
+      brandColor: e.brandColor,
+      websiteUrl: e.websiteUrl,
+      privacyUrl: e.privacyUrl,
+      termsUrl: e.termsUrl,
+      supportUrl: e.supportUrl,
+      icon: e.icon,
+      redirectUri: mcpRedirectUri(e.url),
+      clientId: null,
+      enabled: true,
+      requiresClientId: e.requiresClientId,
+      requiresSecret: e.requiresSecret,
+      scopes: e.scopes,
+    };
+  }
+
+  /**
+   * The connector list. Published catalogue first, the engine's bundled
+   * manifests as the fallback — so a fresh install with no network still has a
+   * usable page, and adding a connector no longer needs an app release.
+   */
   function readConnectorCatalogue(): Connector[] {
+    const remote = loadCachedCatalogue();
+    if (remote) {
+      // `unavailable` entries stay documented in the catalogue but are not
+      // offered: a card that cannot work spends the user's trust.
+      return remote.connectors.filter((e) => !e.unavailable).map(connectorFromCatalogue);
+    }
+    return readBundledCatalogue();
+  }
+
+  function readBundledCatalogue(): Connector[] {
     const root = connectorCatalogueDir();
     let entries: string[];
     try {
@@ -6066,6 +6412,12 @@ app.whenReady().then(async () => {
           clientId: null,
           enabled: true,
           requiresClientId: !!CONNECTORS_BRING_YOUR_OWN[name],
+          requiresSecret: !!CONNECTORS_BRING_YOUR_OWN[name]?.secret,
+          // The bundled manifest's scope list travels with the connector so a
+          // saved registration asks Google for exactly what the server needs.
+          scopes: Array.isArray(srv.scopes)
+            ? (srv.scopes as unknown[]).filter((x): x is string => typeof x === "string")
+            : [],
         });
       }
     }
@@ -6073,6 +6425,11 @@ app.whenReady().then(async () => {
   }
 
   ipcMain.handle("connectors:list", async () => {
+    // Opening the page is the natural moment to pick up a newly published
+    // connector. Awaited, but bounded by the fetch's own timeout, and a
+    // failure simply leaves the cached list in place.
+    await refreshCatalogue();
+    await wakeManagedPlugins();
     const catalogue = readConnectorCatalogue();
     const configured = readMcpConfig().servers;
     let status: Record<string, string> = {};
@@ -6121,10 +6478,17 @@ app.whenReady().then(async () => {
     if (cfg.servers.some((sv) => sv.name === name)) return { ok: false, error: `${connector.displayName} is already added.` };
 
     const reg = await registerOAuthClient(connector.url);
+    if (!("clientId" in reg)) {
+      // No silent Codex-branded fallback. It was originally "a working
+      // sign-in beats blocking on branding" — in practice the user met a
+      // consent screen naming another product, with no hint why, twice. A
+      // named failure they can retry beats a surprise they cannot explain.
+      return { ok: false, error: `Could not register Unbiased with ${connector.displayName}: ${reg.error}` };
+    }
     const entry: UserMcpServer = {
       name: connector.name,
       url: connector.url,
-      ...("clientId" in reg ? { oauthClientId: reg.clientId } : {}),
+      oauthClientId: reg.clientId,
     };
     if (!writeMcpConfig([...cfg.servers, entry])) return { ok: false, error: "Could not save the server list." };
     try {
@@ -6158,26 +6522,47 @@ app.whenReady().then(async () => {
    * there yet, so this works as a first action rather than requiring a failed
    * Connect first.
    */
-  ipcMain.handle("connectors:set-client-id", async (_e, payload: { name: string; clientId: string }) => {
+  ipcMain.handle("connectors:set-client-id", async (_e, payload: { name: string; clientId: string; clientSecret?: string }) => {
     const name = typeof payload?.name === "string" ? payload.name : "";
-    const clientId = typeof payload?.clientId === "string" ? payload.clientId.trim() : "";
+    // Sanitize hard, because the Google console's credential table puts the
+    // ID next to other cells: a drag-select copies "…apps.googleusercontent.com
+    // Creation date" and the pasted client is silently invalid. No OAuth client
+    // id or secret contains whitespace or zero-width characters, so cutting at
+    // the first one is unambiguous and repairs the paste instead of failing an
+    // hour later inside a token exchange.
+    const clean = (v: unknown): string =>
+      typeof v === "string" ? v.replace(/[\u200b-\u200d\ufeff]/g, "").trim().split(/\s/)[0] ?? "" : "";
+    const clientId = clean(payload?.clientId);
+    const clientSecret = clean(payload?.clientSecret);
     const connector = readConnectorCatalogue().find((c) => c.name === name);
     if (!connector) return { ok: false, error: "That connector is not in the catalogue." };
     // Written verbatim into config.toml, so it is held to the same rule as
     // every other value there.
-    if (/["\\]|[\u0000-\u001f]/.test(clientId)) {
-      return { ok: false, error: "A client ID cannot contain quotes or backslashes." };
+    if (/["\\]|[\u0000-\u001f]/.test(clientId) || /["\\]|[\u0000-\u001f]/.test(clientSecret)) {
+      return { ok: false, error: "A client ID or secret cannot contain quotes or backslashes." };
     }
+    // No hard secret requirement any more. The pinned engine LOSES the secret
+    // between authorize and token exchange (Google answered "client_secret is
+    // missing" to a request our plugin config supplied one for — its stored
+    // OAuth state has no secret field), so the Desktop-client route is dead
+    // until the engine is fixed. An iOS-type Google client needs no secret at
+    // all and rides the ordinary client-id path instead; leaving the field
+    // empty selects that route.
     if (runningTurns.size > 0) return { ok: false, error: "Finish the running turn first — this restarts the engine." };
     const cfg = readMcpConfig();
     if (cfg.error) return { ok: false, error: cfg.error };
     const exists = cfg.servers.some((sv) => sv.name === name);
     // An empty value clears it, which is the way back to automatic sign-up.
+    const fields = clientId
+      ? {
+          oauthClientId: clientId,
+          ...(clientSecret ? { oauthClientSecret: clientSecret } : { oauthClientSecret: undefined }),
+          ...(connector.scopes.length ? { scopes: connector.scopes } : {}),
+        }
+      : { oauthClientId: undefined, oauthClientSecret: undefined };
     const next = exists
-      ? cfg.servers.map((sv) =>
-          sv.name === name ? { ...sv, ...(clientId ? { oauthClientId: clientId } : { oauthClientId: undefined }) } : sv,
-        )
-      : [...cfg.servers, { name, url: connector.url, ...(clientId ? { oauthClientId: clientId } : {}) }];
+      ? cfg.servers.map((sv) => (sv.name === name ? { ...sv, ...fields } : sv))
+      : [...cfg.servers, { name, url: connector.url, ...fields }];
     if (!writeMcpConfig(next)) return { ok: false, error: "Could not save the server list." };
     try {
       await startEngine();
@@ -6261,6 +6646,22 @@ app.whenReady().then(async () => {
     return message;
   }
 
+  /**
+   * Wake the plugin subsystem so managed-plugin servers exist.
+   *
+   * codex materializes marketplace plugins LAZILY: until something touches
+   * the plugin registry, a connector riding the managed-plugin path (the
+   * Google trio) has no MCP server at all, and signing in fails with "No MCP
+   * server named 'gmail' found" — measured live, and plugin/list alone made
+   * the server appear with its full tool set. Cheap and idempotent, so it is
+   * safe to call before any operation that needs those servers.
+   */
+  async function wakeManagedPlugins(): Promise<void> {
+    const hasManaged = readMcpConfig().servers.some((sv) => sv.oauthClientSecret);
+    if (!hasManaged) return;
+    await engine.request("plugin/list", {}).catch(() => undefined);
+  }
+
   ipcMain.handle("mcp:login", async (_e, name: string) => {
     if (typeof name !== "string" || !name) return { ok: false, error: "No server named." };
     // Claim our own OAuth client before codex can register its own.
@@ -6295,8 +6696,21 @@ app.whenReady().then(async () => {
       // works; the consent screen just says Codex. Better to proceed and let
       // the user decide than to block on branding.
     }
+    await wakeManagedPlugins();
+    const attemptLogin = () =>
+      engine.request("mcpServer/oauth/login", { name }) as Promise<{ authorizationUrl?: string }>;
     try {
-      const res = (await engine.request("mcpServer/oauth/login", { name })) as { authorizationUrl?: string };
+      let res: { authorizationUrl?: string };
+      try {
+        res = await attemptLogin();
+      } catch (err) {
+        // The wake is asynchronous on the engine side too — one bounded
+        // retry covers the window where the marketplace is still loading.
+        if (!/no mcp server named/i.test(String(err))) throw err;
+        await new Promise((r) => setTimeout(r, 1_500));
+        await wakeManagedPlugins();
+        res = await attemptLogin();
+      }
       const url = typeof res?.authorizationUrl === "string" ? res.authorizationUrl : "";
       if (!url) return { ok: false, error: "The engine did not return a sign-in link." };
       await shell.openExternal(url);
@@ -7858,22 +8272,10 @@ app.whenReady().then(async () => {
           // Chrome can park our tab again whenever another one comes forward,
           // and a parked tab silently stops painting. Cheap to reassert.
           await mirrorCall("Page.bringToFront").catch(() => {});
-          // Self-correct a wrong-shaped viewport rather than living with it.
-          const want = mirrorViewport(mirrorSize.width, mirrorSize.height);
-          const got = mirrorLastFrame;
-          if (got && (Math.abs(got.width - want.width) > 2 || Math.abs(got.height - want.height) > 2)) {
-            try {
-              const vp = await mirrorApplyViewport(mirrorSize.width, mirrorSize.height, mirrorSize.dpr);
-              await mirrorCall("Page.startScreencast", {
-                format: "jpeg",
-                quality: 85,
-                ...mirrorFrameBounds(vp),
-                everyNthFrame: 1,
-              });
-            } catch {
-              /* next tick */
-            }
-          }
+          // Backstop only: the frame handler corrects a wrong shape within one
+          // frame. This catches the case where frames have stopped arriving
+          // altogether, so nothing is left to trigger that path.
+          if (mirrorShapeWrong(mirrorLastFrame)) await mirrorCorrectViewport();
         }
       } catch {
         mirrorTeardown(true); // Chrome went away

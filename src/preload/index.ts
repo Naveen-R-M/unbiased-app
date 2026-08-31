@@ -100,8 +100,8 @@ contextBridge.exposeInMainWorld("unbiased", {
   connectorsRemove: (name: string) => ipcRenderer.invoke("connectors:remove", name),
   connectorsSetEnabled: (name: string, enabled: boolean) =>
     ipcRenderer.invoke("connectors:set-enabled", { name, enabled }),
-  connectorsSetClientId: (name: string, clientId: string) =>
-    ipcRenderer.invoke("connectors:set-client-id", { name, clientId }),
+  connectorsSetClientId: (name: string, clientId: string, clientSecret?: string) =>
+    ipcRenderer.invoke("connectors:set-client-id", { name, clientId, clientSecret }),
   onMcpLoginDone: (cb: (p: unknown) => void) => subscribe("mcp:login-done", cb),
   // A dropped File carries no usable path of its own in Electron 32+; only
   // this side can resolve one.
