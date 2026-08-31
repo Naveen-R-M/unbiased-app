@@ -6337,7 +6337,16 @@ function WorkedGroup({ duration, children }: { duration: number | null; children
           ›
         </span>
       </button>
-      {open && <div style={{ paddingTop: 2 }}>{children}</div>}
+      {open && (
+        <>
+          {/* A rule only while open: collapsed, the header is a quiet label
+              and a full-width line would compete with the transcript; open,
+              it is the lid of a container and the line says where the turn's
+              working-out begins. */}
+          <div style={{ height: 1, background: colors.border, maxWidth: "var(--measure)", margin: "2px 0 12px" }} />
+          <div>{children}</div>
+        </>
+      )}
     </div>
   );
 }
@@ -17003,6 +17012,29 @@ function isBrowserStep(e: CommandEntry): boolean {
   return c.startsWith("browser_") || c.startsWith("Browse the web") || c.startsWith("Use a signed-in browser session");
 }
 
+const isMemoryStep = (e: CommandEntry): boolean => {
+  const c = e.command ?? "";
+  return c.startsWith("save memory") || c.startsWith("forget memory");
+};
+
+/** Everything that is not one of the app's own tool families is a command the
+ *  engine ran in a shell — that is what earns the monospace and the "Shell"
+ *  label on its output panel. */
+const isShellStep = (e: CommandEntry): boolean => !isBrowserStep(e) && !isMemoryStep(e);
+
+function stepIcon(e: CommandEntry): React.ReactNode {
+  if (isBrowserStep(e)) return <GlobeIcon size={14} />;
+  if (isMemoryStep(e)) return <LightbulbIcon />;
+  return <TerminalIcon size={14} />;
+}
+
+/** What the row says. Shell steps get the verb the transcript elsewhere uses
+ *  ("Ran …"); the tool families already phrase themselves. */
+function stepRowText(e: CommandEntry): string {
+  const c = e.command ?? "";
+  return isShellStep(e) ? `Ran ${c}` : c;
+}
+
 /** Header label for a steps group made ENTIRELY of memory operations — those
  *  groups say what they did ("Saved memory") instead of the generic
  *  "Worked · 1 step". Keyed on the main process's step text (`save memory ·
@@ -17067,7 +17099,10 @@ function StepsGroup({
         : memoryLabel
           ? { text: `${memoryLabel}${failed ? " · issues" : ""}`, color: failed ? colors.err : colors.dim, verb: null }
           : {
-              text: `Worked · ${items.length} step${items.length === 1 ? "" : "s"}${failed ? " · issues" : ""}`,
+              // "Ran commands" rather than "Worked · N steps": the count is
+              // already one row per step below, and the verb says what kind
+              // of work it was without the reader opening the group.
+              text: `Ran command${items.length === 1 ? "" : "s"}${failed ? " · issues" : ""}`,
               color: failed ? colors.err : colors.dim,
               verb: null,
             };
@@ -17087,13 +17122,28 @@ function StepsGroup({
             background: "transparent",
             border: "none",
             color: summary.color,
-            fontSize: 13.5,
+            // Set like the step rows it heads and the answer beside them, so
+            // the whole fold reads in one voice.
+            fontSize: 15.5,
+            lineHeight: 1.6,
+            letterSpacing: "var(--track-body)",
             cursor: "pointer",
-            padding: "2px 0",
+            padding: "3px 0",
             fontFamily: "var(--font-ui)",
           }}
         >
-          {running && !needsApproval ? <ShimmerText text={summary.text} fontSize={13.5} /> : summary.text}
+          <span style={{ display: "flex", flexShrink: 0 }}>{stepIcon(items[0])}</span>
+          {running && !needsApproval ? <ShimmerText text={summary.text} fontSize={15.5} /> : summary.text}
+          <span
+            style={{
+              display: "inline-block",
+              transform: expanded ? "rotate(90deg)" : "none",
+              transition: "transform 120ms var(--ease-out)",
+              fontSize: 11,
+            }}
+          >
+            ›
+          </span>
         </button>
         {summary.verb && (
           <button
@@ -17143,73 +17193,118 @@ function StepsGroup({
           const label = statusLabel(e);
           const hasOutput = Boolean(e.output);
           const itemOpen = openItems.has(e.itemId);
+          const awaiting = e.status === "awaitingApproval" && e.approval && !e.approval.decision;
+          const failed = e.status === "failed" || (e.exitCode ?? 0) !== 0;
           return (
-            <div
-              key={e.itemId}
-              style={{
-                margin: "8px 0",
-                padding: "10px 14px",
-                borderRadius: 12,
-                border: `1px solid ${
-                  e.status === "awaitingApproval" && !e.approval?.expired ? colors.amber : colors.border
-                }`,
-                background: "var(--code-bg)",
-                fontSize: 12.5,
-                fontFamily: "var(--font-code)",
-              }}
-            >
+            <div key={e.itemId} style={{ margin: "1px 0" }}>
+              {/* A line of prose with an icon, not a card. The bordered
+                  monospace box read as debug output even for a step whose
+                  whole story is one sentence; the command itself belongs in
+                  the panel below, where a terminal is the right metaphor. */}
               <div
                 onClick={hasOutput ? () => toggleItem(e.itemId) : undefined}
                 style={{
                   display: "flex",
                   gap: 8,
-                  alignItems: "baseline",
+                  alignItems: "center",
                   cursor: hasOutput ? "pointer" : "default",
+                  padding: "3px 0",
+                  color: failed ? colors.err : colors.dim,
+                  fontSize: 15.5,
+                  lineHeight: 1.6,
+                  letterSpacing: "var(--track-body)",
+                  maxWidth: "var(--measure)",
                 }}
               >
+                <span style={{ display: "flex", flexShrink: 0 }}>{stepIcon(e)}</span>
                 <span
                   style={{
-                    color: hasOutput ? colors.dim : "transparent",
-                    flexShrink: 0,
-                    fontSize: 9,
-                    display: "inline-block",
-                    transform: itemOpen ? "rotate(90deg)" : "none",
-                    transition: "transform 120ms var(--ease-out)",
+                    minWidth: 0,
+                    whiteSpace: "nowrap",
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    fontFamily: isShellStep(e) ? "var(--font-code)" : "inherit",
+                    fontSize: isShellStep(e) ? 14 : undefined,
                   }}
                 >
-                  ▶
+                  {stepRowText(e)}
                 </span>
-                <span style={{ color: label.color, flexShrink: 0 }}>{label.text}</span>
-                <span style={{ whiteSpace: "pre-wrap", color: colors.fg, minWidth: 0, overflowWrap: "anywhere" }}>
-                  {e.command}
-                </span>
+                {e.status !== "completed" && !awaiting && (
+                  <span style={{ color: label.color, flexShrink: 0, fontSize: 13 }}>{label.text}</span>
+                )}
+                {hasOutput && (
+                  <span
+                    style={{
+                      flexShrink: 0,
+                      fontSize: 11,
+                      display: "inline-block",
+                      transform: itemOpen ? "rotate(90deg)" : "none",
+                      transition: "transform 120ms var(--ease-out)",
+                    }}
+                  >
+                    ›
+                  </span>
+                )}
               </div>
-              {e.status === "awaitingApproval" && e.approval && !e.approval.decision && (
-                e.approval.expired ? (
-                  <div style={{ marginTop: 8, fontSize: 12.5, color: colors.dim, lineHeight: 1.5 }}>
+              {awaiting &&
+                (e.approval!.expired ? (
+                  <div style={{ margin: "4px 0 8px", fontSize: 13, color: colors.dim, lineHeight: 1.5 }}>
                     This request is no longer active — the turn behind it ended, usually because the
                     app was closed. Ask again to run it.
                   </div>
                 ) : (
                   <PermissionsPrompt
-                    approval={e.approval}
+                    approval={e.approval!}
                     onDecide={(d) => void decide(e.itemId, e.approval!.requestId, d)}
                   />
-                )
-              )}
+                ))}
               {e.output && itemOpen && (
-                <pre
+                <div
                   style={{
-                    margin: "8px 0 0",
-                    color: colors.dim,
-                    whiteSpace: "pre-wrap",
-                    overflowWrap: "anywhere",
-                    maxHeight: 200,
-                    overflowY: "auto",
+                    margin: "4px 0 10px",
+                    borderRadius: 12,
+                    border: `1px solid ${colors.border}`,
+                    background: "var(--code-bg)",
+                    overflow: "hidden",
+                    maxWidth: "var(--measure)",
                   }}
                 >
-                  {e.output.length > 4000 ? e.output.slice(0, 4000) + "\n… (truncated)" : e.output}
-                </pre>
+                  {/* Naming the surface ("Shell") is what turns a slab of
+                      monospace into a quoted terminal — the reader knows what
+                      they are looking at before they parse a character. */}
+                  <div
+                    style={{
+                      padding: "7px 12px",
+                      borderBottom: `1px solid ${colors.border}`,
+                      color: colors.dim,
+                      fontSize: 12,
+                      letterSpacing: "var(--track-overline)",
+                    }}
+                  >
+                    {isShellStep(e) ? "Shell" : "Output"}
+                  </div>
+                  <pre
+                    style={{
+                      margin: 0,
+                      padding: "10px 12px",
+                      color: colors.dim,
+                      fontFamily: "var(--font-code)",
+                      fontSize: 12.5,
+                      lineHeight: 1.55,
+                      whiteSpace: "pre-wrap",
+                      overflowWrap: "anywhere",
+                      maxHeight: 240,
+                      overflowY: "auto",
+                    }}
+                  >
+                    <span style={{ color: colors.fg }}>
+                      <span style={{ color: colors.dim }}>$ </span>
+                      {e.command}
+                    </span>
+                    {"\n"}
+                    {e.output.length > 4000 ? e.output.slice(0, 4000) + "\n… (truncated)" : e.output}
+                  </pre>
+                </div>
               )}
             </div>
           );
