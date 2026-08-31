@@ -299,3 +299,19 @@ test("a payload served with the trailing newline it is published with still veri
   });
   assert.equal(res.ok, true, `served-with-newline payload must verify (got ${res.ok ? "" : res.reason})`);
 });
+
+test("the cache keeps the ORIGINAL bytes, so a future build can read new fields", () => {
+  // The bug this prevents: the cache used to store re-serialised parsed
+  // objects, so a field the fetching build ignored was gone for good — and an
+  // ETag revalidation (304) meant it was never re-fetched either.
+  const text = payload([entry({ someFutureField: "kept" } as Record<string, unknown>)]);
+  const parsed = parseCatalogue(text, null, NOW)!;
+  assert.equal(parsed.raw, text, "raw must be the exact text parsed");
+  assert.ok(parsed.raw.includes("someFutureField"), "a field this build ignores must survive in the cache");
+});
+
+test("comingSoon is read, and defaults to false", () => {
+  const c = parseCatalogue(payload([entry({ comingSoon: true }), entry({ name: "b" })]), null, NOW)!;
+  assert.equal(c.connectors[0].comingSoon, true);
+  assert.equal(c.connectors[1].comingSoon, false);
+});

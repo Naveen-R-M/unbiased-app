@@ -10423,6 +10423,10 @@ type ConnectorInfo = {
   enabled: boolean;
   requiresClientId: boolean;
   requiresSecret: boolean;
+  /** Listed as a promise, not an offer: no actions, because the provider-side
+   *  app is not ready and every button would end in a failure. */
+  comingSoon: boolean;
+  setupNote: string | null;
   scopes: string[];
   added: boolean;
   authStatus: string | null;
@@ -10832,7 +10836,20 @@ function ConnectorsView({ navOpen, onToggleNav }: { navOpen: boolean; onToggleNa
                   <p style={{ color: colors.dim, fontSize: 14.5, lineHeight: 1.5, margin: "6px 0 0" }}>{open.description}</p>
                 </div>
                 <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0, marginTop: 4 }}>
-                  {open.added ? (
+                  {open.comingSoon ? (
+                    <span
+                      style={{
+                        color: colors.dim,
+                        fontSize: 13,
+                        fontWeight: 500,
+                        border: `1px solid ${colors.border}`,
+                        borderRadius: 999,
+                        padding: "5px 12px",
+                      }}
+                    >
+                      Coming soon
+                    </span>
+                  ) : open.added ? (
                     <>
                       {open.authStatus !== "oAuth" && (
                         <button className="u-chip" onClick={() => void signIn(open)} disabled={busy !== null} style={btnSmallStyle}>
@@ -10888,6 +10905,16 @@ function ConnectorsView({ navOpen, onToggleNav }: { navOpen: boolean; onToggleNa
                   automatically. The callback is shown rather than described
                   because it is unguessable, and one wrong character fails at
                   the authorize step with an error that names nothing useful. */}
+              {open.comingSoon ? (
+                // Nothing to configure yet: offering the field would let
+                // someone register a client against a connector the app then
+                // refuses to connect, which is a worse experience than saying
+                // plainly that it is not ready.
+                <p style={{ color: colors.dim, fontSize: 13.5, lineHeight: 1.55, margin: "34px 0 0", maxWidth: "62ch" }}>
+                  {open.setupNote ?? `${open.displayName} isn't available to connect yet.`}
+                </p>
+              ) : (
+                <>
               <h2 style={{ fontSize: 17, fontWeight: 600, letterSpacing: "var(--track-title)", margin: "34px 0 6px", color: colors.fg }}>
                 Use your own OAuth app
               </h2>
@@ -10987,6 +11014,8 @@ function ConnectorsView({ navOpen, onToggleNav }: { navOpen: boolean; onToggleNa
                   {busy === open.name ? "Saving…" : "Save"}
                 </button>
               </div>
+                </>
+              )}
 
               <h2 style={{ fontSize: 17, fontWeight: 600, letterSpacing: "var(--track-title)", margin: "34px 0 4px", color: colors.fg }}>
                 Information
@@ -11140,7 +11169,16 @@ function ConnectorsView({ navOpen, onToggleNav }: { navOpen: boolean; onToggleNa
                         {c.description}
                       </div>
                       <div style={{ display: "flex", alignItems: "center", gap: 8 }} onClick={(e) => e.stopPropagation()}>
-                        {c.added ? (
+                        {c.comingSoon ? (
+                          // Plain text, not a pill: a pill's own padding pushed
+                          // the words in from the card's text column, so it
+                          // read as indented against the description above it.
+                          // Nothing here is actionable, so nothing needs the
+                          // affordance of a chip.
+                          <span style={{ color: colors.dim, fontSize: 12.5, fontWeight: 500, padding: "3px 0" }}>
+                            Coming soon
+                          </span>
+                        ) : c.added ? (
                           <>
                             {/* Only the connected state is stated. "Needs
                                 sign-in" sat beside a button labelled Sign in,
