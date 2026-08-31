@@ -17133,17 +17133,10 @@ function StepsGroup({
           }}
         >
           <span style={{ display: "flex", flexShrink: 0 }}>{stepIcon(items[0])}</span>
+          {/* No chevron here: the group already has one as a SIBLING button
+              below, kept separate because the browser-name button can sit
+              between them and a button inside a button is invalid markup. */}
           {running && !needsApproval ? <ShimmerText text={summary.text} fontSize={15.5} /> : summary.text}
-          <span
-            style={{
-              display: "inline-block",
-              transform: expanded ? "rotate(90deg)" : "none",
-              transition: "transform 120ms var(--ease-out)",
-              fontSize: 11,
-            }}
-          >
-            ›
-          </span>
         </button>
         {summary.verb && (
           <button
@@ -17181,8 +17174,9 @@ function StepsGroup({
             display: "inline-block",
             transform: expanded ? "rotate(90deg)" : "none",
             transition: "transform 120ms var(--ease-out)",
-            fontSize: 11,
-            marginTop: 1,
+            // Scaled with the header's larger type; the row centres it, so
+            // the old 1px nudge would now push it low.
+            fontSize: 12,
           }}
         >
           ›
