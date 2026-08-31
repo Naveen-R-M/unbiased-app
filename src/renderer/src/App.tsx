@@ -48,6 +48,10 @@ type Entry =
   // A scheduled task the agent created and the user approved. Carries the key
   // so the row can link through to the task it made.
   | { kind: "scheduled"; key: string; name: string; cadence: string }
+  // A note the agent saved to persistent memory. Carries the file path so
+  // the row can open the note itself in a side-panel file tab — saves are
+  // not gated on approval, so being inspectable is the accountability.
+  | { kind: "memory"; name: string; description: string; path: string }
   // A completed turn's work — everything before its final message —
   // collapsed under a "Worked for Ns" header, Codex-style.
   | { kind: "work"; duration: number | null; entries: Entry[] }
@@ -559,6 +563,13 @@ declare global {
         cb: (p: { paneId: PaneId; key: string; name: string; cadence: string }) => void,
       ) => () => void;
       onScheduledOpenRun: (cb: (p: { threadId: string }) => void) => () => void;
+      memoryList: (threadId: string | null) => Promise<{
+        dir: string;
+        memories: { name: string; description: string; type: string; path: string; thisThread: boolean }[];
+      }>;
+      onMemorySaved: (
+        cb: (p: { paneId: PaneId; name: string; description: string; path: string }) => void,
+      ) => () => void;
       onApprovalCanceled: (cb: (p: { paneId: PaneId; requestId: string }) => void) => () => void;
       onApprovalRequest: (
         cb: (p: {
@@ -2210,8 +2221,11 @@ export function App() {
     current: string;
     dirty: DirtyFile[];
   } | null>(null);
-  const [envSection, setEnvSection] = useState<"workin" | "branch" | null>(null);
+  const [envSection, setEnvSection] = useState<"workin" | "branch" | "memory" | null>(null);
   const [envBranchSearch, setEnvBranchSearch] = useState("");
+  const [envMemories, setEnvMemories] = useState<
+    { name: string; description: string; path: string; thisThread: boolean }[] | null
+  >(null);
   const [envMsg, setEnvMsg] = useState<string | null>(null);
   const [envBusy, setEnvBusy] = useState(false);
 
@@ -2237,7 +2251,9 @@ export function App() {
     setEnvBranchSearch("");
     setEnvDiff(null);
     setEnvBranches(null);
+    setEnvMemories(null);
     setEnvOpen(true);
+    void window.unbiased.memoryList(activeThreadId).then((r) => setEnvMemories(r.memories));
     // All fetches fill in as they land; the popover opens immediately.
     if (activeProjectPath) {
       void window.unbiased.listWorktrees(activeProjectPath).then((r) => setExistingWts(r.worktrees));
@@ -3277,6 +3293,79 @@ export function App() {
                           Create new branch…
                         </button>
                       </div>
+                    )}
+                    {envMemories && envMemories.length > 0 && (
+                      <>
+                        <EnvRow
+                          icon={<LightbulbIcon />}
+                          label="Agent memory"
+                          right={
+                            <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                              <span style={{ color: colors.dim, fontVariantNumeric: "tabular-nums" }}>
+                                {envMemories.length}
+                              </span>
+                              <Chevron open={envSection === "memory"} />
+                            </span>
+                          }
+                          onClick={() => setEnvSection((s) => (s === "memory" ? null : "memory"))}
+                        />
+                        {envSection === "memory" && (
+                          <div style={{ padding: "0 0 4px 12px", maxHeight: 220, overflowY: "auto" }}>
+                            {envMemories.map((m) => (
+                              <button
+                                key={m.name}
+                                onClick={() => {
+                                  setEnvOpen(false);
+                                  void openFileInPanel(m.path);
+                                }}
+                                title={m.path}
+                                style={{
+                                  display: "flex",
+                                  alignItems: "baseline",
+                                  gap: 8,
+                                  width: "100%",
+                                  background: "transparent",
+                                  border: "none",
+                                  borderRadius: 8,
+                                  padding: "6px 10px",
+                                  fontSize: 12.5,
+                                  cursor: "pointer",
+                                  textAlign: "left",
+                                  fontFamily: "inherit",
+                                }}
+                              >
+                                <span style={{ color: colors.accent, flexShrink: 0 }}>{m.name}</span>
+                                <span
+                                  style={{
+                                    color: colors.dim,
+                                    flex: 1,
+                                    minWidth: 0,
+                                    whiteSpace: "nowrap",
+                                    overflow: "hidden",
+                                    textOverflow: "ellipsis",
+                                  }}
+                                >
+                                  {m.description}
+                                </span>
+                                {m.thisThread && (
+                                  <span
+                                    style={{
+                                      color: colors.dim,
+                                      fontSize: 11,
+                                      border: `1px solid ${colors.border}`,
+                                      borderRadius: 5,
+                                      padding: "1px 6px",
+                                      flexShrink: 0,
+                                    }}
+                                  >
+                                    this chat
+                                  </span>
+                                )}
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </>
                     )}
                     <div style={{ borderTop: `1px solid ${colors.border}`, margin: "6px 4px" }} />
                     <EnvRow icon={<CommitIcon />} label="Commit or push" onClick={() => void envCommitPush()} />
@@ -8210,6 +8299,14 @@ function ChatPane({
           { kind: "scheduled", key: p.key, name: p.name, cadence: p.cadence },
         ]);
       }),
+      window.unbiased.onMemorySaved((p) => {
+        if (p.paneId !== paneId) return;
+        producedRef.current = true;
+        setEntries((es) => [
+          ...withoutTrailingPlaceholder(es),
+          { kind: "memory", name: p.name, description: p.description, path: p.path },
+        ]);
+      }),
       window.unbiased.onCompaction((p) => {
         if (p.paneId !== paneId) return;
         setEntries((es) => {
@@ -8662,6 +8759,43 @@ function ChatPane({
               View task
             </button>
           )}
+        </div>
+      );
+    }
+    if (e.kind === "memory") {
+      // Memory saves are not gated on approval, so this row is the
+      // accountability: the write is visible where it happened, and the name
+      // opens the note itself in the side panel.
+      return (
+        <div
+          key={block.key}
+          style={{ display: "flex", alignItems: "center", gap: 8, margin: "14px 0", fontSize: 13 }}
+        >
+          <span style={{ color: colors.accent, display: "flex" }}>
+            <LightbulbIcon />
+          </span>
+          <span style={{ color: colors.dim }}>
+            Saved memory{" "}
+            {onOpenFile ? (
+              <button
+                onClick={() => onOpenFile(e.path)}
+                style={{
+                  background: "transparent",
+                  border: "none",
+                  padding: 0,
+                  color: colors.accent,
+                  fontSize: 13,
+                  cursor: "pointer",
+                  fontFamily: "inherit",
+                }}
+              >
+                {e.name}
+              </button>
+            ) : (
+              <span style={{ color: colors.fg }}>{e.name}</span>
+            )}{" "}
+            — {e.description}
+          </span>
         </div>
       );
     }

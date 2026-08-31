@@ -94,6 +94,8 @@ contextBridge.exposeInMainWorld("unbiased", {
   onScheduledRunState: (cb: (p: unknown) => void) => subscribe("scheduled:run-state", cb),
   onScheduledCreated: (cb: (p: unknown) => void) => subscribe("chat:scheduled-created", cb),
   onScheduledOpenRun: (cb: (p: unknown) => void) => subscribe("scheduled:open-run", cb),
+  memoryList: (threadId: string | null) => ipcRenderer.invoke("memory:list", threadId),
+  onMemorySaved: (cb: (p: unknown) => void) => subscribe("chat:memory-saved", cb),
   // A dropped File carries no usable path of its own in Electron 32+; only
   // this side can resolve one.
   pathForDroppedFile: (file: File) => {
