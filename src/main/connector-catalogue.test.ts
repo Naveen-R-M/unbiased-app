@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { generateKeyPairSync, sign } from "node:crypto";
 import {
+  isAcceptableSuccessor,
   CATALOGUE_PUBLIC_KEY,
   CATALOGUE_SCHEMA,
   CATALOGUE_URLS,
@@ -15,7 +16,9 @@ import {
 const NOW = "2026-08-31T00:00:00.000Z";
 const REPO = "/Users/naveen/Projects/Work/unbiased-connectors";
 const entry = (over: Record<string, unknown> = {}) => ({ name: "linear", url: "https://mcp.linear.app/mcp", ...over });
-const payload = (connectors: unknown[], schema = CATALOGUE_SCHEMA) => JSON.stringify({ schema, connectors });
+const PUBLISHED = "2026-08-30T00:00:00.000Z";
+const payload = (connectors: unknown[], schema = CATALOGUE_SCHEMA, publishedAt: unknown = PUBLISHED) =>
+  JSON.stringify({ schema, publishedAt, connectors });
 
 test("the real published catalogue verifies against the key baked into the app", () => {
   // The end-to-end contract between the two repos. If this fails, either the
@@ -188,4 +191,96 @@ test("an unchanged primary ends the walk — no pointless second request", async
   });
   assert.deepEqual(res, { ok: false, reason: "unchanged" });
   assert.equal(asked.length, 1);
+});
+
+test("a payload without a usable publishedAt is refused", () => {
+  // Built by hand: passing `undefined` through payload() would hit the default
+  // parameter and quietly test the valid case instead.
+  const missing = JSON.stringify({ schema: CATALOGUE_SCHEMA, connectors: [entry()] });
+  assert.equal(parseCatalogue(missing, null, NOW), null, "missing");
+  for (const bad of ["", "yesterday", 12345, null])
+    assert.equal(parseCatalogue(payload([entry()], CATALOGUE_SCHEMA, bad), null, NOW), null, JSON.stringify(bad));
+});
+
+test("a wildly future timestamp is refused, so the floor cannot be pinned forever", () => {
+  const future = new Date(Date.parse(NOW) + 8 * 24 * 3600_000).toISOString();
+  assert.equal(parseCatalogue(payload([entry()], CATALOGUE_SCHEMA, future), null, NOW), null);
+  // a few hours of clock skew is tolerated
+  const skewed = new Date(Date.parse(NOW) + 3600_000).toISOString();
+  assert.ok(parseCatalogue(payload([entry()], CATALOGUE_SCHEMA, skewed), null, NOW));
+});
+
+test("older payloads are rejected, same and newer accepted", () => {
+  const at = (t: string) => parseCatalogue(payload([entry()], CATALOGUE_SCHEMA, t), null, NOW)!;
+  const current = at("2026-08-30T00:00:00.000Z");
+  assert.equal(isAcceptableSuccessor(at("2026-08-29T00:00:00.000Z"), current), false, "older must be refused");
+  assert.equal(isAcceptableSuccessor(at("2026-08-30T00:00:00.000Z"), current), true, "same publish, re-fetched");
+  assert.equal(isAcceptableSuccessor(at("2026-08-31T00:00:00.000Z"), current), true, "newer");
+  assert.equal(isAcceptableSuccessor(at("2026-08-29T00:00:00.000Z"), null), true, "nothing cached yet");
+});
+
+/** The genuinely signed payload, so the rollback path can be reached — an
+ *  unsigned fake stops at the signature check and never gets there. */
+function realSigned(): { text: string; sig: string } | null {
+  try {
+    return {
+      text: readFileSync(`${REPO}/dist/catalogue.json`, "utf8").trim(),
+      sig: readFileSync(`${REPO}/dist/catalogue.json.sig`, "utf8").trim(),
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** A catalogue dated after the real one, to stand in for "what we already
+ *  trust" when testing that we refuse to go backwards. */
+function newerThan(published: string): ReturnType<typeof parseCatalogue> {
+  const later = new Date(Date.parse(published) + 60_000).toISOString();
+  return parseCatalogue(payload([entry()], CATALOGUE_SCHEMA, later), null, later);
+}
+
+test("a validly signed but OLDER payload is refused as a rollback", async () => {
+  const real = realSigned();
+  if (!real) return; // sibling checkout absent
+  const published = JSON.parse(real.text).publishedAt as string;
+  const current = newerThan(published);
+  const res = await fetchCatalogue(null, {
+    url: "https://x.example/c.json",
+    current,
+    now: () => new Date(Date.parse(published) + 120_000).toISOString(),
+    fetch: (async (u: string | URL) =>
+      new Response(String(u).endsWith(".sig") ? real.sig : real.text, { status: 200 })) as unknown as typeof fetch,
+  });
+  assert.deepEqual(res, { ok: false, reason: "rollback" });
+});
+
+test("the same payload is accepted when nothing newer is cached", async () => {
+  const real = realSigned();
+  if (!real) return;
+  const published = JSON.parse(real.text).publishedAt as string;
+  const res = await fetchCatalogue(null, {
+    url: "https://x.example/c.json",
+    current: null,
+    now: () => new Date(Date.parse(published) + 120_000).toISOString(),
+    fetch: (async (u: string | URL) =>
+      new Response(String(u).endsWith(".sig") ? real.sig : real.text, { status: 200 })) as unknown as typeof fetch,
+  });
+  assert.equal(res.ok, true, "a fresh install must accept the live catalogue");
+});
+
+test("the walk stops on a rollback instead of shopping hosts", async () => {
+  const real = realSigned();
+  if (!real) return;
+  const published = JSON.parse(real.text).publishedAt as string;
+  const asked: string[] = [];
+  const res = await fetchCatalogueFromAnyHost(null, {
+    current: newerThan(published),
+    now: () => new Date(Date.parse(published) + 120_000).toISOString(),
+    fetch: (async (u: string | URL) => {
+      asked.push(String(u));
+      return new Response(String(u).endsWith(".sig") ? real.sig : real.text, { status: 200 });
+    }) as unknown as typeof fetch,
+  });
+  assert.deepEqual(res, { ok: false, reason: "rollback" });
+  assert.equal(asked.filter((u) => !u.endsWith(".sig")).length, 1, `asked: ${asked.join(", ")}`);
 });

@@ -6278,9 +6278,16 @@ app.whenReady().then(async () => {
     if (catalogueRefreshing) return catalogueRefreshing;
     catalogueRefreshing = (async () => {
       const current = loadCachedCatalogue();
-      const res = await fetchCatalogueFromAnyHost(current?.etag ?? null);
+      // `current` arms the rollback check: a genuinely-signed but OLDER payload
+      // is refused rather than accepted, so whoever can write the bucket
+      // cannot quietly reinstate a withdrawn connector.
+      const res = await fetchCatalogueFromAnyHost(current?.etag ?? null, { current });
       if (!res.ok) {
-        if (res.reason !== "unchanged") console.log(`[connectors] catalogue refresh skipped: ${res.reason}`);
+        if (res.reason === "rollback")
+          console.warn(
+            `[connectors] REFUSED an older catalogue than the one cached (${current?.publishedAt}) — keeping the cached copy`,
+          );
+        else if (res.reason !== "unchanged") console.log(`[connectors] catalogue refresh skipped: ${res.reason}`);
         return;
       }
       catalogueCache = res.catalogue;
@@ -6288,13 +6295,22 @@ app.whenReady().then(async () => {
       try {
         writeFileSync(
           cataloguePath(),
-          JSON.stringify({ payload: JSON.stringify({ schema: res.catalogue.schema, connectors: res.catalogue.connectors }), etag: res.catalogue.etag }),
+          JSON.stringify({
+            payload: JSON.stringify({
+              schema: res.catalogue.schema,
+              publishedAt: res.catalogue.publishedAt,
+              connectors: res.catalogue.connectors,
+            }),
+            etag: res.catalogue.etag,
+          }),
           { mode: 0o600 },
         );
       } catch (err) {
         console.log(`[connectors] could not cache the catalogue: ${String(err)}`);
       }
-      console.log(`[connectors] catalogue updated: ${res.catalogue.connectors.length} entries`);
+      console.log(
+        `[connectors] catalogue updated: ${res.catalogue.connectors.length} entries, published ${res.catalogue.publishedAt}`,
+      );
     })().finally(() => {
       catalogueRefreshing = null;
     });

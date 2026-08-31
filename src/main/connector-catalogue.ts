@@ -78,7 +78,20 @@ export type CatalogueEntry = {
   unavailable: string | null;
 };
 
-export type Catalogue = { schema: number; connectors: CatalogueEntry[]; etag: string | null; fetchedAt: string };
+export type Catalogue = {
+  schema: number;
+  /** When the maintainer built and signed this payload. Inside the signed
+   *  bytes, so it cannot be forged or stripped in transit. */
+  publishedAt: string;
+  connectors: CatalogueEntry[];
+  etag: string | null;
+  fetchedAt: string;
+};
+
+/** A payload dated further ahead than this is refused: a clock that wrong is
+ *  either broken or an attempt to pin the monotonic floor into the future,
+ *  after which no genuine publish would ever be accepted again. */
+const MAX_CLOCK_SKEW_MS = 24 * 60 * 60 * 1000;
 
 const str = (v: unknown, max = 4000): string | null =>
   typeof v === "string" && v.trim() && v.length <= max ? v.trim() : null;
@@ -120,9 +133,13 @@ export function parseCatalogue(text: string, etag: string | null, now: string): 
     return null;
   }
   if (!raw || typeof raw !== "object") return null;
-  const body = raw as { schema?: unknown; connectors?: unknown };
+  const body = raw as { schema?: unknown; publishedAt?: unknown; connectors?: unknown };
   if (body.schema !== CATALOGUE_SCHEMA) return null;
   if (!Array.isArray(body.connectors)) return null;
+  const publishedAt = typeof body.publishedAt === "string" ? body.publishedAt : "";
+  const publishedMs = Date.parse(publishedAt);
+  if (!publishedAt || Number.isNaN(publishedMs)) return null;
+  if (publishedMs > Date.parse(now) + MAX_CLOCK_SKEW_MS) return null;
   const connectors: CatalogueEntry[] = [];
   const seen = new Set<string>();
   for (const item of body.connectors) {
@@ -156,7 +173,7 @@ export function parseCatalogue(text: string, etag: string | null, now: string): 
     });
   }
   if (!connectors.length) return null; // an empty catalogue is a broken publish
-  return { schema: CATALOGUE_SCHEMA, connectors, etag, fetchedAt: now };
+  return { schema: CATALOGUE_SCHEMA, publishedAt, connectors, etag, fetchedAt: now };
 }
 
 export function verifyCatalogue(text: string, signatureB64: string, publicKeyPem = CATALOGUE_PUBLIC_KEY): boolean {
@@ -174,11 +191,33 @@ export type FetchDeps = {
   now?: () => string;
   url?: string;
   timeoutMs?: number;
+  /** What the caller already trusts. Passing it enforces the rollback check
+   *  here rather than leaving it to every caller to remember. */
+  current?: Catalogue | null;
 };
 
 export type FetchResult =
   | { ok: true; catalogue: Catalogue }
-  | { ok: false; reason: "unchanged" | "offline" | "bad-signature" | "bad-payload" | "http" };
+  | { ok: false; reason: "unchanged" | "offline" | "bad-signature" | "bad-payload" | "http" | "rollback" };
+
+/**
+ * Is `next` at least as new as what we already trust?
+ *
+ * Signatures prove authorship, not freshness: a genuinely-signed OLDER payload
+ * is still genuinely signed, so anyone who can write the bucket could serve
+ * yesterday's catalogue — reinstating a connector that was withdrawn, or
+ * undoing a corrected URL. Refusing to go backwards is what makes publishing
+ * rights weaker than signing rights, which is the whole point of keeping the
+ * key off the build machine.
+ */
+export function isAcceptableSuccessor(next: Catalogue, current: Catalogue | null): boolean {
+  if (!current?.publishedAt) return true;
+  const a = Date.parse(next.publishedAt);
+  const b = Date.parse(current.publishedAt);
+  if (Number.isNaN(a)) return false;
+  if (Number.isNaN(b)) return true;
+  return a >= b; // equal is fine: the same publish, re-fetched
+}
 
 /**
  * Fetch the payload and its detached signature, verify, parse.
@@ -196,6 +235,9 @@ export async function fetchCatalogueFromAnyHost(etag: string | null, deps: Fetch
   for (const url of urls) {
     const res = await fetchCatalogue(etag, { ...deps, url });
     if (res.ok || res.reason === "unchanged") return res;
+    // A rollback is an answer, not an outage: trying the next host would just
+    // be shopping for a host willing to serve us something older.
+    if (res.reason === "rollback") return res;
     last = res;
   }
   return last;
@@ -223,7 +265,9 @@ export async function fetchCatalogue(etag: string | null, deps: FetchDeps = {}):
     // unverified input is work done on an attacker's behalf.
     if (!verifyCatalogue(text, sig)) return { ok: false, reason: "bad-signature" };
     const parsed = parseCatalogue(text, res.headers.get("etag"), now());
-    return parsed ? { ok: true, catalogue: parsed } : { ok: false, reason: "bad-payload" };
+    if (!parsed) return { ok: false, reason: "bad-payload" };
+    if (!isAcceptableSuccessor(parsed, deps.current ?? null)) return { ok: false, reason: "rollback" };
+    return { ok: true, catalogue: parsed };
   } catch {
     return { ok: false, reason: "offline" };
   }
