@@ -3,7 +3,9 @@
 // are injected into every thread's developer instructions. This module is the
 // pure half — format, validation, index — kept free of Electron and (in this
 // section) the filesystem so the parts that are easy to get wrong can be
-// exercised on their own, the same split scheduler.ts uses.
+// exercised on their own, the same split scheduler.ts uses. The fs layer at
+// the bottom is the only part that touches disk.
+import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 export type MemoryType = "user" | "feedback" | "project" | "reference";
@@ -168,4 +170,72 @@ export function renderMemorySection(notes: MemoryNote[], dir: string): string {
  *  not a word char, dot or hyphen. */
 export function projectMemoryDir(root: string, projectPath: string): string {
   return join(root, projectPath.replace(/[^\w.-]/g, "_"));
+}
+
+// ── fs layer ────────────────────────────────────────────────────────────
+
+/** Every path built from a note name goes through this gate first — the
+ *  validated slug alphabet has no separators, so a checked name cannot
+ *  escape the directory. */
+const noteFile = (dir: string, name: string): string | null =>
+  NAME_RE.test(name) ? join(dir, `${name}.md`) : null;
+
+// Write-to-temp + rename in the same directory, the saveTasks /
+// mcp-servers.json pattern: a crash mid-write can never leave a truncated
+// file behind.
+function atomicWrite(path: string, content: string): void {
+  const tmp = `${path}.tmp-${process.pid}`;
+  writeFileSync(tmp, content, "utf8");
+  renameSync(tmp, path);
+}
+
+export function loadMemoryNotes(dir: string): MemoryNote[] {
+  let entries: string[];
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    return [];
+  }
+  const notes: MemoryNote[] = [];
+  for (const f of entries.sort()) {
+    if (!f.endsWith(".md") || f === "MEMORY.md") continue;
+    try {
+      const parsed = parseMemoryFile(readFileSync(join(dir, f), "utf8"));
+      // The filename is the identity; frontmatter that disagrees (or is
+      // absent) still loads under the name the file actually has.
+      if (parsed) notes.push({ ...parsed, name: f.slice(0, -3) });
+    } catch {
+      /* unreadable file: skip, never fail the whole store */
+    }
+  }
+  return notes;
+}
+
+function rebuildIndex(dir: string): void {
+  atomicWrite(join(dir, "MEMORY.md"), renderIndex(loadMemoryNotes(dir)));
+}
+
+export function saveMemoryNote(dir: string, note: MemoryNote): { path: string } | { error: string } {
+  const path = noteFile(dir, note.name);
+  if (!path) return { error: "Invalid memory name." };
+  mkdirSync(dir, { recursive: true });
+  const existing = loadMemoryNotes(dir);
+  const isUpdate = existing.some((n) => n.name === note.name);
+  if (!isUpdate && existing.length >= MEMORY_MAX_NOTES) {
+    return { error: `This project is at the limit of ${MEMORY_MAX_NOTES} memories — forget one first.` };
+  }
+  atomicWrite(path, renderMemoryFile(note));
+  rebuildIndex(dir);
+  return { path };
+}
+
+export function deleteMemoryNote(dir: string, name: string): { ok: true } | { error: string } {
+  const path = noteFile(dir, name);
+  if (!path) return { error: "Invalid memory name." };
+  if (!loadMemoryNotes(dir).some((n) => n.name === name)) {
+    return { error: `No memory named "${name}" — check the index for the exact name.` };
+  }
+  rmSync(path);
+  rebuildIndex(dir);
+  return { ok: true };
 }

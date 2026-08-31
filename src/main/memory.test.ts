@@ -1,13 +1,20 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   MEMORY_INDEX_CAP,
+  MEMORY_MAX_NOTES,
   type MemoryNote,
+  deleteMemoryNote,
+  loadMemoryNotes,
   parseMemoryFile,
   projectMemoryDir,
   renderIndex,
   renderMemoryFile,
   renderMemorySection,
+  saveMemoryNote,
   validateMemory,
 } from "./memory";
 
@@ -155,6 +162,86 @@ test("renderMemorySection truncates at the cap and says how many were dropped", 
   const s = renderMemorySection(many, "/tmp/mem");
   assert.ok(s.length <= MEMORY_INDEX_CAP, `section is ${s.length} bytes`);
   assert.match(s, /\d+ more — list the directory/);
+});
+
+// ── fs layer ────────────────────────────────────────────────────────────
+
+const scratch = () => mkdtempSync(join(tmpdir(), "mem-test-"));
+const note = (name: string, description = `about ${name}`): MemoryNote => ({
+  name,
+  description,
+  type: "project",
+  body: `body of ${name}`,
+});
+
+test("saveMemoryNote creates the directory, the file, and the index", () => {
+  const dir = join(scratch(), "does", "not", "exist", "yet");
+  const r = saveMemoryNote(dir, note("first"));
+  assert.ok(!("error" in r), JSON.stringify(r));
+  assert.ok(existsSync(join(dir, "first.md")));
+  const idx = readFileSync(join(dir, "MEMORY.md"), "utf8");
+  assert.ok(idx.includes("- first — about first"));
+});
+
+test("saving the same name overwrites — that is the edit mechanism", () => {
+  const dir = scratch();
+  saveMemoryNote(dir, note("n", "old description"));
+  saveMemoryNote(dir, note("n", "new description"));
+  const loaded = loadMemoryNotes(dir);
+  assert.equal(loaded.length, 1);
+  assert.equal(loaded[0].description, "new description");
+  assert.ok(!readFileSync(join(dir, "MEMORY.md"), "utf8").includes("old description"));
+});
+
+test("saveMemoryNote refuses past the note cap (updates still allowed)", () => {
+  const dir = scratch();
+  for (let i = 0; i < MEMORY_MAX_NOTES; i++) saveMemoryNote(dir, note(`n-${i}`));
+  const refused = saveMemoryNote(dir, note("one-too-many"));
+  assert.ok("error" in refused);
+  const updated = saveMemoryNote(dir, note("n-0", "still editable at the cap"));
+  assert.ok(!("error" in updated), JSON.stringify(updated));
+});
+
+test("loadMemoryNotes returns [] for a missing dir and skips junk files", () => {
+  assert.deepEqual(loadMemoryNotes(join(scratch(), "never-created")), []);
+  const dir = scratch();
+  saveMemoryNote(dir, note("real"));
+  writeFileSync(join(dir, "MEMORY.md"), "- fake — the index is not a note\n");
+  const loaded = loadMemoryNotes(dir);
+  assert.equal(loaded.length, 1);
+  assert.equal(loaded[0].name, "real");
+});
+
+test("a foreign note with unknown frontmatter survives load + resave", () => {
+  const dir = scratch();
+  writeFileSync(
+    join(dir, "foreign.md"),
+    "---\nname: foreign\ndescription: from another tool\nmetadata:\n  originSessionId: abc\n---\n\nBody.",
+  );
+  const [loaded] = loadMemoryNotes(dir);
+  const r = saveMemoryNote(dir, loaded);
+  assert.ok(!("error" in r));
+  assert.ok(readFileSync(join(dir, "foreign.md"), "utf8").includes("originSessionId: abc"));
+});
+
+test("deleteMemoryNote removes the file and its index line", () => {
+  const dir = scratch();
+  saveMemoryNote(dir, note("keep"));
+  saveMemoryNote(dir, note("drop"));
+  const r = deleteMemoryNote(dir, "drop");
+  assert.ok(!("error" in r), JSON.stringify(r));
+  assert.ok(!existsSync(join(dir, "drop.md")));
+  const idx = readFileSync(join(dir, "MEMORY.md"), "utf8");
+  assert.ok(idx.includes("keep"));
+  assert.ok(!idx.includes("drop"));
+});
+
+test("deleteMemoryNote rejects unknown names and traversal attempts", () => {
+  const dir = scratch();
+  saveMemoryNote(dir, note("only"));
+  assert.ok("error" in deleteMemoryNote(dir, "no-such-note"));
+  assert.ok("error" in deleteMemoryNote(dir, "../only"));
+  assert.ok(existsSync(join(dir, "only.md")));
 });
 
 // ── projectMemoryDir ────────────────────────────────────────────────────
