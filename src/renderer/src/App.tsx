@@ -3378,17 +3378,22 @@ export function App() {
                                 background: "transparent",
                                 border: "none",
                                 borderRadius: 8,
-                                padding: "6px 10px",
-                                fontSize: 12.5,
+                                padding: "8px 10px",
                                 cursor: "pointer",
                                 textAlign: "left",
                                 fontFamily: "inherit",
                               }}
                             >
                               <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                                {/* Identity carries hierarchy by WEIGHT, not
+                                    color — same register as the Subagents
+                                    rows this section sits beside. */}
                                 <span
                                   style={{
-                                    color: colors.accent,
+                                    color: colors.fg,
+                                    fontSize: 13.5,
+                                    fontWeight: 600,
+                                    letterSpacing: -0.1,
                                     flex: 1,
                                     minWidth: 0,
                                     whiteSpace: "nowrap",
@@ -3415,13 +3420,16 @@ export function App() {
                               </span>
                               {/* The description is the note's whole summary —
                                   wrapped in full, never ellipsized: truncating
-                                  it is what made the row read as "CH…". */}
+                                  it is what made the row read as "CH…". Body
+                                  text: dim, near-zero tracking, looser leading
+                                  than the heading above it. */}
                               <span
                                 style={{
                                   display: "block",
                                   color: colors.dim,
+                                  fontSize: 12.5,
                                   lineHeight: 1.45,
-                                  paddingTop: 2,
+                                  paddingTop: 3,
                                 }}
                               >
                                 {m.description}
