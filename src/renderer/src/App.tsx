@@ -9000,7 +9000,10 @@ function ChatPane({
               thing they are about, above the copy button — and outside the
               text that button copies, which takes e.text alone. */}
           {e.memories?.map((m) => (
-            <div key={m.path} style={{ marginTop: 12 }}>
+            // Space on BOTH sides: the action row that follows carries no top
+            // margin of its own, so without this the receipt and the copy
+            // button read as one stack of glyphs.
+            <div key={m.path} style={{ margin: "12px 0 14px" }}>
               <MemoryReceipt {...m} onOpen={onOpenFile} />
             </div>
           ))}
