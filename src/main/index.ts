@@ -8011,7 +8011,17 @@ app.whenReady().then(async () => {
       // pane shows the prompt with nothing under it. Observed on a two-agent
       // parallel spawn whose replies were sitting in the rollout the whole
       // time. If the filter emptied the timeline, it was the wrong call.
-      if (turnRows.length === 0) turnRows = collectTurns(false);
+      if (turnRows.length === 0) {
+        turnRows = collectTurns(false).map((r) => ({
+          ...r,
+          // The very reason the filter dropped these is that they are stamped
+          // a tick BEFORE the mail that triggered them — so keeping the raw
+          // time would sort the agent's reply ABOVE the task it answers.
+          // Clamp to the spawn moment and let the mail-first tie-break below
+          // put the prompt where it belongs.
+          t: spawnAt !== null ? Math.max(r.t, spawnAt) : r.t,
+        }));
+      }
       const timeline: { t: number; mail: boolean; entries: unknown[] }[] = [...turnRows];
       for (const m of mail) {
         // Floor to seconds to match turn.startedAt's resolution — mail is
