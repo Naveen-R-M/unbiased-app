@@ -2351,14 +2351,18 @@ export function App() {
       !branchCreate &&
       !renameDialog &&
       !moveDialog &&
-      !editProj;
+      !editProj &&
+      // A WebContentsView is an OS-level overlay, not a DOM node: the panel
+      // hiding itself with display:none would leave the page floating over
+      // Scheduled or Connectors. It has to be told.
+      !pageOpen;
     for (const id of browserTabs) {
       void window.unbiased.setBrowserVisible({
         id,
         visible: sideOpen && panelMode === `browser:${id}` && clear,
       });
     }
-  }, [browserTabs, sideOpen, panelMode, sidePlusOpen, envOpen, showSettings, showChangelog, confirmDialog, fullAccessPrompt, branchSwitch, branchCreate, renameDialog, moveDialog, editProj]);
+  }, [browserTabs, sideOpen, panelMode, sidePlusOpen, envOpen, showSettings, showChangelog, confirmDialog, fullAccessPrompt, branchSwitch, branchCreate, renameDialog, moveDialog, editProj, pageOpen]);
 
   function openSideChatTab() {
     setSidePlusOpen(false);
@@ -2584,6 +2588,17 @@ export function App() {
   const litProject = (path: string) =>
     !pageOpen && activeProject?.path === path && !activeThreadId;
   const inProject = activeProjectName !== null;
+  /** The side panel belongs to a CONVERSATION — its tabs are that chat's
+   *  agents, files, terminals and side chats. Scheduled and Connectors are
+   *  destinations of their own, so leaving a chat for one has to take the
+   *  panel with it, exactly as switching conversations does. `sideOpen` stays
+   *  the user's preference and the panel keeps its state, so coming back
+   *  restores what was there.
+   *
+   *  The one exception is the Agent browser: a scheduled run drives it, and
+   *  watching that run happen is the reason to be on the Scheduled page at
+   *  all (the mirror is already wired to the running task's thread). */
+  const sideVisible = sideOpen && (!pageOpen || panelMode === "agentmirror");
   // Git operations target the conversation's actual checkout — the
   // worktree when isolated, else the project directory. (Referenced by
   // the branch-switcher handlers above; they run post-render.)
@@ -3909,7 +3924,7 @@ export function App() {
         )}
       </div>
 
-      {sideOpen && (
+      {sideVisible && (
         <div
           onMouseDown={() => {
             draggingRef.current = true;
@@ -3930,9 +3945,9 @@ export function App() {
           its visibility toggles. */}
         <div
           style={{
-            flex: sideOpen ? `${sideFrac} 1 0%` : "0 0 0%",
-            minWidth: sideOpen ? 300 : 0,
-            display: sideOpen ? "flex" : "none",
+            flex: sideVisible ? `${sideFrac} 1 0%` : "0 0 0%",
+            minWidth: sideVisible ? 300 : 0,
+            display: sideVisible ? "flex" : "none",
             flexDirection: "column",
             background: "var(--nav-bg)",
           }}
