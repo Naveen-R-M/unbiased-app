@@ -50,6 +50,9 @@ type Entry =
        *  answer so they render inside it — above the copy row, and outside
        *  the text that row copies. */
       memories?: { name: string; description: string; path: string }[];
+      /** The sub-agents this turn used, same idea: the lifecycle rows stay in
+       *  the fold, but who did the work is part of the result. */
+      agents?: { name: string; threadId: string }[];
     }
   // Sub-agent lifecycle row in the transcript flow (Codex-style
   // "Created an agent" / "Closed an agent" markers).
@@ -8277,13 +8280,30 @@ function ChatPane({
                 .filter((e) => e.kind !== "memory")
                 .map((e) => (e.kind === "assistant" && e.memories ? { ...e, memories: undefined } : e));
               const didWork = foldable.some((e) => e.kind === "agent" || e.kind === "command");
+              // Who did the work survives the fold as a pill per sub-agent.
+              // Keyed on the thread, latest name wins: an agent is created
+              // before it picks a nickname, so the "started" row can carry a
+              // placeholder that a later row corrects.
+              const agentsById = new Map<string, { name: string; threadId: string }>();
+              for (const e of work) {
+                if (e.kind === "agent" && e.agentThreadId && e.name) {
+                  agentsById.set(e.agentThreadId, { name: e.name, threadId: e.agentThreadId });
+                }
+              }
+              const agents = [...agentsById.values()];
               // Receipts move ONTO the answer, so they render inside it —
               // under the text, above the copy row. Folded they would vanish;
               // left loose above the answer they duplicated the steps header
               // that already says "Saved memory".
               const answer: Entry | null =
-                finalMsg && receipts.length > 0
-                  ? { ...finalMsg, memories: [...(finalMsg.memories ?? []), ...receipts] }
+                finalMsg && (receipts.length > 0 || agents.length > 0)
+                  ? {
+                      ...finalMsg,
+                      ...(receipts.length > 0
+                        ? { memories: [...(finalMsg.memories ?? []), ...receipts] }
+                        : null),
+                      ...(agents.length > 0 ? { agents } : null),
+                    }
                   : finalMsg;
               if (didWork && foldable.length > 0) {
                 const duration = workStartedAt !== null ? (Date.now() - workStartedAt) / 1000 : null;
@@ -8295,7 +8315,7 @@ function ChatPane({
                   // nothing): the loose rows stay, so the write is still seen.
                   ...(answer ? [] : memoryRows),
                 ];
-              } else if (answer && receipts.length > 0) {
+              } else if (answer && (receipts.length > 0 || agents.length > 0)) {
                 next = [...next.slice(0, start), ...foldable, answer];
               }
             }
@@ -8397,6 +8417,11 @@ function ChatPane({
           list.map((e) => {
             if (e.kind === "agent" && e.name && names[e.name]) return { ...e, name: names[e.name] };
             if (e.kind === "work") return { ...e, entries: retitle(e.entries) };
+            // The pills on a finished answer carry the same names as the rows
+            // inside its fold, so they have to be retitled with them.
+            if (e.kind === "assistant" && e.agents?.some((a) => names[a.name])) {
+              return { ...e, agents: e.agents.map((a) => (names[a.name] ? { ...a, name: names[a.name] } : a)) };
+            }
             return e;
           });
         setEntries(retitle);
@@ -8410,6 +8435,13 @@ function ChatPane({
             list.map((e) => {
               if (e.kind === "agent" && e.agentThreadId === p.agentThreadId) return { ...e, name: p.name };
               if (e.kind === "work") return { ...e, entries: rename(e.entries) };
+              // …and the pills, which hold the same identity by thread id.
+              if (e.kind === "assistant" && e.agents?.some((a) => a.threadId === p.agentThreadId)) {
+                return {
+                  ...e,
+                  agents: e.agents.map((a) => (a.threadId === p.agentThreadId ? { ...a, name: p.name } : a)),
+                };
+              }
               return e;
             });
           setEntries(rename);
@@ -8999,14 +9031,31 @@ function ChatPane({
           {/* Receipts sit between the answer and its action row: below the
               thing they are about, above the copy button — and outside the
               text that button copies, which takes e.text alone. */}
-          {e.memories?.map((m) => (
-            // Space on BOTH sides: the action row that follows carries no top
-            // margin of its own, so without this the receipt and the copy
-            // button read as one stack of glyphs.
-            <div key={m.path} style={{ margin: "12px 0 14px" }}>
-              <MemoryReceipt {...m} onOpen={onOpenFile} />
+          {/* What the turn left behind, as pills: memories on one line, the
+              sub-agents that did the work on the next. Space on BOTH sides —
+              the action row that follows carries no top margin of its own, so
+              without it the receipts and the copy button read as one stack of
+              glyphs. */}
+          {/* Explicit boolean: `a?.length || b?.length` yields 0 when both are
+              empty, and React renders a stray "0". */}
+          {((e.memories?.length ?? 0) > 0 || (e.agents?.length ?? 0) > 0) && (
+            <div style={{ margin: "12px 0 14px", display: "flex", flexDirection: "column", gap: 8 }}>
+              {e.memories && e.memories.length > 0 && (
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                  {e.memories.map((m) => (
+                    <MemoryReceipt key={m.path} {...m} onOpen={onOpenFile} />
+                  ))}
+                </div>
+              )}
+              {e.agents && e.agents.length > 0 && (
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                  {e.agents.map((a) => (
+                    <AgentReceipt key={a.threadId} name={a.name} threadId={a.threadId} onOpen={onOpenAgent} />
+                  ))}
+                </div>
+              )}
             </div>
-          ))}
+          )}
           {/* Every settled reply gets its action row, not just the newest one:
               wanting to copy an answer from earlier in a conversation is at
               least as common as copying the last one, and the timestamp is the
@@ -17035,9 +17084,54 @@ function isBrowserStep(e: CommandEntry): boolean {
   return c.startsWith("browser_") || c.startsWith("Browse the web") || c.startsWith("Use a signed-in browser session");
 }
 
-/** "Saved Memory" — the receipt for an ungated write. Same register as the
- *  sub-agent lifecycle rows; the note's identity is in the tooltip and one
- *  click away in the side panel. */
+/** The shared pill: a chip-surfaced control that opens the thing it names.
+ *  One shape for every receipt a turn leaves behind, so a memory and an
+ *  agent read as the same kind of object. */
+function ReceiptPill({
+  icon,
+  children,
+  title,
+  onClick,
+}: {
+  icon: React.ReactNode;
+  children: React.ReactNode;
+  title?: string;
+  onClick?: () => void;
+}) {
+  return (
+    <button
+      // u-chip gives the hover the app's other chips have; the press-scale is
+      // global. A pill says "control" before the pointer arrives — which this
+      // needs, being the one way into the thing it announces.
+      className={onClick ? "u-chip" : undefined}
+      onClick={onClick}
+      title={title}
+      style={{
+        display: "inline-flex",
+        alignItems: "center",
+        gap: 7,
+        background: "var(--chip)",
+        border: `1px solid ${colors.border}`,
+        borderRadius: 999,
+        padding: "5px 12px 5px 10px",
+        color: colors.dim,
+        fontSize: 13,
+        lineHeight: 1.2,
+        cursor: onClick ? "pointer" : "default",
+        fontFamily: "inherit",
+        maxWidth: "100%",
+      }}
+    >
+      <span style={{ display: "flex", flexShrink: 0 }}>{icon}</span>
+      <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+        {children}
+      </span>
+    </button>
+  );
+}
+
+/** "Saved Memory" — the receipt for an ungated write. The note's identity is
+ *  in the tooltip and one click away in the side panel. */
 function MemoryReceipt({
   name,
   description,
@@ -17050,36 +17144,40 @@ function MemoryReceipt({
   onOpen?: (path: string) => void;
 }) {
   return (
-    <button
-      // u-chip gives the hover the app's other chips have; the press-scale is
-      // global. A pill says "control" before the pointer arrives — which this
-      // needs, being the one way into the note it is announcing.
-      className={onOpen ? "u-chip" : undefined}
-      onClick={onOpen ? () => onOpen(path) : undefined}
+    <ReceiptPill
+      icon={<LightbulbIcon />}
       title={`${name} — ${description}`}
-      style={{
-        display: "inline-flex",
-        alignItems: "center",
-        gap: 7,
-        background: "var(--chip)",
-        border: `1px solid ${colors.border}`,
-        borderRadius: 999,
-        padding: "5px 12px 5px 10px",
-        color: colors.dim,
-        fontSize: 13,
-        lineHeight: 1.2,
-        cursor: onOpen ? "pointer" : "default",
-        fontFamily: "inherit",
-        maxWidth: "100%",
-      }}
+      onClick={onOpen ? () => onOpen(path) : undefined}
     >
-      <span style={{ display: "flex", flexShrink: 0 }}>
-        <LightbulbIcon />
-      </span>
-      <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-        Saved <span style={{ color: "var(--fg-soft)", fontWeight: 500 }}>Memory</span>
-      </span>
-    </button>
+      Saved <span style={{ color: "var(--fg-soft)", fontWeight: 500 }}>Memory</span>
+    </ReceiptPill>
+  );
+}
+
+/** One pill per sub-agent the turn used — its own emoji and nickname, the
+ *  same identity the roster and the lifecycle rows show, opening the same
+ *  side-panel view. */
+function AgentReceipt({
+  name,
+  threadId,
+  onOpen,
+}: {
+  name: string;
+  threadId: string;
+  onOpen?: (a: { threadId: string; name: string }) => void;
+}) {
+  return (
+    <ReceiptPill
+      icon={
+        <span aria-hidden="true" style={{ fontSize: 13, lineHeight: 1 }}>
+          {agentEmoji(threadId)}
+        </span>
+      }
+      title={`Open ${name}'s conversation`}
+      onClick={onOpen ? () => onOpen({ threadId, name }) : undefined}
+    >
+      <span style={{ color: "var(--fg-soft)", fontWeight: 500 }}>{name}</span>
+    </ReceiptPill>
   );
 }
 
