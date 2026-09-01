@@ -6424,7 +6424,10 @@ function AgentLifecycleRow({
           border: "none",
           padding: 0,
           color: entry.event === "failed" ? colors.err : colors.dim,
-          fontSize: 13.5,
+          // Set like the step rows it sits among inside the fold.
+          fontSize: 15.5,
+          lineHeight: 1.6,
+          letterSpacing: "var(--track-body)",
           cursor: "pointer",
           fontFamily: "inherit",
         }}
@@ -6446,6 +6449,8 @@ function AgentLifecycleRow({
       </button>
       {open && (
         <div
+          onClick={onOpen}
+          title={onOpen ? "Open conversation" : undefined}
           style={{
             color: colors.dim,
             fontSize: 13,
@@ -6454,31 +6459,17 @@ function AgentLifecycleRow({
             alignItems: "center",
             gap: 10,
             minWidth: 0,
+            cursor: onOpen ? "pointer" : "default",
           }}
         >
+          {/* Plain prose. "a sub-agent" used to be an accent-coloured button
+              carrying the open-conversation affordance, which put orange on
+              every row of a delegating turn and made the detail line shout
+              louder than the header naming the agent. The whole row already
+              opens the conversation, and the pills under the answer are the
+              durable way in. */}
           <span style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-            {label.detail}{" "}
-            {onOpen ? (
-              // "a sub-agent" keeps the open-conversation affordance the name
-              // button used to carry — the name itself moved to the header.
-              <button
-                onClick={onOpen}
-                title="Open conversation"
-                style={{
-                  background: "transparent",
-                  border: "none",
-                  color: colors.accent,
-                  fontSize: "inherit",
-                  cursor: "pointer",
-                  fontFamily: "inherit",
-                  padding: 0,
-                }}
-              >
-                a sub-agent
-              </button>
-            ) : (
-              <span>a sub-agent</span>
-            )}
+            {label.detail} a sub-agent
             {prompt ? ` with the instructions: ${prompt}` : entry.path ? ` — ${entry.path}` : ""}
           </span>
         </div>

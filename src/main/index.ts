@@ -7989,18 +7989,30 @@ app.whenReady().then(async () => {
       // rollout line would set spawnAt to 0 and disable the filter.
       const stamped = mail.filter((m) => m.at > 0);
       const spawnAt = stamped.length > 0 ? Math.min(...stamped.map((m) => Math.floor(m.at))) : null;
-      const timeline: { t: number; mail: boolean; entries: unknown[] }[] = [];
-      for (const turn of result.thread.turns ?? []) {
-        const t = turn.startedAt ?? 0;
-        // A turn without startedAt can't be classified — keep it rather
-        // than silently dropping the agent's replies.
-        if (spawnAt !== null && turn.startedAt != null && t < spawnAt) continue; // forked parent history
-        const entries = threadToEntries({ ...result.thread, turns: [turn] }).entries.filter(
-          (e) => (e as { kind?: string }).kind !== "user",
-        );
-        if (entries.length === 0) continue;
-        timeline.push({ t, mail: false, entries });
-      }
+      const collectTurns = (dropPreSpawn: boolean) => {
+        const out: { t: number; mail: boolean; entries: unknown[] }[] = [];
+        for (const turn of result.thread.turns ?? []) {
+          const t = turn.startedAt ?? 0;
+          // A turn without startedAt can't be classified — keep it rather
+          // than silently dropping the agent's replies.
+          if (dropPreSpawn && spawnAt !== null && turn.startedAt != null && t < spawnAt) continue;
+          const entries = threadToEntries({ ...result.thread, turns: [turn] }).entries.filter(
+            (e) => (e as { kind?: string }).kind !== "user",
+          );
+          if (entries.length === 0) continue;
+          out.push({ t, mail: false, entries });
+        }
+        return out;
+      };
+      let turnRows = collectTurns(true);
+      // A freshly spawned agent has no forked parent history to drop, and its
+      // one turn can start a tick BEFORE the task mail is stamped — in which
+      // case the pre-spawn filter removes the agent's entire reply and the
+      // pane shows the prompt with nothing under it. Observed on a two-agent
+      // parallel spawn whose replies were sitting in the rollout the whole
+      // time. If the filter emptied the timeline, it was the wrong call.
+      if (turnRows.length === 0) turnRows = collectTurns(false);
+      const timeline: { t: number; mail: boolean; entries: unknown[] }[] = [...turnRows];
       for (const m of mail) {
         // Floor to seconds to match turn.startedAt's resolution — mail is
         // recorded milliseconds INTO the second its turn starts.
