@@ -514,6 +514,13 @@ let mirrorViewRoot: string | null = null;
 // instead of letterboxing until someone drags the pane.
 /** Set when the connector IPC is wired; a no-op before then, because the
  *  engine can start before that scope exists. */
+/**
+ * Bumped whenever threadToEntries changes what it produces, or when a fix
+ * makes previously-dropped content renderable. A cache from an older build is
+ * then ignored in favour of replaying history.
+ */
+const TRANSCRIPT_CACHE_VERSION = 2;
+
 let refreshCatalogueAtStartup: () => void = () => {};
 
 let mirrorLastFrame: { width: number; height: number } | null = null;
@@ -2658,6 +2665,24 @@ function threadToEntries(
           // where the live path plants its start index on send.
           if (!foldThisTurn) runningTurnStart = entries.length;
           break;
+        // A reply that came back through the chat-completions dialect is stored
+        // raw — `message` with role assistant and an output_text part — rather
+        // than as codex's own `agentMessage`. Both shapes occur in one session
+        // depending on which backend answered, and only the second was ever
+        // handled: the missing replies were in the transcript file the whole
+        // time, dropped by this switch on the way to the screen.
+        case "message": {
+          const m = item as { role?: string; text?: string; content?: unknown; phase?: string | null };
+          const text = m.text ?? contentToText(m.content);
+          if (!text) break;
+          if (m.role === "user") {
+            entries.push({ kind: "user", text });
+            if (!foldThisTurn) runningTurnStart = entries.length;
+          } else {
+            bucket.push({ kind: "assistant", text, phase: m.phase ?? null });
+          }
+          break;
+        }
         case "agentMessage": {
           // `phase` is the engine's own record of which messages were interim
           // narration ("commentary") and which was the answer
@@ -3953,6 +3978,24 @@ function wireNotifications(): void {
         const phase = msg.method === "item/started" ? "started" : "completed";
         // A finished assistant message lands in the engine's history — the
         // partial-stream buffer for it is no longer needed.
+        // Same shape as the replay case above: a message delivered whole, in
+        // the chat-completions form. Nothing streamed it, so without this the
+        // pane shows nothing at all — the agent looks like it stopped working
+        // when in fact it had answered and finished the turn.
+        if (item?.type === "message" && phase === "completed" && threadId) {
+          const m = item as unknown as { role?: string; text?: string; content?: unknown };
+          const text = m.text ?? contentToText(m.content);
+          // Skip the echo of the user's own message, and anything already
+          // streamed — a delta-fed buffer means the pane has it.
+          if (text && m.role !== "user" && !bgStream.get(threadId)) {
+            if (paneId) {
+              send("chat:delta", { paneId, delta: text });
+              send("chat:message-boundary", { paneId });
+            }
+            if (subAgents.has(threadId)) send("chat:subagent-delta", { threadId, delta: text });
+          }
+          bgStream.delete(threadId);
+        }
         if (item?.type === "agentMessage" && phase === "completed" && threadId) {
           bgStream.delete(threadId);
           // Message boundary: the next delta belongs to a NEW assistant
@@ -5494,7 +5537,12 @@ app.whenReady().then(async () => {
 
   ipcMain.handle("transcript:save", (_e, p: { threadId: string; entries: unknown }) => {
     try {
-      writeFileSync(transcriptFile(p.threadId), JSON.stringify(p.entries));
+      // Stamped, so a cache written by a build that BUILT entries differently
+      // can be told apart from one this build would produce.
+      writeFileSync(
+        transcriptFile(p.threadId),
+        JSON.stringify({ cacheVersion: TRANSCRIPT_CACHE_VERSION, entries: p.entries }),
+      );
       return { ok: true };
     } catch {
       return { ok: false };
@@ -5503,8 +5551,24 @@ app.whenReady().then(async () => {
 
   ipcMain.handle("transcript:load", (_e, threadId: string) => {
     try {
+      const raw = JSON.parse(readFileSync(transcriptFile(threadId), "utf8")) as unknown;
+      // A cache from an older build is discarded rather than preferred over
+      // history. This is not hypothetical: a build that dropped
+      // chat-completions `message` items wrote caches missing whole replies,
+      // and because the renderer keeps the RICHER of cache and history — and
+      // a flat stale cache counts richer than the same turn folded — those
+      // replies stayed invisible on every reopen even after the bug was fixed.
+      const stamped = raw as { cacheVersion?: number; entries?: unknown };
+      const entries =
+        stamped && typeof stamped === "object" && "cacheVersion" in stamped
+          ? stamped.cacheVersion === TRANSCRIPT_CACHE_VERSION
+            ? stamped.entries
+            : null
+          : // Unstamped = written before this check existed. Older than the
+            // current builder by definition, so history wins.
+            null;
       // Caches written before redaction existed may hold raw values.
-      return redactSecrets({ entries: JSON.parse(readFileSync(transcriptFile(threadId), "utf8")) });
+      return redactSecrets({ entries });
     } catch {
       return { entries: null };
     }
@@ -8094,6 +8158,15 @@ app.whenReady().then(async () => {
           runningTurnStartedAt: replay.runningTurnStartedAt,
         };
       })(),
+      // Carried WITH the transcript rather than pushed alongside it.
+      // applyRolloutNicknames above sends a chat:subagent-renames event, but
+      // that event loses a race it can never win: the renderer retitles the
+      // entries it holds at that moment, and then this result replaces them
+      // with the un-renamed replay. It went unnoticed while cached
+      // transcripts already had the nicknames baked in; discarding stale
+      // caches exposed it, and every reopened conversation showed raw task
+      // names ("explore_main_process") instead of the engine's own ("Zeno").
+      subAgentNames: Object.fromEntries(rolloutNicknames(id)),
       running,
       streamText: bgStream.get(id) ?? "",
       approvals,

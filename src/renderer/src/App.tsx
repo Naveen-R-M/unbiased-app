@@ -659,6 +659,9 @@ declare global {
         streamText: string;
         approvals: HeldApproval[];
         failure: string | null;
+        /** Engine-assigned sub-agent nicknames, recovered from the rollout and
+         *  carried with the transcript so they cannot lose a race against it. */
+        subAgentNames?: Record<string, string>;
       }>;
       detachThread: (cwd?: string) => Promise<{ ok: boolean }>;
       deleteThread: (id: string) => Promise<{ ok: boolean }>;
@@ -2033,6 +2036,21 @@ export function App() {
     if (res.failure) {
       // The turn died while nobody was watching.
       entries = [...entries, { kind: "assistant", text: `⚠ Turn failed: ${res.failure}` }];
+    }
+    // Apply the engine's own sub-agent nicknames before these entries are set,
+    // not after. Main also emits chat:subagent-renames, but that event races
+    // this assignment and loses: it retitles whatever the pane holds at the
+    // moment it arrives, and then these entries replace them. Rows therefore
+    // read "explore_main_process" where the engine had said "Zeno".
+    const subNames = res.subAgentNames ?? {};
+    if (Object.keys(subNames).length > 0) {
+      const retitle = (list: Entry[]): Entry[] =>
+        list.map((e) => {
+          if (e.kind === "agent" && e.name && subNames[e.name]) return { ...e, name: subNames[e.name] };
+          if (e.kind === "work") return { ...e, entries: retitle(e.entries) };
+          return e;
+        });
+      entries = retitle(entries);
     }
     setActiveProject(null);
     setActiveThreadId(id);
