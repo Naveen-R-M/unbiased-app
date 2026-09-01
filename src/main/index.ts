@@ -1214,6 +1214,25 @@ const MEMORY_TOOLS = [
   },
 ];
 
+/** How far before its own task mail a sub-agent's first turn may be stamped
+ *  and still count as the agent's. See the filter in subagents:transcript. */
+const SPAWN_GRACE_SECONDS = 2;
+
+/** What KIND of thing a step card describes. Sent with every command entry so
+ *  the transcript never has to infer it from the text — a shell command, an
+ *  MCP call and a scheduling proposal all arrive as `command` entries, and
+ *  only this says which is which. Without it the renderer classified by
+ *  string prefix and dressed a scheduling card as a shell command, complete
+ *  with a fabricated `$` prompt. */
+type StepSource = "shell" | "browser" | "memory" | "tool";
+
+function dynamicToolSource(tool: string | undefined): StepSource {
+  const t = tool ?? "";
+  if (t.startsWith("browser_")) return "browser";
+  if (t.startsWith("memory_")) return "memory";
+  return "tool";
+}
+
 /** The step card's label for a dynamic tool call — used by both the live
  *  notification path and history replay, so a call renders identically on
  *  resume. Most tools show their raw arguments (short and informative:
@@ -2607,6 +2626,7 @@ function threadToEntries(
             status: item.status ?? "completed",
             exitCode: item.exitCode,
             output: item.aggregatedOutput,
+            source: "shell",
           });
           break;
         case "dynamicToolCall": {
@@ -2616,6 +2636,7 @@ function threadToEntries(
             itemId: d.id ?? "unknown",
             command: dynamicToolCommandText(d.tool, d.arguments),
             status: d.success === false ? "failed" : (d.status ?? "completed"),
+            source: dynamicToolSource(d.tool),
           });
           break;
         }
@@ -2636,6 +2657,7 @@ function threadToEntries(
             command: `${t.server ?? "mcp"}.${t.tool ?? "tool"}${margsText}`.slice(0, 400),
             status: t.status ?? "completed",
             output: t.error?.message ?? undefined,
+            source: "tool",
           });
           break;
         }
@@ -3950,7 +3972,7 @@ function wireNotifications(): void {
         }
         if (!paneId) break; // history holds these for a backgrounded thread
         if (item?.type === "commandExecution") {
-          send("chat:command", { paneId, phase, item });
+          send("chat:command", { paneId, phase, item: { ...(item as object), source: "shell" } });
         } else if (item?.type === "dynamicToolCall") {
           // Dynamic tool calls render as command-style cards.
           const d = item as { id?: string; tool?: string; arguments?: unknown; status?: string; success?: boolean };
@@ -3960,6 +3982,7 @@ function wireNotifications(): void {
             item: {
               id: d.id,
               command: dynamicToolCommandText(d.tool, d.arguments),
+              source: dynamicToolSource(d.tool),
               // A started call is in progress — defaulting to "completed"
               // showed a green "done" for a page still loading.
               status:
@@ -3988,6 +4011,7 @@ function wireNotifications(): void {
             item: {
               id: t.id,
               command: `${t.server ?? "mcp"}.${t.tool ?? "tool"}${margsText}`.slice(0, 400),
+              source: "tool",
               status: t.status ?? (phase === "started" ? "inProgress" : "completed"),
               // Without this a failed call is a red card with an empty body.
               // The engine puts the cause here ("user rejected MCP tool call",
@@ -4645,7 +4669,19 @@ async function handleMemoryToolCall(
   // into that unrelated conversation for good.
   const paneId = paneForThread(rootThreadOf(threadId));
   if (paneId) {
-    send("chat:memory-saved", { paneId, name: note.name, description: note.description, path: saved.path });
+    // Flag saves that came from a SUB-AGENT. They are routed to the parent's
+    // pane but belong to no turn of that conversation, and a sub-agent
+    // outlives the turn that spawned it — so the renderer must not splice
+    // the receipt onto whatever answer happens to be last, which would
+    // attribute the write to a finished turn that never made it.
+    const fromSubAgent = !!(threadId && subAgents.has(threadId));
+    send("chat:memory-saved", {
+      paneId,
+      name: note.name,
+      description: note.description,
+      path: saved.path,
+      fromSubAgent,
+    });
   }
 
   return text(
@@ -7989,40 +8025,34 @@ app.whenReady().then(async () => {
       // rollout line would set spawnAt to 0 and disable the filter.
       const stamped = mail.filter((m) => m.at > 0);
       const spawnAt = stamped.length > 0 ? Math.min(...stamped.map((m) => Math.floor(m.at))) : null;
-      const collectTurns = (dropPreSpawn: boolean) => {
-        const out: { t: number; mail: boolean; entries: unknown[] }[] = [];
-        for (const turn of result.thread.turns ?? []) {
-          const t = turn.startedAt ?? 0;
-          // A turn without startedAt can't be classified — keep it rather
-          // than silently dropping the agent's replies.
-          if (dropPreSpawn && spawnAt !== null && turn.startedAt != null && t < spawnAt) continue;
-          const entries = threadToEntries({ ...result.thread, turns: [turn] }).entries.filter(
-            (e) => (e as { kind?: string }).kind !== "user",
-          );
-          if (entries.length === 0) continue;
-          out.push({ t, mail: false, entries });
-        }
-        return out;
-      };
-      let turnRows = collectTurns(true);
-      // A freshly spawned agent has no forked parent history to drop, and its
-      // one turn can start a tick BEFORE the task mail is stamped — in which
-      // case the pre-spawn filter removes the agent's entire reply and the
-      // pane shows the prompt with nothing under it. Observed on a two-agent
-      // parallel spawn whose replies were sitting in the rollout the whole
-      // time. If the filter emptied the timeline, it was the wrong call.
-      if (turnRows.length === 0) {
-        turnRows = collectTurns(false).map((r) => ({
-          ...r,
-          // The very reason the filter dropped these is that they are stamped
-          // a tick BEFORE the mail that triggered them — so keeping the raw
-          // time would sort the agent's reply ABOVE the task it answers.
-          // Clamp to the spawn moment and let the mail-first tie-break below
-          // put the prompt where it belongs.
-          t: spawnAt !== null ? Math.max(r.t, spawnAt) : r.t,
-        }));
+      const timeline: { t: number; mail: boolean; entries: unknown[] }[] = [];
+      for (const turn of result.thread.turns ?? []) {
+        const t = turn.startedAt ?? 0;
+        // A turn without startedAt can't be classified — keep it rather
+        // than silently dropping the agent's replies.
+        //
+        // The window matters. Mail is recorded milliseconds INTO the second
+        // its turn starts and both sides are floored to seconds, so an
+        // agent's own first turn can be stamped a tick BEFORE the task that
+        // triggered it — a strict `t < spawnAt` then deletes the agent's
+        // entire reply (observed: a two-agent spawn whose answers sat in the
+        // rollout unseen). Forked parent history is older by minutes or
+        // hours, so a couple of seconds of grace separates the two cleanly.
+        //
+        // Do NOT widen this to "keep everything when the filter finds
+        // nothing": an agent that has not answered yet ALSO yields nothing,
+        // and the pane would then show the parent's whole conversation in
+        // the agent's voice.
+        if (spawnAt !== null && turn.startedAt != null && t < spawnAt - SPAWN_GRACE_SECONDS) continue;
+        const entries = threadToEntries({ ...result.thread, turns: [turn] }).entries.filter(
+          (e) => (e as { kind?: string }).kind !== "user",
+        );
+        if (entries.length === 0) continue;
+        // Nothing the agent did precedes its own spawn, so clamping only
+        // lifts the tick-early turns — and the mail-first tie-break below
+        // then keeps the prompt above the reply it triggered.
+        timeline.push({ t: spawnAt !== null ? Math.max(t, spawnAt) : t, mail: false, entries });
       }
-      const timeline: { t: number; mail: boolean; entries: unknown[] }[] = [...turnRows];
       for (const m of mail) {
         // Floor to seconds to match turn.startedAt's resolution — mail is
         // recorded milliseconds INTO the second its turn starts.
