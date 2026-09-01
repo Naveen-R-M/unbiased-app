@@ -3101,7 +3101,11 @@ export function App() {
 
       <div
         style={{
-          flex: sideOpen ? `${1 - sideFrac} 1 0%` : "1 1 0%",
+          // sideVisible, not sideOpen: with a flex-grow of 1 - sideFrac and a
+          // zero basis, a column whose panel is hidden claims only its old
+          // share of the row and leaves the rest of the window empty — the
+          // page ends up pinned left with black beside it.
+          flex: sideVisible ? `${1 - sideFrac} 1 0%` : "1 1 0%",
           minWidth: 320,
           display: "flex",
           flexDirection: "column",
