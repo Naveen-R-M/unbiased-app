@@ -41,13 +41,29 @@ type CommandItem = {
 type Entry =
   | { kind: "user"; text: string; annotations?: SentAnnotation[] }
   | { kind: "compaction" }
-  | { kind: "assistant"; text: string; interrupted?: boolean; at?: number }
+  | {
+      kind: "assistant";
+      text: string;
+      interrupted?: boolean;
+      at?: number;
+      /** Memory receipts for the turn this answer ended. They ride ON the
+       *  answer so they render inside it — above the copy row, and outside
+       *  the text that row copies. */
+      memories?: { name: string; description: string; path: string }[];
+      /** The sub-agents this turn used, same idea: the lifecycle rows stay in
+       *  the fold, but who did the work is part of the result. */
+      agents?: { name: string; threadId: string }[];
+    }
   // Sub-agent lifecycle row in the transcript flow (Codex-style
   // "Created an agent" / "Closed an agent" markers).
   | { kind: "agent"; event: string; name: string; path?: string; agentThreadId?: string; prompt?: string | null }
   // A scheduled task the agent created and the user approved. Carries the key
   // so the row can link through to the task it made.
   | { kind: "scheduled"; key: string; name: string; cadence: string }
+  // A note the agent saved to persistent memory. Carries the file path so
+  // the row can open the note itself in a side-panel file tab — saves are
+  // not gated on approval, so being inspectable is the accountability.
+  | { kind: "memory"; name: string; description: string; path: string }
   // A completed turn's work — everything before its final message —
   // collapsed under a "Worked for Ns" header, Codex-style.
   | { kind: "work"; duration: number | null; entries: Entry[] }
@@ -55,6 +71,11 @@ type Entry =
       kind: "command";
       itemId: string;
       command: string;
+      /** What kind of thing this step is, set by the main process (shell |
+       *  browser | memory | tool) or "approval" for a card the app itself
+       *  raised. Absent on entries persisted before this existed, which is
+       *  why the readers below still fall back to text sniffing. */
+      source?: "shell" | "browser" | "memory" | "tool" | "approval";
       status: string; // inProgress | completed | failed | declined | awaitingApproval | canceled
       exitCode?: number;
       output?: string;
@@ -564,6 +585,19 @@ declare global {
         cb: (p: { paneId: PaneId; key: string; name: string; cadence: string }) => void,
       ) => () => void;
       onScheduledOpenRun: (cb: (p: { threadId: string }) => void) => () => void;
+      memoryList: (threadId: string | null) => Promise<{
+        dir: string;
+        memories: { name: string; description: string; type: string; path: string; thisThread: boolean }[];
+      }>;
+      onMemorySaved: (
+        cb: (p: {
+          paneId: PaneId;
+          name: string;
+          description: string;
+          path: string;
+          fromSubAgent?: boolean;
+        }) => void,
+      ) => () => void;
       mcpLogin: (name: string) => Promise<{ ok: boolean; error?: string }>;
       connectorsList: () => Promise<{ connectors: ConnectorInfo[] }>;
       connectorsConnect: (
@@ -2234,8 +2268,11 @@ export function App() {
     current: string;
     dirty: DirtyFile[];
   } | null>(null);
-  const [envSection, setEnvSection] = useState<"workin" | "branch" | null>(null);
+  const [envSection, setEnvSection] = useState<"workin" | "branch" | "memory" | null>(null);
   const [envBranchSearch, setEnvBranchSearch] = useState("");
+  const [envMemories, setEnvMemories] = useState<
+    { name: string; description: string; path: string; thisThread: boolean }[] | null
+  >(null);
   const [envMsg, setEnvMsg] = useState<string | null>(null);
   const [envBusy, setEnvBusy] = useState(false);
 
@@ -2261,7 +2298,9 @@ export function App() {
     setEnvBranchSearch("");
     setEnvDiff(null);
     setEnvBranches(null);
+    setEnvMemories(null);
     setEnvOpen(true);
+    void window.unbiased.memoryList(activeThreadId).then((r) => setEnvMemories(r.memories));
     // All fetches fill in as they land; the popover opens immediately.
     if (activeProjectPath) {
       void window.unbiased.listWorktrees(activeProjectPath).then((r) => setExistingWts(r.worktrees));
@@ -2323,14 +2362,18 @@ export function App() {
       !branchCreate &&
       !renameDialog &&
       !moveDialog &&
-      !editProj;
+      !editProj &&
+      // A WebContentsView is an OS-level overlay, not a DOM node: the panel
+      // hiding itself with display:none would leave the page floating over
+      // Scheduled or Connectors. It has to be told.
+      !pageOpen;
     for (const id of browserTabs) {
       void window.unbiased.setBrowserVisible({
         id,
         visible: sideOpen && panelMode === `browser:${id}` && clear,
       });
     }
-  }, [browserTabs, sideOpen, panelMode, sidePlusOpen, envOpen, showSettings, showChangelog, confirmDialog, fullAccessPrompt, branchSwitch, branchCreate, renameDialog, moveDialog, editProj]);
+  }, [browserTabs, sideOpen, panelMode, sidePlusOpen, envOpen, showSettings, showChangelog, confirmDialog, fullAccessPrompt, branchSwitch, branchCreate, renameDialog, moveDialog, editProj, pageOpen]);
 
   function openSideChatTab() {
     setSidePlusOpen(false);
@@ -2556,6 +2599,17 @@ export function App() {
   const litProject = (path: string) =>
     !pageOpen && activeProject?.path === path && !activeThreadId;
   const inProject = activeProjectName !== null;
+  /** The side panel belongs to a CONVERSATION — its tabs are that chat's
+   *  agents, files, terminals and side chats. Scheduled and Connectors are
+   *  destinations of their own, so leaving a chat for one has to take the
+   *  panel with it, exactly as switching conversations does. `sideOpen` stays
+   *  the user's preference and the panel keeps its state, so coming back
+   *  restores what was there.
+   *
+   *  The one exception is the Agent browser: a scheduled run drives it, and
+   *  watching that run happen is the reason to be on the Scheduled page at
+   *  all (the mirror is already wired to the running task's thread). */
+  const sideVisible = sideOpen && (!pageOpen || panelMode === "agentmirror");
   // Git operations target the conversation's actual checkout — the
   // worktree when isolated, else the project directory. (Referenced by
   // the branch-switcher handlers above; they run post-render.)
@@ -3058,7 +3112,11 @@ export function App() {
 
       <div
         style={{
-          flex: sideOpen ? `${1 - sideFrac} 1 0%` : "1 1 0%",
+          // sideVisible, not sideOpen: with a flex-grow of 1 - sideFrac and a
+          // zero basis, a column whose panel is hidden claims only its old
+          // share of the row and leaves the rest of the window empty — the
+          // page ends up pinned left with black beside it.
+          flex: sideVisible ? `${1 - sideFrac} 1 0%` : "1 1 0%",
           minWidth: 320,
           display: "flex",
           flexDirection: "column",
@@ -3327,9 +3385,108 @@ export function App() {
                     )}
                     </>
                   )}
-                  {subAgentsList.length > 0 && (
+                  {/* Standalone, NOT inside the inProject block: plain chats
+                      (~/Unbiased) have a memory store too, and hiding it there
+                      is how a saved note becomes untraceable. */}
+                  {envMemories && envMemories.length > 0 && (
                     <>
                       {inProject && <div style={{ borderTop: `1px solid ${colors.border}`, margin: "6px 4px" }} />}
+                      <EnvRow
+                        icon={<LightbulbIcon />}
+                        label="Memory"
+                        right={
+                          <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                            <span style={{ color: colors.dim, fontVariantNumeric: "tabular-nums" }}>
+                              {envMemories.length}
+                            </span>
+                            <Chevron open={envSection === "memory"} />
+                          </span>
+                        }
+                        onClick={() => setEnvSection((s) => (s === "memory" ? null : "memory"))}
+                      />
+                      {envSection === "memory" && (
+                        <div style={{ padding: "0 0 4px 12px", maxHeight: 260, overflowY: "auto" }}>
+                          {envMemories.map((m) => (
+                            <button
+                              key={m.name}
+                              onClick={() => {
+                                setEnvOpen(false);
+                                void openFileInPanel(m.path);
+                              }}
+                              title={m.path}
+                              style={{
+                                display: "block",
+                                width: "100%",
+                                background: "transparent",
+                                border: "none",
+                                borderRadius: 8,
+                                padding: "8px 10px",
+                                cursor: "pointer",
+                                textAlign: "left",
+                                fontFamily: "inherit",
+                              }}
+                            >
+                              <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                                {/* Identity carries hierarchy by WEIGHT, not
+                                    color — same register as the Subagents
+                                    rows this section sits beside. */}
+                                <span
+                                  style={{
+                                    color: colors.fg,
+                                    fontSize: 13.5,
+                                    fontWeight: 600,
+                                    letterSpacing: -0.1,
+                                    flex: 1,
+                                    minWidth: 0,
+                                    whiteSpace: "nowrap",
+                                    overflow: "hidden",
+                                    textOverflow: "ellipsis",
+                                  }}
+                                >
+                                  {m.name}
+                                </span>
+                                {m.thisThread && (
+                                  <span
+                                    style={{
+                                      color: colors.dim,
+                                      fontSize: 11,
+                                      border: `1px solid ${colors.border}`,
+                                      borderRadius: 5,
+                                      padding: "1px 6px",
+                                      flexShrink: 0,
+                                    }}
+                                  >
+                                    this chat
+                                  </span>
+                                )}
+                              </span>
+                              {/* The description is the note's whole summary —
+                                  wrapped in full, never ellipsized: truncating
+                                  it is what made the row read as "CH…". Body
+                                  text: dim, near-zero tracking, looser leading
+                                  than the heading above it. */}
+                              <span
+                                style={{
+                                  display: "block",
+                                  color: colors.dim,
+                                  fontSize: 12.5,
+                                  lineHeight: 1.45,
+                                  paddingTop: 3,
+                                }}
+                              >
+                                {m.description}
+                              </span>
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </>
+                  )}
+                  {subAgentsList.length > 0 && (
+                    <>
+                      {(inProject || (envMemories?.length ?? 0) > 0) && (
+                        <div style={{ borderTop: `1px solid ${colors.border}`, margin: "6px 4px" }} />
+                      )}
                       <div style={{ color: colors.dim, fontSize: 12.5, padding: "4px 10px 8px" }}>Subagents</div>
                       {subAgentsList.map((a) => (
                         <button
@@ -3380,9 +3537,9 @@ export function App() {
                       ))}
                     </>
                   )}
-                  {!inProject && subAgentsList.length === 0 && (
+                  {!inProject && subAgentsList.length === 0 && (envMemories?.length ?? 0) === 0 && (
                     <div style={{ color: colors.dim, fontSize: 12.5, padding: "4px 10px 8px", lineHeight: 1.4 }}>
-                      Sub-agents spawned in this chat will appear here.
+                      Sub-agents spawned in this chat, and memories the agent saves, will appear here.
                     </div>
                   )}
                 </div>
@@ -3782,7 +3939,7 @@ export function App() {
         )}
       </div>
 
-      {sideOpen && (
+      {sideVisible && (
         <div
           onMouseDown={() => {
             draggingRef.current = true;
@@ -3803,9 +3960,9 @@ export function App() {
           its visibility toggles. */}
         <div
           style={{
-            flex: sideOpen ? `${sideFrac} 1 0%` : "0 0 0%",
-            minWidth: sideOpen ? 300 : 0,
-            display: sideOpen ? "flex" : "none",
+            flex: sideVisible ? `${sideFrac} 1 0%` : "0 0 0%",
+            minWidth: sideVisible ? 300 : 0,
+            display: sideVisible ? "flex" : "none",
             flexDirection: "column",
             background: "var(--nav-bg)",
           }}
@@ -6178,8 +6335,14 @@ function BrowserPane({ browserId }: { browserId: number }) {
  *  The final message stays outside, always visible. */
 function WorkedGroup({ duration, children }: { duration: number | null; children: React.ReactNode }) {
   const [open, setOpen] = useState(false);
+  // A small bottom margin, not zero: the answer below tightens its own top
+  // margin after a fold, and with nothing here the two collapsed to 2px —
+  // the metadata line then read as the answer's first line, and the gap
+  // JUMPED when the fold was opened (the last child's margin collapsing
+  // through). 8px also gives the group bottom spacing when it is the last
+  // block, which a turn still working or ending without an answer needs.
   return (
-    <div style={{ margin: "14px 0" }}>
+    <div style={{ margin: "14px 0 8px" }}>
       <button
         onClick={() => setOpen((o) => !o)}
         aria-expanded={open}
@@ -6194,10 +6357,15 @@ function WorkedGroup({ duration, children }: { duration: number | null; children
           width: "fit-content",
           background: "transparent",
           border: "none",
-          padding: "2px 0 4px",
+          padding: "2px 0 2px",
           color: colors.dim,
-          fontSize: 12.5,
-          letterSpacing: "var(--track-meta)",
+          // Set like the answer it introduces — same size, leading and
+          // tracking — so the fold reads as a quiet line of the same voice
+          // rather than a caption in a different one. Colour alone carries
+          // the hierarchy.
+          fontSize: 15.5,
+          lineHeight: 1.7,
+          letterSpacing: "var(--track-body)",
           cursor: "pointer",
           fontFamily: "inherit",
         }}
@@ -6214,7 +6382,16 @@ function WorkedGroup({ duration, children }: { duration: number | null; children
           ›
         </span>
       </button>
-      {open && <div style={{ paddingTop: 2 }}>{children}</div>}
+      {open && (
+        <>
+          {/* A rule only while open: collapsed, the header is a quiet label
+              and a full-width line would compete with the transcript; open,
+              it is the lid of a container and the line says where the turn's
+              working-out begins. */}
+          <div style={{ height: 1, background: colors.border, maxWidth: "var(--measure)", margin: "2px 0 12px" }} />
+          <div>{children}</div>
+        </>
+      )}
     </div>
   );
 }
@@ -6280,7 +6457,10 @@ function AgentLifecycleRow({
           border: "none",
           padding: 0,
           color: entry.event === "failed" ? colors.err : colors.dim,
-          fontSize: 13.5,
+          // Set like the step rows it sits among inside the fold.
+          fontSize: 15.5,
+          lineHeight: 1.6,
+          letterSpacing: "var(--track-body)",
           cursor: "pointer",
           fontFamily: "inherit",
         }}
@@ -6312,31 +6492,39 @@ function AgentLifecycleRow({
             minWidth: 0,
           }}
         >
-          <span style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-            {label.detail}{" "}
-            {onOpen ? (
-              // "a sub-agent" keeps the open-conversation affordance the name
-              // button used to carry — the name itself moved to the header.
-              <button
-                onClick={onOpen}
-                title="Open conversation"
-                style={{
-                  background: "transparent",
-                  border: "none",
-                  color: colors.accent,
-                  fontSize: "inherit",
-                  cursor: "pointer",
-                  fontFamily: "inherit",
-                  padding: 0,
-                }}
-              >
-                a sub-agent
-              </button>
-            ) : (
-              <span>a sub-agent</span>
-            )}
+          {/* Plain prose. "a sub-agent" used to be an accent-coloured button
+              carrying the open-conversation affordance, which put orange on
+              every row of a delegating turn and made the detail line shout
+              louder than the header naming the agent. The whole row already
+              opens the conversation, and the pills under the answer are the
+              durable way in. */}
+          {/* A real button, so the open action stays reachable by keyboard
+              and announces itself to a screen reader — it lost that when the
+              accent-coloured "a sub-agent" button became plain text and the
+              click moved onto the wrapping div. Dim rather than accent: the
+              colour was the thing worth removing, not the control. */}
+          <button
+            onClick={onOpen}
+            disabled={!onOpen}
+            title={onOpen ? "Open conversation" : undefined}
+            style={{
+              background: "transparent",
+              border: "none",
+              padding: 0,
+              margin: 0,
+              color: "inherit",
+              font: "inherit",
+              textAlign: "left",
+              cursor: onOpen ? "pointer" : "default",
+              minWidth: 0,
+              whiteSpace: "nowrap",
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+            }}
+          >
+            {label.detail} a sub-agent
             {prompt ? ` with the instructions: ${prompt}` : entry.path ? ` — ${entry.path}` : ""}
-          </span>
+          </button>
         </div>
       )}
     </div>
@@ -8124,14 +8312,61 @@ function ChatPane({
               const last = turnEntries[turnEntries.length - 1];
               const finalMsg = last?.kind === "assistant" ? last : null;
               const work = finalMsg ? turnEntries.slice(0, -1) : turnEntries;
-              const didWork = work.some((e) => e.kind === "agent" || e.kind === "command");
-              if (didWork && work.length > 0) {
+              const memoryRows = work.filter((e) => e.kind === "memory");
+              // Receipts already attached to narration that is about to be
+              // folded away are hoisted out — a receipt inside a collapsed
+              // fold is a write nobody sees.
+              const receipts = [
+                ...work.flatMap((e) => (e.kind === "assistant" ? (e.memories ?? []) : [])),
+                ...memoryRows.map((m) => ({ name: m.name, description: m.description, path: m.path })),
+              ];
+              const foldable = work
+                .filter((e) => e.kind !== "memory")
+                .map((e) => (e.kind === "assistant" && e.memories ? { ...e, memories: undefined } : e));
+              const didWork = foldable.some((e) => e.kind === "agent" || e.kind === "command");
+              // Who did the work survives the fold as a pill per sub-agent.
+              // Keyed on the thread, latest name wins: an agent is created
+              // before it picks a nickname, so the "started" row can carry a
+              // placeholder that a later row corrects.
+              const agentsById = new Map<string, { name: string; threadId: string }>();
+              for (const e of work) {
+                if (e.kind === "agent" && e.agentThreadId && e.name) {
+                  agentsById.set(e.agentThreadId, { name: e.name, threadId: e.agentThreadId });
+                }
+              }
+              const agents = [...agentsById.values()];
+              // Receipts move ONTO the answer, so they render inside it —
+              // under the text, above the copy row. Folded they would vanish;
+              // left loose above the answer they duplicated the steps header
+              // that already says "Saved memory".
+              const answer: Entry | null =
+                finalMsg && (receipts.length > 0 || agents.length > 0)
+                  ? {
+                      ...finalMsg,
+                      ...(receipts.length > 0
+                        ? { memories: dedupeReceipts([...(finalMsg.memories ?? []), ...receipts]) }
+                        : null),
+                      ...(agents.length > 0 ? { agents } : null),
+                    }
+                  : finalMsg;
+              if (didWork && foldable.length > 0) {
                 const duration = workStartedAt !== null ? (Date.now() - workStartedAt) / 1000 : null;
                 next = [
                   ...next.slice(0, start),
-                  { kind: "work", duration, entries: work },
-                  ...(finalMsg ? [finalMsg] : []),
+                  { kind: "work", duration, entries: foldable },
+                  ...(answer ? [answer] : []),
+                  // No answer to carry them (a turn that saved and then said
+                  // nothing, or was interrupted): every receipt becomes a
+                  // loose row again — including ones hoisted off narration
+                  // that is about to be folded away. Re-adding only the
+                  // already-loose rows destroyed those, and a memory write
+                  // has no other trace in the transcript.
+                  ...(answer
+                    ? []
+                    : receipts.map((r) => ({ kind: "memory" as const, ...r }))),
                 ];
+              } else if (answer && (receipts.length > 0 || agents.length > 0)) {
+                next = [...next.slice(0, start), ...foldable, answer];
               }
             }
           }
@@ -8232,6 +8467,11 @@ function ChatPane({
           list.map((e) => {
             if (e.kind === "agent" && e.name && names[e.name]) return { ...e, name: names[e.name] };
             if (e.kind === "work") return { ...e, entries: retitle(e.entries) };
+            // The pills on a finished answer carry the same names as the rows
+            // inside its fold, so they have to be retitled with them.
+            if (e.kind === "assistant" && e.agents?.some((a) => names[a.name])) {
+              return { ...e, agents: e.agents.map((a) => (names[a.name] ? { ...a, name: names[a.name] } : a)) };
+            }
             return e;
           });
         setEntries(retitle);
@@ -8245,6 +8485,13 @@ function ChatPane({
             list.map((e) => {
               if (e.kind === "agent" && e.agentThreadId === p.agentThreadId) return { ...e, name: p.name };
               if (e.kind === "work") return { ...e, entries: rename(e.entries) };
+              // …and the pills, which hold the same identity by thread id.
+              if (e.kind === "assistant" && e.agents?.some((a) => a.threadId === p.agentThreadId)) {
+                return {
+                  ...e,
+                  agents: e.agents.map((a) => (a.threadId === p.agentThreadId ? { ...a, name: p.name } : a)),
+                };
+              }
               return e;
             });
           setEntries(rename);
@@ -8263,6 +8510,34 @@ function ChatPane({
           ...withoutTrailingPlaceholder(es),
           { kind: "scheduled", key: p.key, name: p.name, cadence: p.cadence },
         ]);
+      }),
+      window.unbiased.onMemorySaved((p) => {
+        if (p.paneId !== paneId) return;
+        producedRef.current = true;
+        const receipt = { name: p.name, description: p.description, path: p.path };
+        setEntries((es) => {
+          const cleaned = withoutTrailingPlaceholder(es);
+          const last = cleaned[cleaned.length - 1];
+          // This event can land either side of turn/completed — measured both
+          // ways — so the receipt attaches to whatever text is already
+          // written rather than trusting arrival order. Attaching to mid-turn
+          // narration is safe: the fold hoists receipts onto the final answer.
+          //
+          // Two things must NOT be attached, because the answer they would
+          // land on belongs to a different turn: a save from a SUB-AGENT,
+          // which outlives the turn that spawned it and can report long
+          // after; and any save arriving while the trailing answer is
+          // replayed history sitting below this turn's scope.
+          const scope = turnStartIndexRef.current;
+          const inScope = scope === null || cleaned.length - 1 >= scope;
+          if (!p.fromSubAgent && inScope && last?.kind === "assistant" && last.text) {
+            return [
+              ...cleaned.slice(0, -1),
+              { ...last, memories: dedupeReceipts([...(last.memories ?? []), receipt]) },
+            ];
+          }
+          return [...cleaned, { kind: "memory", ...receipt }];
+        });
       }),
       window.unbiased.onCompaction((p) => {
         if (p.paneId !== paneId) return;
@@ -8642,7 +8917,14 @@ function ChatPane({
   // isLast to be TRUE; now that every settled reply shows one, the group's
   // intermediate narration has to be excluded explicitly or each line of it
   // sprouts a copy button.
-  const renderBlock = (block: DisplayBlock, isLast = false, nested = false): React.ReactNode => {
+  const renderBlock = (
+    block: DisplayBlock,
+    isLast = false,
+    nested = false,
+    /** This block directly follows a "Worked for Ns" fold — the answer it
+     *  introduces pulls up against it instead of taking full turn spacing. */
+    afterWork = false,
+  ): React.ReactNode => {
     if (block.kind === "steps") {
       return (
         <StepsGroup key={`s${block.key}`} items={block.items} statusLabel={statusLabel} decide={decide} />
@@ -8719,6 +9001,16 @@ function ChatPane({
         </div>
       );
     }
+    if (e.kind === "memory") {
+      // The live row, shown while the turn is still running. On completion
+      // the receipt moves onto the answer (see the turn/completed fold), so
+      // this standalone form survives only for turns that never answer.
+      return (
+        <div key={block.key} style={{ margin: "14px 0" }}>
+          <MemoryReceipt name={e.name} description={e.description} path={e.path} onOpen={onOpenFile} />
+        </div>
+      );
+    }
     if (e.kind === "compaction") {
       return (
         <div
@@ -8778,7 +9070,7 @@ function ChatPane({
         <div
           key={block.key}
           style={{
-            margin: "22px 0",
+            margin: afterWork ? "0 0 22px" : "22px 0",
             lineHeight: 1.7,
             fontSize: 15.5,
             color: "var(--fg-msg)",
@@ -8794,6 +9086,34 @@ function ChatPane({
             {e.text}
           </Markdown>
           {e.interrupted && <div style={{ color: colors.dim, fontSize: 12, marginTop: 4 }}>— stopped</div>}
+          {/* Receipts sit between the answer and its action row: below the
+              thing they are about, above the copy button — and outside the
+              text that button copies, which takes e.text alone. */}
+          {/* What the turn left behind, as pills: memories on one line, the
+              sub-agents that did the work on the next. Space on BOTH sides —
+              the action row that follows carries no top margin of its own, so
+              without it the receipts and the copy button read as one stack of
+              glyphs. */}
+          {/* Explicit boolean: `a?.length || b?.length` yields 0 when both are
+              empty, and React renders a stray "0". */}
+          {((e.memories?.length ?? 0) > 0 || (e.agents?.length ?? 0) > 0) && (
+            <div style={{ margin: "12px 0 14px", display: "flex", flexDirection: "column", gap: 8 }}>
+              {e.memories && e.memories.length > 0 && (
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                  {e.memories.map((m) => (
+                    <MemoryReceipt key={m.path} {...m} onOpen={onOpenFile} />
+                  ))}
+                </div>
+              )}
+              {e.agents && e.agents.length > 0 && (
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                  {e.agents.map((a) => (
+                    <AgentReceipt key={a.threadId} name={a.name} threadId={a.threadId} onOpen={onOpenAgent} />
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
           {/* Every settled reply gets its action row, not just the newest one:
               wanting to copy an answer from earlier in a conversation is at
               least as common as copying the last one, and the timestamp is the
@@ -8984,7 +9304,11 @@ function ChatPane({
               {b.n}
             </span>
           ))}
-          {toDisplayBlocks(entries).map((b, i, arr) => renderBlock(b, i === arr.length - 1))}
+          {toDisplayBlocks(entries).map((b, i, arr) => {
+            const prev = arr[i - 1];
+            const afterWork = prev?.kind === "entry" && prev.entry.kind === "work";
+            return renderBlock(b, i === arr.length - 1, false, afterWork);
+          })}
           {compacting && (
             <div style={{ display: "flex", justifyContent: "flex-start", margin: "10px 0" }}>
               <div
@@ -16814,8 +17138,168 @@ const closeAgentMirrorRef: { current: (() => void) | null } = { current: null };
 /** A step driven by the agent browser. Keyed on the tool name rather than the
  *  human label, which is localised prose and changes. */
 function isBrowserStep(e: CommandEntry): boolean {
+  if (e.source) return e.source === "browser";
   const c = e.command ?? "";
   return c.startsWith("browser_") || c.startsWith("Browse the web") || c.startsWith("Use a signed-in browser session");
+}
+
+/** Saving the same note twice in one turn is an UPDATE, not two events —
+ *  and `path` is the React key, so keeping both also collides. Last wins:
+ *  the later save is the one whose description is current. */
+function dedupeReceipts<T extends { path: string }>(list: T[]): T[] {
+  const byPath = new Map<string, T>();
+  for (const r of list) byPath.set(r.path, r);
+  return [...byPath.values()];
+}
+
+/** The shared pill: a chip-surfaced control that opens the thing it names.
+ *  One shape for every receipt a turn leaves behind, so a memory and an
+ *  agent read as the same kind of object. */
+function ReceiptPill({
+  icon,
+  children,
+  title,
+  onClick,
+}: {
+  icon: React.ReactNode;
+  children: React.ReactNode;
+  title?: string;
+  onClick?: () => void;
+}) {
+  return (
+    <button
+      // u-chip gives the hover the app's other chips have; the press-scale is
+      // global. A pill says "control" before the pointer arrives — which this
+      // needs, being the one way into the thing it announces.
+      className={onClick ? "u-chip" : undefined}
+      onClick={onClick}
+      title={title}
+      style={{
+        display: "inline-flex",
+        alignItems: "center",
+        gap: 7,
+        background: "var(--chip)",
+        border: `1px solid ${colors.border}`,
+        borderRadius: 999,
+        padding: "5px 12px 5px 10px",
+        color: colors.dim,
+        fontSize: 13,
+        lineHeight: 1.2,
+        cursor: onClick ? "pointer" : "default",
+        fontFamily: "inherit",
+        maxWidth: "100%",
+      }}
+    >
+      <span style={{ display: "flex", flexShrink: 0 }}>{icon}</span>
+      <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+        {children}
+      </span>
+    </button>
+  );
+}
+
+/** "Saved Memory" — the receipt for an ungated write. The note's identity is
+ *  in the tooltip and one click away in the side panel. */
+function MemoryReceipt({
+  name,
+  description,
+  path,
+  onOpen,
+}: {
+  name: string;
+  description: string;
+  path: string;
+  onOpen?: (path: string) => void;
+}) {
+  return (
+    <ReceiptPill
+      icon={<LightbulbIcon />}
+      title={`${name} — ${description}`}
+      onClick={onOpen ? () => onOpen(path) : undefined}
+    >
+      Saved <span style={{ color: "var(--fg-soft)", fontWeight: 500 }}>Memory</span>
+    </ReceiptPill>
+  );
+}
+
+/** One pill per sub-agent the turn used — its own emoji and nickname, the
+ *  same identity the roster and the lifecycle rows show, opening the same
+ *  side-panel view. */
+function AgentReceipt({
+  name,
+  threadId,
+  onOpen,
+}: {
+  name: string;
+  threadId: string;
+  onOpen?: (a: { threadId: string; name: string }) => void;
+}) {
+  return (
+    <ReceiptPill
+      icon={
+        <span aria-hidden="true" style={{ fontSize: 13, lineHeight: 1 }}>
+          {agentEmoji(threadId)}
+        </span>
+      }
+      title={`Open ${name}'s conversation`}
+      onClick={onOpen ? () => onOpen({ threadId, name }) : undefined}
+    >
+      <span style={{ color: "var(--fg-soft)", fontWeight: 500 }}>{name}</span>
+    </ReceiptPill>
+  );
+}
+
+const isMemoryStep = (e: CommandEntry): boolean => {
+  if (e.source) return e.source === "memory";
+  const c = e.command ?? "";
+  return c.startsWith("save memory") || c.startsWith("forget memory");
+};
+
+/** A real shell command — the only kind that earns monospace, a "Ran" verb
+ *  and a `$` prompt under a "Shell" heading. Asserted POSITIVELY from the
+ *  source the main process sends: inferring it by elimination dressed MCP
+ *  calls, scheduling proposals and app-raised approval cards as shell, and a
+ *  fabricated `$ Schedule "Daily digest"` claims a shell ran a sentence.
+ *  Entries persisted before `source` existed keep the old guess. */
+const isShellStep = (e: CommandEntry): boolean =>
+  e.source ? e.source === "shell" : !isBrowserStep(e) && !isMemoryStep(e);
+
+function stepIcon(e: CommandEntry): React.ReactNode {
+  if (isBrowserStep(e)) return <GlobeIcon size={14} />;
+  if (isMemoryStep(e)) return <LightbulbIcon />;
+  return <TerminalIcon size={14} />;
+}
+
+/** What the row says. Shell steps get a verb — but only in the PAST tense
+ *  once they have actually run: "Ran rm -rf …" on a command still waiting for
+ *  the user's approval asserts something that has not happened, next to the
+ *  card asking whether it may. */
+function stepRowText(e: CommandEntry): string {
+  const c = e.command ?? "";
+  if (!isShellStep(e)) return c;
+  if (e.status === "awaitingApproval") return `Run ${c}`;
+  if (e.status === "inProgress") return `Running ${c}`;
+  return `Ran ${c}`;
+}
+
+/** Header label for a steps group made ENTIRELY of memory operations — those
+ *  groups say what they did ("Saved memory") instead of the generic
+ *  "Worked · 1 step". Keyed on the main process's step text (`save memory ·
+ *  <name>`), the same trick isBrowserStep uses. Mixed groups return null and
+ *  keep the count, so a memory step buried in real work is not overclaimed. */
+function memoryStepsLabel(items: CommandEntry[]): string | null {
+  if (!items.length) return null;
+  let saves = 0;
+  let forgets = 0;
+  for (const e of items) {
+    const c = e.command ?? "";
+    if (c.startsWith("save memory")) saves++;
+    else if (c.startsWith("forget memory")) forgets++;
+    else return null;
+  }
+  if (forgets === 0) return saves === 1 ? "Saved memory" : `Saved ${saves} memories`;
+  if (saves === 0) return forgets === 1 ? "Forgot memory" : `Forgot ${forgets} memories`;
+  return `Updated memory · ${items.length} steps`;
 }
 
 function StepsGroup({
@@ -16847,17 +17331,28 @@ function StepsGroup({
 
   // Browser work says so, and says it about a thing the user can go look at.
   const browsing = items.some(isBrowserStep);
+  // Same courtesy for memory-only groups: name the action, not the count.
+  const memoryLabel = memoryStepsLabel(items);
   const summary = needsApproval
     ? { text: "Needs your approval", color: colors.fg, verb: null as string | null }
     : running
-      ? { text: browsing ? "Using" : "Working…", color: colors.amber, verb: browsing ? "Using" : null }
+      ? {
+          text: browsing ? "Using" : memoryLabel ? "Updating memory…" : "Working…",
+          color: colors.amber,
+          verb: browsing ? "Using" : null,
+        }
       : browsing
         ? { text: "Used", color: failed ? colors.err : colors.dim, verb: "Used" }
-        : {
-            text: `Worked · ${items.length} step${items.length === 1 ? "" : "s"}${failed ? " · issues" : ""}`,
-            color: failed ? colors.err : colors.dim,
-            verb: null,
-          };
+        : memoryLabel
+          ? { text: `${memoryLabel}${failed ? " · issues" : ""}`, color: failed ? colors.err : colors.dim, verb: null }
+          : {
+              // "Ran commands" rather than "Worked · N steps": the count is
+              // already one row per step below, and the verb says what kind
+              // of work it was without the reader opening the group.
+              text: `Ran command${items.length === 1 ? "" : "s"}${failed ? " · issues" : ""}`,
+              color: failed ? colors.err : colors.dim,
+              verb: null,
+            };
 
   return (
     <div style={{ margin: "14px 0" }}>
@@ -16874,13 +17369,27 @@ function StepsGroup({
             background: "transparent",
             border: "none",
             color: summary.color,
-            fontSize: 13.5,
+            // Set like the step rows it heads and the answer beside them, so
+            // the whole fold reads in one voice.
+            fontSize: 15.5,
+            lineHeight: 1.6,
+            letterSpacing: "var(--track-body)",
             cursor: "pointer",
-            padding: "2px 0",
+            padding: "3px 0",
             fontFamily: "var(--font-ui)",
           }}
         >
-          {running && !needsApproval ? <ShimmerText text={summary.text} fontSize={13.5} /> : summary.text}
+          {/* The icon follows the same item the LABEL does: "Used · Agent
+              Browser" comes from `some(isBrowserStep)`, so picking the icon
+              off items[0] put a terminal beside the word "Used" on any mixed
+              group — the one case where the header has to summarise. */}
+          <span style={{ display: "flex", flexShrink: 0 }}>
+            {stepIcon(browsing ? (items.find(isBrowserStep) ?? items[0]) : items[0])}
+          </span>
+          {/* No chevron here: the group already has one as a SIBLING button
+              below, kept separate because the browser-name button can sit
+              between them and a button inside a button is invalid markup. */}
+          {running && !needsApproval ? <ShimmerText text={summary.text} fontSize={15.5} /> : summary.text}
         </button>
         {summary.verb && (
           <button
@@ -16918,8 +17427,9 @@ function StepsGroup({
             display: "inline-block",
             transform: expanded ? "rotate(90deg)" : "none",
             transition: "transform 120ms var(--ease-out)",
-            fontSize: 11,
-            marginTop: 1,
+            // Scaled with the header's larger type; the row centres it, so
+            // the old 1px nudge would now push it low.
+            fontSize: 12,
           }}
         >
           ›
@@ -16930,73 +17440,127 @@ function StepsGroup({
           const label = statusLabel(e);
           const hasOutput = Boolean(e.output);
           const itemOpen = openItems.has(e.itemId);
+          const awaiting = e.status === "awaitingApproval" && e.approval && !e.approval.decision;
+          const failed = e.status === "failed" || (e.exitCode ?? 0) !== 0;
           return (
-            <div
-              key={e.itemId}
-              style={{
-                margin: "8px 0",
-                padding: "10px 14px",
-                borderRadius: 12,
-                border: `1px solid ${
-                  e.status === "awaitingApproval" && !e.approval?.expired ? colors.amber : colors.border
-                }`,
-                background: "var(--code-bg)",
-                fontSize: 12.5,
-                fontFamily: "var(--font-code)",
-              }}
-            >
+            <div key={e.itemId} style={{ margin: "1px 0" }}>
+              {/* A line of prose with an icon, not a card. The bordered
+                  monospace box read as debug output even for a step whose
+                  whole story is one sentence; the command itself belongs in
+                  the panel below, where a terminal is the right metaphor. */}
               <div
                 onClick={hasOutput ? () => toggleItem(e.itemId) : undefined}
                 style={{
                   display: "flex",
                   gap: 8,
-                  alignItems: "baseline",
+                  alignItems: "center",
                   cursor: hasOutput ? "pointer" : "default",
+                  padding: "3px 0",
+                  color: awaiting ? colors.amber : failed ? colors.err : colors.dim,
+                  fontSize: 15.5,
+                  lineHeight: 1.6,
+                  letterSpacing: "var(--track-body)",
+                  maxWidth: "var(--measure)",
                 }}
               >
+                <span style={{ display: "flex", flexShrink: 0 }}>{stepIcon(e)}</span>
                 <span
+                  // A command the user is being asked to approve wraps in
+                  // full: they cannot consent to what an ellipsis hid, and it
+                  // has no output panel to reveal the rest. Everything else
+                  // stays one tidy line, with the full text on hover.
+                  title={e.command}
                   style={{
-                    color: hasOutput ? colors.dim : "transparent",
-                    flexShrink: 0,
-                    fontSize: 9,
-                    display: "inline-block",
-                    transform: itemOpen ? "rotate(90deg)" : "none",
-                    transition: "transform 120ms var(--ease-out)",
+                    minWidth: 0,
+                    ...(awaiting
+                      ? { whiteSpace: "pre-wrap", overflowWrap: "anywhere" }
+                      : { whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }),
+                    fontFamily: isShellStep(e) ? "var(--font-code)" : "inherit",
+                    fontSize: isShellStep(e) ? 14 : undefined,
                   }}
                 >
-                  ▶
+                  {stepRowText(e)}
                 </span>
-                <span style={{ color: label.color, flexShrink: 0 }}>{label.text}</span>
-                <span style={{ whiteSpace: "pre-wrap", color: colors.fg, minWidth: 0, overflowWrap: "anywhere" }}>
-                  {e.command}
-                </span>
+                {/* The label carries the reason a row is red. `failed` also
+                    fires on a "completed" step with a non-zero exit code —
+                    the ordinary way a shell command fails — so gating the
+                    label on status alone left those rows red and silent. */}
+                {(failed || (e.status !== "completed" && !awaiting)) && (
+                  <span style={{ color: label.color, flexShrink: 0, fontSize: 13 }}>{label.text}</span>
+                )}
+                {hasOutput && (
+                  <span
+                    style={{
+                      flexShrink: 0,
+                      fontSize: 11,
+                      display: "inline-block",
+                      transform: itemOpen ? "rotate(90deg)" : "none",
+                      transition: "transform 120ms var(--ease-out)",
+                    }}
+                  >
+                    ›
+                  </span>
+                )}
               </div>
-              {e.status === "awaitingApproval" && e.approval && !e.approval.decision && (
-                e.approval.expired ? (
-                  <div style={{ marginTop: 8, fontSize: 12.5, color: colors.dim, lineHeight: 1.5 }}>
+              {awaiting &&
+                (e.approval!.expired ? (
+                  <div style={{ margin: "4px 0 8px", fontSize: 13, color: colors.dim, lineHeight: 1.5 }}>
                     This request is no longer active — the turn behind it ended, usually because the
                     app was closed. Ask again to run it.
                   </div>
                 ) : (
                   <PermissionsPrompt
-                    approval={e.approval}
+                    approval={e.approval!}
                     onDecide={(d) => void decide(e.itemId, e.approval!.requestId, d)}
                   />
-                )
-              )}
+                ))}
               {e.output && itemOpen && (
-                <pre
+                <div
                   style={{
-                    margin: "8px 0 0",
-                    color: colors.dim,
-                    whiteSpace: "pre-wrap",
-                    overflowWrap: "anywhere",
-                    maxHeight: 200,
-                    overflowY: "auto",
+                    margin: "4px 0 10px",
+                    borderRadius: 12,
+                    border: `1px solid ${colors.border}`,
+                    background: "var(--code-bg)",
+                    overflow: "hidden",
+                    maxWidth: "var(--measure)",
                   }}
                 >
-                  {e.output.length > 4000 ? e.output.slice(0, 4000) + "\n… (truncated)" : e.output}
-                </pre>
+                  {/* Naming the surface ("Shell") is what turns a slab of
+                      monospace into a quoted terminal — the reader knows what
+                      they are looking at before they parse a character. */}
+                  <div
+                    style={{
+                      padding: "7px 12px",
+                      borderBottom: `1px solid ${colors.border}`,
+                      color: colors.dim,
+                      fontSize: 12,
+                      letterSpacing: "var(--track-overline)",
+                    }}
+                  >
+                    {isShellStep(e) ? "Shell" : "Output"}
+                  </div>
+                  <pre
+                    style={{
+                      margin: 0,
+                      padding: "10px 12px",
+                      color: colors.dim,
+                      fontFamily: "var(--font-code)",
+                      fontSize: 12.5,
+                      lineHeight: 1.55,
+                      whiteSpace: "pre-wrap",
+                      overflowWrap: "anywhere",
+                      maxHeight: 240,
+                      overflowY: "auto",
+                    }}
+                  >
+                    <span style={{ color: colors.fg }}>
+                      <span style={{ color: colors.dim }}>$ </span>
+                      {e.command}
+                    </span>
+                    {"\n"}
+                    {e.output.length > 4000 ? e.output.slice(0, 4000) + "\n… (truncated)" : e.output}
+                  </pre>
+                </div>
               )}
             </div>
           );

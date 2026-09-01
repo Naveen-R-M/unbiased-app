@@ -6,6 +6,25 @@ Format matters: `## <version> — <date>`, then `### <section>`, then `-` bullet
 
 Write for the person using the app, not the person who wrote the code.
 
+## 1.8.0 — September 1, 2026
+
+### New
+
+- **Memory.** Pareto now keeps notes for a project and reads them at the start of every later conversation there, so a correction lands once instead of every week. It saves what a future chat would otherwise have to rediscover — a rule you stated, a fact about the project that is written down nowhere, the cause of something that took an hour to work out — with the reasoning behind it, not just the rule. Nothing is saved quietly: a **Saved Memory** pill appears under the answer that saved it, and opens the note itself. Everything lives in plain readable files under `.unbiased/memory` in your home folder, one per note. You can ask for a note to be forgotten, and you will be asked to confirm before anything is deleted — deleting a note cannot be undone. Memory is not available while plan mode is on, which stays read-only.
+- **Connectors.** A page for connecting the services you already use — Slack, Linear, Notion, Figma and more — so Pareto can work in them. Sign-in happens in your browser; services that are not ready yet say **Coming soon** rather than offering a button that cannot work. The catalogue keeps itself current and the page opens from what it already knows, instead of waiting on the network to draw anything.
+- Sub-agents a turn used now appear as pills under its answer, next to any memory it saved. Clicking one opens that agent's conversation in the side panel.
+
+### Improved
+
+- The **Worked for…** fold reads like an account of what happened instead of debug output. Steps are sentences with an icon — "Ran …", "Searched the web for …" — and the group says what kind of work it was. A step's output opens into a panel that names itself, with the command it ran above it. The whole fold is set in the same type as the answer it belongs to, and sits with that answer rather than floating between turns.
+- Opening **Scheduled** or **Connectors** now puts the previous conversation's side panel away, the way switching conversations already did, and the page uses the whole window instead of the column the panel left behind.
+
+### Fixed
+
+- A sub-agent's conversation showed the task you gave it and nothing else — its reply was there the whole time, hidden by a filter meant to keep a parent conversation's history out of the agent's view. The reply is back, and the task still comes first.
+- A command waiting for your approval no longer describes itself as already run, and no longer hides the middle of itself behind an ellipsis — you can read the whole thing before deciding, and it is marked as waiting.
+- A step that failed with an error code shows the code again. It turned red and said nothing about why.
+
 ## 1.7.0 — August 28, 2026
 
 ### New
