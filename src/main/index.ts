@@ -69,6 +69,14 @@ import {
   saveMemoryNote,
   validateMemory,
 } from "./memory";
+import {
+  LearningClient,
+  buildEvent,
+  buildTaskMeta,
+  readSidecarManifest,
+  resolveSidecarDir,
+  sidecarLooksInstalled,
+} from "./learning";
 import { spawn as ptySpawn, type IPty } from "@lydell/node-pty";
 
 const engine = new EngineClient();
@@ -2213,6 +2221,51 @@ function memoryDirForCwd(cwd: string | null): string {
   return projectMemoryDir(memoryRoot(), project);
 }
 
+// ── The learning sidecar (observe-only) ─────────────────────────────────
+// Absent unless its bundle is installed, and silent when it is not: this is
+// an optional companion process, not a dependency. It observes; nothing it
+// learns rides a prompt from here.
+let learning: LearningClient | null = null;
+
+/** Fire-and-forget: every call site should be one line that cannot fail. */
+function observeLearning(
+  kind: Parameters<typeof buildEvent>[0]["kind"],
+  threadId: string | null | undefined,
+  summary: string,
+  data?: Record<string, unknown>,
+): void {
+  if (!learning?.isReady || !threadId) return;
+  try {
+    learning.observe(buildEvent({ kind, threadId, turnId: runningTurns.get(threadId) ?? null, summary, data }));
+  } catch {
+    /* learning must never be able to break a turn */
+  }
+}
+
+async function startLearning(): Promise<void> {
+  const dir = resolveSidecarDir({
+    isPackaged: app.isPackaged,
+    resourcesPath: process.resourcesPath,
+    appPath: app.getAppPath(),
+  });
+  if (!sidecarLooksInstalled(dir)) return; // not installed: nothing to say
+  const manifest = readSidecarManifest(dir);
+  if (!manifest) return;
+  if ("error" in manifest) {
+    console.warn(`[learning] not starting: ${manifest.error}`);
+    return;
+  }
+  const client = new LearningClient(manifest, join(app.getPath("userData"), "learning.db"));
+  try {
+    await client.start();
+    learning = client;
+    console.log(`[learning] sidecar ${manifest.version} observing`);
+  } catch (err) {
+    console.warn(`[learning] handshake failed, learning is off: ${String(err)}`);
+    void client.stop();
+  }
+}
+
 function memoryDirForThread(threadId: string | null): string {
   const root = threadId ? rootThreadOf(threadId) : null;
   return memoryDirForCwd((root && threadCwds.get(root)) || mainCwd);
@@ -3850,6 +3903,10 @@ function wireNotifications(): void {
       case "turn/started": {
         const turn = params.turn as { id?: string } | undefined;
         if (threadId && turn?.id) {
+          // The judge governor treats "unknown" as busy; say so honestly, so
+          // background judging can never compete with this turn for the
+          // gateway's per-org concurrency.
+          learning?.setIdle(false);
           runningTurns.set(threadId, turn.id);
           bgStream.delete(threadId);
           send("chat:thread-activity", { threadId, running: true });
@@ -3973,6 +4030,18 @@ function wireNotifications(): void {
         if (!paneId) break; // history holds these for a backgrounded thread
         if (item?.type === "commandExecution") {
           send("chat:command", { paneId, phase, item: { ...(item as object), source: "shell" } });
+          // Both halves: the command attempted, and how it ended. The
+          // sidecar's reward model reads the exit code, and its
+          // repeated-failed-command signal needs the call text to normalise.
+          const ce = item as { command?: string; status?: string; exitCode?: number; aggregatedOutput?: string };
+          if (phase === "started") {
+            observeLearning("tool_call", threadId, ce.command ?? "(command)", { argsSummary: ce.command ?? "" });
+          } else if (phase === "completed") {
+            observeLearning("tool_output", threadId, ce.command ?? "(command)", {
+              exitCode: typeof ce.exitCode === "number" ? ce.exitCode : 0,
+              commandSummary: ce.command ?? "",
+            });
+          }
         } else if (item?.type === "dynamicToolCall") {
           // Dynamic tool calls render as command-style cards.
           const d = item as { id?: string; tool?: string; arguments?: unknown; status?: string; success?: boolean };
@@ -4083,6 +4152,17 @@ function wireNotifications(): void {
           | { status?: string; usage?: unknown; error?: { message?: string; additionalDetails?: string | null } | null }
           | undefined;
         if (threadId) {
+          // The event the sidecar's whole reflex hangs on: turn_completed is
+          // what triggers scoring and distillation on its side. Observed
+          // BEFORE runningTurns is cleared so the event still carries its
+          // turn id, then flushed — a turn boundary is exactly the moment the
+          // app is between pieces of work.
+          observeLearning("turn_completed", threadId, `turn ${turn?.status ?? "completed"}`, {
+            status: turn?.status ?? "completed",
+          });
+          learning?.flush();
+          // Idle again: nothing of the user's is competing for the gateway.
+          if (runningTurns.size <= 1) learning?.setIdle(true);
           runningTurns.delete(threadId);
           bgStream.delete(threadId);
           // A turn can't end while the engine still waits on an approval —
@@ -4259,6 +4339,16 @@ function wireNotifications(): void {
       // the conversation is reopened. Auto-declining here would silently
       // reject work the user asked for.
       function deliverApproval(payload: Record<string, unknown>): void {
+        // An app-only signal. Rollouts carry no record that the user was ever
+        // asked, so the sidecar's approval_decline weight is unreachable from
+        // replayed history — these two events are the app's unique
+        // contribution to the corpus.
+        observeLearning(
+          "approval_requested",
+          typeof params.threadId === "string" ? params.threadId : null,
+          String(payload.command ?? "approval"),
+          { kind: String(payload.kind ?? "command") },
+        );
         // A sub-agent's approval must surface in its PARENT's pane — the sub
         // thread never owns a pane, so without this reroute the request
         // would sit in heldApprovals forever and the spawn would hang.
@@ -4642,6 +4732,14 @@ async function handleMemoryToolCall(
       return text("The user declined. Keep the memory and do not offer to remove it again unless asked.", false);
     }
     const r = deleteMemoryNote(dir, name);
+    if (!("error" in r)) {
+      // The negative label the sidecar has none of: a human said this belief
+      // was wrong. Refuting by name is best-effort — the lesson id is the
+      // sidecar's, and only lessons proposed AS memories will match — so a
+      // miss is an unknown_lesson result, not a failure.
+      learning?.refuteLesson(`memory:${name}`, "user asked to forget the memory this became");
+      observeLearning("assistant_message", threadId, `forgot memory ${name}`, { memoryForgotten: name });
+    }
     return "error" in r ? text(r.error, false) : text(`Forgot "${name}". It will not appear in future conversations.`, true);
   }
   if (tool !== "memory_save") return text(`Unknown memory tool ${tool}.`, false);
@@ -4667,6 +4765,11 @@ async function handleMemoryToolCall(
   // would drop its row into whatever chat happens to be on screen, and the
   // main pane persists its transcript, so the foreign row would be saved
   // into that unrelated conversation for good.
+  // A human-validated label, and free: the user let this stand. The corpus
+  // has almost no strong signal of its own, so a save is worth recording.
+  observeLearning("assistant_message", threadId, `saved memory ${note.name}: ${note.description}`, {
+    memorySaved: note.name,
+  });
   const paneId = paneForThread(rootThreadOf(threadId));
   if (paneId) {
     // Flag saves that came from a SUB-AGENT. They are routed to the parent's
@@ -5090,6 +5193,9 @@ async function startEngine(): Promise<void> {
   // Only now is there something to run a task WITH. Idempotent, so a
   // re-login after a sign-out simply resumes the existing timer.
   startScheduler();
+  // After the engine, and never blocking it: an absent or broken sidecar
+  // leaves the app exactly as it was.
+  void startLearning();
 }
 
 app.whenReady().then(async () => {
@@ -5329,6 +5435,20 @@ app.whenReady().then(async () => {
       // branch just set mainCwd above. Recorded so a memory_save from any of
       // them resolves to the right project's store.
       threadCwds.set(started.thread.id, mainCwd ?? defaultChatDir());
+      // The scope-bearing event, using the SAME resolution memory uses: a
+      // worktree belongs to its parent project. The sidecar cannot derive
+      // this — cwd cannot tell /a/api from /b/api, and it has no worktree
+      // knowledge at all — so the app declares it.
+      if (learning?.isReady) {
+        const at = mainCwd ?? defaultChatDir();
+        learning.observe(
+          buildTaskMeta({
+            threadId: started.thread.id,
+            cwd: at,
+            projectKey: loadWorktrees()[at]?.project ?? at,
+          }),
+        );
+      }
       threadAccessModes.set(started.thread.id, accessMode);
       created = true;
     }
@@ -7643,6 +7763,12 @@ app.whenReady().then(async () => {
     // was quit while the card was up. Say so rather than returning a bare
     // false the caller can mistake for "sent".
     if (pending === undefined) return { ok: false, expired: true };
+    observeLearning(
+      "approval_decision",
+      "threadId" in pending ? (pending.threadId as string | null) : null,
+      `user ${payload.decision}`,
+      { decision: payload.decision === "acceptForSession" ? "acceptForSession" : payload.decision },
+    );
     pendingApprovals.delete(payload.requestId);
     // No engine item stands behind a synthesized card, so nothing would ever
     // flip it off "running" — resolve it here. Shared by local approvals and
@@ -8789,6 +8915,8 @@ app.whenReady().then(async () => {
 app.on("window-all-closed", () => {
   for (const pty of ptys.values()) pty.kill();
   ptys.clear();
+  void learning?.stop();
+  learning = null;
   // Downloads and unpacked archives that were never installed.
   for (const dir of skillStages) {
     try {
