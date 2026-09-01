@@ -8158,6 +8158,15 @@ app.whenReady().then(async () => {
           runningTurnStartedAt: replay.runningTurnStartedAt,
         };
       })(),
+      // Carried WITH the transcript rather than pushed alongside it.
+      // applyRolloutNicknames above sends a chat:subagent-renames event, but
+      // that event loses a race it can never win: the renderer retitles the
+      // entries it holds at that moment, and then this result replaces them
+      // with the un-renamed replay. It went unnoticed while cached
+      // transcripts already had the nicknames baked in; discarding stale
+      // caches exposed it, and every reopened conversation showed raw task
+      // names ("explore_main_process") instead of the engine's own ("Zeno").
+      subAgentNames: Object.fromEntries(rolloutNicknames(id)),
       running,
       streamText: bgStream.get(id) ?? "",
       approvals,
