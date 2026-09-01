@@ -21,7 +21,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { isAbsolute, join, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 
 /** The protocol version this client speaks. A sidecar advertising anything
  *  else is refused rather than guessed at — the version lives in the bundle's
@@ -378,13 +378,28 @@ export class LearningClient {
   }
 }
 
-/** Where to look for the bundle, in the same three-step shape
- *  resolveEngineDir uses: an override for development and tests, the packaged
- *  resources, then a sibling checkout. */
+/** Where to look for the bundle: an override first (development, tests, CI),
+ *  then the packaged resources, then a sibling checkout.
+ *
+ *  The sibling search walks UP rather than counting `..` the way
+ *  resolveEngineDir does. That single `..` is correct only in a plain
+ *  checkout: from a git worktree it lands in `.claude/worktrees/`, which is
+ *  why running the engine from a worktree needs UNBIASED_ENGINE_DIR every
+ *  time. Walking up finds the sibling from either. */
 export function resolveSidecarDir(opts: { isPackaged: boolean; resourcesPath: string; appPath: string }): string {
   const override = process.env.UNBIASED_LEARNING_DIR;
   if (override) return override;
   if (opts.isPackaged) return join(opts.resourcesPath, "sidecar");
+  let at = opts.appPath;
+  for (let i = 0; i < 8; i++) {
+    const candidate = join(at, "learning-algorithm", "dist", "sidecar");
+    if (existsSync(candidate)) return candidate;
+    const up = dirname(at);
+    if (up === at) break;
+    at = up;
+  }
+  // Nothing found: return the plain-checkout guess so the caller's "not
+  // installed" path reports a sensible location.
   return join(opts.appPath, "..", "learning-algorithm", "dist", "sidecar");
 }
 

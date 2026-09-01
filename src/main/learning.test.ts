@@ -9,6 +9,7 @@ import {
   buildTaskMeta,
   readSidecarManifest,
   redactForLearning,
+  resolveSidecarDir,
 } from "./learning";
 
 const scratch = () => mkdtempSync(join(tmpdir(), "sidecar-"));
@@ -136,4 +137,20 @@ test("flushing an empty queue sends nothing", async () => {
   const q = new EventQueue({ capacity: 5, send: async () => void calls++ });
   await q.flush();
   assert.equal(calls, 0);
+});
+
+test("the dev fallback finds a sibling checkout from a worktree, not just a plain clone", () => {
+  // A single `..` from appPath is correct only in a plain checkout; from
+  // .claude/worktrees/<name> it lands in worktrees/. That is why running the
+  // engine from a worktree needs an env override every time, and it is a trap
+  // worth not copying.
+  const root = scratch();
+  const bundle = join(root, "learning-algorithm", "dist", "sidecar");
+  mkdirSync(bundle, { recursive: true });
+  const deep = join(root, "unbiased-app", ".claude", "worktrees", "wt-1");
+  mkdirSync(deep, { recursive: true });
+  assert.equal(
+    resolveSidecarDir({ isPackaged: false, resourcesPath: "/unused", appPath: deep }),
+    bundle,
+  );
 });
