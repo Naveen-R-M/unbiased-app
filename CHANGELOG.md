@@ -6,6 +6,18 @@ Format matters: `## <version> — <date>`, then `### <section>`, then `-` bullet
 
 Write for the person using the app, not the person who wrote the code.
 
+## 1.8.2 — September 2, 2026
+
+### Improved
+
+- Clicking a project name in the sidebar collapses or expands it — the threads underneath fold away without needing a separate chevron, which is no longer shown.
+- The menu that opens from a project or a conversation in the sidebar has a quieter, more deliberate feel: a translucent material with blur, compact icon tiles for each action, and a header that identifies what you are acting on before you commit.
+- The copy icon no longer appears next to every working step while the assistant is busy. It shows once, under the final answer, where copying is actually useful.
+
+### Fixed
+
+- The thread actions menu — Rename, Move to project, Delete — now matches the project menu's styling instead of looking like a leftover from an earlier pass.
+
 ## 1.8.1 — September 2, 2026
 
 ### Improved
