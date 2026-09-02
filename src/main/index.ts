@@ -2234,6 +2234,24 @@ function memoryDirForCwd(cwd: string | null): string {
 // learns rides a prompt from here.
 let learning: LearningClient | null = null;
 
+/** Threads whose task_meta has already been sent this session. */
+const learningAnnounced = new Set<string>();
+
+/** Every thread announces its scope before its first event, whichever path
+ *  created it. Emitting task_meta only where a NEW main thread is started left
+ *  8 of 11 real tasks with no projectKey at all — side chats, sub-agent
+ *  threads and reopened conversations all produce events without ever going
+ *  through that path, and a task with no scope can only ever carry global
+ *  lessons. */
+function announceLearningTask(threadId: string): void {
+  if (learningAnnounced.has(threadId)) return;
+  learningAnnounced.add(threadId);
+  const at = threadCwds.get(rootThreadOf(threadId)) ?? mainCwd ?? defaultChatDir();
+  learning?.observe(
+    buildTaskMeta({ threadId, cwd: at, projectKey: loadWorktrees()[at]?.project ?? at }),
+  );
+}
+
 /** Fire-and-forget: every call site should be one line that cannot fail. */
 function observeLearning(
   kind: Parameters<typeof buildEvent>[0]["kind"],
@@ -2243,6 +2261,7 @@ function observeLearning(
 ): void {
   if (!learning?.isReady || !threadId) return;
   try {
+    announceLearningTask(threadId);
     learning.observe(buildEvent({ kind, threadId, turnId: runningTurns.get(threadId) ?? null, summary, data }));
   } catch {
     /* learning must never be able to break a turn */
@@ -4084,6 +4103,34 @@ function wireNotifications(): void {
               exitCode: typeof ce.exitCode === "number" ? ce.exitCode : 0,
               commandSummary: ce.command ?? "",
             });
+          }
+        } else if (item?.type === "fileChange") {
+          // The edit-quality half of the reward model runs entirely on this:
+          // without file_change there is no focused_edit, no broad_edit, no
+          // test_deletion, and test_pass_after_edit is gated on having seen an
+          // edit — so four of the six lesson templates were unreachable on app
+          // data. Only COMPLETED patches are reported, and only successful
+          // ones: an edit that failed or was declined never landed, and
+          // crediting (or penalising) it would be a false accusation.
+          const fc = item as {
+            status?: string;
+            changes?: { path?: string; kind?: { type?: string } }[];
+          };
+          if (phase === "completed" && fc.status === "completed") {
+            const changes = Array.isArray(fc.changes) ? fc.changes : [];
+            const files = changes.map((c) => c.path).filter((x): x is string => typeof x === "string");
+            const deletedFiles = changes
+              .filter((c) => c.kind?.type === "delete")
+              .map((c) => c.path)
+              .filter((x): x is string => typeof x === "string");
+            if (files.length) {
+              observeLearning(
+                "file_change",
+                threadId,
+                deletedFiles.length ? `deleted: ${deletedFiles.join(", ")}` : files.join(", "),
+                { files, deletedFiles },
+              );
+            }
           }
         } else if (item?.type === "dynamicToolCall") {
           // Dynamic tool calls render as command-style cards.

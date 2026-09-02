@@ -6,6 +6,7 @@ import { join } from "node:path";
 import {
   LEARNING_SUMMARY_MAX,
   EventQueue,
+  buildEvent,
   buildTaskMeta,
   readSidecarManifest,
   redactForLearning,
@@ -153,4 +154,18 @@ test("the dev fallback finds a sibling checkout from a worktree, not just a plai
     resolveSidecarDir({ isPackaged: false, resourcesPath: "/unused", appPath: deep }),
     bundle,
   );
+});
+
+test("a file change carries its paths and flags deletions structurally", () => {
+  // The reward model reads deletedFiles, not prose: a summary that happens not
+  // to say "delete" must still register a deleted test.
+  const e = buildEvent({
+    kind: "file_change",
+    threadId: "thr_1",
+    summary: "deleted: src/a.test.ts",
+    data: { files: ["src/a.ts", "src/a.test.ts"], deletedFiles: ["src/a.test.ts"] },
+  });
+  assert.equal(e.kind, "file_change");
+  assert.deepEqual(e.data.files, ["src/a.ts", "src/a.test.ts"]);
+  assert.deepEqual(e.data.deletedFiles, ["src/a.test.ts"]);
 });
