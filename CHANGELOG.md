@@ -6,6 +6,19 @@ Format matters: `## <version> — <date>`, then `### <section>`, then `-` bullet
 
 Write for the person using the app, not the person who wrote the code.
 
+## 1.8.1 — September 2, 2026
+
+### Improved
+
+- The sidebar uses a translucent material now — enough blur to keep depth, enough pigment to keep text clear — with quiet neutral hover and selection states instead of a red accent stripe through every active destination. The footer fades into the nav instead of meeting it with a hard line.
+- Rename and Delete on a conversation in the sidebar open a tighter menu: compact rows, a divider before the destructive action, and Delete is red so you know what you are committing to.
+- A sub-agent's side panel no longer repeats its name and path in a bar below the header. The header already had it; the duplicate is gone, along with the status column that said the same thing a third way.
+
+### Fixed
+
+- Pasted images show as thumbnail previews in the conversation instead of a line of clip-emoji filenames. You see the picture you sent, not a reference to it.
+- The instruction you gave a sub-agent now aligns to the left margin of the panel, below the agent's icon, instead of indenting to a second column that did not line up with anything. Both lines of the lifecycle row are the same size now.
+
 ## 1.8.0 — September 1, 2026
 
 ### New
