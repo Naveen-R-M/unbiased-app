@@ -73,6 +73,7 @@ import {
   LearningClient,
   buildEvent,
   buildTaskMeta,
+  patchedFilesFromCommand,
   readSidecarManifest,
   resolveSidecarDir,
   sidecarLooksInstalled,
@@ -2237,6 +2238,30 @@ let learning: LearningClient | null = null;
 /** Threads whose task_meta has already been sent this session. */
 const learningAnnounced = new Set<string>();
 
+/** Edits already reported, keyed by thread + the paths touched. An edit can
+ *  reach us twice — once as the engine's fileChange item and once as the
+ *  apply_patch shell command that produced it — and counting it twice would
+ *  mint two focused_edit signals (or two test_deletion penalties) for one
+ *  edit. Bounded, because it only needs to catch the same-turn double. */
+const learningEdits = new Set<string>();
+function observeFileChange(
+  threadId: string | null | undefined,
+  files: string[],
+  deletedFiles: string[],
+): void {
+  if (!threadId || !files.length) return;
+  const key = `${threadId}:${[...files].sort().join("|")}`;
+  if (learningEdits.has(key)) return;
+  if (learningEdits.size > 500) learningEdits.clear();
+  learningEdits.add(key);
+  observeLearning(
+    "file_change",
+    threadId,
+    deletedFiles.length ? `deleted: ${deletedFiles.join(", ")}` : files.join(", "),
+    { files, deletedFiles },
+  );
+}
+
 /** Every thread announces its scope before its first event, whichever path
  *  created it. Emitting task_meta only where a NEW main thread is started left
  *  8 of 11 real tasks with no projectKey at all — side chats, sub-agent
@@ -4103,6 +4128,16 @@ function wireNotifications(): void {
               exitCode: typeof ce.exitCode === "number" ? ce.exitCode : 0,
               commandSummary: ce.command ?? "",
             });
+            // Most edits are an apply_patch heredoc, not a fileChange item.
+            // Extracted from the RAW command, before the summary is clipped to
+            // 400 chars — a truncated heredoc loses its later markers. Only on
+            // exit 0: a patch that failed never landed, so crediting a focused
+            // edit (or penalising a deleted test) would be a false accusation.
+            const exited = typeof ce.exitCode === "number" ? ce.exitCode : 0;
+            if (exited === 0) {
+              const patch = patchedFilesFromCommand(ce.command ?? "");
+              if (patch) observeFileChange(threadId, patch.files, patch.deletedFiles);
+            }
           }
         } else if (item?.type === "fileChange") {
           // The edit-quality half of the reward model runs entirely on this:
@@ -4123,14 +4158,7 @@ function wireNotifications(): void {
               .filter((c) => c.kind?.type === "delete")
               .map((c) => c.path)
               .filter((x): x is string => typeof x === "string");
-            if (files.length) {
-              observeLearning(
-                "file_change",
-                threadId,
-                deletedFiles.length ? `deleted: ${deletedFiles.join(", ")}` : files.join(", "),
-                { files, deletedFiles },
-              );
-            }
+            observeFileChange(threadId, files, deletedFiles);
           }
         } else if (item?.type === "dynamicToolCall") {
           // Dynamic tool calls render as command-style cards.

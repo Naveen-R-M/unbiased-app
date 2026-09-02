@@ -107,6 +107,44 @@ export function redactForLearning(text: string): string {
   return out.replace(/\s+/g, " ").trim().slice(0, LEARNING_SUMMARY_MAX);
 }
 
+// ── Edits that arrive as shell commands ───────────────────────────────────
+// The engine reports its own patch tool as a `fileChange` thread item, but the
+// agent mostly edits by shelling out to `apply_patch` with a heredoc — measured
+// on a real corpus, 5 of 298 tool calls carried patch markers while exactly 1
+// fileChange item existed. Without extracting those, focused_edit, broad_edit
+// and test_deletion never fire on app data, which is the entire edit-quality
+// half of the reward model. The replay mapper solved this the same way; this is
+// the app-side twin of it.
+
+/** Same cap the sidecar's mapper uses: a patch touching more files than this
+ *  is already "broad", and the list is a label rather than a manifest. */
+export const LEARNING_MAX_PATCH_FILES = 30;
+
+/** NOT line-anchored, deliberately: the command text is not guaranteed to keep
+ *  its newlines by the time it reaches us, and a `^`-anchored marker regex
+ *  would then silently find nothing. */
+const PATCH_MARKER = /\*\*\* (Add|Update|Delete) File:\s*([^\n*"]+)/g;
+
+/** Files a shell `apply_patch` would touch, or null when the command is not a
+ *  patch. Requires both the invocation and at least one marker, so `grep
+ *  apply_patch` is not mistaken for an edit. */
+export function patchedFilesFromCommand(
+  command: string,
+): { files: string[]; deletedFiles: string[] } | null {
+  if (!command || !command.includes("apply_patch") || !command.includes("*** ")) return null;
+  const files: string[] = [];
+  const deletedFiles: string[] = [];
+  PATCH_MARKER.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = PATCH_MARKER.exec(command)) !== null && files.length < LEARNING_MAX_PATCH_FILES) {
+    const path = m[2]!.trim().replace(/["']$/, "");
+    if (!path) continue;
+    files.push(path);
+    if (m[1] === "Delete") deletedFiles.push(path);
+  }
+  return files.length ? { files, deletedFiles } : null;
+}
+
 // ── Events ────────────────────────────────────────────────────────────────
 
 export type LearningEventKind =

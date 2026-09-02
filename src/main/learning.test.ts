@@ -6,8 +6,10 @@ import { join } from "node:path";
 import {
   LEARNING_SUMMARY_MAX,
   EventQueue,
+  LEARNING_MAX_PATCH_FILES,
   buildEvent,
   buildTaskMeta,
+  patchedFilesFromCommand,
   readSidecarManifest,
   redactForLearning,
   resolveSidecarDir,
@@ -168,4 +170,50 @@ test("a file change carries its paths and flags deletions structurally", () => {
   assert.equal(e.kind, "file_change");
   assert.deepEqual(e.data.files, ["src/a.ts", "src/a.test.ts"]);
   assert.deepEqual(e.data.deletedFiles, ["src/a.test.ts"]);
+});
+
+// ── Edits arrive as apply_patch heredocs, not as fileChange items ──────────
+// Measured on the live corpus: 5 of 298 tool calls carried patch markers, and
+// exactly 1 fileChange item existed. So most edits reach us as shell commands
+// and the reward model was blind to them.
+
+test("patch markers are extracted from an apply_patch heredoc", () => {
+  const cmd = [
+    `/bin/zsh -lc "apply_patch <<'PATCH'`,
+    "*** Begin Patch",
+    "*** Update File: src/renderer/src/App.tsx",
+    "*** Add File: src/main/new.ts",
+    "*** Delete File: src/main/old.test.ts",
+    "*** End Patch",
+    `PATCH"`,
+  ].join("\n");
+  const out = patchedFilesFromCommand(cmd);
+  assert.ok(out);
+  assert.deepEqual(out.files, [
+    "src/renderer/src/App.tsx",
+    "src/main/new.ts",
+    "src/main/old.test.ts",
+  ]);
+  assert.deepEqual(out.deletedFiles, ["src/main/old.test.ts"]);
+});
+
+test("markers are found even when the command arrives on one line", () => {
+  // The engine's command text is not guaranteed to keep newlines, and a
+  // line-anchored regex would silently find nothing.
+  const cmd = `/bin/zsh -lc "apply_patch <<'PATCH' *** Begin Patch *** Update File: src/a.ts *** End Patch PATCH"`;
+  const out = patchedFilesFromCommand(cmd);
+  assert.deepEqual(out?.files, ["src/a.ts"]);
+});
+
+test("a command with no patch in it yields nothing", () => {
+  assert.equal(patchedFilesFromCommand("npm test -- --watch=false"), null);
+  assert.equal(patchedFilesFromCommand("grep -rn 'apply_patch' src/"), null, "a mention is not a patch");
+  assert.equal(patchedFilesFromCommand(""), null);
+});
+
+test("the file list is capped, so a giant patch cannot flood one event", () => {
+  const many = Array.from({ length: 80 }, (_, i) => `*** Update File: src/f${i}.ts`).join("\n");
+  const out = patchedFilesFromCommand(`apply_patch <<'P'\n*** Begin Patch\n${many}\n*** End Patch\nP`);
+  assert.ok(out);
+  assert.ok(out.files.length <= LEARNING_MAX_PATCH_FILES, `got ${out.files.length}`);
 });
