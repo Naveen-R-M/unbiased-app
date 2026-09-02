@@ -92,6 +92,61 @@
         transform: none;
       }
 
+      /* Sidebar material and interaction language. The navigation is a
+         structural layer, so it uses a denser material than floating menus:
+         enough translucency to keep depth, enough pigment to preserve text
+         contrast. Selection stays neutral and quiet; the accent is reserved
+         for status and actions instead of drawing a red stripe through every
+         active destination. */
+      .u-sidebar {
+        background:
+          linear-gradient(180deg, color-mix(in srgb, var(--fg) 2.8%, transparent), transparent 24%),
+          color-mix(in srgb, var(--nav-bg) 94%, transparent);
+        -webkit-backdrop-filter: blur(28px) saturate(1.18);
+        backdrop-filter: blur(28px) saturate(1.18);
+        box-shadow:
+          inset -1px 0 color-mix(in srgb, var(--fg) 8%, transparent),
+          10px 0 30px rgba(0, 0, 0, 0.08);
+      }
+      .u-sidebar-row {
+        background: transparent;
+        transition:
+          background-color 120ms var(--ease-out),
+          color 120ms var(--ease-out),
+          box-shadow 120ms var(--ease-out);
+      }
+      .u-sidebar-row:hover {
+        background: color-mix(in srgb, var(--fg) 5.5%, transparent);
+      }
+      .u-sidebar-row[data-active="true"] {
+        background: color-mix(in srgb, var(--fg) 9%, transparent);
+        box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--fg) 3.5%, transparent);
+      }
+      .u-sidebar-row[data-active="true"]:hover {
+        background: color-mix(in srgb, var(--fg) 11%, transparent);
+      }
+      .u-sidebar-row:active {
+        background: color-mix(in srgb, var(--fg) 12%, transparent);
+      }
+      .u-sidebar-section:hover,
+      .u-sidebar-icon-button:hover {
+        color: var(--fg-soft) !important;
+      }
+      .u-sidebar-icon-button {
+        transition:
+          background-color 120ms var(--ease-out),
+          color 120ms var(--ease-out);
+      }
+      .u-sidebar-icon-button:hover {
+        background: color-mix(in srgb, var(--fg) 5.5%, transparent) !important;
+      }
+      .u-sidebar-bottom {
+        background: linear-gradient(to bottom, transparent, color-mix(in srgb, var(--nav-bg) 90%, transparent) 16px);
+      }
+      .u-sidebar-footer {
+        border-top: 1px solid color-mix(in srgb, var(--fg) 6%, transparent) !important;
+      }
+
       /* Small chip buttons. The press-scale is already global; what was
          missing is the hover, which is what tells you the thing is a control
          before you commit to clicking it. Same 150ms ease-out as the fields,
@@ -223,11 +278,25 @@
          only earns its place now that the app actually uses backdrop-filter. */
       @media (prefers-reduced-transparency: reduce) {
         :root { --scrim-blur: none; }
+        .u-sidebar {
+          background: var(--nav-bg);
+          -webkit-backdrop-filter: none;
+          backdrop-filter: none;
+        }
       }
       /* Higher contrast wants a heavier, more definite dim behind a modal
          rather than a see-through one. */
       @media (prefers-contrast: more) {
         :root { --scrim-blur: none; }
+        .u-sidebar {
+          background: var(--nav-bg);
+          -webkit-backdrop-filter: none;
+          backdrop-filter: none;
+          box-shadow: inset -1px 0 color-mix(in srgb, var(--fg) 24%, transparent);
+        }
+        .u-sidebar-row[data-active="true"] {
+          box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--fg) 28%, transparent);
+        }
       }
 
       /* Reduced motion. Not "no feedback" — a gentler equivalent. What goes is
