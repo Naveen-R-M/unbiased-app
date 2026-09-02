@@ -39,7 +39,7 @@ type CommandItem = {
 };
 
 type Entry =
-  | { kind: "user"; text: string; annotations?: SentAnnotation[] }
+  | { kind: "user"; text: string; annotations?: SentAnnotation[]; attachments?: Attachment[] }
   | { kind: "compaction" }
   | {
       kind: "assistant";
@@ -2748,17 +2748,18 @@ export function App() {
     >
       {navOpen && (
       <nav
+        className="u-sidebar"
         style={{
           width: navWidth,
           flexShrink: 0,
-          borderRight: `1px solid ${colors.border}`,
           display: "flex",
           flexDirection: "column",
-          background: colors.panel,
+          position: "relative",
+          zIndex: 2,
         }}
       >
-        <div style={{ padding: "14px 14px 6px" }}>
-          <div style={{ display: "flex", marginBottom: 14, padding: "2px 0" }}>
+        <div style={{ padding: "16px 14px 8px" }}>
+          <div style={{ display: "flex", marginBottom: 15, padding: "2px 2px" }}>
             <Wordmark height={15} />
           </div>
           <SidebarAction onClick={() => void newChat()} disabled={false} icon={<NewChatIcon />}>
@@ -2808,7 +2809,7 @@ export function App() {
             </span>
           </SidebarAction>
         </div>
-        <div style={{ flex: 1, overflowY: "auto", padding: "0 8px 12px" }}>
+        <div style={{ flex: 1, overflowY: "auto", padding: "2px 8px 16px" }}>
           {sidebarView.projects.length === 0 && sidebarView.recents.length === 0 && (
             <div style={{ color: colors.dim, fontSize: 12, padding: "8px 8px" }}>No conversations yet</div>
           )}
@@ -2835,14 +2836,15 @@ export function App() {
               }
               title="Create project"
               aria-label="Create project"
+              className="u-sidebar-icon-button"
               style={{
                 background: "transparent",
                 border: "none",
                 color: colors.dim,
                 cursor: "pointer",
-                // Mirror SectionLabel's padding box (14px top, 6px bottom)
-                // so the glyph sits on the label's text line.
-                padding: "14px 8px 6px",
+                // Mirror SectionLabel's padding box so the glyph sits on the
+                // same optical line as the label.
+                padding: "19px 8px 7px",
                 display: "flex",
                 alignItems: "center",
                 flexShrink: 0,
@@ -2871,17 +2873,14 @@ export function App() {
                   // activeProject, so exactly one row is ever lit. activeProject
                   // itself must stay set — the Files view, work mode and the
                   // chat's working directory all read it.
-                  // Same selected language as ThreadRow — accent rail plus a
-                  // tint — so "this project is active" and "this chat is
-                  // active" are visibly the same kind of state, which they are.
+                  // Same selected material as ThreadRow, so "this project is
+                  // active" and "this chat is active" remain one clear state.
                   // `lit` rather than a bare comparison: Scheduled is a
                   // destination too, so while it is open no chat or project may
                   // claim the highlight. Without this the sidebar showed two
                   // selected rows at once — the view you are in, and the chat
                   // you were in before it.
-                  background: litProject(p.path) ? "var(--chip)" : "transparent",
-                  boxShadow: litProject(p.path) ? "inset 2px 0 0 0 var(--accent)" : "none",
-                  borderRadius: 8,
+                  borderRadius: 9,
                   padding: "8px 8px 6px",
                   // A project heads the chats nested under it, so it keeps its
                   // original 14.5 and takes the weight; the chats stay at 14.
@@ -2891,6 +2890,8 @@ export function App() {
                   color: "var(--fg-soft)",
                   boxSizing: "border-box",
                 }}
+                className="u-sidebar-row"
+                data-active={litProject(p.path)}
               >
                 <ProjectIcon icon={p.icon} color={p.color} />
                 <span
@@ -3059,7 +3060,7 @@ export function App() {
             }
           />
         )}
-        <div style={{ padding: "4px 14px 2px", flexShrink: 0, display: "flex", alignItems: "center", gap: 2 }}>
+        <div className="u-sidebar-bottom" style={{ padding: "12px 14px 3px", flexShrink: 0, display: "flex", alignItems: "center", gap: 4 }}>
           <div style={{ flex: 1, minWidth: 0 }}>
             <SidebarAction onClick={() => setShowSettings(true)} disabled={false} icon={<GearIcon />}>
               Settings
@@ -3072,17 +3073,18 @@ export function App() {
               setShowChangelog(true);
             }}
             title="What's new"
+            className="u-sidebar-icon-button"
             style={{
               position: "relative",
               display: "flex",
               alignItems: "center",
               justifyContent: "center",
-              width: 30,
-              height: 30,
+              width: 32,
+              height: 32,
               flexShrink: 0,
               background: "transparent",
               border: "none",
-              borderRadius: 8,
+              borderRadius: 9,
               color: "var(--fg-soft)",
               cursor: "pointer",
             }}
@@ -4205,7 +4207,6 @@ export function App() {
                 <SubAgentPane
                   key={a.threadId}
                   threadId={a.threadId}
-                  name={subAgentsList.find((x) => x.threadId === a.threadId)?.name ?? a.name}
                   status={subAgentsList.find((x) => x.threadId === a.threadId)?.status ?? "idle"}
                 />
               ),
@@ -4790,19 +4791,23 @@ export function App() {
           style={{
             position: "fixed",
             top: threadMenu.y,
-            left: Math.max(8, Math.min(threadMenu.x - 210, window.innerWidth - 226)),
-            width: 210,
-            background: colors.panel,
-            border: `1px solid ${colors.border}`,
-            borderRadius: 12,
-            padding: 6,
+            left: Math.max(8, Math.min(threadMenu.x - 190, window.innerWidth - 206)),
+            width: 190,
+            background: "color-mix(in srgb, var(--panel) 86%, transparent)",
+            border: "1px solid color-mix(in srgb, var(--fg) 10%, transparent)",
+            borderRadius: 11,
+            padding: 5,
             zIndex: 60,
-            boxShadow: "0 8px 24px rgba(0,0,0,0.45)",
+            boxShadow: "0 14px 36px rgba(0,0,0,0.32), 0 2px 8px rgba(0,0,0,0.22)",
+            backdropFilter: "blur(20px) saturate(1.15)",
+            WebkitBackdropFilter: "blur(20px) saturate(1.15)",
+            transformOrigin: "top right",
           }}
         >
           <MenuItem
             icon={<PencilIcon />}
             label="Rename…"
+            compact
             onClick={() => {
               setRenameDialog({ id: threadMenu.id, name: threadMenu.title, error: null });
               setThreadMenu(null);
@@ -4812,6 +4817,7 @@ export function App() {
             <MenuItem
               icon={<FolderOutlineIcon size={15} />}
               label="Move to project…"
+              compact
               disabled={sidebar.projects.length === 0}
               desc={sidebar.projects.length === 0 ? "No projects yet" : undefined}
               onClick={() => {
@@ -4820,9 +4826,12 @@ export function App() {
               }}
             />
           )}
+          <div style={{ height: 1, margin: "4px 7px", background: "color-mix(in srgb, var(--fg) 9%, transparent)" }} />
           <MenuItem
             icon={<TrashIcon />}
             label="Delete"
+            compact
+            destructive
             onClick={() => {
               const id = threadMenu.id;
               setThreadMenu(null);
@@ -6484,8 +6493,18 @@ function AgentLifecycleRow({
         }}
       >
         <AgentIcon />
-        <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-          {label.verb} <span style={{ color: entry.event === "failed" ? "inherit" : "var(--fg-soft)" }}>{headerName}</span>
+        <span
+          style={{
+            minWidth: 0,
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap",
+            color: entry.event === "failed" ? "inherit" : "var(--fg-soft)",
+            fontSize: 15.5,
+            fontWeight: 400,
+          }}
+        >
+          {label.verb} {headerName}
         </span>
         <span
           style={{
@@ -6502,8 +6521,9 @@ function AgentLifecycleRow({
         <div
           style={{
             color: colors.dim,
-            fontSize: 13,
-            padding: "6px 0 0 26px",
+            fontSize: 15.5,
+            lineHeight: 1.6,
+            padding: "6px 0 0",
             display: "flex",
             alignItems: "center",
             gap: 10,
@@ -6680,9 +6700,8 @@ function buildMdComponents(
   };
 }
 
-function SubAgentPane({ threadId, name, status }: { threadId: string; name: string; status: string }) {
+function SubAgentPane({ threadId, status }: { threadId: string; status: string }) {
   const [entries, setEntries] = useState<Entry[]>([]);
-  const [path, setPath] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [tail, setTail] = useState("");
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -6700,7 +6719,6 @@ function SubAgentPane({ threadId, name, status }: { threadId: string; name: stri
       const r = await window.unbiased.subagentTranscript(threadId);
       if (!alive) return;
       setEntries(r.entries);
-      setPath(r.path);
       setError(r.error ?? null);
       // A delta can land between the engine snapshot and this resolve —
       // never let the older snapshot truncate newer streamed text. An empty
@@ -6735,29 +6753,6 @@ function SubAgentPane({ threadId, name, status }: { threadId: string; name: stri
 
   return (
     <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
-      <div
-        style={{
-          padding: "10px 16px",
-          borderBottom: `1px solid ${colors.border}`,
-          fontSize: 12.5,
-          color: colors.dim,
-          display: "flex",
-          alignItems: "center",
-          gap: 8,
-          flexShrink: 0,
-        }}
-        title={path ?? undefined}
-      >
-        <span style={{ fontSize: 15, lineHeight: 1 }}>{agentEmoji(threadId)}</span>
-        <span style={{ color: colors.fg, fontWeight: 600, fontSize: 13.5, letterSpacing: -0.1 }}>{name}</span>
-        <span style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{path}</span>
-        <span style={{ flex: 1 }} />
-        {status === "running" ? (
-          <ShimmerText text="working…" />
-        ) : (
-          <span style={{ color: status === "failed" ? colors.err : colors.dim }}>{status}</span>
-        )}
-      </div>
       <div ref={scrollRef} style={{ flex: 1, overflowY: "auto", padding: "18px 20px" }}>
         {error && <div style={{ color: colors.err, fontSize: 13 }}>{error}</div>}
         {!error && entries.length === 0 && tail === "" && (
@@ -8663,7 +8658,7 @@ function ChatPane({
     producedRef.current = false;
     turnStartedAtRef.current = Date.now();
     setEntries((es) => {
-      const next: Entry[] = [...es, { kind: "user", text: q.text, annotations: q.annotations }];
+      const next: Entry[] = [...es, { kind: "user", text: q.text, annotations: q.annotations, attachments: q.attachments }];
       turnStartIndexRef.current = next.length;
       return next;
     });
@@ -8700,10 +8695,9 @@ function ChatPane({
     setDraft("");
     setAttachments([]);
     setAnnotations([]);
-    const suffix = sentAttachments.length > 0 ? `📎 ${sentAttachments.map((a) => a.name).join(", ")}` : "";
     const msg: QueuedMsg = {
       id: nextQueueIdRef.current++,
-      text: [text, suffix].filter(Boolean).join("\n\n"),
+      text,
       wire,
       attachments: sentAttachments,
       annotations:
@@ -8961,8 +8955,52 @@ function ChatPane({
             margin: "10px 0",
           }}
         >
-          {e.annotations && e.annotations.length > 0 && <SentAnnotations items={e.annotations} />}
-          {e.text && (
+         {e.annotations && e.annotations.length > 0 && <SentAnnotations items={e.annotations} />}
+          {e.attachments && e.attachments.length > 0 && (
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 10, justifyContent: "flex-end" }}>
+              {e.attachments.map((a) =>
+                a.kind === "image" && a.thumb ? (
+                  <img
+                    key={a.path}
+                    src={a.thumb}
+                    alt={a.name}
+                    title={a.name}
+                    onClick={onPreviewImage ? () => onPreviewImage(a) : undefined}
+                    style={{
+                      width: 132,
+                      height: 132,
+                      objectFit: "cover",
+                      borderRadius: 12,
+                      border: `1px solid ${colors.border}`,
+                      cursor: onPreviewImage ? "pointer" : "default",
+                      display: "block",
+                    }}
+                  />
+                ) : (
+                  <span
+                    key={a.path}
+                    title={a.path}
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 8,
+                      background: "var(--chip)",
+                      border: `1px solid ${colors.border}`,
+                      borderRadius: 12,
+                      padding: "8px 12px",
+                      fontSize: 12.5,
+                      color: colors.dim,
+                      maxWidth: 200,
+                    }}
+                  >
+                    {a.kind === "folder" ? <FolderOutlineIcon size={16} /> : <FileIcon />}
+                    <span style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{a.name}</span>
+                  </span>
+                ),
+              )}
+            </div>
+          )}
+         {e.text && (
             <div
               style={{
                 // Narrower than before (85% let a long question run almost the
@@ -15616,11 +15654,8 @@ function HeaderEdge() {
   );
 }
 
-// --chip, not an accent wash: every other surface in this chrome is a neutral
-// grey mixed from surface+ink, so an accent tint at 12% resolves to #2e1917 —
-// a warm maroon that is the only hue in the sidebar. The accent belongs in the
-// rail, where a saturated 2px marker is exactly what says "selected"; the fill
-// only needs to lift the row off the background, which is --chip's whole job.
+// Sidebar destinations use the same neutral material for hover and selection.
+// Keeping accent out of navigation preserves it for status and primary action.
 function SidebarAction({
   onClick,
   disabled,
@@ -15632,7 +15667,7 @@ function SidebarAction({
   disabled: boolean;
   icon: React.ReactNode;
   /** Rows that lead somewhere you can still be — Scheduled — light up while
-   *  you are there, using the same rail as a selected chat. The plain actions
+   *  you are there, using the same material as a selected chat. Plain actions
    *  (New chat, Open project) never pass it: they do a thing and return. */
   active?: boolean;
   children: React.ReactNode;
@@ -15641,18 +15676,18 @@ function SidebarAction({
     <button
       onClick={onClick}
       disabled={disabled}
+      className="u-sidebar-row"
+      data-active={Boolean(active)}
       style={{
         display: "flex",
         alignItems: "center",
         gap: 10,
         width: "100%",
-        background: active ? "var(--chip)" : "transparent",
-        boxShadow: active ? "inset 2px 0 0 0 var(--accent)" : "none",
         fontWeight: active ? 500 : 400,
         color: disabled ? colors.dim : active ? colors.fg : "var(--fg-soft)",
         border: "none",
-        borderRadius: 8,
-        padding: "8px 8px",
+        borderRadius: 9,
+        padding: "8px 9px",
         // Left at 14. An earlier pass took the whole sidebar to 13.5 to
         // unify it; unified it did, but the sidebar went quiet with it.
         // Hierarchy is carried by weight and the active rail instead.
@@ -15785,13 +15820,14 @@ function SectionLabel({
     fontWeight: 600,
     textTransform: "uppercase",
     letterSpacing: "var(--track-overline)",
-    padding: "18px 8px 6px",
+    padding: "19px 8px 7px",
   };
   if (!onToggle) return <div style={base}>{children}</div>;
   return (
     <button
       onClick={onToggle}
       aria-expanded={!collapsed}
+      className="u-sidebar-section"
       style={{
         ...base,
         display: "flex",
@@ -16412,6 +16448,8 @@ function MenuItem({
   label,
   desc,
   disabled,
+  compact,
+  destructive,
   trailing,
   onClick,
 }: {
@@ -16419,6 +16457,8 @@ function MenuItem({
   label: string;
   desc?: string;
   disabled?: boolean;
+  compact?: boolean;
+  destructive?: boolean;
   /** Right-edge slot: a state chip, or a chevron for rows that open a panel.
    *  At full width the right edge is otherwise dead space, and "does this go
    *  somewhere or toggle something?" is exactly what it should answer. */
@@ -16438,15 +16478,16 @@ function MenuItem({
       style={{
         display: "flex",
         alignItems: "center",
-        gap: 10,
+        gap: compact ? 9 : 10,
         width: "100%",
         background: hover && !disabled ? "var(--chip)" : "transparent",
         border: "none",
-        borderRadius: 8,
-        padding: "7px 10px",
-        fontSize: 13.5,
+        borderRadius: compact ? 7 : 8,
+        padding: compact ? "6px 8px" : "7px 10px",
+        fontSize: compact ? 13 : 13.5,
+        fontWeight: compact ? 450 : undefined,
         letterSpacing: "var(--track-body)",
-        color: disabled ? colors.dim : colors.fg,
+        color: disabled ? colors.dim : destructive ? colors.err : colors.fg,
         cursor: disabled ? "default" : "pointer",
         textAlign: "left",
         fontFamily: "inherit",
@@ -16457,10 +16498,10 @@ function MenuItem({
           does, and at --dim it was the faintest thing in it. */}
       <span
         style={{
-          color: disabled ? colors.dim : "var(--fg-soft)",
+          color: disabled ? colors.dim : destructive ? colors.err : "var(--fg-soft)",
           display: "flex",
           justifyContent: "center",
-          width: 18,
+          width: compact ? 16 : 18,
           flexShrink: 0,
         }}
       >
@@ -16468,7 +16509,7 @@ function MenuItem({
       </span>
       {/* Fixed column. Ragged labels give the descriptions a ragged left
           edge too, which is what reads as clutter at this width. */}
-      <span style={{ whiteSpace: "nowrap", minWidth: 148, flexShrink: 0 }}>{label}</span>
+      <span style={{ whiteSpace: "nowrap", minWidth: compact ? 0 : 148, flexShrink: 0 }}>{label}</span>
       {desc && (
         <span
           style={{
@@ -16606,18 +16647,15 @@ function ThreadRow({
     <div
       onMouseEnter={() => onHover(thread.id)}
       onMouseLeave={() => onHover(null)}
+      className="u-sidebar-row"
+      data-active={active}
       style={{
         display: "flex",
         alignItems: "center",
-        // The active row was a flat --chip fill, the same treatment hover and
-        // open popovers use — so "which chat am I in" competed with "what is
-        // my cursor over". An accent rail plus a tinted fill says *selected*
-        // in a way no neutral shade can, and the 2px inset keeps the text
-        // baseline aligned with the inactive rows above and below it.
-        background: active ? "var(--chip)" : "transparent",
-        boxShadow: active ? "inset 2px 0 0 0 var(--accent)" : "none",
-        borderRadius: 8,
-        marginBottom: 1,
+        // Selection is a slightly stronger neutral material than hover. This
+        // keeps the title aligned while avoiding a decorative accent rail.
+        borderRadius: 9,
+        marginBottom: 2,
         paddingLeft: indent ? 25 : 0,
       }}
     >
@@ -16634,8 +16672,8 @@ function ThreadRow({
           color: active ? colors.fg : "var(--fg-soft)",
           border: "none",
           padding: "8px 4px 8px 8px",
-          // Back at 14; the active state is carried by weight and the accent
-          // rail rather than by shrinking every inactive row.
+          // Active state is carried by weight and material rather than by
+          // shrinking every inactive row.
           fontSize: 14,
           fontWeight: active ? 500 : 400,
           letterSpacing: "var(--track-body)",
@@ -17105,9 +17143,9 @@ function PermissionsPrompt({
 function ChatFooter({ status, busy }: { status: EngineStatus; busy: boolean }) {
   return (
     <footer
+      className="u-sidebar-footer"
       style={{
-        padding: "10px 14px",
-        borderTop: `1px solid ${colors.border}`,
+        padding: "9px 16px 11px",
         fontSize: 11.5,
         color: colors.dim,
         display: "flex",
