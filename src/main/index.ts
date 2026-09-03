@@ -1986,12 +1986,21 @@ const axLines = new Map<string, Map<number, string>>();
  *  rather than a terminal glyph. */
 const axIcons = new Map<string, string>();
 
-/** Diagnostics go to a FILE, not console.log: the dev launcher runs the app
- *  through `open -W -n`, which discards stdout, so an instrumented run this
- *  week produced an empty log and told us nothing. */
+/** Diagnostics. The console is the normal home, but the dev launcher runs the
+ *  app through `open -W -n`, which discards stdout — an instrumented run this
+ *  week produced an empty log and told us nothing. So with UNBIASED_AX_DEBUG=1
+ *  the same lines also append to a file, matching the bridge's own switch.
+ *
+ *  Off by default: these lines name the apps a user drove and the elements
+ *  they touched, and a world-readable /tmp file that grows forever is not
+ *  something to hand every user for the sake of one debugging session. */
+const AX_DEBUG_FILE = process.env.UNBIASED_AX_DEBUG === "1" ? "/tmp/unbiased-ax-diag.log" : null;
+
 function axLog(line: string): void {
+  console.log(`[ax] ${line}`);
+  if (!AX_DEBUG_FILE) return;
   try {
-    appendFileSync("/tmp/unbiased-ax-diag.log", `${new Date().toISOString().slice(11, 23)} ${line}\n`);
+    appendFileSync(AX_DEBUG_FILE, `${new Date().toISOString().slice(11, 23)} ${line}\n`);
   } catch {
     // diagnostics must never break a turn
   }
