@@ -119,6 +119,11 @@ export type ComputerUseDependencies = {
   loadNut: () => Promise<NutRuntime>;
   beforeAction?: () => Promise<void> | void;
   afterAction?: () => Promise<void> | void;
+  /** The name macOS lists this build under in Privacy & Security — "Unbiased
+   *  Dev" for the dev launcher, "Unbiased" when shipped. Permission messages
+   *  send the user to that pane to find a row, so the row has to be the one
+   *  that is actually there. Defaults to the shipped name. */
+  appName?: () => string;
 };
 
 export class SerialExecutor {
@@ -274,12 +279,12 @@ export function parseComputerAction(tool: string, rawArgs: unknown, display: Com
   }
 }
 
-function inputUnavailable(err: unknown): ComputerActionResult {
+function inputUnavailable(err: unknown, appName: string): ComputerActionResult {
   const detail = err instanceof Error ? err.message : String(err);
   return {
     ok: false,
     message:
-      "Desktop input is unavailable because macOS has not granted Accessibility access to this running app. " +
+      `Desktop input is unavailable because macOS has not granted Accessibility access to ${appName}. ` +
       `Details: ${detail}`,
   };
 }
@@ -290,6 +295,7 @@ export function createComputerUseService(deps: ComputerUseDependencies): {
 } {
   const executor = new SerialExecutor();
   const platform = deps.platform ?? process.platform;
+  const appName = () => deps.appName?.() ?? "Unbiased";
 
   async function withSurface<T>(work: () => Promise<T>): Promise<T> {
     await deps.beforeAction?.();
@@ -323,19 +329,19 @@ export function createComputerUseService(deps: ComputerUseDependencies): {
               ok: false,
               permission: err instanceof ComputerPermissionError ? err.permission : "screen-capture",
               message:
-                "Desktop capture failed. In System Settings > Privacy & Security > Screen & System Audio Recording, allow Unbiased, then restart the app. " +
+                `Desktop capture failed. In System Settings > Privacy & Security > Screen & System Audio Recording, allow ${appName()}, then restart the app. ` +
                 `Details: ${detail}`,
             };
           }
         }
         if (!deps.accessibilityTrusted(true)) {
-          return { ...inputUnavailable("Accessibility permission was not granted."), permission: "accessibility" };
+          return { ...inputUnavailable("Accessibility permission was not granted.", appName()), permission: "accessibility" };
         }
         let nut: NutRuntime;
         try {
           nut = await deps.loadNut();
         } catch (err) {
-          return inputUnavailable(err);
+          return inputUnavailable(err, appName());
         }
         try {
           if (action.type === "move") {
@@ -370,7 +376,7 @@ export function createComputerUseService(deps: ComputerUseDependencies): {
             message: `Scrolled at (${action.point.x}, ${action.point.y}) by (${action.deltaX}, ${action.deltaY}).`,
           };
         } catch (err) {
-          return inputUnavailable(err);
+          return inputUnavailable(err, appName());
         }
       });
     });

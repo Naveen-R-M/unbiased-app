@@ -1761,7 +1761,16 @@ function primaryComputerDisplay(): ComputerDisplay {
 
 let restoreComputerWindow = false;
 let screenPermissionEstablished = false;
+/** What macOS lists this build under in Privacy & Security. The dev launcher
+ *  registers as "Unbiased Dev"; a plain electron-vite run shows up as
+ *  "Electron"; the shipped app is "Unbiased". Every message that sends the
+ *  user to a permission pane must name the row that is actually there. */
+function computerPermissionAppName(): string {
+  return productionBuild() ? "Unbiased" : process.env.UNBIASED_DEV_APP_NAME ?? "Electron";
+}
+
 const computerUse = createComputerUseService({
+  appName: computerPermissionAppName,
   getPrimaryDisplay: primaryComputerDisplay,
   // Captured AT the frame, not at the display: a full-resolution 4K capture is
   // 4.15MB of base64 PNG per screenshot, and since the rollout is re-sent
@@ -1897,7 +1906,7 @@ async function offerComputerPermissionSettings(
   permission: ComputerPermission,
 ): Promise<string> {
   const settings = COMPUTER_PERMISSION_SETTINGS[permission];
-  const permissionAppName = productionBuild() ? "Unbiased" : process.env.UNBIASED_DEV_APP_NAME ?? "Electron";
+  const permissionAppName = computerPermissionAppName();
   const devAccessibilityRecovery = permission === "accessibility" && !productionBuild() && permissionAppName === "Unbiased Dev";
   const approvalCommand = devAccessibilityRecovery
     ? `/usr/bin/tccutil reset Accessibility ai.unbiased.desktop.dev && /usr/bin/open ${JSON.stringify(settings.uri)}`
