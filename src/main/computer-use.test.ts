@@ -248,3 +248,47 @@ test("mapping is monotonic across the frame", () => {
     previous = mapped;
   }
 });
+
+// ── Permission messages name the app the user has to find ─────────────────
+// The dev build registers with macOS as "Unbiased Dev". Measured on a real
+// tool result: the first sentence said "allow Unbiased" and the recovery
+// sentence appended after it said "enable Unbiased Dev" -- one message, two
+// different rows to look for, and only one of them exists in the pane.
+
+test("permission failures name the app that is actually in the macOS list", async () => {
+  const service = createComputerUseService({
+    platform: "darwin",
+    appName: () => "Unbiased Dev",
+    getPrimaryDisplay: () => display,
+    capturePrimaryDisplay: async () => {
+      throw new Error("Failed to get sources.");
+    },
+    accessibilityTrusted: () => false,
+    loadNut: async () => {
+      throw new Error("not needed");
+    },
+  });
+  const shot = await service.run({ type: "screenshot" });
+  assert.equal(shot.ok, false);
+  assert.match(shot.message, /allow Unbiased Dev,/);
+  assert.doesNotMatch(shot.message, /allow Unbiased,/);
+  const click = await service.run({ type: "click", point: { x: 1, y: 1 }, button: "left" });
+  assert.equal(click.ok, false);
+  assert.match(click.message, /Accessibility access to Unbiased Dev\b/);
+});
+
+test("with no name configured the messages fall back to the shipped app's", async () => {
+  const service = createComputerUseService({
+    platform: "darwin",
+    getPrimaryDisplay: () => display,
+    capturePrimaryDisplay: async () => {
+      throw new Error("x");
+    },
+    accessibilityTrusted: () => true,
+    loadNut: async () => {
+      throw new Error("not needed");
+    },
+  });
+  const shot = await service.run({ type: "screenshot" });
+  assert.match(shot.message, /allow Unbiased,/);
+});
