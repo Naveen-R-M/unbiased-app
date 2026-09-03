@@ -75,26 +75,27 @@ type Entry =
        *  browser | memory | tool) or "approval" for a card the app itself
        *  raised. Absent on entries persisted before this existed, which is
        *  why the readers below still fall back to text sniffing. */
-      source?: "shell" | "browser" | "memory" | "tool" | "approval";
-      status: string; // inProgress | completed | failed | declined | awaitingApproval | canceled
-      exitCode?: number;
-      output?: string;
-      approval?: {
-        /** The turn behind this card is gone — quitting the app is the usual
-         *  way. Kept visible rather than dropped, because the request really
-         *  was made; it just cannot be answered now. */
-        expired?: boolean;
-        requestId: string;
-        reason: string | null;
-        kind?: "command" | "fileChange" | "mcpTool";
-        grantRoot?: string | null;
-        /** The engine's own wording for the question. codex writes it for MCP
-         *  tool calls and it is the only place the tool's name appears, so it
-         *  is shown verbatim rather than rebuilt here. */
-        message?: string | null;
-        decision?: ApprovalDecision;
-      };
-    };
+     source?: "shell" | "browser" | "memory" | "tool" | "approval" | "computer";
+     status: string; // inProgress | completed | failed | declined | awaitingApproval | canceled
+     exitCode?: number;
+     output?: string;
+     approval?: {
+       /** The turn behind this card is gone — quitting the app is the usual
+        *  way. Kept visible rather than dropped, because the request really
+        *  was made; it just cannot be answered now. */
+       expired?: boolean;
+       requestId: string;
+       reason: string | null;
+      kind?: "command" | "fileChange" | "mcpTool" | "computer";
+      allowForSession?: boolean;
+      grantRoot?: string | null;
+       /** The engine's own wording for the question. codex writes it for MCP
+        *  tool calls and it is the only place the tool's name appears, so it
+        *  is shown verbatim rather than rebuilt here. */
+       message?: string | null;
+       decision?: ApprovalDecision;
+     };
+   };
 
 type ApprovalDecision = "accept" | "acceptForSession" | "decline";
 // "main" or a dynamic side-chat pane ("side:<n>").
@@ -113,6 +114,7 @@ type QueuedMsg = {
   id: number;
   text: string; // display text for the transcript entry
   wire: string; // what actually goes to the engine
+  computer?: boolean; // explicitly prefer desktop tools for this turn
   attachments: Attachment[];
   annotations?: SentAnnotation[];
 };
@@ -418,7 +420,8 @@ type SkillEntry = {
 
 type HeldApproval = {
   requestId: string;
-  kind?: "command" | "fileChange" | "mcpTool";
+  kind?: "command" | "fileChange" | "mcpTool" | "computer";
+  allowForSession?: boolean;
   itemId: string | null;
   command: string;
   cwd: string | null;
@@ -503,6 +506,7 @@ declare global {
         paneId: PaneId,
         text: string,
         attachments?: Attachment[],
+        options?: { computer?: boolean },
       ) => Promise<{ turnId: string | null; threadId: string; created: boolean }>;
       chooseAttachments: () => Promise<{ attachments: Attachment[] }>;
       attachPaths: (paths: string[]) => Promise<{ attachments: Attachment[] }>;
@@ -617,7 +621,8 @@ declare global {
         cb: (p: {
           paneId: PaneId;
           requestId: string;
-          kind?: "command" | "fileChange" | "mcpTool";
+          kind?: "command" | "fileChange" | "mcpTool" | "computer";
+          allowForSession?: boolean;
           itemId: string | null;
           command: string;
           cwd: string | null;
@@ -1243,6 +1248,7 @@ export function App() {
   // screen rect — the nav's overflow would clip an absolute menu at
   // narrow sidebar widths), and the pending confirm dialog.
   const [projMenu, setProjMenu] = useState<{ path: string; x: number; y: number } | null>(null);
+  const [collapsedProjects, setCollapsedProjects] = useState<Set<string>>(new Set());
   const [confirmDialog, setConfirmDialog] = useState<{
     kind: "archive" | "remove";
     path: string;
@@ -2861,12 +2867,21 @@ export function App() {
               <div
                 onMouseEnter={() => setHoveredProject(p.path)}
                 onMouseLeave={() => setHoveredProject(null)}
+                onClick={() =>
+                  setCollapsedProjects((cur) => {
+                    const next = new Set(cur);
+                    if (next.has(p.path)) next.delete(p.path);
+                    else next.add(p.path);
+                    return next;
+                  })
+                }
                 title={p.path}
                 style={{
                   display: "flex",
                   alignItems: "center",
                   gap: 10,
                   width: "100%",
+                  cursor: "pointer",
                   // The project carries the highlight only until its chat has a
                   // thread; from then on the thread row owns it. openThread keeps
                   // the same invariant from the other direction by clearing
@@ -2906,7 +2921,11 @@ export function App() {
                   {p.name}
                 </span>
                 {(hoveredProject === p.path || projMenu?.path === p.path) && (
-                  <span data-projmenu style={{ display: "flex", alignItems: "center", gap: 10, flexShrink: 0 }}>
+                  <span
+                    data-projmenu
+                    onClick={(e) => e.stopPropagation()}
+                    style={{ display: "flex", alignItems: "center", gap: 10, flexShrink: 0 }}
+                  >
                     <button
                       onClick={(e) => {
                         const r = (e.currentTarget as HTMLButtonElement).getBoundingClientRect();
@@ -2945,22 +2964,68 @@ export function App() {
                     </button>
                     {projMenu?.path === p.path && (
                       <div
+                        data-popover
                         style={{
                           position: "fixed",
                           top: projMenu.y,
-                          left: Math.max(8, Math.min(projMenu.x - 210, window.innerWidth - 226)),
-                          width: 210,
-                          background: colors.panel,
-                          border: `1px solid ${colors.border}`,
-                          borderRadius: 12,
+                          left: Math.max(8, Math.min(projMenu.x - 208, window.innerWidth - 224)),
+                          width: 208,
+                          background: "linear-gradient(160deg, color-mix(in srgb, var(--fg) 5%, transparent), transparent 42%), color-mix(in srgb, var(--panel) 91%, transparent)",
+                          border: "1px solid color-mix(in srgb, var(--fg) 12%, transparent)",
+                          borderRadius: 14,
                           padding: 6,
                           zIndex: 60,
-                          boxShadow: "0 8px 24px rgba(0,0,0,0.45)",
+                          boxShadow: "inset 0 1px color-mix(in srgb, var(--fg) 8%, transparent), 0 18px 48px rgba(0,0,0,0.34), 0 3px 10px rgba(0,0,0,0.2)",
+                          backdropFilter: "blur(24px) saturate(1.18)",
+                          WebkitBackdropFilter: "blur(24px) saturate(1.18)",
+                          transformOrigin: "top right",
+                          animation: "unbiased-field-pop 140ms var(--ease-out)",
                         }}
                       >
+                        <div
+                          style={{
+                            display: "flex",
+                            alignItems: "center",
+                            gap: 9,
+                            minWidth: 0,
+                            padding: "5px 8px 8px",
+                          }}
+                        >
+                          <ProjectIcon icon={p.icon} color={p.color} />
+                          <div style={{ minWidth: 0 }}>
+                            <div
+                              style={{
+                                color: colors.dim,
+                                fontSize: 10.5,
+                                fontWeight: 600,
+                                letterSpacing: "0.055em",
+                                lineHeight: 1.2,
+                                textTransform: "uppercase",
+                              }}
+                            >
+                              Project
+                            </div>
+                            <div
+                              style={{
+                                color: "var(--fg-soft)",
+                                fontSize: 12.5,
+                                fontWeight: 500,
+                                lineHeight: 1.35,
+                                overflow: "hidden",
+                                textOverflow: "ellipsis",
+                                whiteSpace: "nowrap",
+                              }}
+                            >
+                              {p.name}
+                            </div>
+                          </div>
+                        </div>
+                        <div style={{ height: 1, margin: "0 7px 4px", background: "color-mix(in srgb, var(--fg) 9%, transparent)" }} />
                         <MenuItem
                           icon={<PencilIcon />}
                           label="Edit project…"
+                          compact
+                          iconSurface
                           onClick={() => {
                             setProjMenu(null);
                             setEditProj({
@@ -2979,6 +3044,8 @@ export function App() {
                         <MenuItem
                           icon={<FolderOutlineIcon size={15} />}
                           label="Reveal in Finder"
+                          compact
+                          iconSurface
                           onClick={() => {
                             setProjMenu(null);
                             void window.unbiased.revealProject(p.path);
@@ -2987,6 +3054,8 @@ export function App() {
                         <MenuItem
                           icon={<ArchiveIcon />}
                           label="Archive chats"
+                          compact
+                          iconSurface
                           disabled={p.threads.length === 0}
                           desc={p.threads.length === 0 ? "No chats" : undefined}
                           onClick={() => {
@@ -2999,9 +3068,13 @@ export function App() {
                             });
                           }}
                         />
+                        <div style={{ height: 1, margin: "4px 7px", background: "color-mix(in srgb, var(--fg) 9%, transparent)" }} />
                         <MenuItem
-                          icon={<CloseIcon />}
+                          icon={<TrashIcon />}
                           label="Remove"
+                          compact
+                          destructive
+                          iconSurface
                           onClick={() => {
                             setProjMenu(null);
                             setConfirmDialog({ kind: "remove", path: p.path, name: p.name, count: 0 });
@@ -3012,7 +3085,7 @@ export function App() {
                   </span>
                 )}
               </div>
-              {p.threads.map((t) => (
+              {!collapsedProjects.has(p.path) && p.threads.map((t) => (
                 <ThreadRow
                   key={t.id}
                   thread={t}
@@ -4791,23 +4864,66 @@ export function App() {
           style={{
             position: "fixed",
             top: threadMenu.y,
-            left: Math.max(8, Math.min(threadMenu.x - 190, window.innerWidth - 206)),
-            width: 190,
-            background: "color-mix(in srgb, var(--panel) 86%, transparent)",
-            border: "1px solid color-mix(in srgb, var(--fg) 10%, transparent)",
-            borderRadius: 11,
-            padding: 5,
+            left: Math.max(8, Math.min(threadMenu.x - 208, window.innerWidth - 224)),
+            width: 208,
+            background: "linear-gradient(160deg, color-mix(in srgb, var(--fg) 5%, transparent), transparent 42%), color-mix(in srgb, var(--panel) 91%, transparent)",
+            border: "1px solid color-mix(in srgb, var(--fg) 12%, transparent)",
+            borderRadius: 14,
+            padding: 6,
             zIndex: 60,
-            boxShadow: "0 14px 36px rgba(0,0,0,0.32), 0 2px 8px rgba(0,0,0,0.22)",
-            backdropFilter: "blur(20px) saturate(1.15)",
-            WebkitBackdropFilter: "blur(20px) saturate(1.15)",
+            boxShadow: "inset 0 1px color-mix(in srgb, var(--fg) 8%, transparent), 0 18px 48px rgba(0,0,0,0.34), 0 3px 10px rgba(0,0,0,0.2)",
+            backdropFilter: "blur(24px) saturate(1.18)",
+            WebkitBackdropFilter: "blur(24px) saturate(1.18)",
             transformOrigin: "top right",
+            animation: "unbiased-field-pop 140ms var(--ease-out)",
           }}
         >
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 9,
+              minWidth: 0,
+              padding: "5px 8px 8px",
+            }}
+          >
+            <span style={{ color: "var(--fg-soft)", display: "flex", flexShrink: 0 }}>
+              <ChatBubbleIcon />
+            </span>
+            <div style={{ minWidth: 0 }}>
+              <div
+                style={{
+                  color: colors.dim,
+                  fontSize: 10.5,
+                  fontWeight: 600,
+                  letterSpacing: "0.055em",
+                  lineHeight: 1.2,
+                  textTransform: "uppercase",
+                }}
+              >
+                Chat
+              </div>
+              <div
+                style={{
+                  color: "var(--fg-soft)",
+                  fontSize: 12.5,
+                  fontWeight: 500,
+                  lineHeight: 1.35,
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                  whiteSpace: "nowrap",
+                }}
+              >
+                {threadMenu.title}
+              </div>
+            </div>
+          </div>
+          <div style={{ height: 1, margin: "0 7px 4px", background: "color-mix(in srgb, var(--fg) 9%, transparent)" }} />
           <MenuItem
             icon={<PencilIcon />}
             label="Rename…"
             compact
+            iconSurface
             onClick={() => {
               setRenameDialog({ id: threadMenu.id, name: threadMenu.title, error: null });
               setThreadMenu(null);
@@ -4818,6 +4934,7 @@ export function App() {
               icon={<FolderOutlineIcon size={15} />}
               label="Move to project…"
               compact
+              iconSurface
               disabled={sidebar.projects.length === 0}
               desc={sidebar.projects.length === 0 ? "No projects yet" : undefined}
               onClick={() => {
@@ -4832,6 +4949,7 @@ export function App() {
             label="Delete"
             compact
             destructive
+            iconSurface
             onClick={() => {
               const id = threadMenu.id;
               setThreadMenu(null);
@@ -7846,6 +7964,10 @@ function ChatPane({
 }) {
   const [entries, setEntries] = useState<Entry[]>(reset.entries);
   const [draft, setDraft] = useState("");
+  // A one-turn preference, like Codex's Computer composer option. Computer
+  // tools remain registered for every thread so natural-language desktop
+  // requests still work without explicitly selecting this first.
+  const [computerSelected, setComputerSelected] = useState(false);
   // The composer grows with its content instead of scrolling a fixed two-row
   // box: a pasted URL wraps to three lines, and hiding two of them behind a
   // scrollbar makes it look like the paste half-failed. Height is measured,
@@ -8158,6 +8280,7 @@ function ChatPane({
         requestId: p.requestId,
         reason: p.reason,
         kind: p.kind,
+        allowForSession: p.allowForSession,
         grantRoot: p.grantRoot,
         message: p.message,
       };
@@ -8249,6 +8372,7 @@ function ChatPane({
     setAnnotations([]);
     setPendingComment(null);
     setQueue([]);
+    setComputerSelected(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [reset.nonce]);
 
@@ -8695,7 +8819,7 @@ function ChatPane({
       return next;
     });
     try {
-      const res = await window.unbiased.sendMessage(paneId, q.wire, q.attachments);
+      const res = await window.unbiased.sendMessage(paneId, q.wire, q.attachments, { computer: q.computer });
       threadIdRef.current = res.threadId;
       onThreadCreated?.(res.threadId, res.created, q.text);
     } catch (err) {
@@ -8710,7 +8834,7 @@ function ChatPane({
     // comments carry the intent even without accompanying prose.
     if ((!text && annotations.length === 0) || !connected) return;
     const anns = annotations;
-    const wire = (
+    const message = (
       anns.length > 0
         ? `Regarding ${anns.length === 1 ? "this excerpt" : "these excerpts"} from the conversation:\n\n` +
           anns
@@ -8723,6 +8847,7 @@ function ChatPane({
           `\n\n${text}`
         : text
     ).trimEnd();
+    const wire = message;
     const sentAttachments = attachments;
     setDraft("");
     setAttachments([]);
@@ -8731,6 +8856,7 @@ function ChatPane({
       id: nextQueueIdRef.current++,
       text,
       wire,
+      computer: computerSelected,
       attachments: sentAttachments,
       annotations:
         anns.length > 0
@@ -8768,6 +8894,7 @@ function ChatPane({
     setDraft(q.text);
     setAttachments(q.attachments);
     if (q.annotations) setAnnotations(q.annotations);
+    setComputerSelected(!!q.computer);
   }
 
   async function decide(itemId: string, requestId: string, decision: ApprovalDecision) {
@@ -9212,7 +9339,7 @@ function ChatPane({
               yet. And anything folded into a work group, which `nested`
               carries — that content is intermediate narration, and a copy row
               per line of it would bury the group it belongs to. */}
-          {e.text && !nested && !(isLast && busy) && (
+          {e.text && !nested && !busy && (
             <AssistantActions text={e.text} at={e.at} />
           )}
         </div>
@@ -9540,6 +9667,16 @@ function ChatPane({
               >
                 Pareto
               </div>
+              <MenuItem
+                icon={<DesktopIcon />}
+                label="Computer"
+                desc="Control Mac apps with Pareto"
+                trailing={<StatePill on={computerSelected} />}
+                onClick={() => {
+                  setComputerSelected((selected) => !selected);
+                  setPlusOpen(false);
+                }}
+              />
               <MenuItem
                 icon={<SkillIcon />}
                 label="Skills"
@@ -9932,6 +10069,29 @@ function ChatPane({
                 >
                   <LightbulbIcon />
                   Plan mode
+                  <CloseIcon />
+                </button>
+              )}
+              {computerSelected && (
+                <button
+                  onClick={() => setComputerSelected(false)}
+                  title="Use computer tools for the next message. Click to remove."
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 7,
+                    background: "var(--chip)",
+                    border: "none",
+                    borderRadius: 999,
+                    padding: "4px 10px",
+                    color: colors.accent,
+                    fontSize: 13.5,
+                    cursor: "pointer",
+                    fontFamily: "inherit",
+                  }}
+                >
+                  <DesktopIcon />
+                  Computer
                   <CloseIcon />
                 </button>
               )}
@@ -15921,6 +16081,14 @@ function ChatPlusIcon({ size = 14, strokeWidth = 2 }: { size?: number; strokeWid
   );
 }
 
+function ChatBubbleIcon() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" style={{ flexShrink: 0 }}>
+      <path d="M21 11.5a8.38 8.38 0 0 1-8.5 8.5 8.5 8.5 0 0 1-3.5-.76L3 21l1.76-6A8.5 8.5 0 1 1 21 11.5Z" />
+    </svg>
+  );
+}
+
 function SideChatIcon() {
   return (
     <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -16044,6 +16212,16 @@ function TerminalIcon({ size = 15 }: { size?: number } = {}) {
       <rect x="3" y="3" width="18" height="18" rx="4" />
       <path d="m7.5 9 3 3-3 3" />
       <path d="M13 15h3.5" />
+    </svg>
+  );
+}
+
+function DesktopIcon({ size = 15 }: { size?: number } = {}) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <rect x="2" y="4" width="20" height="13" rx="2" />
+      <path d="M8 20h8" />
+      <path d="M12 17v3" />
     </svg>
   );
 }
@@ -16478,6 +16656,7 @@ function MenuItem({
   disabled,
   compact,
   destructive,
+  iconSurface,
   trailing,
   onClick,
 }: {
@@ -16487,6 +16666,7 @@ function MenuItem({
   disabled?: boolean;
   compact?: boolean;
   destructive?: boolean;
+  iconSurface?: boolean;
   /** Right-edge slot: a state chip, or a chevron for rows that open a panel.
    *  At full width the right edge is otherwise dead space, and "does this go
    *  somewhere or toggle something?" is exactly what it should answer. */
@@ -16528,8 +16708,19 @@ function MenuItem({
         style={{
           color: disabled ? colors.dim : destructive ? colors.err : "var(--fg-soft)",
           display: "flex",
+          alignItems: "center",
           justifyContent: "center",
-          width: compact ? 16 : 18,
+          width: iconSurface ? 24 : compact ? 16 : 18,
+          height: iconSurface ? 24 : undefined,
+          borderRadius: iconSurface ? 6 : undefined,
+          background: iconSurface
+            ? destructive
+              ? "color-mix(in srgb, var(--accent) 10%, transparent)"
+              : "color-mix(in srgb, var(--fg) 6%, transparent)"
+            : undefined,
+          boxShadow: iconSurface
+            ? `inset 0 0 0 1px color-mix(in srgb, ${destructive ? "var(--accent)" : "var(--fg)"} 5%, transparent)`
+            : undefined,
           flexShrink: 0,
         }}
       >
@@ -16958,7 +17149,8 @@ function PermissionsPrompt({
 }: {
   approval: {
     reason: string | null;
-    kind?: "command" | "fileChange" | "mcpTool";
+    kind?: "command" | "fileChange" | "mcpTool" | "computer";
+    allowForSession?: boolean;
     grantRoot?: string | null;
     message?: string | null;
   };
@@ -17011,7 +17203,9 @@ function PermissionsPrompt({
     // server and the tool. Showing it verbatim keeps the card truthful when
     // the engine changes its phrasing, and avoids inventing a sentence that
     // cannot mention the tool (the request carries no tool field).
-    approval.kind === "mcpTool" ? (
+    approval.kind === "computer" ? (
+      <>Allow Pareto to control this desktop?</>
+    ) : approval.kind === "mcpTool" ? (
       <>{approval.message ?? "Allow Pareto to run this MCP tool?"}</>
     ) : approval.kind === "fileChange" ? (
       rootName ? (
@@ -17085,7 +17279,7 @@ function PermissionsPrompt({
               background: colors.fg,
               color: "var(--bg)",
               border: "none",
-              borderRadius: "999px 0 0 999px",
+              borderRadius: approval.allowForSession === false ? "999px" : "999px 0 0 999px",
               padding: "8px 10px 8px 16px",
               fontSize: 13.5,
               fontWeight: 500,
@@ -17096,6 +17290,7 @@ function PermissionsPrompt({
             Allow once
             <span style={{ opacity: 0.55, fontSize: 12 }}>⏎</span>
           </button>
+          {approval.allowForSession !== false && (
           <button
             onClick={() => setMenuOpen((o) => !o)}
             aria-label="More allow options"
@@ -17116,6 +17311,7 @@ function PermissionsPrompt({
               <path d="m6 9 6 6 6-6" />
             </svg>
           </button>
+          )}
           {menuOpen && (
             <div
               style={{
@@ -17339,6 +17535,13 @@ const isMemoryStep = (e: CommandEntry): boolean => {
   return c.startsWith("save memory") || c.startsWith("forget memory");
 };
 
+/** A desktop control step — screenshot, click, type, key, scroll. Like the
+ *  browser step, keyed on the source the main process sends. */
+const isComputerStep = (e: CommandEntry): boolean => {
+  if (e.source) return e.source === "computer";
+  return false;
+};
+
 /** A real shell command — the only kind that earns monospace, a "Ran" verb
  *  and a `$` prompt under a "Shell" heading. Asserted POSITIVELY from the
  *  source the main process sends: inferring it by elimination dressed MCP
@@ -17346,11 +17549,12 @@ const isMemoryStep = (e: CommandEntry): boolean => {
  *  fabricated `$ Schedule "Daily digest"` claims a shell ran a sentence.
  *  Entries persisted before `source` existed keep the old guess. */
 const isShellStep = (e: CommandEntry): boolean =>
-  e.source ? e.source === "shell" : !isBrowserStep(e) && !isMemoryStep(e);
+  e.source ? e.source === "shell" : !isBrowserStep(e) && !isMemoryStep(e) && !isComputerStep(e);
 
 function stepIcon(e: CommandEntry): React.ReactNode {
   if (isBrowserStep(e)) return <GlobeIcon size={14} />;
   if (isMemoryStep(e)) return <LightbulbIcon />;
+  if (isComputerStep(e)) return <DesktopIcon size={14} />;
   return <TerminalIcon size={14} />;
 }
 
@@ -17415,18 +17619,22 @@ function StepsGroup({
 
   // Browser work says so, and says it about a thing the user can go look at.
   const browsing = items.some(isBrowserStep);
+  // Desktop control steps get their own label too.
+  const computing = items.some(isComputerStep);
   // Same courtesy for memory-only groups: name the action, not the count.
   const memoryLabel = memoryStepsLabel(items);
   const summary = needsApproval
     ? { text: "Needs your approval", color: colors.fg, verb: null as string | null }
     : running
       ? {
-          text: browsing ? "Using" : memoryLabel ? "Updating memory…" : "Working…",
+          text: browsing ? "Using" : memoryLabel ? "Updating memory…" : computing ? "Controlling desktop…" : "Working…",
           color: colors.amber,
           verb: browsing ? "Using" : null,
         }
       : browsing
         ? { text: "Used", color: failed ? colors.err : colors.dim, verb: "Used" }
+        : computing
+          ? { text: "Controlled desktop", color: failed ? colors.err : colors.dim, verb: null }
         : memoryLabel
           ? { text: `${memoryLabel}${failed ? " · issues" : ""}`, color: failed ? colors.err : colors.dim, verb: null }
           : {
@@ -17468,7 +17676,7 @@ function StepsGroup({
               off items[0] put a terminal beside the word "Used" on any mixed
               group — the one case where the header has to summarise. */}
           <span style={{ display: "flex", flexShrink: 0 }}>
-            {stepIcon(browsing ? (items.find(isBrowserStep) ?? items[0]) : items[0])}
+            {stepIcon(browsing ? (items.find(isBrowserStep) ?? items[0]) : computing ? (items.find(isComputerStep) ?? items[0]) : items[0])}
           </span>
           {/* No chevron here: the group already has one as a SIBLING button
               below, kept separate because the browser-name button can sit
@@ -17621,7 +17829,7 @@ function StepsGroup({
                       letterSpacing: "var(--track-overline)",
                     }}
                   >
-                    {isShellStep(e) ? "Shell" : "Output"}
+                    {isShellStep(e) ? "Shell" : isComputerStep(e) ? "Desktop" : "Output"}
                   </div>
                   <pre
                     style={{

@@ -2,6 +2,7 @@ import {
   app,
   BrowserWindow,
   clipboard,
+  desktopCapturer,
   dialog,
   ipcMain,
   Menu,
@@ -9,6 +10,7 @@ import {
   Notification,
   screen,
   shell,
+  systemPreferences,
   WebContentsView,
 } from "electron";
 import type { MenuItemConstructorOptions } from "electron";
@@ -79,6 +81,17 @@ import {
   sidecarLooksInstalled,
 } from "./learning";
 import { spawn as ptySpawn, type IPty } from "@lydell/node-pty";
+import {
+  COMPUTER_PERMISSION_SETTINGS,
+  createComputerUseService,
+  openComputerPermissionSettings,
+  parseComputerAction,
+  requestComputerPermission,
+  type ComputerAction,
+  type ComputerDisplay,
+  type ComputerPermission,
+  type NutRuntime,
+} from "./computer-use";
 
 const engine = new EngineClient();
 let win: BrowserWindow | null = null;
@@ -1129,6 +1142,86 @@ function agentBrowserTools(): typeof AGENT_BROWSER_TOOLS | undefined {
   return agentBrowserBin() ? AGENT_BROWSER_TOOLS : undefined;
 }
 
+const COMPUTER_USE_TOOLS = [
+  {
+    type: "function",
+    name: "computer_screenshot",
+    description:
+      "Capture the primary display and return it as an image. The result states the exact logical coordinate frame to use for later computer actions. This always requires explicit user approval.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    type: "function",
+    name: "computer_move",
+    description:
+      "Move the pointer to logical coordinates on the primary display. Take a fresh computer_screenshot first. This always requires explicit user approval.",
+    inputSchema: {
+      type: "object",
+      properties: { x: { type: "integer" }, y: { type: "integer" } },
+      required: ["x", "y"],
+    },
+  },
+  {
+    type: "function",
+    name: "computer_click",
+    description:
+      "Click explicit logical coordinates on the primary display. Take a fresh computer_screenshot first. This always requires explicit user approval.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        x: { type: "integer" },
+        y: { type: "integer" },
+        button: { type: "string", enum: ["left", "middle", "right"], default: "left" },
+      },
+      required: ["x", "y"],
+    },
+  },
+  {
+    type: "function",
+    name: "computer_type",
+    description:
+      "Type text into the application that currently has keyboard focus. Never use this for passwords or secrets. This always requires explicit user approval.",
+    inputSchema: {
+      type: "object",
+      properties: { text: { type: "string", maxLength: 4000 } },
+      required: ["text"],
+    },
+  },
+  {
+    type: "function",
+    name: "computer_key",
+    description:
+      "Press one supported key, optionally with command, control, option, or shift. This always requires explicit user approval.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        key: { type: "string", description: "A letter, digit, F1-F12, arrow key, Enter, Escape, Tab, Space, Backspace, Delete, Home, End, PageUp, or PageDown." },
+        modifiers: {
+          type: "array",
+          items: { type: "string", enum: ["command", "control", "option", "shift"] },
+        },
+      },
+      required: ["key"],
+    },
+  },
+  {
+    type: "function",
+    name: "computer_scroll",
+    description:
+      "Scroll at explicit logical coordinates on the primary display. Positive deltaY scrolls down; positive deltaX scrolls right. Values are OS scroll steps from -100 to 100. This always requires explicit user approval.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        x: { type: "integer" },
+        y: { type: "integer" },
+        deltaX: { type: "integer", minimum: -100, maximum: 100, default: 0 },
+        deltaY: { type: "integer", minimum: -100, maximum: 100, default: 0 },
+      },
+      required: ["x", "y"],
+    },
+  },
+];
+
 // Scheduling, offered to the model as a dynamic tool — the same extension
 // point the browser uses, so no new machinery is involved.
 //
@@ -1240,11 +1333,12 @@ const SPAWN_GRACE_SECONDS = 2;
  *  only this says which is which. Without it the renderer classified by
  *  string prefix and dressed a scheduling card as a shell command, complete
  *  with a fabricated `$` prompt. */
-type StepSource = "shell" | "browser" | "memory" | "tool";
+type StepSource = "shell" | "browser" | "computer" | "memory" | "tool";
 
 function dynamicToolSource(tool: string | undefined): StepSource {
   const t = tool ?? "";
   if (t.startsWith("browser_")) return "browser";
+  if (t.startsWith("computer_")) return "computer";
   if (t.startsWith("memory_")) return "memory";
   return "tool";
 }
@@ -1263,6 +1357,16 @@ function dynamicToolCommandText(tool: string | undefined, rawArgs: unknown): str
     const name = typeof args.name === "string" && args.name.trim() ? args.name.trim() : "memory";
     return `${t === "memory_save" ? "save memory" : "forget memory"} · ${name}`;
   }
+  if (t === "computer_screenshot") return "capture desktop";
+  if (t === "computer_type") return "type text";
+  if (t === "computer_move") return `move to ${String(args.x)}, ${String(args.y)}`;
+  if (t === "computer_click") return `click at ${String(args.x)}, ${String(args.y)}`;
+  if (t === "computer_key") {
+    const modifiers = Array.isArray(args.modifiers) ? args.modifiers.filter((x): x is string => typeof x === "string") : [];
+    const key = typeof args.key === "string" ? args.key : "key";
+    return `press ${[...modifiers, key].join("+")}`;
+  }
+  if (t === "computer_scroll") return `scroll at ${String(args.x)}, ${String(args.y)}`;
   const argsText = Object.keys(args).length ? ` ${JSON.stringify(args)}` : "";
   return `${t}${argsText}`.slice(0, 400);
 }
@@ -1277,7 +1381,7 @@ function dynamicToolCommandText(tool: string | undefined, rawArgs: unknown): str
  * machine without agent-browser installed.
  */
 function threadDynamicTools(): Record<string, unknown>[] | undefined {
-  const tools = [...SCHEDULE_TOOLS, ...MEMORY_TOOLS, ...(agentBrowserTools() ?? [])];
+  const tools = [...COMPUTER_USE_TOOLS, ...SCHEDULE_TOOLS, ...MEMORY_TOOLS, ...(agentBrowserTools() ?? [])];
   return tools.length ? (tools as Record<string, unknown>[]) : undefined;
 }
 
@@ -1553,6 +1657,241 @@ type DynamicToolResponse = {
   contentItems: ({ type: "inputText"; text: string } | { type: "inputImage"; imageUrl: string })[];
   success: boolean;
 };
+
+function primaryComputerDisplay(): ComputerDisplay {
+  const display = screen.getPrimaryDisplay();
+  return {
+    id: display.id,
+    bounds: display.bounds,
+    size: display.size,
+    scaleFactor: display.scaleFactor,
+  };
+}
+
+let restoreComputerWindow = false;
+let screenPermissionEstablished = false;
+const computerUse = createComputerUseService({
+  getPrimaryDisplay: primaryComputerDisplay,
+  capturePrimaryDisplay: async (display) => {
+    const permission = systemPreferences.getMediaAccessStatus("screen");
+    if (permission !== "granted") screenPermissionEstablished = false;
+    const sources = await desktopCapturer.getSources({
+      types: ["screen"],
+      thumbnailSize: display.size,
+      fetchWindowIcons: false,
+    });
+    const source = sources.find((candidate) => candidate.display_id === String(display.id));
+    if (!source) throw new Error("The primary display was not returned by Electron.");
+    const image = source.thumbnail.resize(display.size);
+    if (image.isEmpty()) throw new Error("Electron returned an empty desktop image.");
+    screenPermissionEstablished = true;
+    return { dataUrl: image.toDataURL(), ...image.getSize() };
+  },
+  accessibilityTrusted: (prompt) => systemPreferences.isTrustedAccessibilityClient(prompt),
+  loadNut: async () => (await import("@nut-tree-fork/nut-js")) as unknown as NutRuntime,
+  beforeAction: async () => {
+    if (!screenPermissionEstablished) return;
+    restoreComputerWindow = !!win?.isVisible();
+    if (!restoreComputerWindow || !win) return;
+    win.hide();
+    await new Promise((resolve) => setTimeout(resolve, 120));
+  },
+  afterAction: () => {
+    if (restoreComputerWindow && win && !win.isDestroyed()) win.showInactive();
+    restoreComputerWindow = false;
+  },
+});
+
+function computerApprovalCommand(action: ComputerAction): string {
+  switch (action.type) {
+    case "screenshot": return "Capture the primary display";
+    case "move": return `Move the pointer to (${action.point.x}, ${action.point.y})`;
+    case "click": return `${action.button[0].toUpperCase()}${action.button.slice(1)} click at (${action.point.x}, ${action.point.y})`;
+    case "type": return `Type ${action.text.length} character${action.text.length === 1 ? "" : "s"}`;
+    case "key": return `Press ${[...action.modifiers, action.key].join("+")}`;
+    case "scroll": return `Scroll at (${action.point.x}, ${action.point.y}) by (${action.deltaX}, ${action.deltaY})`;
+  }
+}
+
+function devAccessibilityRecoveryMarker(): string {
+  return join(app.getPath("userData"), "dev-accessibility-recovery.json");
+}
+
+function scheduleDevAccessibilityRecovery(): void {
+  const nodeExecutable = process.env.npm_node_execpath;
+  const appPath = app.getAppPath();
+  const helperPath = join(appPath, "build", "dev-accessibility-relaunch.cjs");
+  const launcherPath = join(appPath, "build", "dev-launcher.cjs");
+  if (!nodeExecutable || !existsSync(nodeExecutable)) {
+    throw new Error("The Node.js executable used by the dev server could not be found.");
+  }
+  if (!existsSync(helperPath) || !existsSync(launcherPath)) {
+    throw new Error("The Unbiased Dev relaunch helper could not be found.");
+  }
+  const rendererUrl = process.env.ELECTRON_RENDERER_URL ?? "";
+  let port = 5173;
+  try {
+    port = Number(new URL(rendererUrl).port) || port;
+  } catch {
+    // The launcher falls back to its standard development port.
+  }
+  const helper = spawnProcess(
+    nodeExecutable,
+    [
+      helperPath,
+      JSON.stringify({
+        pid: process.pid,
+        bundleIdentifier: "ai.unbiased.desktop.dev",
+        bundlePath: dirname(dirname(dirname(process.execPath))),
+        appPath,
+        launcherPath,
+        markerPath: devAccessibilityRecoveryMarker(),
+        rendererUrl,
+        port,
+      }),
+    ],
+    { detached: true, stdio: "ignore", env: { ...process.env } },
+  );
+  helper.unref();
+  setTimeout(() => {
+    app.quit();
+    setTimeout(() => app.exit(0), 4_000).unref();
+  }, 650).unref();
+}
+
+async function completeDevAccessibilityRecovery(): Promise<void> {
+  if (app.isPackaged || (process.env.UNBIASED_DEV_APP_NAME ?? "") !== "Unbiased Dev") return;
+  const markerPath = devAccessibilityRecoveryMarker();
+  if (!existsSync(markerPath)) return;
+  let recoveryError = "";
+  try {
+    const marker = JSON.parse(readFileSync(markerPath, "utf8")) as { error?: unknown };
+    recoveryError = typeof marker.error === "string" ? marker.error : "";
+  } catch {
+    // A malformed marker still means the permission flow needs finishing.
+  }
+  rmSync(markerPath, { force: true });
+  if (recoveryError) {
+    console.error(`[computer-use] dev Accessibility recovery failed before relaunch: ${recoveryError}`);
+  }
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  if (win && !win.isDestroyed()) {
+    win.show();
+    win.focus();
+    app.focus({ steal: true });
+  }
+  try {
+    console.info("[computer-use] requesting native Accessibility registration after dev relaunch");
+    const status = await requestComputerPermission("accessibility", async () => {
+      const permissionModule = await import("node-mac-permissions");
+      return permissionModule.default;
+    });
+    console.info(`[computer-use] native Accessibility registration returned status=${status}`);
+    systemPreferences.isTrustedAccessibilityClient(true);
+    await openComputerPermissionSettings("accessibility", (uri) => shell.openExternal(uri));
+    console.info(`[computer-use] completed dev Accessibility recovery; status=${status}`);
+  } catch (err) {
+    console.error("[computer-use] could not complete dev Accessibility recovery:", err);
+  }
+}
+
+async function offerComputerPermissionSettings(
+  threadId: string | null,
+  permission: ComputerPermission,
+): Promise<string> {
+  const settings = COMPUTER_PERMISSION_SETTINGS[permission];
+  const permissionAppName = app.isPackaged ? "Unbiased" : process.env.UNBIASED_DEV_APP_NAME ?? "Electron";
+  const devAccessibilityRecovery = permission === "accessibility" && !app.isPackaged && permissionAppName === "Unbiased Dev";
+  const approvalCommand = devAccessibilityRecovery
+    ? `/usr/bin/tccutil reset Accessibility ai.unbiased.desktop.dev && /usr/bin/open ${JSON.stringify(settings.uri)}`
+    : `/usr/bin/open ${JSON.stringify(settings.uri)}`;
+  const approvalReason = devAccessibilityRecovery
+    ? [
+        "The enabled Unbiased Dev row may belong to an older dev-app signature, which macOS treats as a different app.",
+        "Allow clearing only the Accessibility decision for ai.unbiased.desktop.dev, registering this running build, and opening Settings?",
+        "You still make the final permission decision in macOS. Use Quit & Reopen if macOS offers it.",
+      ].join("\n")
+    : [
+        `${settings.label} access is blocked. Allow opening the exact macOS Privacy & Security pane?`,
+        "macOS keeps the final permission decision with you; Unbiased can only show the native prompt or open Settings.",
+        `Enable ${permissionAppName}, then restart the app.`,
+      ].join("\n");
+  const decision = await requestLocalApproval(
+    threadId,
+    approvalCommand,
+    approvalReason,
+    { allowForSession: false },
+  );
+  if (decision === "decline") return " The user declined to open System Settings.";
+  try {
+    if (win && !win.isDestroyed()) {
+      win.show();
+      win.focus();
+      app.focus({ steal: true });
+    }
+    if (devAccessibilityRecovery) {
+      scheduleDevAccessibilityRecovery();
+      return " Restarting Unbiased Dev to replace the stale macOS Accessibility identity. After it reopens, macOS will register this exact build and open Accessibility automatically.";
+    }
+    const status = await requestComputerPermission(
+      permission,
+      async () => {
+        const permissionModule = await import("node-mac-permissions");
+        return permissionModule.default;
+      },
+    );
+    console.info(`[computer-use] requested macOS ${permission} permission; status=${status}`);
+    await openComputerPermissionSettings(permission, (uri) => shell.openExternal(uri));
+    console.info(`[computer-use] opened macOS ${permission} privacy settings`);
+    return devAccessibilityRecovery
+      ? ` Cleared the stale dev permission and registered this build. Enable ${permissionAppName} in Accessibility, then use Quit & Reopen if macOS offers it.`
+      : ` Opened System Settings > Privacy & Security > ${settings.label}; enable ${permissionAppName} there, then restart this app.`;
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    return ` Could not open System Settings: ${detail}`;
+  }
+}
+
+async function handleComputerUseCall(
+  tool: string,
+  rawArgs: unknown,
+  threadId: string | null,
+): Promise<DynamicToolResponse> {
+  let action: ComputerAction;
+  try {
+    action = parseComputerAction(tool, rawArgs, computerUse.getPrimaryDisplay());
+  } catch (err) {
+    return { contentItems: [{ type: "inputText", text: err instanceof Error ? err.message : String(err) }], success: false };
+  }
+  const decision = await requestLocalApproval(
+    threadId,
+    computerApprovalCommand(action),
+    [
+      "This gives Pareto one-time access to the primary display or desktop input.",
+      "Visible desktop content and the action result may be added to this conversation and sent to the model.",
+      "Review the action carefully, especially before typing or clicking in another app.",
+    ].join("\n"),
+    { allowForSession: false, kind: "computer" },
+  );
+  if (decision === "decline") {
+    return {
+      contentItems: [{ type: "inputText", text: "The user declined this computer action. Do not retry it unless they ask." }],
+      success: false,
+    };
+  }
+  const result = await computerUse.run(action);
+  const recovery = !result.ok && result.permission
+    ? await offerComputerPermissionSettings(threadId, result.permission)
+    : "";
+  return {
+    contentItems: [
+      { type: "inputText", text: result.message + recovery },
+      ...(result.ok && result.screenshot ? [{ type: "inputImage" as const, imageUrl: result.screenshot.dataUrl }] : []),
+    ],
+    success: result.ok,
+  };
+}
+
 async function handleAgentBrowserCall(
   tool: string,
   rawArgs: unknown,
@@ -2362,6 +2701,10 @@ const PLAN_DIRECTIVE =
   "any action with side effects — research read-only. Produce a concrete " +
   "implementation plan: numbered steps, the files to change and how, risks, " +
   "and open questions. End by asking whether to proceed with the plan.";
+
+const COMPUTER_DIRECTIVE =
+  "COMPUTER is selected for this turn. Use the computer tools when desktop interaction helps complete the request. " +
+  "Every desktop action still requires explicit user approval.";
 
 // Work-in mode for NEW project chats: the live checkout, or an isolated
 // git worktree created per conversation (agent works on its own branch,
@@ -3600,7 +3943,12 @@ let nextEngineApproval = 1;
  *  wait for the human. Routed exactly like an engine approval: a sub-agent's
  *  request surfaces in its PARENT's pane, and a backgrounded conversation
  *  holds it until reopened. */
-function requestLocalApproval(threadId: string | null, command: string, reason: string): Promise<ApprovalDecision> {
+function requestLocalApproval(
+  threadId: string | null,
+  command: string,
+  reason: string,
+  options: { allowForSession?: boolean; kind?: "command" | "computer" } = {},
+): Promise<ApprovalDecision> {
   const requestId = `apr_${APPROVAL_BOOT}_local_${nextLocalApproval++}`;
   return new Promise((resolve) => {
     pendingApprovals.set(requestId, { kind: "local", threadId, settle: resolve });
@@ -3608,11 +3956,12 @@ function requestLocalApproval(threadId: string | null, command: string, reason: 
     const target = sub ? sub.parent : threadId;
     const payload: Record<string, unknown> = {
       requestId,
-      kind: "command",
+      kind: options.kind ?? "command",
       itemId: requestId,
       command,
       cwd: null,
       reason,
+      allowForSession: options.allowForSession ?? true,
       ...(sub ? { agentName: sub.name } : {}),
     };
     const paneId = target ? paneForThread(target) : null;
@@ -4497,7 +4846,9 @@ function wireNotifications(): void {
           ? handleScheduleToolCall(tool, args, approvalThread)
           : tool.startsWith("memory_")
             ? handleMemoryToolCall(tool, args, approvalThread)
-            : handleAgentBrowserCall(tool, args, approvalThread);
+            : tool.startsWith("computer_")
+              ? handleComputerUseCall(tool, args, approvalThread)
+              : handleAgentBrowserCall(tool, args, approvalThread);
         void call
           .catch((err) => ({
             contentItems: [{ type: "inputText" as const, text: `tool crashed: ${String(err)}` }],
@@ -5447,8 +5798,9 @@ app.whenReady().then(async () => {
     paneId: PaneId;
     text: string;
     attachments?: { name: string; path: string; kind?: "image" }[];
+    computer?: boolean;
   }) => {
-    const { paneId, text, attachments } = payload;
+    const { paneId, text, attachments, computer } = payload;
     const pane = ensurePane(paneId);
     let created = false;
     if (!pane.threadId) {
@@ -5551,6 +5903,7 @@ app.whenReady().then(async () => {
         input.push({ type: "mention", name: a.name, path: a.path });
       }
     }
+    if (computer) input.unshift({ type: "text", text: COMPUTER_DIRECTIVE });
     if (planMode) input.unshift({ type: "text", text: PLAN_DIRECTIVE });
     const result = (await engine.request("turn/start", {
       threadId: pane.threadId,
@@ -9011,6 +9364,7 @@ app.whenReady().then(async () => {
   });
 
   createWindow();
+  void completeDevAccessibilityRecovery();
   // Check for updates shortly after launch (let the window settle first),
   // then on a slow timer — a desktop app can stay open for days.
   // Before the first check, so a bundle staged by a previous run is offered

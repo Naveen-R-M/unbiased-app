@@ -1,10 +1,10 @@
 {
   "name": "unbiased-app",
-  "version": "1.8.1",
-  "description": "Unbiased desktop \u2014 Pareto-powered coding agent",
+  "version": "1.8.2",
+  "description": "Unbiased desktop — Pareto-powered coding agent",
   "main": "out/main/index.js",
   "scripts": {
-    "dev": "electron-vite dev",
+    "dev": "node build/dev-launcher.cjs",
     "build": "electron-vite build",
     "typecheck": "tsc --noEmit",
     "dist": "electron-vite build && electron-builder --publish never",
@@ -42,7 +42,10 @@
       }
     ],
     "asarUnpack": [
-      "node_modules/@lydell/node-pty/**"
+      "node_modules/@lydell/node-pty/**",
+      "node_modules/@nut-tree-fork/libnut-darwin/**",
+      "node_modules/@nut-tree-fork/node-mac-permissions/**",
+      "node_modules/node-mac-permissions/**"
     ],
     "npmRebuild": false,
     "afterPack": "build/adhoc-sign.cjs",
@@ -68,8 +71,10 @@
   "type": "commonjs",
   "dependencies": {
     "@lydell/node-pty": "^1.2.0-beta.15",
+    "@nut-tree-fork/nut-js": "^4.2.6",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/xterm": "^6.0.0",
+    "node-mac-permissions": "^2.5.0",
     "prismjs": "^1.30.0",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
@@ -93,7 +98,8 @@
   "allowScripts": {
     "electron@43.4.0": true,
     "esbuild@0.25.12": true,
-    "esbuild@0.28.2": true
+    "esbuild@0.28.2": true,
+    "node-mac-permissions@2.5.0": true
   },
   "private": true
 }

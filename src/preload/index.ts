@@ -34,8 +34,12 @@ contextBridge.exposeInMainWorld("unbiased", {
   authDeviceWait: () => ipcRenderer.invoke("auth:device-wait"),
   authDeviceCancel: () => ipcRenderer.invoke("auth:device-cancel"),
 
-  sendMessage: (paneId: string, text: string, attachments?: { name: string; path: string; kind?: string }[]) =>
-    ipcRenderer.invoke("chat:send", { paneId, text, attachments }),
+  sendMessage: (
+    paneId: string,
+    text: string,
+    attachments?: { name: string; path: string; kind?: string }[],
+    options?: { computer?: boolean },
+  ) => ipcRenderer.invoke("chat:send", { paneId, text, attachments, computer: options?.computer }),
   chooseAttachments: () => ipcRenderer.invoke("attach:choose"),
   attachPaths: (paths: string[]) => ipcRenderer.invoke("attach:paths", { paths }),
   clipboardImage: () => ipcRenderer.invoke("attach:clipboard-image"),
