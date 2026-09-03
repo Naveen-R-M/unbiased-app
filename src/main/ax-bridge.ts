@@ -89,20 +89,19 @@ export function axConsent(opts: { tool: string; mode: "ask" | "auto" | "full"; g
   return opts.granted ? "allow" : "ask";
 }
 
-/** Nothing needs the app in front. The Accessibility API reads and presses
- *  background apps on any Space, and a key event posted to the pid reaches one
- *  too — verified against a backgrounded Brave, which stayed backgrounded.
- *
- *  Kept as a function rather than deleted because the question it asks ("does
- *  this steal the user's screen?") is the one to ask of any new action. */
-export function axNeedsFocus(_tool: string, _args: Record<string, unknown>): boolean {
-  return false;
+/** Whether an action takes over the user's screen. Reading and pressing never
+ *  do: the Accessibility API works on background apps, and a key posted to the
+ *  pid reaches one — both verified against a backgrounded Brave that stayed
+ *  backgrounded. Raising is the sole exception, and it exists because an app
+ *  whose every window is on another Space is not in the tree at all. */
+export function axNeedsFocus(tool: string, _args: Record<string, unknown>): boolean {
+  return tool === "computer_raise";
 }
 
 /** The app a computer step acted on, so the transcript can show that app's own
  *  icon instead of a generic terminal glyph. */
 export function appOfStep(tool: string, args: Record<string, unknown>): string | null {
-  if (tool !== "computer_app_state" && tool !== "computer_act") return null;
+  if (tool !== "computer_app_state" && tool !== "computer_act" && tool !== "computer_raise") return null;
   const app = typeof args.app === "string" ? args.app.trim() : "";
   return app || null;
 }
@@ -213,6 +212,8 @@ export function describeAxAction(tool: string, rawArgs: unknown, lines?: Map<num
       return "List running apps";
     case "computer_app_state":
       return `Read the UI of ${app}`;
+    case "computer_raise":
+      return `Bring ${app} to the front`;
     case "computer_act": {
       const id = typeof a.id === "number" ? a.id : null;
       const line = id !== null ? lines?.get(id) ?? null : null;

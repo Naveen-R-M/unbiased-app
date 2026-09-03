@@ -198,11 +198,20 @@ test("listing apps is never gated: it names apps and touches nothing", () => {
 // to a backgrounded Brave was verified not to change the frontmost app).
 // A capability the model cannot be talked out of using is one to remove.
 
-test("nothing needs the app in front any more", () => {
+test("reading and acting never need the app in front", () => {
   for (const args of [{ app: "Brave", key: "space" }, { app: "Brave", key: "space", id: 774 }, { app: "Brave", id: 1, action: "press" }]) {
     assert.equal(axNeedsFocus("computer_act", args), false, JSON.stringify(args));
   }
-  assert.equal(axNeedsFocus("computer_raise", {}), false, "computer_raise no longer exists");
+  assert.equal(axNeedsFocus("computer_app_state", { app: "Brave" }), false);
+});
+
+test("raise is the one thing that takes the screen, and it exists again", () => {
+  // Removing it was an over-correction. With every window of an app on another
+  // Space, the tree is the menu bar and nothing else — raising is the only way
+  // in, and without it the model spent six minutes failing to find one.
+  assert.equal(axNeedsFocus("computer_raise", { app: "Brave" }), true);
+  assert.equal(describeAxAction("computer_raise", { app: "Brave" }), "Bring Brave to the front");
+  assert.equal(appOfStep("computer_raise", { app: "Brave" }), "Brave", "a raise step wears the app's icon too");
 });
 
 // ── The app a step touched ─────────────────────────────────────────────────

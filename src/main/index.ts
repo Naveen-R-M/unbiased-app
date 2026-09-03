@@ -1247,7 +1247,7 @@ const COMPUTER_USE_TOOLS = [
 // by element id. Declared only while the bridge is running — see
 // threadDynamicTools. Measured against real Brave: the task that took the
 // screenshot tools 27 calls and 6.7 minutes took this path 8 calls and 9.3s.
-const AX_TOOL_NAMES = new Set(["computer_apps", "computer_app_state", "computer_act"]);
+const AX_TOOL_NAMES = new Set(["computer_apps", "computer_app_state", "computer_raise", "computer_act"]);
 const AX_TOOLS = [
   {
     type: "function",
@@ -1263,7 +1263,7 @@ const AX_TOOLS = [
       "Reach for this BEFORE computer_screenshot: it answers what is on screen, which tab is selected, and where a control is, as text. "
       + "It works on a BACKGROUND app on any Space and never takes over the user's screen. " +
       "Ids are stable per app until an element disappears. After the first read of an app the result is a DIFF (~ changed, + added, removed by id) unless full=true. " +
-      "Windows reported as offscreen can still be read and pressed exactly where they are; there is no way to bring an app forward and no need to. Pass query to search for one control by title instead of reading everything. " +
+      "If the result says every window is on another Space, the app is NOT in the tree — call computer_raise once, then read again. If windows ARE listed, work with them and do not raise. Pass query to search for one control by title instead of reading everything. " +
       "Web page content inside a browser needs web=true. Use computer_screenshot when you need to SEE something the tree cannot express — whether a video is actually playing, a canvas, a rendered chart — and one confirming screenshot at the end of a visual task is worth taking.",
     inputSchema: {
       type: "object",
@@ -1278,6 +1278,13 @@ const AX_TOOLS = [
       },
       required: ["app"],
     },
+  },
+  {
+    type: "function",
+    name: "computer_raise",
+    description:
+      "Bring an app to the front, switching Spaces if its windows are elsewhere. This TAKES OVER the user's screen, so use it in exactly one case: computer_app_state reported that every window of the app is on another Space, which means the app is not in the tree and cannot be read or acted on until it is raised. Never raise to read or press an app whose windows are already listed. This always requires explicit user approval.",
+    inputSchema: { type: "object", properties: { app: { type: "string" } }, required: ["app"] },
   },
   {
     type: "function",
@@ -1436,6 +1443,7 @@ function dynamicToolCommandText(tool: string | undefined, rawArgs: unknown): str
     return `${t === "memory_save" ? "save memory" : "forget memory"} · ${name}`;
   }
   if (t === "computer_apps") return "list apps";
+  if (t === "computer_raise") return `raise ${String(args.app)}`;
   if (t === "computer_app_state") return typeof args.query === "string" ? `find "${args.query}" in ${String(args.app)}` : `read ${String(args.app)}`;
   if (t === "computer_act") {
     if (typeof args.key === "string") return `press ${args.key} in ${String(args.app)}`;
@@ -2040,6 +2048,12 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         const r = await ax.request("apps", {}, 3_000);
         const apps = (r.apps as { name: string; bundleId?: string; frontmost: boolean }[]) ?? [];
         return axText(apps.map((x) => `${x.name}${x.frontmost ? " [frontmost]" : ""}${x.bundleId ? ` (${x.bundleId})` : ""}`).join("\n") || "(no apps)", true);
+      }
+      case "computer_raise": {
+        const r = await ax.request("raise", { app: appName });
+        const diff = String(r.diff ?? "");
+        remember(diff);
+        return axText(`${appName} is in front and its windows are now readable.\n${diff}`, true);
       }
       case "computer_app_state": {
         const w = await ax.request("windows", { app: appName }, 3_000);
