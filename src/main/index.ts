@@ -17,21 +17,7 @@ import type { MenuItemConstructorOptions } from "electron";
 import type { NativeImage } from "electron";
 import { dirname, isAbsolute, join, relative } from "node:path";
 import { homedir, hostname } from "node:os";
-import {
-  closeSync,
-  cpSync,
-  existsSync,
-  mkdirSync,
-  mkdtempSync,
-  openSync,
-  readdirSync,
-  readFileSync,
-  readSync,
-  renameSync,
-  rmSync,
-  statSync,
-  writeFileSync,
-} from "node:fs";
+import { appendFileSync, closeSync, cpSync, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import { startSecretProxy, type SecretConnector } from "./oauth-proxy";
@@ -1986,7 +1972,7 @@ async function reassertRaise(root: string): Promise<void> {
   const appName = axRaised.get(root);
   if (!appName || !ax?.alive) return;
   try {
-    console.log(`[ax] raise ${appName} (re-assert after an approval card)`);
+    axLog(`raise ${appName} (re-assert after an approval card)`);
     await ax.request("raise", { app: appName }, 3_000);
   } catch {
     // the app may have quit; the next read will say so plainly
@@ -1999,6 +1985,17 @@ const axLines = new Map<string, Map<number, string>>();
  *  shows it beside each step, so "press #643 in Brave" carries Brave's icon
  *  rather than a terminal glyph. */
 const axIcons = new Map<string, string>();
+
+/** Diagnostics go to a FILE, not console.log: the dev launcher runs the app
+ *  through `open -W -n`, which discards stdout, so an instrumented run this
+ *  week produced an empty log and told us nothing. */
+function axLog(line: string): void {
+  try {
+    appendFileSync("/tmp/unbiased-ax-diag.log", `${new Date().toISOString().slice(11, 23)} ${line}\n`);
+  } catch {
+    // diagnostics must never break a turn
+  }
+}
 
 /** The icon for a step, if we have already fetched it. Synchronous on purpose:
  *  a transcript row must not wait on IPC, and the icon arrives on the next
@@ -2036,7 +2033,7 @@ async function startAxBridge(): Promise<void> {
   try {
     const hello = await client.start();
     ax = client;
-    console.log(`[ax] bridge ${hello.version} ready (${hello.trusted ? "trusted" : "NOT trusted: Accessibility not granted"})`);
+    axLog(`bridge ${hello.version} ready (${hello.trusted ? "trusted" : "NOT trusted: Accessibility not granted"})`);
   } catch (err) {
     console.warn(`[ax] handshake failed: ${String(err)}`);
     client.stop();
@@ -2087,7 +2084,7 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         return axText(apps.map((x) => `${x.name}${x.frontmost ? " [frontmost]" : ""}${x.bundleId ? ` (${x.bundleId})` : ""}`).join("\n") || "(no apps)", true);
       }
       case "computer_raise": {
-        console.log(`[ax] raise ${appName} (the model asked)`);
+        axLog(`raise ${appName} (the model asked)`);
         axRaised.set(root, appName);
         const r = await ax.request("raise", { app: appName });
         const diff = String(r.diff ?? "");
@@ -2104,7 +2101,7 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
           offscreen: Number(w.offscreen ?? 0),
           raisedBefore: axRaised.get(root) === appName,
         })) {
-          console.log(`[ax] raise ${appName} (auto: read found 0 windows here, ${String(w.offscreen)} offscreen)`);
+          axLog(`raise ${appName} (auto: read found 0 windows here, ${String(w.offscreen)} offscreen)`);
           await ax.request("raise", { app: appName }, 5_000);
           w = await ax.request("windows", { app: appName }, 3_000);
         }
@@ -2135,7 +2132,7 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         return axText(`${head}\n\n${label} (${String(r.count)} elements${r.truncated ? ", truncated — use query or depth" : ""}):\n${body}`, true);
       }
       case "computer_act": {
-        console.log(`[ax] act ${appName} ${JSON.stringify({ id: a.id, action: a.action, key: a.key, value: typeof a.value === "string" ? "<set>" : undefined })}`);
+        axLog(`act ${appName} ${JSON.stringify({ id: a.id, action: a.action, key: a.key, value: typeof a.value === "string" ? "<set>" : undefined })}`);
         const modes = ["action", "value", "key"].filter((k) => a[k] !== undefined);
         if (modes.length !== 1) return axText("Pass exactly one of action, value, or key.", false);
         let r;
