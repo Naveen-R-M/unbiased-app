@@ -14,7 +14,7 @@ const defaultAppRoot = join(launcherRoot, "default-app");
 const defaultAppAsar = join(launcherApp, "Contents", "Resources", "default_app.asar");
 const version = require(join(root, "node_modules", "electron", "package.json")).version;
 const markerPath = join(launcherRoot, "version");
-const launcherRevision = "8";
+const launcherRevision = "9";
 
 function run(command, args) {
   const result = require("node:child_process").spawnSync(command, args, { stdio: "inherit" });
@@ -98,7 +98,19 @@ function prepareMacLauncher() {
       'entry="$1"',
       "shift",
       `if [ "$entry" = "." ]; then entry=${JSON.stringify(root)}; fi`,
-      `exec /usr/bin/open -W -n ${JSON.stringify(launcherApp)} --env ELECTRON_RENDERER_URL --env NODE_ENV_ELECTRON_VITE --env UNBIASED_DEV_APP_NAME --args "$entry" "$@"`,
+      // `open --env NAME` does NOT forward the current value: its own help
+      // says a bare NAME sets "a null string value". Every variable arrived
+      // in the app as "", which is why the app could not tell it was a dev
+      // run and looked for the engine inside its own bundle. The values have
+      // to be written out as NAME=VALUE.
+      `exec /usr/bin/open -W -n ${JSON.stringify(launcherApp)} \\`,
+      `  --env "ELECTRON_RENDERER_URL=$ELECTRON_RENDERER_URL" \\`,
+      `  --env "NODE_ENV_ELECTRON_VITE=$NODE_ENV_ELECTRON_VITE" \\`,
+      `  --env "UNBIASED_DEV_APP_NAME=$UNBIASED_DEV_APP_NAME" \\`,
+      // Not set by the launcher, but the engine path cannot be resolved from
+      // a git worktree without it — see resolveEngineDir.
+      `  --env "UNBIASED_ENGINE_DIR=$UNBIASED_ENGINE_DIR" \\`,
+      `  --args "$entry" "$@"`,
       "",
     ].join("\n"),
     { mode: 0o755 },
