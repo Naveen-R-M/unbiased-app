@@ -1,4 +1,17 @@
 export const COMPUTER_TEXT_LIMIT = 4_000;
+/** The long edge a screenshot is delivered at. Vision models downsample past
+ *  roughly this, so a full-resolution capture spends megabytes on detail the
+ *  model never sees. Measured on a 3840x2160 display: one screenshot was
+ *  4.15MB of base64 PNG, and four of them took a conversation to 10.2MB and
+ *  a "413 Payload Too Large" from the API, because the whole rollout is
+ *  re-sent every turn. */
+export const COMPUTER_CAPTURE_MAX_EDGE = 1568;
+/** Screenshots go out as JPEG, not PNG. Measured on one real 2048x1152
+ *  desktop capture from a failing session: PNG was 4.15MB of base64 and
+ *  capping it to 1568px only reached 2.66MB -- four of those still exceed the
+ *  API's body limit. The same frame as JPEG q85 is 0.48MB, 8.6x smaller, and
+ *  softened text costs nothing a vision model needs to locate a button. */
+export const COMPUTER_CAPTURE_JPEG_QUALITY = 85;
 export const COMPUTER_SCROLL_LIMIT = 100;
 
 export type ComputerPoint = { x: number; y: number };
@@ -13,6 +26,9 @@ export type ComputerScreenshot = {
   width: number;
   height: number;
 };
+/** The pixel frame the model is shown. Tool-call coordinates are in THIS
+ *  frame, never in display space — desktopPoint is the only way back. */
+export type CaptureFrame = { width: number; height: number };
 export type ComputerMouseButton = "left" | "middle" | "right";
 export type ComputerModifier = "command" | "control" | "option" | "shift";
 
@@ -98,7 +114,7 @@ export type NutRuntime = {
 export type ComputerUseDependencies = {
   platform?: NodeJS.Platform;
   getPrimaryDisplay: () => ComputerDisplay;
-  capturePrimaryDisplay: (display: ComputerDisplay) => Promise<ComputerScreenshot>;
+  capturePrimaryDisplay: (display: ComputerDisplay, frame: CaptureFrame) => Promise<ComputerScreenshot>;
   accessibilityTrusted: (prompt: boolean) => boolean;
   loadNut: () => Promise<NutRuntime>;
   beforeAction?: () => Promise<void> | void;
@@ -151,19 +167,46 @@ function integer(value: unknown, field: string): number {
   return value;
 }
 
+/** Both the size to capture at and the coordinate space the model works in.
+ *  Derived from the display rather than passed around, so the frame used to
+ *  validate a coordinate cannot drift from the frame used to place a click. */
+export function captureFrameFor(display: ComputerDisplay): CaptureFrame {
+  const { width, height } = display.size;
+  const longest = Math.max(width, height);
+  if (longest <= COMPUTER_CAPTURE_MAX_EDGE) return { width, height };
+  const ratio = COMPUTER_CAPTURE_MAX_EDGE / longest;
+  // Floored: the frame must never claim a row or column the display lacks.
+  return { width: Math.max(1, Math.floor(width * ratio)), height: Math.max(1, Math.floor(height * ratio)) };
+}
+
 export function validatePoint(raw: Record<string, unknown>, display: ComputerDisplay): ComputerPoint {
   const x = integer(raw.x, "x");
   const y = integer(raw.y, "y");
-  if (x < 0 || x >= display.size.width || y < 0 || y >= display.size.height) {
+  // Against the FRAME, not the display: the model only ever saw the frame, so
+  // a larger coordinate is a mistake on its part. Scaling it anyway would
+  // click somewhere the model never looked.
+  const frame = captureFrameFor(display);
+  if (x < 0 || x >= frame.width || y < 0 || y >= frame.height) {
     throw new Error(
-      `Coordinates (${x}, ${y}) are outside the primary display. Use x=0..${display.size.width - 1}, y=0..${display.size.height - 1}.`,
+      `Coordinates (${x}, ${y}) are outside the screenshot. Use x=0..${frame.width - 1}, y=0..${frame.height - 1}, the frame computer_screenshot reported.`,
     );
   }
   return { x, y };
 }
 
 export function desktopPoint(point: ComputerPoint, display: ComputerDisplay): ComputerPoint {
-  return { x: point.x + display.bounds.x, y: point.y + display.bounds.y };
+  const frame = captureFrameFor(display);
+  // Pixel centres, so the first and last columns of the frame land inside the
+  // display instead of on its edges; clamped because a rounded far corner can
+  // otherwise fall one pixel past the end.
+  const scaled = (value: number, frameSize: number, displaySize: number): number =>
+    frameSize === displaySize
+      ? value
+      : Math.min(displaySize - 1, Math.floor((value + 0.5) * (displaySize / frameSize)));
+  return {
+    x: scaled(point.x, frame.width, display.size.width) + display.bounds.x,
+    y: scaled(point.y, frame.height, display.size.height) + display.bounds.y,
+  };
 }
 
 export function validateButton(value: unknown): ComputerMouseButton {
@@ -266,7 +309,7 @@ export function createComputerUseService(deps: ComputerUseDependencies): {
         const display = deps.getPrimaryDisplay();
         if (action.type === "screenshot") {
           try {
-            const screenshot = await deps.capturePrimaryDisplay(display);
+            const screenshot = await deps.capturePrimaryDisplay(display, captureFrameFor(display));
             return {
               ok: true,
               message:

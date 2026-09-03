@@ -83,6 +83,7 @@ import {
 } from "./learning";
 import { spawn as ptySpawn, type IPty } from "@lydell/node-pty";
 import {
+  COMPUTER_CAPTURE_JPEG_QUALITY,
   COMPUTER_PERMISSION_SETTINGS,
   createComputerUseService,
   openComputerPermissionSettings,
@@ -1155,14 +1156,14 @@ const COMPUTER_USE_TOOLS = [
     type: "function",
     name: "computer_screenshot",
     description:
-      "Capture the primary display and return it as an image. The result states the exact logical coordinate frame to use for later computer actions. This always requires explicit user approval.",
+      "Capture the primary display and return it as an image. The result states the exact coordinate frame to use for later computer actions; it is scaled down from the display, so never assume the display resolution. This always requires explicit user approval.",
     inputSchema: { type: "object", properties: {} },
   },
   {
     type: "function",
     name: "computer_move",
     description:
-      "Move the pointer to logical coordinates on the primary display. Take a fresh computer_screenshot first. This always requires explicit user approval.",
+      "Move the pointer to coordinates in the frame that computer_screenshot reported, which is NOT the display resolution. Take a fresh computer_screenshot first. This always requires explicit user approval.",
     inputSchema: {
       type: "object",
       properties: { x: { type: "integer" }, y: { type: "integer" } },
@@ -1173,7 +1174,7 @@ const COMPUTER_USE_TOOLS = [
     type: "function",
     name: "computer_click",
     description:
-      "Click explicit logical coordinates on the primary display. Take a fresh computer_screenshot first. This always requires explicit user approval.",
+      "Click explicit coordinates in the frame that computer_screenshot reported, which is NOT the display resolution. Take a fresh computer_screenshot first. This always requires explicit user approval.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1216,7 +1217,7 @@ const COMPUTER_USE_TOOLS = [
     type: "function",
     name: "computer_scroll",
     description:
-      "Scroll at explicit logical coordinates on the primary display. Positive deltaY scrolls down; positive deltaX scrolls right. Values are OS scroll steps from -100 to 100. This always requires explicit user approval.",
+      "Scroll at explicit coordinates in the frame that computer_screenshot reported. Positive deltaY scrolls down; positive deltaX scrolls right. Values are OS scroll steps from -100 to 100. This always requires explicit user approval.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1680,20 +1681,26 @@ let restoreComputerWindow = false;
 let screenPermissionEstablished = false;
 const computerUse = createComputerUseService({
   getPrimaryDisplay: primaryComputerDisplay,
-  capturePrimaryDisplay: async (display) => {
+  // Captured AT the frame, not at the display: a full-resolution 4K capture is
+  // 4.15MB of base64 PNG per screenshot, and since the rollout is re-sent
+  // every turn, four of them ended a conversation with 413 Payload Too Large.
+  capturePrimaryDisplay: async (display, frame) => {
     const permission = systemPreferences.getMediaAccessStatus("screen");
     if (permission !== "granted") screenPermissionEstablished = false;
     const sources = await desktopCapturer.getSources({
       types: ["screen"],
-      thumbnailSize: display.size,
+      thumbnailSize: frame,
       fetchWindowIcons: false,
     });
     const source = sources.find((candidate) => candidate.display_id === String(display.id));
     if (!source) throw new Error("The primary display was not returned by Electron.");
-    const image = source.thumbnail.resize(display.size);
+    const image = source.thumbnail.resize(frame);
     if (image.isEmpty()) throw new Error("Electron returned an empty desktop image.");
     screenPermissionEstablished = true;
-    return { dataUrl: image.toDataURL(), ...image.getSize() };
+    // toDataURL() is PNG. See COMPUTER_CAPTURE_JPEG_QUALITY: on a real capture
+    // that was 4.15MB of base64 against 0.48MB for the same frame as JPEG.
+    const jpeg = image.toJPEG(COMPUTER_CAPTURE_JPEG_QUALITY);
+    return { dataUrl: `data:image/jpeg;base64,${jpeg.toString("base64")}`, ...image.getSize() };
   },
   accessibilityTrusted: (prompt) => systemPreferences.isTrustedAccessibilityClient(prompt),
   loadNut: async () => (await import("@nut-tree-fork/nut-js")) as unknown as NutRuntime,

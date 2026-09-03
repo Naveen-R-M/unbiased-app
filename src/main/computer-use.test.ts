@@ -1,7 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  COMPUTER_CAPTURE_MAX_EDGE,
   COMPUTER_PERMISSION_SETTINGS,
+  captureFrameFor,
   ComputerPermissionError,
   SerialExecutor,
   createComputerUseService,
@@ -23,7 +25,7 @@ const display = {
 
 test("primary-display coordinates are validated in the screenshot frame", () => {
   assert.deepEqual(validatePoint({ x: 0, y: 899 }, display), { x: 0, y: 899 });
-  assert.throws(() => validatePoint({ x: 1440, y: 1 }, display), /outside the primary display/);
+  assert.throws(() => validatePoint({ x: 1440, y: 1 }, display), /outside the screenshot/);
   assert.throws(() => validatePoint({ x: 2.5, y: 1 }, display), /x must be an integer/);
 });
 
@@ -166,4 +168,83 @@ test("screenshot responses state the exact coordinate frame", async () => {
   const result = await service.run({ type: "screenshot" });
   assert.equal(result.ok, true);
   if (result.ok) assert.match(result.message, /x=0\.\.1439, y=0\.\.899/);
+});
+
+// ── The capture frame ──────────────────────────────────────────────────────
+// Measured 2026-09-03 on a 3840x2160 display: every computer_screenshot added
+// 4.15MB of base64 PNG to the conversation, four of them took one rollout to
+// 10.2MB, and the following turn came back "413 Payload Too Large". Vision
+// models downsample past roughly 1568px on the long edge, so those megabytes
+// bought nothing the model could see.
+//
+// Capping the capture introduces exactly one risk, and it is arithmetic: if
+// the frame the model is TOLD about and the display a click lands on ever
+// disagree, clicks go somewhere else on a real desktop. Hence the round-trip
+// assertions below.
+
+const display4k = {
+  id: 2,
+  bounds: { x: 0, y: 0, width: 3840, height: 2160 },
+  size: { width: 3840, height: 2160 },
+  scaleFactor: 1,
+};
+
+test("a display within the cap is delivered whole, and mapping stays identity", () => {
+  // 1440x900 is under the cap, so nothing about the existing behaviour moves.
+  assert.deepEqual(captureFrameFor(display), { width: 1440, height: 900 });
+  assert.deepEqual(desktopPoint({ x: 400, y: 200 }, display), { x: -1040, y: 224 });
+});
+
+test("a 4K display is capped on its long edge with the aspect ratio intact", () => {
+  const frame = captureFrameFor(display4k);
+  assert.equal(Math.max(frame.width, frame.height), COMPUTER_CAPTURE_MAX_EDGE);
+  assert.equal(frame.width, 1568);
+  assert.equal(frame.height, 882); // 2160 * 1568/3840, exactly
+  // The payload scales with area, which is the whole point of doing this.
+  const shrink = (frame.width * frame.height) / (3840 * 2160);
+  assert.ok(shrink < 0.2, `expected a >5x area cut, got ${(1 / shrink).toFixed(1)}x`);
+});
+
+test("every corner of the frame maps inside the display, never past its edge", () => {
+  const frame = captureFrameFor(display4k);
+  for (const [x, y] of [
+    [0, 0],
+    [frame.width - 1, 0],
+    [0, frame.height - 1],
+    [frame.width - 1, frame.height - 1],
+  ] as const) {
+    const p = desktopPoint({ x, y }, display4k);
+    assert.ok(p.x >= 0 && p.x < 3840, `x ${p.x} out of the display for frame x ${x}`);
+    assert.ok(p.y >= 0 && p.y < 2160, `y ${p.y} out of the display for frame y ${y}`);
+  }
+});
+
+test("the middle of the frame lands in the middle of the display", () => {
+  const frame = captureFrameFor(display4k);
+  const p = desktopPoint({ x: Math.floor(frame.width / 2), y: Math.floor(frame.height / 2) }, display4k);
+  assert.ok(Math.abs(p.x - 1920) <= 4, `x ${p.x} not near 1920`);
+  assert.ok(Math.abs(p.y - 1080) <= 4, `y ${p.y} not near 1080`);
+});
+
+test("coordinates are validated against the FRAME, not the display", () => {
+  // The model only ever sees the frame, so a coordinate the display could
+  // hold but the frame cannot is a model mistake and has to be refused --
+  // silently scaling it would click a place the model never looked at.
+  const frame = captureFrameFor(display4k);
+  assert.deepEqual(validatePoint({ x: frame.width - 1, y: frame.height - 1 }, display4k), {
+    x: frame.width - 1,
+    y: frame.height - 1,
+  });
+  assert.throws(() => validatePoint({ x: 2344, y: 2089 }, display4k), /outside/);
+  assert.throws(() => validatePoint({ x: frame.width, y: 0 }, display4k), /outside/);
+});
+
+test("mapping is monotonic across the frame", () => {
+  const frame = captureFrameFor(display4k);
+  let previous = -1;
+  for (let x = 0; x < frame.width; x += 37) {
+    const { x: mapped } = desktopPoint({ x, y: 0 }, display4k);
+    assert.ok(mapped > previous, `frame x ${x} mapped to ${mapped}, not past ${previous}`);
+    previous = mapped;
+  }
 });
