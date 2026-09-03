@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { AxClient, AxError, describeAxAction, elementLine, readAxManifest, resolveAxDir } from "./ax-bridge";
+import { AxClient, AxError, describeAxAction, indexElementLines, readAxManifest, resolveAxDir } from "./ax-bridge";
 
 const scratch = () => mkdtempSync(join(tmpdir(), "ax-"));
 
@@ -130,15 +130,25 @@ const TREE = [
 ].join("\n");
 
 test("an approval for act names the element the model is about to press", () => {
-  const text = describeAxAction("computer_act", { app: "Brave", id: 643, action: "press" }, TREE);
+  const lines = indexElementLines(TREE);
+  const text = describeAxAction("computer_act", { app: "Brave", id: 643, action: "press" }, lines);
   assert.ok(text.startsWith('press #643 in Brave — link "Tame Impala - Loser (Official Video)'), text);
   assert.ok(text.endsWith("…") && text.length < 100, `clipped for a one-line card: ${text}`);
-  assert.equal(elementLine(TREE, 13), 'text field "Address and search bar" = youtube.com {press}', "a ~ diff line is still a line");
-  assert.equal(elementLine(TREE, 999), null);
+  assert.equal(lines.get(13), 'text field "Address and search bar" = youtube.com {press}', "a ~ diff line is still a line");
+  assert.equal(lines.get(999), undefined);
+});
+
+test("the index accumulates: a diff updates one line and keeps the rest", () => {
+  // The model read the full tree once, then a diff. An approval for an id the
+  // diff did not mention must still name it.
+  const lines = indexElementLines(TREE);
+  indexElementLines('~13     text field "Address and search bar" = youtube.com/results?q=x {press}', lines);
+  assert.ok(lines.get(13)!.includes("results?q=x"), "updated");
+  assert.ok(lines.get(643)!.startsWith("link"), "kept");
 });
 
 test("set and key read as what they are", () => {
-  assert.equal(describeAxAction("computer_act", { app: "Brave", id: 13, value: "https://youtube.com" }, TREE),
+  assert.equal(describeAxAction("computer_act", { app: "Brave", id: 13, value: "https://youtube.com" }, indexElementLines(TREE)),
     'Set #13 in Brave — text field "Address and search bar" = youtube.com {press} to "https://youtube.com"');
   assert.equal(describeAxAction("computer_act", { app: "Brave", key: "return" }), "Press return in Brave");
   assert.equal(describeAxAction("computer_app_state", { app: "Brave" }), "Read the UI of Brave");

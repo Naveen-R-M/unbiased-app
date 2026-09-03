@@ -161,21 +161,20 @@ export class AxClient {
   }
 }
 
-/** The element line for an id, from the last tree text the model saw of this
- *  app — so an approval reads `press 643 in Brave — link "Tame Impala…"`, not
- *  a bare number. */
-export function elementLine(tree: string | undefined, id: number): string | null {
-  if (!tree) return null;
-  for (const line of tree.split("\n")) {
+/** id -> element line, accumulated across every tree and diff the model saw of
+ *  an app. A diff omits unchanged elements, so the last text alone cannot name
+ *  an id the model read two turns ago; the index can. */
+export function indexElementLines(text: string, into: Map<number, string> = new Map()): Map<number, string> {
+  for (const line of text.split("\n")) {
     const m = /^[~+]?\s*(\d+)\s+(.*)$/.exec(line);
-    if (m && Number(m[1]) === id) return m[2]!.trim();
+    if (m) into.set(Number(m[1]), m[2]!.trim());
   }
-  return null;
+  return into;
 }
 
-/** What the approval card says. Kept short: the card is a sentence, the reason
- *  text below it carries the rest. */
-export function describeAxAction(tool: string, rawArgs: unknown, lastTree?: string): string {
+/** What the approval card says: `press #643 in Brave — link "Tame Impala…"`,
+ *  not a bare number. Kept short; the reason text below carries the rest. */
+export function describeAxAction(tool: string, rawArgs: unknown, lines?: Map<number, string>): string {
   const a = (rawArgs && typeof rawArgs === "object" ? rawArgs : {}) as Record<string, unknown>;
   const app = typeof a.app === "string" && a.app ? a.app : "the app";
   const clip = (s: string) => (s.length > 60 ? s.slice(0, 60) + "…" : s);
@@ -188,7 +187,7 @@ export function describeAxAction(tool: string, rawArgs: unknown, lastTree?: stri
       return `Bring ${app} to the front`;
     case "computer_act": {
       const id = typeof a.id === "number" ? a.id : null;
-      const line = id !== null ? elementLine(lastTree, id) : null;
+      const line = id !== null ? lines?.get(id) ?? null : null;
       const target = id !== null ? `#${id} in ${app}${line ? ` — ${clip(line)}` : ""}` : app;
       if (typeof a.key === "string") return `Press ${a.key} in ${app}`;
       if (typeof a.value === "string") return `Set ${target} to "${clip(a.value)}"`;

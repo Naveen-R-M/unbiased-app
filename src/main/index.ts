@@ -49,6 +49,15 @@ import { get as httpGet } from "node:http";
 import { EngineClient, engineVersionFromUserAgent, type EngineStatus } from "./engine";
 import { pollDeviceToken, requestDeviceAuthorization } from "./device-auth";
 import { RendererCrashRecovery } from "./crash-recovery";
+import {
+  AxClient,
+  AxError,
+  axLooksInstalled,
+  describeAxAction,
+  indexElementLines,
+  readAxManifest,
+  resolveAxDir,
+} from "./ax-bridge";
 import { isProductionBuild } from "./runtime-mode";
 import {
   dueAt,
@@ -1231,6 +1240,67 @@ const COMPUTER_USE_TOOLS = [
   },
 ];
 
+// The accessibility bridge (unbiased-ax): an app's structure as text, acted on
+// by element id. Declared only while the bridge is running — see
+// threadDynamicTools. Measured against real Brave: the task that took the
+// screenshot tools 27 calls and 6.7 minutes took this path 8 calls and 9.3s.
+const AX_TOOL_NAMES = new Set(["computer_apps", "computer_app_state", "computer_raise", "computer_act"]);
+const AX_TOOLS = [
+  {
+    type: "function",
+    name: "computer_apps",
+    description: "List running apps with the frontmost marked. No approval needed. Use the returned name for the other computer_* tools.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    type: "function",
+    name: "computer_app_state",
+    description:
+      "Read an app's windows and UI element tree as text, one element per line: id, role, title, value, flags, and the actions it supports in braces. " +
+      "Reach for this BEFORE computer_screenshot: it answers what is on screen, which tab is selected, and where a control is, as text, across Spaces. " +
+      "Ids are stable per app until an element disappears. After the first read of an app the result is a DIFF (~ changed, + added, removed by id) unless full=true. " +
+      "If the result says windows are offscreen, call computer_raise first. Pass query to search for one control by title instead of reading everything. " +
+      "Web page content inside a browser needs web=true. Falls back to computer_screenshot for content the tree does not expose (canvases, video). This always requires explicit user approval.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        app: { type: "string", description: "App name, name prefix, bundle id, or pid — e.g. \"Brave\"." },
+        query: { type: "string", description: "Find elements whose title or value contains this, instead of returning the whole tree." },
+        role: { type: "string", description: "With query: restrict to a role, e.g. \"text field\", \"link\", \"button\", \"tab\"." },
+        interactive: { type: "boolean", default: true, description: "Only controls a user can operate. Set false to include static text." },
+        web: { type: "boolean", default: false, description: "Include web page content in browsers (Chromium builds it on request)." },
+        full: { type: "boolean", default: false, description: "Return the whole tree even when a diff is available." },
+        depth: { type: "integer", description: "Maximum tree depth (default 14)." },
+      },
+      required: ["app"],
+    },
+  },
+  {
+    type: "function",
+    name: "computer_raise",
+    description: "Bring an app to the front, switching Spaces if its windows are elsewhere, and return its updated state. Needed before acting on an app whose windows computer_app_state reported as offscreen. This always requires explicit user approval.",
+    inputSchema: { type: "object", properties: { app: { type: "string" } }, required: ["app"] },
+  },
+  {
+    type: "function",
+    name: "computer_act",
+    description:
+      "Act on an element by the id computer_app_state returned. Exactly one of: action (an action the element listed in braces, e.g. press, or focus), value (set a text field), key (a real key event to the app: return, tab, escape, space, delete, up, down, left, right — use key=return to commit a browser address bar after setting its value). " +
+      "Returns the diff of what changed, so you need not read again. This always requires explicit user approval.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        app: { type: "string" },
+        id: { type: "integer", description: "Element id from computer_app_state. Not needed for key." },
+        action: { type: "string" },
+        value: { type: "string" },
+        key: { type: "string", enum: ["return", "tab", "escape", "space", "delete", "up", "down", "left", "right"] },
+      },
+      required: ["app"],
+    },
+  },
+];
+
 // Scheduling, offered to the model as a dynamic tool — the same extension
 // point the browser uses, so no new machinery is involved.
 //
@@ -1366,6 +1436,14 @@ function dynamicToolCommandText(tool: string | undefined, rawArgs: unknown): str
     const name = typeof args.name === "string" && args.name.trim() ? args.name.trim() : "memory";
     return `${t === "memory_save" ? "save memory" : "forget memory"} · ${name}`;
   }
+  if (t === "computer_apps") return "list apps";
+  if (t === "computer_app_state") return typeof args.query === "string" ? `find "${args.query}" in ${String(args.app)}` : `read ${String(args.app)}`;
+  if (t === "computer_raise") return `raise ${String(args.app)}`;
+  if (t === "computer_act") {
+    if (typeof args.key === "string") return `press ${args.key} in ${String(args.app)}`;
+    if (typeof args.value === "string") return `set #${String(args.id)} in ${String(args.app)}`;
+    return `${typeof args.action === "string" ? args.action : "press"} #${String(args.id)} in ${String(args.app)}`;
+  }
   if (t === "computer_screenshot") return "capture desktop";
   if (t === "computer_type") return "type text";
   if (t === "computer_move") return `move to ${String(args.x)}, ${String(args.y)}`;
@@ -1390,7 +1468,7 @@ function dynamicToolCommandText(tool: string | undefined, rawArgs: unknown): str
  * machine without agent-browser installed.
  */
 function threadDynamicTools(): Record<string, unknown>[] | undefined {
-  const tools = [...COMPUTER_USE_TOOLS, ...SCHEDULE_TOOLS, ...MEMORY_TOOLS, ...(agentBrowserTools() ?? [])];
+  const tools = [...(ax?.alive ? AX_TOOLS : []), ...COMPUTER_USE_TOOLS, ...SCHEDULE_TOOLS, ...MEMORY_TOOLS, ...(agentBrowserTools() ?? [])];
   return tools.length ? (tools as Record<string, unknown>[]) : undefined;
 }
 
@@ -1864,6 +1942,124 @@ async function offerComputerPermissionSettings(
   } catch (err) {
     const detail = err instanceof Error ? err.message : String(err);
     return ` Could not open System Settings: ${detail}`;
+  }
+}
+
+// ── The accessibility bridge ─────────────────────────────────────────────
+let ax: AxClient | null = null;
+/** id -> element line per app, accumulated from every tree and diff the model
+ *  saw, so an approval can say WHICH element is about to be pressed. */
+const axLines = new Map<string, Map<number, string>>();
+
+async function startAxBridge(): Promise<void> {
+  if (ax?.alive) return;
+  const dir = resolveAxDir({ isPackaged: productionBuild(), resourcesPath: process.resourcesPath, appPath: app.getAppPath() });
+  if (!axLooksInstalled(dir)) return; // not installed: the tools are simply absent
+  const manifest = readAxManifest(dir);
+  if (!manifest) return;
+  if ("error" in manifest) {
+    console.warn(`[ax] not starting: ${manifest.error}`);
+    return;
+  }
+  const client = new AxClient(manifest);
+  try {
+    const hello = await client.start();
+    ax = client;
+    console.log(`[ax] bridge ${hello.version} ready (${hello.trusted ? "trusted" : "NOT trusted: Accessibility not granted"})`);
+  } catch (err) {
+    console.warn(`[ax] handshake failed: ${String(err)}`);
+    client.stop();
+  }
+}
+
+function axText(text: string, success: boolean): DynamicToolResponse {
+  return { contentItems: [{ type: "inputText", text }], success };
+}
+
+async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | null): Promise<DynamicToolResponse> {
+  if (!ax?.alive) await startAxBridge(); // it may have died; one attempt to bring it back
+  if (!ax?.alive) return axText("The accessibility bridge is not running. Use computer_screenshot instead.", false);
+  const a = (rawArgs && typeof rawArgs === "object" ? rawArgs : {}) as Record<string, unknown>;
+  const appName = typeof a.app === "string" ? a.app.trim() : "";
+  if (tool !== "computer_apps" && !appName) return axText("app is required. Call computer_apps to list running apps.", false);
+
+  if (tool !== "computer_apps") {
+    const decision = await requestLocalApproval(
+      threadId,
+      describeAxAction(tool, a, axLines.get(appName)),
+      [
+        "This reads or operates the app's user interface through macOS Accessibility, without a screenshot.",
+        "UI text (window titles, tab names, field contents) may be added to this conversation and sent to the model.",
+      ].join("\n"),
+      { allowForSession: false, kind: "computer" },
+    );
+    if (decision === "decline") return axText("The user declined this computer action. Do not retry it unless they ask.", false);
+  }
+
+  const remember = (text: string) => {
+    if (!appName) return;
+    axLines.set(appName, indexElementLines(text, axLines.get(appName)));
+  };
+  try {
+    switch (tool) {
+      case "computer_apps": {
+        const r = await ax.request("apps", {}, 3_000);
+        const apps = (r.apps as { name: string; bundleId?: string; frontmost: boolean }[]) ?? [];
+        return axText(apps.map((x) => `${x.name}${x.frontmost ? " [frontmost]" : ""}${x.bundleId ? ` (${x.bundleId})` : ""}`).join("\n") || "(no apps)", true);
+      }
+      case "computer_raise": {
+        const r = await ax.request("raise", { app: appName });
+        const diff = String(r.diff ?? "");
+        remember(diff);
+        return axText(`${appName} is in front.\n${diff}`, true);
+      }
+      case "computer_app_state": {
+        const w = await ax.request("windows", { app: appName }, 3_000);
+        const offscreen = Number(w.offscreen ?? 0);
+        const windowsText = String(w.text ?? "");
+        const head = [
+          windowsText ? `windows:\n${windowsText}` : "windows: none on this Space",
+          typeof w.hint === "string" ? w.hint : "",
+        ].filter(Boolean).join("\n");
+        if (!windowsText && offscreen > 0) return axText(head, true);
+        const opts: Record<string, unknown> = {
+          app: appName,
+          interactive: a.interactive !== false,
+          web: a.web === true,
+          full: a.full === true,
+          ...(typeof a.depth === "number" ? { depth: a.depth } : {}),
+        };
+        if (typeof a.query === "string" && a.query.trim()) {
+          const r = await ax.request("find", { ...opts, title: a.query.trim(), ...(typeof a.role === "string" ? { role: a.role } : {}) });
+          const matches = (r.matches as string[]) ?? [];
+          remember(matches.join("\n"));
+          return axText(`${head}\n\n${matches.length} match(es) for "${a.query}":\n${matches.join("\n") || "(none — try without role, or with web=true for page content)"}`, true);
+        }
+        const r = await ax.request("tree", opts);
+        const body = String(r.tree ?? r.diff ?? "");
+        remember(body);
+        const label = r.tree !== undefined ? "tree" : "changes since last read";
+        return axText(`${head}\n\n${label} (${String(r.count)} elements${r.truncated ? ", truncated — use query or depth" : ""}):\n${body}`, true);
+      }
+      case "computer_act": {
+        const modes = ["action", "value", "key"].filter((k) => a[k] !== undefined);
+        if (modes.length !== 1) return axText("Pass exactly one of action, value, or key.", false);
+        let r;
+        if (typeof a.key === "string") r = await ax.request("key", { app: appName, key: a.key });
+        else if (typeof a.value === "string") r = await ax.request("setValue", { app: appName, id: a.id, value: a.value });
+        else r = await ax.request("act", { app: appName, id: a.id, action: String(a.action) });
+        const diff = String(r.diff ?? "");
+        remember(diff);
+        return axText(`Done.\n${diff}`, true);
+      }
+      default:
+        return axText(`Unknown tool ${tool}`, false);
+    }
+  } catch (err) {
+    // The bridge's errors already say what to do: not_trusted names the pane,
+    // no_such_element says to read again, no_such_app says to list apps.
+    const msg = err instanceof AxError ? `${err.message}${err.code === "not_trusted" ? " Fall back to computer_screenshot for now." : ""}` : String(err);
+    return axText(msg, false);
   }
 }
 
@@ -4861,6 +5057,8 @@ function wireNotifications(): void {
           ? handleScheduleToolCall(tool, args, approvalThread)
           : tool.startsWith("memory_")
             ? handleMemoryToolCall(tool, args, approvalThread)
+            : AX_TOOL_NAMES.has(tool)
+              ? handleAxCall(tool, args, approvalThread)
             : tool.startsWith("computer_")
               ? handleComputerUseCall(tool, args, approvalThread)
               : handleAgentBrowserCall(tool, args, approvalThread);
@@ -5648,6 +5846,8 @@ async function startEngine(): Promise<void> {
   // After the engine, and never blocking it: an absent or broken sidecar
   // leaves the app exactly as it was.
   void startLearning();
+  // Same footing as the sidecar: absent or broken, the app is exactly as it was.
+  void startAxBridge();
 }
 
 app.whenReady().then(async () => {
