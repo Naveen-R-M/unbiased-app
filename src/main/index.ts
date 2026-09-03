@@ -1258,7 +1258,7 @@ const AX_TOOLS = [
     type: "function",
     name: "computer_app_state",
     description:
-      "Read an app's windows and UI element tree as text, one element per line: id, role, title, value, flags, and the actions it supports in braces. " +
+      "Read an app's windows and UI element tree as text, one element per line: id, role, title, value, flags, and the actions it supports in braces. Act on those ids: the controls are named, so press them rather than guessing keyboard shortcuts. " +
       "Reach for this BEFORE computer_screenshot: it answers what is on screen, which tab is selected, and where a control is, as text. "
       + "It works on a BACKGROUND app on any Space and does not take over the user's screen, so never raise an app in order to read it. " +
       "Ids are stable per app until an element disappears. After the first read of an app the result is a DIFF (~ changed, + added, removed by id) unless full=true. " +
@@ -1288,13 +1288,14 @@ const AX_TOOLS = [
     type: "function",
     name: "computer_act",
     description:
-      "Act on an element by the id computer_app_state returned. Exactly one of: action (an action the element listed in braces, e.g. press, or focus), value (set a text field), key (a real key event to the app: return, tab, escape, space, delete, up, down, left, right — use key=return to commit a browser address bar after setting its value). " +
+      "Act on an element by the id computer_app_state returned. Exactly one of: action (an action the element listed in braces, e.g. press, or focus), value (set a text field), key (a real key event: return, tab, escape, space, delete, up, down, left, right — use key=return to commit a browser address bar after setting its value). " +
+      "PREFER pressing the control the tree names over a keyboard shortcut: a video player exposes button \"Play (k)\", so press that id. A key WITHOUT id goes wherever keyboard focus already is and will type into whatever field is focused; pass id with key to aim it at an element, which is focused first. " +
       "Works on a background app without taking the user's screen; a key event brings the window forward first because it has to. Returns the diff of what changed, so you need not read again.",
     inputSchema: {
       type: "object",
       properties: {
         app: { type: "string" },
-        id: { type: "integer", description: "Element id from computer_app_state. Not needed for key." },
+        id: { type: "integer", description: "Element id from computer_app_state. With key, that element is focused first so the keystroke lands there." },
         action: { type: "string" },
         value: { type: "string" },
         key: { type: "string", enum: ["return", "tab", "escape", "space", "delete", "up", "down", "left", "right"] },
@@ -2058,9 +2059,11 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         if (modes.length !== 1) return axText("Pass exactly one of action, value, or key.", false);
         let r;
         if (typeof a.key === "string") {
-          // The only action that needs the window able to receive it.
+          // A bare key goes wherever focus already is, so the window has to be
+          // able to receive it. With an id the bridge focuses that element and
+          // the key lands there, taking nobody's screen.
           if (axNeedsFocus(tool, a)) await ax.request("raise", { app: appName });
-          r = await ax.request("key", { app: appName, key: a.key });
+          r = await ax.request("key", { app: appName, key: a.key, ...(typeof a.id === "number" ? { id: a.id } : {}) });
         }
         else if (typeof a.value === "string") r = await ax.request("setValue", { app: appName, id: a.id, value: a.value });
         else r = await ax.request("act", { app: appName, id: a.id, action: String(a.action) });

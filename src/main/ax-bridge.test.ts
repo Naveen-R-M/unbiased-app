@@ -198,3 +198,11 @@ test("a synthetic key event is the one action that needs the app in front", () =
   // Posted to the pid, but the window must be able to receive it.
   assert.equal(axNeedsFocus("computer_act", { app: "Brave", key: "return" }), true);
 });
+
+test("a key aimed at an element does not need the app in front — focusing it is enough", () => {
+  // Measured: the model sent space to play a video, focus was in the omnibox,
+  // and it typed spaces into the URL. With a target there is nothing to steal
+  // the screen for: the bridge focuses the element and sends the key there.
+  assert.equal(axNeedsFocus("computer_act", { app: "Brave", key: "space", id: 774 }), false);
+  assert.equal(axNeedsFocus("computer_act", { app: "Brave", key: "space" }), true, "a bare key still needs the window");
+});

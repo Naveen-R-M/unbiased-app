@@ -95,7 +95,10 @@ export function axConsent(opts: { tool: string; mode: "ask" | "auto" | "full"; g
  *  the pid, but the window still has to be able to receive it. */
 export function axNeedsFocus(tool: string, args: Record<string, unknown>): boolean {
   if (tool === "computer_raise") return true;
-  return tool === "computer_act" && typeof args.key === "string";
+  // A key aimed at an element needs no window: the bridge focuses that element
+  // and the key lands there. Only a BARE key depends on where focus happens to
+  // be, and for that the window has to be able to receive it.
+  return tool === "computer_act" && typeof args.key === "string" && typeof args.id !== "number";
 }
 
 export type AxResult = Record<string, unknown>;
