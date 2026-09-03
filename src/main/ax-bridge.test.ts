@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { AxClient, AxError, describeAxAction, indexElementLines, readAxManifest, resolveAxDir } from "./ax-bridge";
+import { AxClient, AxError, axConsent, axNeedsFocus, describeAxAction, indexElementLines, readAxManifest, resolveAxDir } from "./ax-bridge";
 
 const scratch = () => mkdtempSync(join(tmpdir(), "ax-"));
 
@@ -153,4 +153,48 @@ test("set and key read as what they are", () => {
   assert.equal(describeAxAction("computer_act", { app: "Brave", key: "return" }), "Press return in Brave");
   assert.equal(describeAxAction("computer_app_state", { app: "Brave" }), "Read the UI of Brave");
   assert.equal(describeAxAction("computer_raise", { app: "Brave" }), "Bring Brave to the front");
+});
+
+// ── Consent policy ─────────────────────────────────────────────────────────
+// Measured on the first live run: eight AX calls, eight approval cards, in a
+// conversation whose mode was set to full — where MODE_THREAD_POLICY says
+// approvalPolicy "never". The card was hard-coded to ask every time, and
+// nothing consulted the mode. The browser gate at index.ts:1583 had the right
+// shape all along; this is that shape, made testable.
+
+test("full access means what it says: no card", () => {
+  for (const tool of ["computer_app_state", "computer_act", "computer_raise"]) {
+    assert.equal(axConsent({ tool, mode: "full", granted: false }), "allow", tool);
+  }
+});
+
+test("ask and auto still ask, because the action reaches outside the sandbox", () => {
+  assert.equal(axConsent({ tool: "computer_act", mode: "ask", granted: false }), "ask");
+  assert.equal(axConsent({ tool: "computer_act", mode: "auto", granted: false }), "ask");
+});
+
+test("a session grant for this app skips later cards, in ask and auto alike", () => {
+  assert.equal(axConsent({ tool: "computer_act", mode: "ask", granted: true }), "allow");
+  assert.equal(axConsent({ tool: "computer_app_state", mode: "auto", granted: true }), "allow");
+});
+
+test("listing apps is never gated: it names apps and touches nothing", () => {
+  assert.equal(axConsent({ tool: "computer_apps", mode: "ask", granted: false }), "allow");
+});
+
+// ── Reading must not steal the screen ──────────────────────────────────────
+// The model raised Brave three times in one task, taking the user's screen
+// each time, because it assumed a read needed focus. It does not: the
+// Accessibility API reads background apps across Spaces, which is the whole
+// advantage over screenshots.
+
+test("only an explicit raise brings an app forward", () => {
+  assert.equal(axNeedsFocus("computer_raise", {}), true);
+  assert.equal(axNeedsFocus("computer_app_state", { app: "Brave" }), false);
+  assert.equal(axNeedsFocus("computer_act", { app: "Brave", id: 1, action: "press" }), false);
+});
+
+test("a synthetic key event is the one action that needs the app in front", () => {
+  // Posted to the pid, but the window must be able to receive it.
+  assert.equal(axNeedsFocus("computer_act", { app: "Brave", key: "return" }), true);
 });

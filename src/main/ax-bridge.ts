@@ -77,6 +77,27 @@ export class AxError extends Error {
   }
 }
 
+/** Whether an AX call needs a consent card. The access mode already answers
+ *  this: `full` is `approvalPolicy: "never"`, and asking anyway ignores what
+ *  the user set. Same shape as the browser gate — mode first, then a
+ *  per-conversation grant. Reading UI text is as sensitive as acting on it
+ *  (window titles and field contents reach the model), so both are gated
+ *  together; only listing app names is free. */
+export function axConsent(opts: { tool: string; mode: "ask" | "auto" | "full"; granted: boolean }): "allow" | "ask" {
+  if (opts.tool === "computer_apps") return "allow";
+  if (opts.mode === "full") return "allow";
+  return opts.granted ? "allow" : "ask";
+}
+
+/** Whether the app has to be brought forward. Almost never: the Accessibility
+ *  API reads and presses background apps across Spaces, which is precisely why
+ *  this beats screenshots. A synthetic key event is the exception — it goes to
+ *  the pid, but the window still has to be able to receive it. */
+export function axNeedsFocus(tool: string, args: Record<string, unknown>): boolean {
+  if (tool === "computer_raise") return true;
+  return tool === "computer_act" && typeof args.key === "string";
+}
+
 export type AxResult = Record<string, unknown>;
 type Pending = { resolve: (r: AxResult) => void; reject: (e: Error) => void; timer: NodeJS.Timeout };
 

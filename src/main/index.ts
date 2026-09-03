@@ -52,7 +52,9 @@ import { RendererCrashRecovery } from "./crash-recovery";
 import {
   AxClient,
   AxError,
+  axConsent,
   axLooksInstalled,
+  axNeedsFocus,
   describeAxAction,
   indexElementLines,
   readAxManifest,
@@ -1257,10 +1259,11 @@ const AX_TOOLS = [
     name: "computer_app_state",
     description:
       "Read an app's windows and UI element tree as text, one element per line: id, role, title, value, flags, and the actions it supports in braces. " +
-      "Reach for this BEFORE computer_screenshot: it answers what is on screen, which tab is selected, and where a control is, as text, across Spaces. " +
+      "Reach for this BEFORE computer_screenshot: it answers what is on screen, which tab is selected, and where a control is, as text. "
+      + "It works on a BACKGROUND app on any Space and does not take over the user's screen, so never raise an app in order to read it. " +
       "Ids are stable per app until an element disappears. After the first read of an app the result is a DIFF (~ changed, + added, removed by id) unless full=true. " +
-      "If the result says windows are offscreen, call computer_raise first. Pass query to search for one control by title instead of reading everything. " +
-      "Web page content inside a browser needs web=true. Falls back to computer_screenshot for content the tree does not expose (canvases, video). This always requires explicit user approval.",
+      "Windows reported as offscreen can still be read and pressed — do not raise unless a key event needs the window. Pass query to search for one control by title instead of reading everything. " +
+      "Web page content inside a browser needs web=true. Use computer_screenshot when you need to SEE something the tree cannot express — whether a video is actually playing, a canvas, a rendered chart — and one confirming screenshot at the end of a visual task is worth taking.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1278,7 +1281,7 @@ const AX_TOOLS = [
   {
     type: "function",
     name: "computer_raise",
-    description: "Bring an app to the front, switching Spaces if its windows are elsewhere, and return its updated state. Needed before acting on an app whose windows computer_app_state reported as offscreen. This always requires explicit user approval.",
+    description: "Bring an app to the front, taking over the user's screen and switching Spaces. Rarely needed: reading and pressing work on background apps. Use it when the user asked to see the app, or when a key event needs the window (computer_act with key does this for you).",
     inputSchema: { type: "object", properties: { app: { type: "string" } }, required: ["app"] },
   },
   {
@@ -1286,7 +1289,7 @@ const AX_TOOLS = [
     name: "computer_act",
     description:
       "Act on an element by the id computer_app_state returned. Exactly one of: action (an action the element listed in braces, e.g. press, or focus), value (set a text field), key (a real key event to the app: return, tab, escape, space, delete, up, down, left, right — use key=return to commit a browser address bar after setting its value). " +
-      "Returns the diff of what changed, so you need not read again. This always requires explicit user approval.",
+      "Works on a background app without taking the user's screen; a key event brings the window forward first because it has to. Returns the diff of what changed, so you need not read again.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1947,6 +1950,9 @@ async function offerComputerPermissionSettings(
 
 // ── The accessibility bridge ─────────────────────────────────────────────
 let ax: AxClient | null = null;
+/** Conversations that granted desktop control for the session, so "allow for
+ *  session" means it. Same shape as browserNetGrants. */
+const axGrants = new Set<string>();
 /** id -> element line per app, accumulated from every tree and diff the model
  *  saw, so an approval can say WHICH element is about to be pressed. */
 const axLines = new Map<string, Map<number, string>>();
@@ -1983,17 +1989,23 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
   const appName = typeof a.app === "string" ? a.app.trim() : "";
   if (tool !== "computer_apps" && !appName) return axText("app is required. Call computer_apps to list running apps.", false);
 
-  if (tool !== "computer_apps") {
+  // The access mode already decided this: full is approvalPolicy "never", and
+  // a card there ignores what the user set. Mode first, then the grant.
+  const root = rootThreadOf(threadId);
+  const mode = threadAccessModes.get(root) ?? accessMode;
+  if (axConsent({ tool, mode, granted: axGrants.has(root) }) === "ask") {
     const decision = await requestLocalApproval(
       threadId,
       describeAxAction(tool, a, axLines.get(appName)),
       [
         "This reads or operates the app's user interface through macOS Accessibility, without a screenshot.",
         "UI text (window titles, tab names, field contents) may be added to this conversation and sent to the model.",
+        "Allowing for the session covers further desktop reads and actions in this conversation.",
       ].join("\n"),
-      { allowForSession: false, kind: "computer" },
+      { kind: "computer" },
     );
     if (decision === "decline") return axText("The user declined this computer action. Do not retry it unless they ask.", false);
+    if (decision === "acceptForSession") axGrants.add(root);
   }
 
   const remember = (text: string) => {
@@ -2011,7 +2023,7 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         const r = await ax.request("raise", { app: appName });
         const diff = String(r.diff ?? "");
         remember(diff);
-        return axText(`${appName} is in front.\n${diff}`, true);
+        return axText(`${appName} is in front (this took over the user's screen — do not do it to read or press; only when a key event needs the window).\n${diff}`, true);
       }
       case "computer_app_state": {
         const w = await ax.request("windows", { app: appName }, 3_000);
@@ -2045,7 +2057,11 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         const modes = ["action", "value", "key"].filter((k) => a[k] !== undefined);
         if (modes.length !== 1) return axText("Pass exactly one of action, value, or key.", false);
         let r;
-        if (typeof a.key === "string") r = await ax.request("key", { app: appName, key: a.key });
+        if (typeof a.key === "string") {
+          // The only action that needs the window able to receive it.
+          if (axNeedsFocus(tool, a)) await ax.request("raise", { app: appName });
+          r = await ax.request("key", { app: appName, key: a.key });
+        }
         else if (typeof a.value === "string") r = await ax.request("setValue", { app: appName, id: a.id, value: a.value });
         else r = await ax.request("act", { app: appName, id: a.id, action: String(a.action) });
         const diff = String(r.diff ?? "");
@@ -2502,6 +2518,7 @@ function resetSubAgentState(): void {
   }
   pendingApprovals.clear();
   browserNetGrants.clear();
+  axGrants.clear();
   browserConnectGrants.clear();
   threadAccessModes.clear();
   browserAttachedExternal = false;
