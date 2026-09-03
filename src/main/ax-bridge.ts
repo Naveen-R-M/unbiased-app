@@ -89,16 +89,22 @@ export function axConsent(opts: { tool: string; mode: "ask" | "auto" | "full"; g
   return opts.granted ? "allow" : "ask";
 }
 
-/** Whether the app has to be brought forward. Almost never: the Accessibility
- *  API reads and presses background apps across Spaces, which is precisely why
- *  this beats screenshots. A synthetic key event is the exception — it goes to
- *  the pid, but the window still has to be able to receive it. */
-export function axNeedsFocus(tool: string, args: Record<string, unknown>): boolean {
-  if (tool === "computer_raise") return true;
-  // A key aimed at an element needs no window: the bridge focuses that element
-  // and the key lands there. Only a BARE key depends on where focus happens to
-  // be, and for that the window has to be able to receive it.
-  return tool === "computer_act" && typeof args.key === "string" && typeof args.id !== "number";
+/** Nothing needs the app in front. The Accessibility API reads and presses
+ *  background apps on any Space, and a key event posted to the pid reaches one
+ *  too — verified against a backgrounded Brave, which stayed backgrounded.
+ *
+ *  Kept as a function rather than deleted because the question it asks ("does
+ *  this steal the user's screen?") is the one to ask of any new action. */
+export function axNeedsFocus(_tool: string, _args: Record<string, unknown>): boolean {
+  return false;
+}
+
+/** The app a computer step acted on, so the transcript can show that app's own
+ *  icon instead of a generic terminal glyph. */
+export function appOfStep(tool: string, args: Record<string, unknown>): string | null {
+  if (tool !== "computer_app_state" && tool !== "computer_act") return null;
+  const app = typeof args.app === "string" ? args.app.trim() : "";
+  return app || null;
 }
 
 export type AxResult = Record<string, unknown>;
@@ -207,8 +213,6 @@ export function describeAxAction(tool: string, rawArgs: unknown, lines?: Map<num
       return "List running apps";
     case "computer_app_state":
       return `Read the UI of ${app}`;
-    case "computer_raise":
-      return `Bring ${app} to the front`;
     case "computer_act": {
       const id = typeof a.id === "number" ? a.id : null;
       const line = id !== null ? lines?.get(id) ?? null : null;

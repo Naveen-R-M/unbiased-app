@@ -36,6 +36,10 @@ type CommandItem = {
   exitCode?: number;
   aggregatedOutput?: string;
   output?: string;
+  /** Sent live by the main process, not only on a transcript reload. */
+  source?: "shell" | "browser" | "memory" | "tool" | "approval" | "computer";
+  /** For a computer step: the icon of the app it acted on, as a data URL. */
+  appIcon?: string;
 };
 
 type Entry =
@@ -76,6 +80,8 @@ type Entry =
        *  raised. Absent on entries persisted before this existed, which is
        *  why the readers below still fall back to text sniffing. */
      source?: "shell" | "browser" | "memory" | "tool" | "approval" | "computer";
+     /** For a computer step: the icon of the app it acted on, as a data URL. */
+     appIcon?: string;
      status: string; // inProgress | completed | failed | declined | awaitingApproval | canceled
      exitCode?: number;
      output?: string;
@@ -8746,6 +8752,10 @@ function ChatPane({
               status: item.status ?? existing.status,
               exitCode: item.exitCode ?? existing.exitCode,
               output: item.aggregatedOutput ?? item.output ?? existing.output,
+              // Carried live, not only on a transcript reload: without these a
+              // desktop step spent the whole turn looking like a shell command.
+              source: item.source ?? existing.source,
+              appIcon: item.appIcon ?? existing.appIcon,
             };
           });
           if (found) return mapped;
@@ -8758,6 +8768,8 @@ function ChatPane({
               status: item.status ?? (p.phase === "started" ? "inProgress" : "completed"),
               exitCode: item.exitCode,
               output: item.aggregatedOutput ?? item.output,
+              source: item.source,
+              appIcon: item.appIcon,
             },
           ];
         });
@@ -17552,6 +17564,19 @@ const isShellStep = (e: CommandEntry): boolean =>
   e.source ? e.source === "shell" : !isBrowserStep(e) && !isMemoryStep(e) && !isComputerStep(e);
 
 function stepIcon(e: CommandEntry): React.ReactNode {
+  // A desktop step shows the icon of the app it touched: "press #643 in Brave"
+  // reads at a glance beside Brave's own icon, which a terminal glyph does not.
+  if (e.appIcon) {
+    return (
+      <img
+        src={e.appIcon}
+        alt=""
+        width={14}
+        height={14}
+        style={{ borderRadius: 3, display: "block", objectFit: "contain" }}
+      />
+    );
+  }
   if (isBrowserStep(e)) return <GlobeIcon size={14} />;
   if (isMemoryStep(e)) return <LightbulbIcon />;
   if (isComputerStep(e)) return <DesktopIcon size={14} />;

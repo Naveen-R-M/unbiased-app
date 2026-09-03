@@ -52,6 +52,7 @@ import { RendererCrashRecovery } from "./crash-recovery";
 import {
   AxClient,
   AxError,
+  appOfStep,
   axConsent,
   axLooksInstalled,
   axNeedsFocus,
@@ -1246,7 +1247,7 @@ const COMPUTER_USE_TOOLS = [
 // by element id. Declared only while the bridge is running — see
 // threadDynamicTools. Measured against real Brave: the task that took the
 // screenshot tools 27 calls and 6.7 minutes took this path 8 calls and 9.3s.
-const AX_TOOL_NAMES = new Set(["computer_apps", "computer_app_state", "computer_raise", "computer_act"]);
+const AX_TOOL_NAMES = new Set(["computer_apps", "computer_app_state", "computer_act"]);
 const AX_TOOLS = [
   {
     type: "function",
@@ -1260,9 +1261,9 @@ const AX_TOOLS = [
     description:
       "Read an app's windows and UI element tree as text, one element per line: id, role, title, value, flags, and the actions it supports in braces. Act on those ids: the controls are named, so press them rather than guessing keyboard shortcuts. " +
       "Reach for this BEFORE computer_screenshot: it answers what is on screen, which tab is selected, and where a control is, as text. "
-      + "It works on a BACKGROUND app on any Space and does not take over the user's screen, so never raise an app in order to read it. " +
+      + "It works on a BACKGROUND app on any Space and never takes over the user's screen. " +
       "Ids are stable per app until an element disappears. After the first read of an app the result is a DIFF (~ changed, + added, removed by id) unless full=true. " +
-      "Windows reported as offscreen can still be read and pressed — do not raise unless a key event needs the window. Pass query to search for one control by title instead of reading everything. " +
+      "Windows reported as offscreen can still be read and pressed exactly where they are; there is no way to bring an app forward and no need to. Pass query to search for one control by title instead of reading everything. " +
       "Web page content inside a browser needs web=true. Use computer_screenshot when you need to SEE something the tree cannot express — whether a video is actually playing, a canvas, a rendered chart — and one confirming screenshot at the end of a visual task is worth taking.",
     inputSchema: {
       type: "object",
@@ -1280,17 +1281,11 @@ const AX_TOOLS = [
   },
   {
     type: "function",
-    name: "computer_raise",
-    description: "Bring an app to the front, taking over the user's screen and switching Spaces. Rarely needed: reading and pressing work on background apps. Use it when the user asked to see the app, or when a key event needs the window (computer_act with key does this for you).",
-    inputSchema: { type: "object", properties: { app: { type: "string" } }, required: ["app"] },
-  },
-  {
-    type: "function",
     name: "computer_act",
     description:
       "Act on an element by the id computer_app_state returned. Exactly one of: action (an action the element listed in braces, e.g. press, or focus), value (set a text field), key (a real key event: return, tab, escape, space, delete, up, down, left, right — use key=return to commit a browser address bar after setting its value). " +
       "PREFER pressing the control the tree names over a keyboard shortcut: a video player exposes button \"Play (k)\", so press that id. A key WITHOUT id goes wherever keyboard focus already is and will type into whatever field is focused; pass id with key to aim it at an element, which is focused first. " +
-      "Works on a background app without taking the user's screen; a key event brings the window forward first because it has to. Returns the diff of what changed, so you need not read again.",
+      "Works on a background app without ever taking the user's screen, key events included. Returns the diff of what changed, so you need not read again.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1442,7 +1437,6 @@ function dynamicToolCommandText(tool: string | undefined, rawArgs: unknown): str
   }
   if (t === "computer_apps") return "list apps";
   if (t === "computer_app_state") return typeof args.query === "string" ? `find "${args.query}" in ${String(args.app)}` : `read ${String(args.app)}`;
-  if (t === "computer_raise") return `raise ${String(args.app)}`;
   if (t === "computer_act") {
     if (typeof args.key === "string") return `press ${args.key} in ${String(args.app)}`;
     if (typeof args.value === "string") return `set #${String(args.id)} in ${String(args.app)}`;
@@ -1957,6 +1951,32 @@ const axGrants = new Set<string>();
 /** id -> element line per app, accumulated from every tree and diff the model
  *  saw, so an approval can say WHICH element is about to be pressed. */
 const axLines = new Map<string, Map<number, string>>();
+/** app name -> its icon as a data URL, fetched once per app. The transcript
+ *  shows it beside each step, so "press #643 in Brave" carries Brave's icon
+ *  rather than a terminal glyph. */
+const axIcons = new Map<string, string>();
+
+/** The icon for a step, if we have already fetched it. Synchronous on purpose:
+ *  a transcript row must not wait on IPC, and the icon arrives on the next
+ *  read of the same app. */
+function axStepIcon(tool: string | undefined, rawArgs: unknown): string | undefined {
+  const name = appOfStep(tool ?? "", (rawArgs && typeof rawArgs === "object" ? rawArgs : {}) as Record<string, unknown>);
+  return name ? axIcons.get(name) || undefined : undefined;
+}
+
+async function axIconFor(appName: string): Promise<string | undefined> {
+  if (!appName || !ax?.alive) return undefined;
+  const cached = axIcons.get(appName);
+  if (cached !== undefined) return cached || undefined;
+  try {
+    const r = await ax.request("icon", { app: appName }, 3_000);
+    const png = typeof r.png === "string" ? r.png : "";
+    axIcons.set(appName, png ? `data:image/png;base64,${png}` : "");
+  } catch {
+    axIcons.set(appName, ""); // an app with no icon is not asked about again
+  }
+  return axIcons.get(appName) || undefined;
+}
 
 async function startAxBridge(): Promise<void> {
   if (ax?.alive) return;
@@ -2009,6 +2029,7 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
     if (decision === "acceptForSession") axGrants.add(root);
   }
 
+  void axIconFor(appName); // warm the cache; the row picks it up next read
   const remember = (text: string) => {
     if (!appName) return;
     axLines.set(appName, indexElementLines(text, axLines.get(appName)));
@@ -2019,12 +2040,6 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         const r = await ax.request("apps", {}, 3_000);
         const apps = (r.apps as { name: string; bundleId?: string; frontmost: boolean }[]) ?? [];
         return axText(apps.map((x) => `${x.name}${x.frontmost ? " [frontmost]" : ""}${x.bundleId ? ` (${x.bundleId})` : ""}`).join("\n") || "(no apps)", true);
-      }
-      case "computer_raise": {
-        const r = await ax.request("raise", { app: appName });
-        const diff = String(r.diff ?? "");
-        remember(diff);
-        return axText(`${appName} is in front (this took over the user's screen — do not do it to read or press; only when a key event needs the window).\n${diff}`, true);
       }
       case "computer_app_state": {
         const w = await ax.request("windows", { app: appName }, 3_000);
@@ -2059,10 +2074,7 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         if (modes.length !== 1) return axText("Pass exactly one of action, value, or key.", false);
         let r;
         if (typeof a.key === "string") {
-          // A bare key goes wherever focus already is, so the window has to be
-          // able to receive it. With an id the bridge focuses that element and
-          // the key lands there, taking nobody's screen.
-          if (axNeedsFocus(tool, a)) await ax.request("raise", { app: appName });
+          // Nothing raises: a key posted to the pid reaches a background app.
           r = await ax.request("key", { app: appName, key: a.key, ...(typeof a.id === "number" ? { id: a.id } : {}) });
         }
         else if (typeof a.value === "string") r = await ax.request("setValue", { app: appName, id: a.id, value: a.value });
@@ -3290,6 +3302,7 @@ function threadToEntries(
             command: dynamicToolCommandText(d.tool, d.arguments),
             status: d.success === false ? "failed" : (d.status ?? "completed"),
             source: dynamicToolSource(d.tool),
+            ...(axStepIcon(d.tool, d.arguments) ? { appIcon: axStepIcon(d.tool, d.arguments) } : {}),
           });
           break;
         }
@@ -4718,6 +4731,7 @@ function wireNotifications(): void {
               id: d.id,
               command: dynamicToolCommandText(d.tool, d.arguments),
               source: dynamicToolSource(d.tool),
+              ...(axStepIcon(d.tool, d.arguments) ? { appIcon: axStepIcon(d.tool, d.arguments) } : {}),
               // A started call is in progress — defaulting to "completed"
               // showed a green "done" for a page still loading.
               status:

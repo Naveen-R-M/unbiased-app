@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { AxClient, AxError, axConsent, axNeedsFocus, describeAxAction, indexElementLines, readAxManifest, resolveAxDir } from "./ax-bridge";
+import { AxClient, AxError, appOfStep, axConsent, axNeedsFocus, describeAxAction, indexElementLines, readAxManifest, resolveAxDir } from "./ax-bridge";
 
 const scratch = () => mkdtempSync(join(tmpdir(), "ax-"));
 
@@ -152,7 +152,7 @@ test("set and key read as what they are", () => {
     'Set #13 in Brave — text field "Address and search bar" = youtube.com {press} to "https://youtube.com"');
   assert.equal(describeAxAction("computer_act", { app: "Brave", key: "return" }), "Press return in Brave");
   assert.equal(describeAxAction("computer_app_state", { app: "Brave" }), "Read the UI of Brave");
-  assert.equal(describeAxAction("computer_raise", { app: "Brave" }), "Bring Brave to the front");
+
 });
 
 // ── Consent policy ─────────────────────────────────────────────────────────
@@ -163,7 +163,7 @@ test("set and key read as what they are", () => {
 // shape all along; this is that shape, made testable.
 
 test("full access means what it says: no card", () => {
-  for (const tool of ["computer_app_state", "computer_act", "computer_raise"]) {
+  for (const tool of ["computer_app_state", "computer_act"]) {
     assert.equal(axConsent({ tool, mode: "full", granted: false }), "allow", tool);
   }
 });
@@ -188,21 +188,28 @@ test("listing apps is never gated: it names apps and touches nothing", () => {
 // Accessibility API reads background apps across Spaces, which is the whole
 // advantage over screenshots.
 
-test("only an explicit raise brings an app forward", () => {
-  assert.equal(axNeedsFocus("computer_raise", {}), true);
-  assert.equal(axNeedsFocus("computer_app_state", { app: "Brave" }), false);
-  assert.equal(axNeedsFocus("computer_act", { app: "Brave", id: 1, action: "press" }), false);
+
+
+// ── Raise is gone ──────────────────────────────────────────────────────────
+// Measured across three live runs: the model raised Brave on its own every
+// time — four times in one task — taking the user off whatever they were
+// doing. Codex's trace over the same task never raises: set_value, press_key
+// and click all work on a background app, and ours do too (a bare key posted
+// to a backgrounded Brave was verified not to change the frontmost app).
+// A capability the model cannot be talked out of using is one to remove.
+
+test("nothing needs the app in front any more", () => {
+  for (const args of [{ app: "Brave", key: "space" }, { app: "Brave", key: "space", id: 774 }, { app: "Brave", id: 1, action: "press" }]) {
+    assert.equal(axNeedsFocus("computer_act", args), false, JSON.stringify(args));
+  }
+  assert.equal(axNeedsFocus("computer_raise", {}), false, "computer_raise no longer exists");
 });
 
-test("a synthetic key event is the one action that needs the app in front", () => {
-  // Posted to the pid, but the window must be able to receive it.
-  assert.equal(axNeedsFocus("computer_act", { app: "Brave", key: "return" }), true);
-});
+// ── The app a step touched ─────────────────────────────────────────────────
 
-test("a key aimed at an element does not need the app in front — focusing it is enough", () => {
-  // Measured: the model sent space to play a video, focus was in the omnibox,
-  // and it typed spaces into the URL. With a target there is nothing to steal
-  // the screen for: the bridge focuses the element and sends the key there.
-  assert.equal(axNeedsFocus("computer_act", { app: "Brave", key: "space", id: 774 }), false);
-  assert.equal(axNeedsFocus("computer_act", { app: "Brave", key: "space" }), true, "a bare key still needs the window");
+test("appOfStep names the app a computer step acted on, for its icon", () => {
+  assert.equal(appOfStep("computer_act", { app: "Brave Browser", id: 1 }), "Brave Browser");
+  assert.equal(appOfStep("computer_app_state", { app: "Finder" }), "Finder");
+  assert.equal(appOfStep("computer_apps", {}), null, "listing apps touches no one app");
+  assert.equal(appOfStep("memory_save", { app: "Brave" }), null, "not a computer tool");
 });
