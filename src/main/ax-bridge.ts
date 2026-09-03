@@ -114,6 +114,16 @@ export function offerScreenshotTools(opts: { axAlive: boolean }): boolean {
   return !opts.axAlive;
 }
 
+/** Whether a read that found nothing should raise and try again by itself.
+ *  Only for an app this conversation already raised: the user consented to
+ *  that app coming forward once, and it drifting back off-Space between two
+ *  actions is not a new decision — it is the same one, undone. Measured: one
+ *  working run spent a third of its calls re-asking for a raise it had
+ *  already been given. */
+export function shouldRecoverRaise(s: { windowsHere: number; offscreen: number; raisedBefore: boolean }): boolean {
+  return s.raisedBefore && s.windowsHere === 0 && s.offscreen > 0;
+}
+
 export type AxResult = Record<string, unknown>;
 type Pending = { resolve: (r: AxResult) => void; reject: (e: Error) => void; timer: NodeJS.Timeout };
 

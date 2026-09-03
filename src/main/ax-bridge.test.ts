@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { AxClient, AxError, appOfStep, axConsent, axNeedsFocus, offerScreenshotTools, describeAxAction, indexElementLines, readAxManifest, resolveAxDir } from "./ax-bridge";
+import { AxClient, AxError, appOfStep, axConsent, axNeedsFocus, offerScreenshotTools, shouldRecoverRaise, describeAxAction, indexElementLines, readAxManifest, resolveAxDir } from "./ax-bridge";
 
 const scratch = () => mkdtempSync(join(tmpdir(), "ax-"));
 
@@ -246,4 +246,21 @@ test("with the bridge alive, the screenshot tools are not offered", () => {
   // menu; the tree had Slack's DM list the whole time.
   assert.equal(offerScreenshotTools({ axAlive: true }), false);
   assert.equal(offerScreenshotTools({ axAlive: false }), true, "without a bridge they are the only way");
+});
+
+// ── Recovering a Space we already asked for ────────────────────────────────
+// Measured on a working run: 10 calls, 3 of them raises. The second raise was
+// pure waste — Chrome had drifted back off-Space between one action and the
+// next read, so the read returned nothing and the model had to ask for the
+// raise again. If this conversation already raised that app, the read should
+// recover by itself.
+
+test("a read that comes back empty retries once, but only for an app we raised before", () => {
+  assert.equal(shouldRecoverRaise({ windowsHere: 0, offscreen: 12, raisedBefore: true }), true);
+  assert.equal(shouldRecoverRaise({ windowsHere: 0, offscreen: 12, raisedBefore: false }), false,
+    "never raise an app the model has not already chosen to bring forward");
+  assert.equal(shouldRecoverRaise({ windowsHere: 2, offscreen: 12, raisedBefore: true }), false,
+    "windows are here; nothing to recover");
+  assert.equal(shouldRecoverRaise({ windowsHere: 0, offscreen: 0, raisedBefore: true }), false,
+    "the app has no windows at all — raising will not conjure one");
 });

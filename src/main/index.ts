@@ -55,6 +55,7 @@ import {
   appOfStep,
   axConsent,
   offerScreenshotTools,
+  shouldRecoverRaise,
   axLooksInstalled,
   axNeedsFocus,
   describeAxAction,
@@ -2092,7 +2093,18 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         return axText(`${appName} is in front and its windows are now readable.\n${diff}`, true);
       }
       case "computer_app_state": {
-        const w = await ax.request("windows", { app: appName }, 3_000);
+        let w = await ax.request("windows", { app: appName }, 3_000);
+        // An app this conversation already raised can drift back off-Space
+        // between two actions. That is the raise being undone, not a new
+        // decision, so put it back rather than making the model ask again.
+        if (shouldRecoverRaise({
+          windowsHere: ((w.windows as unknown[]) ?? []).length,
+          offscreen: Number(w.offscreen ?? 0),
+          raisedBefore: axRaised.get(root) === appName,
+        })) {
+          await ax.request("raise", { app: appName }, 5_000);
+          w = await ax.request("windows", { app: appName }, 3_000);
+        }
         const offscreen = Number(w.offscreen ?? 0);
         const windowsText = String(w.text ?? "");
         const head = [
