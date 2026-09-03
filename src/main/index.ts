@@ -1146,7 +1146,9 @@ const AGENT_BROWSER_TOOLS = [
     type: "function",
     name: "browser_connect",
     description:
-      "Get a signed-in browser session, for tasks that need the user's OWN accounts: their email, their X timeline, a dashboard or admin panel — anything behind a login that no public page can answer. CALL THIS DIRECTLY as your first step for such a task. Do NOT ask the user in chat whether you may proceed and do not wait for their reply — that includes private data like their email, messages or bank pages: the app shows them its OWN permission prompt, which they approve or deny, and that prompt IS the consent step, so asking again in chat only wastes a round trip. On approval the app opens and attaches a browser window by itself. Example: a request like 'go over my email and find the message from X' means call browser_connect straight away. There is nothing for the user to run. If the result says the profile is new and not signed in yet, tell the user to sign in in that window and stop; otherwise keep browsing as them. Prefer browser_search for anything public. While attached, browser_close leaves the browser open.",
+      "Get a signed-in browser session, for tasks that need the user's OWN accounts: their email, their X timeline, a dashboard or admin panel — anything behind a login that no public page can answer. CALL THIS DIRECTLY as your first step for such a task. " +
+      "This opens a SEPARATE browser window that the app manages; it does not use the browser the user is running and cannot see their existing windows or tabs. When the user names their own browser (\"my chrome\", \"the tab I have open\") or COMPUTER is selected for the turn, use computer_app_state instead. " +
+      "Do NOT ask the user in chat whether you may proceed and do not wait for their reply — that includes private data like their email, messages or bank pages: the app shows them its OWN permission prompt, which they approve or deny, and that prompt IS the consent step, so asking again in chat only wastes a round trip. On approval the app opens and attaches a browser window by itself. Example: a request like 'go over my email and find the message from X' means call browser_connect straight away. There is nothing for the user to run. If the result says the profile is new and not signed in yet, tell the user to sign in in that window and stop; otherwise keep browsing as them. Prefer browser_search for anything public. While attached, browser_close leaves the browser open.",
     inputSchema: {
       type: "object",
       properties: { port: { type: "string", description: "CDP port or ws:// URL (default 9222)" } },
@@ -1260,7 +1262,9 @@ const AX_TOOLS = [
     type: "function",
     name: "computer_app_state",
     description:
-      "Read an app's windows and UI element tree as text, one element per line: id, role, title, value, flags, and the actions it supports in braces. Act on those ids: the controls are named, so press them rather than guessing keyboard shortcuts. " +
+      "Read an app's windows and UI element tree as text, one element per line: id, role, title, value, flags, and the actions it supports in braces. " +
+      "THIS IS THE TOOL FOR APPS THE USER ALREADY HAS OPEN — their running browser and its existing tabs included, so a site they are already signed into (Slack, Gmail, a dashboard) is read and operated here, in their own window. The browser_* tools open a separate browser instead and cannot see any of it. " +
+      "Act on those ids: the controls are named, so press them rather than guessing keyboard shortcuts. " +
       "Reach for this BEFORE computer_screenshot: it answers what is on screen, which tab is selected, and where a control is, as text. "
       + "It works on a BACKGROUND app on any Space and never takes over the user's screen. " +
       "Ids are stable per app until an element disappears. After the first read of an app the result is a DIFF (~ changed, + added, removed by id) unless full=true. " +
@@ -3010,8 +3014,12 @@ const PLAN_DIRECTIVE =
   "and open questions. End by asking whether to proceed with the plan.";
 
 const COMPUTER_DIRECTIVE =
-  "COMPUTER is selected for this turn. Use the computer tools when desktop interaction helps complete the request. " +
-  "Every desktop action still requires explicit user approval.";
+  "COMPUTER is selected for this turn. The user has explicitly chosen the computer tools, so use them: start with " +
+  "computer_apps or computer_app_state and work through the apps ALREADY OPEN on their machine. " +
+  "Do NOT call browser_connect or the other browser_* tools for this turn — those open a SEPARATE browser window and " +
+  "cannot see the user's own windows or tabs, which is the opposite of what they asked for. This applies even when the " +
+  "task involves a website behind a login: if it is open in a browser they are already running, computer_app_state reads " +
+  "it and computer_act operates it. Every desktop action still requires explicit user approval.";
 
 // Work-in mode for NEW project chats: the live checkout, or an isolated
 // git worktree created per conversation (agent works on its own branch,
