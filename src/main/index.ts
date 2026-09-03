@@ -17,21 +17,7 @@ import type { MenuItemConstructorOptions } from "electron";
 import type { NativeImage } from "electron";
 import { dirname, isAbsolute, join, relative } from "node:path";
 import { homedir, hostname } from "node:os";
-import {
-  closeSync,
-  cpSync,
-  existsSync,
-  mkdirSync,
-  mkdtempSync,
-  openSync,
-  readdirSync,
-  readFileSync,
-  readSync,
-  renameSync,
-  rmSync,
-  statSync,
-  writeFileSync,
-} from "node:fs";
+import { appendFileSync, closeSync, cpSync, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import { startSecretProxy, type SecretConnector } from "./oauth-proxy";
@@ -49,6 +35,20 @@ import { get as httpGet } from "node:http";
 import { EngineClient, engineVersionFromUserAgent, type EngineStatus } from "./engine";
 import { pollDeviceToken, requestDeviceAuthorization } from "./device-auth";
 import { RendererCrashRecovery } from "./crash-recovery";
+import {
+  AxClient,
+  AxError,
+  appOfStep,
+  axConsent,
+  offerScreenshotTools,
+  shouldRecoverRaise,
+  axLooksInstalled,
+  axNeedsFocus,
+  describeAxAction,
+  indexElementLines,
+  readAxManifest,
+  resolveAxDir,
+} from "./ax-bridge";
 import { isProductionBuild } from "./runtime-mode";
 import {
   dueAt,
@@ -1133,7 +1133,9 @@ const AGENT_BROWSER_TOOLS = [
     type: "function",
     name: "browser_connect",
     description:
-      "Get a signed-in browser session, for tasks that need the user's OWN accounts: their email, their X timeline, a dashboard or admin panel — anything behind a login that no public page can answer. CALL THIS DIRECTLY as your first step for such a task. Do NOT ask the user in chat whether you may proceed and do not wait for their reply — that includes private data like their email, messages or bank pages: the app shows them its OWN permission prompt, which they approve or deny, and that prompt IS the consent step, so asking again in chat only wastes a round trip. On approval the app opens and attaches a browser window by itself. Example: a request like 'go over my email and find the message from X' means call browser_connect straight away. There is nothing for the user to run. If the result says the profile is new and not signed in yet, tell the user to sign in in that window and stop; otherwise keep browsing as them. Prefer browser_search for anything public. While attached, browser_close leaves the browser open.",
+      "Get a signed-in browser session, for tasks that need the user's OWN accounts: their email, their X timeline, a dashboard or admin panel — anything behind a login that no public page can answer. CALL THIS DIRECTLY as your first step for such a task. " +
+      "This opens a SEPARATE browser window that the app manages; it does not use the browser the user is running and cannot see their existing windows or tabs. When the user names their own browser (\"my chrome\", \"the tab I have open\") or COMPUTER is selected for the turn, use computer_app_state instead. " +
+      "Do NOT ask the user in chat whether you may proceed and do not wait for their reply — that includes private data like their email, messages or bank pages: the app shows them its OWN permission prompt, which they approve or deny, and that prompt IS the consent step, so asking again in chat only wastes a round trip. On approval the app opens and attaches a browser window by itself. Example: a request like 'go over my email and find the message from X' means call browser_connect straight away. There is nothing for the user to run. If the result says the profile is new and not signed in yet, tell the user to sign in in that window and stop; otherwise keep browsing as them. Prefer browser_search for anything public. While attached, browser_close leaves the browser open.",
     inputSchema: {
       type: "object",
       properties: { port: { type: "string", description: "CDP port or ws:// URL (default 9222)" } },
@@ -1227,6 +1229,72 @@ const COMPUTER_USE_TOOLS = [
         deltaY: { type: "integer", minimum: -100, maximum: 100, default: 0 },
       },
       required: ["x", "y"],
+    },
+  },
+];
+
+// The accessibility bridge (unbiased-ax): an app's structure as text, acted on
+// by element id. Declared only while the bridge is running — see
+// threadDynamicTools. Measured against real Brave: the task that took the
+// screenshot tools 27 calls and 6.7 minutes took this path 8 calls and 9.3s.
+const AX_TOOL_NAMES = new Set(["computer_apps", "computer_app_state", "computer_raise", "computer_act"]);
+const AX_TOOLS = [
+  {
+    type: "function",
+    name: "computer_apps",
+    description: "List running apps with the frontmost marked. No approval needed. Use the returned name for the other computer_* tools.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    type: "function",
+    name: "computer_app_state",
+    description:
+      "Read an app's windows and UI element tree as text, one element per line: id, role, title, value, flags, and the actions it supports in braces. " +
+      "THIS IS THE TOOL FOR APPS THE USER ALREADY HAS OPEN — their running browser and its existing tabs included, so a site they are already signed into (Slack, Gmail, a dashboard) is read and operated here, in their own window. The browser_* tools open a separate browser instead and cannot see any of it. " +
+      "Act on those ids: the controls are named, so press them rather than guessing keyboard shortcuts. " +
+      "Reach for this BEFORE computer_screenshot: it answers what is on screen, which tab is selected, and where a control is, as text. "
+      + "It works on a BACKGROUND app on any Space and never takes over the user's screen. " +
+      "Ids are stable per app until an element disappears. After the first read of an app the result is a DIFF (~ changed, + added, removed by id) unless full=true. " +
+      "If the result says every window is on another Space, the app is NOT in the tree — call computer_raise once, then read again. If windows ARE listed, work with them and do not raise. Pass query to search for one control by title instead of reading everything. " +
+      "Web page content inside a browser needs web=true. Use computer_screenshot when you need to SEE something the tree cannot express — whether a video is actually playing, a canvas, a rendered chart — and one confirming screenshot at the end of a visual task is worth taking.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        app: { type: "string", description: "App name, name prefix, bundle id, or pid — e.g. \"Brave\"." },
+        query: { type: "string", description: "Find elements whose title or value contains this, instead of returning the whole tree." },
+        role: { type: "string", description: "With query: restrict to a role, e.g. \"text field\", \"link\", \"button\", \"tab\"." },
+        interactive: { type: "boolean", default: true, description: "Only controls a user can operate. Set false to include static text." },
+        web: { type: "boolean", default: false, description: "Include web page content in browsers (Chromium builds it on request)." },
+        full: { type: "boolean", default: false, description: "Return the whole tree even when a diff is available." },
+        depth: { type: "integer", description: "Maximum tree depth (default 14)." },
+      },
+      required: ["app"],
+    },
+  },
+  {
+    type: "function",
+    name: "computer_raise",
+    description:
+      "Bring an app to the front, switching Spaces if its windows are elsewhere. This TAKES OVER the user's screen, so use it in exactly one case: computer_app_state reported that every window of the app is on another Space, which means the app is not in the tree and cannot be read or acted on until it is raised. Never raise to read or press an app whose windows are already listed. This always requires explicit user approval.",
+    inputSchema: { type: "object", properties: { app: { type: "string" } }, required: ["app"] },
+  },
+  {
+    type: "function",
+    name: "computer_act",
+    description:
+      "Act on an element by the id computer_app_state returned. Exactly one of: action (an action the element listed in braces, e.g. press, or focus), value (set a text field), key (a real key event: return, tab, escape, space, delete, up, down, left, right — use key=return to commit a browser address bar after setting its value). " +
+      "PREFER pressing the control the tree names over a keyboard shortcut: a video player exposes button \"Play (k)\", so press that id. A key WITHOUT id goes wherever keyboard focus already is and will type into whatever field is focused; pass id with key to aim it at an element, which is focused first. " +
+      "Works on a background app without ever taking the user's screen, key events included. Returns the diff of what changed, so you need not read again.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        app: { type: "string" },
+        id: { type: "integer", description: "Element id from computer_app_state. With key, that element is focused first so the keystroke lands there." },
+        action: { type: "string" },
+        value: { type: "string" },
+        key: { type: "string", enum: ["return", "tab", "escape", "space", "delete", "up", "down", "left", "right"] },
+      },
+      required: ["app"],
     },
   },
 ];
@@ -1366,6 +1434,14 @@ function dynamicToolCommandText(tool: string | undefined, rawArgs: unknown): str
     const name = typeof args.name === "string" && args.name.trim() ? args.name.trim() : "memory";
     return `${t === "memory_save" ? "save memory" : "forget memory"} · ${name}`;
   }
+  if (t === "computer_apps") return "list apps";
+  if (t === "computer_raise") return `raise ${String(args.app)}`;
+  if (t === "computer_app_state") return typeof args.query === "string" ? `find "${args.query}" in ${String(args.app)}` : `read ${String(args.app)}`;
+  if (t === "computer_act") {
+    if (typeof args.key === "string") return `press ${args.key} in ${String(args.app)}`;
+    if (typeof args.value === "string") return `set #${String(args.id)} in ${String(args.app)}`;
+    return `${typeof args.action === "string" ? args.action : "press"} #${String(args.id)} in ${String(args.app)}`;
+  }
   if (t === "computer_screenshot") return "capture desktop";
   if (t === "computer_type") return "type text";
   if (t === "computer_move") return `move to ${String(args.x)}, ${String(args.y)}`;
@@ -1390,7 +1466,13 @@ function dynamicToolCommandText(tool: string | undefined, rawArgs: unknown): str
  * machine without agent-browser installed.
  */
 function threadDynamicTools(): Record<string, unknown>[] | undefined {
-  const tools = [...COMPUTER_USE_TOOLS, ...SCHEDULE_TOOLS, ...MEMORY_TOOLS, ...(agentBrowserTools() ?? [])];
+  const tools = [
+    ...(ax?.alive ? AX_TOOLS : []),
+    ...(offerScreenshotTools({ axAlive: ax?.alive === true }) ? COMPUTER_USE_TOOLS : []),
+    ...SCHEDULE_TOOLS,
+    ...MEMORY_TOOLS,
+    ...(agentBrowserTools() ?? []),
+  ];
   return tools.length ? (tools as Record<string, unknown>[]) : undefined;
 }
 
@@ -1867,6 +1949,223 @@ async function offerComputerPermissionSettings(
   }
 }
 
+// ── The accessibility bridge ─────────────────────────────────────────────
+let ax: AxClient | null = null;
+/** Conversations that granted desktop control for the session, so "allow for
+ *  session" means it. Same shape as browserNetGrants. */
+const axGrants = new Set<string>();
+/** The app each conversation last brought forward, so an approval that steals
+ *  the Space back can be undone. */
+const axRaised = new Map<string, string>();
+
+/** The mode to gate a LOCAL desktop action by. threadAccessModes records what
+ *  a thread started under, because codex fixes its own approvalPolicy at
+ *  thread/start and cannot be changed after — but this app's own cards are not
+ *  bound by that, and the pill the user just set is what they meant. */
+function liveAccessMode(root: string): AccessMode {
+  return accessMode || threadAccessModes.get(root) || "ask";
+}
+
+/** Put back a raise that an approval card undid. Cheap when nothing was
+ *  raised, and silent on failure: this is a convenience, not a step. */
+async function reassertRaise(root: string): Promise<void> {
+  const appName = axRaised.get(root);
+  if (!appName || !ax?.alive) return;
+  try {
+    axLog(`raise ${appName} (re-assert after an approval card)`);
+    await ax.request("raise", { app: appName }, 3_000);
+  } catch {
+    // the app may have quit; the next read will say so plainly
+  }
+}
+/** id -> element line per app, accumulated from every tree and diff the model
+ *  saw, so an approval can say WHICH element is about to be pressed. */
+const axLines = new Map<string, Map<number, string>>();
+/** app name -> its icon as a data URL, fetched once per app. The transcript
+ *  shows it beside each step, so "press #643 in Brave" carries Brave's icon
+ *  rather than a terminal glyph. */
+const axIcons = new Map<string, string>();
+
+/** Diagnostics. The console is the normal home, but the dev launcher runs the
+ *  app through `open -W -n`, which discards stdout — an instrumented run this
+ *  week produced an empty log and told us nothing. So with UNBIASED_AX_DEBUG=1
+ *  the same lines also append to a file, matching the bridge's own switch.
+ *
+ *  Off by default: these lines name the apps a user drove and the elements
+ *  they touched, and a world-readable /tmp file that grows forever is not
+ *  something to hand every user for the sake of one debugging session. */
+const AX_DEBUG_FILE = process.env.UNBIASED_AX_DEBUG === "1" ? "/tmp/unbiased-ax-diag.log" : null;
+
+function axLog(line: string): void {
+  console.log(`[ax] ${line}`);
+  if (!AX_DEBUG_FILE) return;
+  try {
+    appendFileSync(AX_DEBUG_FILE, `${new Date().toISOString().slice(11, 23)} ${line}\n`);
+  } catch {
+    // diagnostics must never break a turn
+  }
+}
+
+/** The icon for a step, if we have already fetched it. Synchronous on purpose:
+ *  a transcript row must not wait on IPC, and the icon arrives on the next
+ *  read of the same app. */
+function axStepIcon(tool: string | undefined, rawArgs: unknown): string | undefined {
+  const name = appOfStep(tool ?? "", (rawArgs && typeof rawArgs === "object" ? rawArgs : {}) as Record<string, unknown>);
+  return name ? axIcons.get(name) || undefined : undefined;
+}
+
+async function axIconFor(appName: string): Promise<string | undefined> {
+  if (!appName || !ax?.alive) return undefined;
+  const cached = axIcons.get(appName);
+  if (cached !== undefined) return cached || undefined;
+  try {
+    const r = await ax.request("icon", { app: appName }, 3_000);
+    const png = typeof r.png === "string" ? r.png : "";
+    axIcons.set(appName, png ? `data:image/png;base64,${png}` : "");
+  } catch {
+    axIcons.set(appName, ""); // an app with no icon is not asked about again
+  }
+  return axIcons.get(appName) || undefined;
+}
+
+async function startAxBridge(): Promise<void> {
+  if (ax?.alive) return;
+  const dir = resolveAxDir({ isPackaged: productionBuild(), resourcesPath: process.resourcesPath, appPath: app.getAppPath() });
+  if (!axLooksInstalled(dir)) return; // not installed: the tools are simply absent
+  const manifest = readAxManifest(dir);
+  if (!manifest) return;
+  if ("error" in manifest) {
+    console.warn(`[ax] not starting: ${manifest.error}`);
+    return;
+  }
+  const client = new AxClient(manifest);
+  try {
+    const hello = await client.start();
+    ax = client;
+    axLog(`bridge ${hello.version} ready (${hello.trusted ? "trusted" : "NOT trusted: Accessibility not granted"})`);
+  } catch (err) {
+    console.warn(`[ax] handshake failed: ${String(err)}`);
+    client.stop();
+  }
+}
+
+function axText(text: string, success: boolean): DynamicToolResponse {
+  return { contentItems: [{ type: "inputText", text }], success };
+}
+
+async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | null): Promise<DynamicToolResponse> {
+  if (!ax?.alive) await startAxBridge(); // it may have died; one attempt to bring it back
+  if (!ax?.alive) return axText("The accessibility bridge is not running. Use computer_screenshot instead.", false);
+  const a = (rawArgs && typeof rawArgs === "object" ? rawArgs : {}) as Record<string, unknown>;
+  const appName = typeof a.app === "string" ? a.app.trim() : "";
+  if (tool !== "computer_apps" && !appName) return axText("app is required. Call computer_apps to list running apps.", false);
+
+  // The access mode already decided this: full is approvalPolicy "never", and
+  // a card there ignores what the user set. Mode first, then the grant.
+  const root = rootThreadOf(threadId);
+  const mode = liveAccessMode(root);
+  if (axConsent({ tool, mode, granted: axGrants.has(root) }) === "ask") {
+    const decision = await requestLocalApproval(
+      threadId,
+      describeAxAction(tool, a, axLines.get(appName)),
+      [
+        "This reads or operates the app's user interface through macOS Accessibility, without a screenshot.",
+        "UI text (window titles, tab names, field contents) may be added to this conversation and sent to the model.",
+        "Allowing for the session covers further desktop reads and actions in this conversation.",
+      ].join("\n"),
+      { kind: "computer" },
+    );
+    if (decision === "decline") return axText("The user declined this computer action. Do not retry it unless they ask.", false);
+    if (decision === "acceptForSession") axGrants.add(root);
+    await reassertRaise(root); // the card took the Space back; put it right
+  }
+
+  void axIconFor(appName); // warm the cache; the row picks it up next read
+  const remember = (text: string) => {
+    if (!appName) return;
+    axLines.set(appName, indexElementLines(text, axLines.get(appName)));
+  };
+  try {
+    switch (tool) {
+      case "computer_apps": {
+        const r = await ax.request("apps", {}, 3_000);
+        const apps = (r.apps as { name: string; bundleId?: string; frontmost: boolean }[]) ?? [];
+        return axText(apps.map((x) => `${x.name}${x.frontmost ? " [frontmost]" : ""}${x.bundleId ? ` (${x.bundleId})` : ""}`).join("\n") || "(no apps)", true);
+      }
+      case "computer_raise": {
+        axLog(`raise ${appName} (the model asked)`);
+        axRaised.set(root, appName);
+        const r = await ax.request("raise", { app: appName });
+        const diff = String(r.diff ?? "");
+        remember(diff);
+        return axText(`${appName} is in front and its windows are now readable.\n${diff}`, true);
+      }
+      case "computer_app_state": {
+        let w = await ax.request("windows", { app: appName }, 3_000);
+        // An app this conversation already raised can drift back off-Space
+        // between two actions. That is the raise being undone, not a new
+        // decision, so put it back rather than making the model ask again.
+        if (shouldRecoverRaise({
+          windowsHere: ((w.windows as unknown[]) ?? []).length,
+          offscreen: Number(w.offscreen ?? 0),
+          raisedBefore: axRaised.get(root) === appName,
+        })) {
+          axLog(`raise ${appName} (auto: read found 0 windows here, ${String(w.offscreen)} offscreen)`);
+          await ax.request("raise", { app: appName }, 5_000);
+          w = await ax.request("windows", { app: appName }, 3_000);
+        }
+        const offscreen = Number(w.offscreen ?? 0);
+        const windowsText = String(w.text ?? "");
+        const head = [
+          windowsText ? `windows:\n${windowsText}` : "windows: none on this Space",
+          typeof w.hint === "string" ? w.hint : "",
+        ].filter(Boolean).join("\n");
+        if (!windowsText && offscreen > 0) return axText(head, true);
+        const opts: Record<string, unknown> = {
+          app: appName,
+          interactive: a.interactive !== false,
+          web: a.web === true,
+          full: a.full === true,
+          ...(typeof a.depth === "number" ? { depth: a.depth } : {}),
+        };
+        if (typeof a.query === "string" && a.query.trim()) {
+          const r = await ax.request("find", { ...opts, title: a.query.trim(), ...(typeof a.role === "string" ? { role: a.role } : {}) });
+          const matches = (r.matches as string[]) ?? [];
+          remember(matches.join("\n"));
+          return axText(`${head}\n\n${matches.length} match(es) for "${a.query}":\n${matches.join("\n") || "(none — try without role, or with web=true for page content)"}`, true);
+        }
+        const r = await ax.request("tree", opts);
+        const body = String(r.tree ?? r.diff ?? "");
+        remember(body);
+        const label = r.tree !== undefined ? "tree" : "changes since last read";
+        return axText(`${head}\n\n${label} (${String(r.count)} elements${r.truncated ? ", truncated — use query or depth" : ""}):\n${body}`, true);
+      }
+      case "computer_act": {
+        axLog(`act ${appName} ${JSON.stringify({ id: a.id, action: a.action, key: a.key, value: typeof a.value === "string" ? "<set>" : undefined })}`);
+        const modes = ["action", "value", "key"].filter((k) => a[k] !== undefined);
+        if (modes.length !== 1) return axText("Pass exactly one of action, value, or key.", false);
+        let r;
+        if (typeof a.key === "string") {
+          // Nothing raises: a key posted to the pid reaches a background app.
+          r = await ax.request("key", { app: appName, key: a.key, ...(typeof a.id === "number" ? { id: a.id } : {}) });
+        }
+        else if (typeof a.value === "string") r = await ax.request("setValue", { app: appName, id: a.id, value: a.value });
+        else r = await ax.request("act", { app: appName, id: a.id, action: String(a.action) });
+        const diff = String(r.diff ?? "");
+        remember(diff);
+        return axText(`Done.\n${diff}`, true);
+      }
+      default:
+        return axText(`Unknown tool ${tool}`, false);
+    }
+  } catch (err) {
+    // The bridge's errors already say what to do: not_trusted names the pane,
+    // no_such_element says to read again, no_such_app says to list apps.
+    const msg = err instanceof AxError ? `${err.message}${err.code === "not_trusted" ? " Fall back to computer_screenshot for now." : ""}` : String(err);
+    return axText(msg, false);
+  }
+}
+
 async function handleComputerUseCall(
   tool: string,
   rawArgs: unknown,
@@ -1878,6 +2177,14 @@ async function handleComputerUseCall(
   } catch (err) {
     return { contentItems: [{ type: "inputText", text: err instanceof Error ? err.message : String(err) }], success: false };
   }
+  // The same gate the AX tools use: full access means no card, and a session
+  // grant covers the conversation. Without this, five screenshot-tool calls in
+  // a Full-access conversation each raised a card — and every card stole the
+  // Space back, undoing the raise before it.
+  const root = rootThreadOf(threadId);
+  if (axConsent({ tool, mode: liveAccessMode(root), granted: axGrants.has(root) }) === "allow") {
+    return runComputerAction(action, threadId);
+  }
   const decision = await requestLocalApproval(
     threadId,
     computerApprovalCommand(action),
@@ -1885,8 +2192,9 @@ async function handleComputerUseCall(
       "This gives Pareto one-time access to the primary display or desktop input.",
       "Visible desktop content and the action result may be added to this conversation and sent to the model.",
       "Review the action carefully, especially before typing or clicking in another app.",
+      "Allowing for the session covers further desktop reads and actions in this conversation.",
     ].join("\n"),
-    { allowForSession: false, kind: "computer" },
+    { kind: "computer" },
   );
   if (decision === "decline") {
     return {
@@ -1894,6 +2202,15 @@ async function handleComputerUseCall(
       success: false,
     };
   }
+  if (decision === "acceptForSession") axGrants.add(root);
+  // A card lives in this app's window, which is usually on the user's own
+  // Space — approving it switches back and undoes any raise that preceded it.
+  // Measured: 16 raises in one task, each one re-doing what a card had undone.
+  await reassertRaise(root);
+  return runComputerAction(action, threadId);
+}
+
+async function runComputerAction(action: ComputerAction, threadId: string | null): Promise<DynamicToolResponse> {
   const result = await computerUse.run(action);
   const recovery = !result.ok && result.permission
     ? await offerComputerPermissionSettings(threadId, result.permission)
@@ -2306,6 +2623,7 @@ function resetSubAgentState(): void {
   }
   pendingApprovals.clear();
   browserNetGrants.clear();
+  axGrants.clear();
   browserConnectGrants.clear();
   threadAccessModes.clear();
   browserAttachedExternal = false;
@@ -2718,8 +3036,12 @@ const PLAN_DIRECTIVE =
   "and open questions. End by asking whether to proceed with the plan.";
 
 const COMPUTER_DIRECTIVE =
-  "COMPUTER is selected for this turn. Use the computer tools when desktop interaction helps complete the request. " +
-  "Every desktop action still requires explicit user approval.";
+  "COMPUTER is selected for this turn. The user has explicitly chosen the computer tools, so use them: start with " +
+  "computer_apps or computer_app_state and work through the apps ALREADY OPEN on their machine. " +
+  "Do NOT call browser_connect or the other browser_* tools for this turn — those open a SEPARATE browser window and " +
+  "cannot see the user's own windows or tabs, which is the opposite of what they asked for. This applies even when the " +
+  "task involves a website behind a login: if it is open in a browser they are already running, computer_app_state reads " +
+  "it and computer_act operates it. Every desktop action still requires explicit user approval.";
 
 // Work-in mode for NEW project chats: the live checkout, or an isolated
 // git worktree created per conversation (agent works on its own branch,
@@ -3074,6 +3396,7 @@ function threadToEntries(
             command: dynamicToolCommandText(d.tool, d.arguments),
             status: d.success === false ? "failed" : (d.status ?? "completed"),
             source: dynamicToolSource(d.tool),
+            ...(axStepIcon(d.tool, d.arguments) ? { appIcon: axStepIcon(d.tool, d.arguments) } : {}),
           });
           break;
         }
@@ -4502,6 +4825,7 @@ function wireNotifications(): void {
               id: d.id,
               command: dynamicToolCommandText(d.tool, d.arguments),
               source: dynamicToolSource(d.tool),
+              ...(axStepIcon(d.tool, d.arguments) ? { appIcon: axStepIcon(d.tool, d.arguments) } : {}),
               // A started call is in progress — defaulting to "completed"
               // showed a green "done" for a page still loading.
               status:
@@ -4861,6 +5185,8 @@ function wireNotifications(): void {
           ? handleScheduleToolCall(tool, args, approvalThread)
           : tool.startsWith("memory_")
             ? handleMemoryToolCall(tool, args, approvalThread)
+            : AX_TOOL_NAMES.has(tool)
+              ? handleAxCall(tool, args, approvalThread)
             : tool.startsWith("computer_")
               ? handleComputerUseCall(tool, args, approvalThread)
               : handleAgentBrowserCall(tool, args, approvalThread);
@@ -5648,6 +5974,8 @@ async function startEngine(): Promise<void> {
   // After the engine, and never blocking it: an absent or broken sidecar
   // leaves the app exactly as it was.
   void startLearning();
+  // Same footing as the sidecar: absent or broken, the app is exactly as it was.
+  void startAxBridge();
 }
 
 app.whenReady().then(async () => {
@@ -6484,6 +6812,11 @@ app.whenReady().then(async () => {
 
   ipcMain.handle("policy:set-mode", (_e, mode: string) => {
     if (mode === "ask" || mode === "auto" || mode === "full") accessMode = mode;
+    // The engine's own approvalPolicy is fixed at thread/start and cannot
+    // follow, but this app's local cards can and should: a user who sets Full
+    // access mid-conversation means it now, not in the next conversation.
+    // Clearing session grants with it, so tightening the mode really tightens.
+    if (accessMode === "ask") axGrants.clear();
     return { mode: accessMode };
   });
 
