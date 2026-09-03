@@ -46,6 +46,7 @@ import type { ChildProcess } from "node:child_process";
 import { get as httpGet } from "node:http";
 import { EngineClient, engineVersionFromUserAgent, type EngineStatus } from "./engine";
 import { pollDeviceToken, requestDeviceAuthorization } from "./device-auth";
+import { RendererCrashRecovery } from "./crash-recovery";
 import {
   dueAt,
   isDue,
@@ -3511,6 +3512,48 @@ function createWindow(): void {
       e.preventDefault();
     }
   });
+  // A dead render frame is never recreated by Electron, and every send into
+  // it throws "Render frame was disposed" — so a single native crash used to
+  // cost the whole session: a white window, a healthy main process, and no
+  // way back short of quitting. Reload instead. When to STOP reloading is the
+  // only judgement here, and it lives in ./crash-recovery where it is tested.
+  const crashRecovery = new RendererCrashRecovery();
+  win.webContents.on("render-process-gone", (_event, details) => {
+    const decision = crashRecovery.onGone(details.reason);
+    console.warn(
+      `[window] renderer gone (${details.reason}, exit ${details.exitCode}) — ${decision.action}`,
+    );
+    if (decision.action === "ignore" || !win || win.isDestroyed()) return;
+    // Out of the event handler before touching the webContents that just died.
+    if (decision.action === "reload") {
+      setTimeout(() => {
+        if (win && !win.isDestroyed()) win.webContents.reload();
+      }, 0);
+      return;
+    }
+    void dialog
+      .showMessageBox(win, {
+        type: "error",
+        title: "Unbiased stopped responding",
+        message: "The window keeps crashing.",
+        detail:
+          `The interface crashed ${decision.attempts} times in under a minute (${details.reason}). ` +
+          `Your conversations are saved either way.`,
+        buttons: ["Reload", "Quit"],
+        defaultId: 0,
+        cancelId: 0,
+      })
+      .then(({ response }) => {
+        if (response === 1) {
+          app.quit();
+          return;
+        }
+        // The user chose to try again knowing it has been looping.
+        crashRecovery.reset();
+        if (win && !win.isDestroyed()) win.webContents.reload();
+      });
+  });
+
   if (process.env.ELECTRON_RENDERER_URL) {
     win.loadURL(process.env.ELECTRON_RENDERER_URL);
   } else {
