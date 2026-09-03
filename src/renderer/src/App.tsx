@@ -1273,6 +1273,28 @@ export function App() {
   } | null>(null);
   // Per-thread ⋯ menu (fixed-positioned like the project menu) and its dialogs.
   const [threadMenu, setThreadMenu] = useState<{ id: string; title: string; inProject: boolean; x: number; y: number } | null>(null);
+  // The menu is anchored below its trigger, which runs off the bottom of the
+  // window for a row near the end of a long Recents list. Measured on the last
+  // row: a 175px panel opened at y=851 in a 950px window and lost 76px off the
+  // bottom, taking a menu item with it. The horizontal position has always
+  // been clamped to the viewport; this is the same clamp on the other axis.
+  //
+  // It has to be measured rather than computed, because the panel's height
+  // depends on which items it shows (Move to project is conditional). A layout
+  // effect lands the correction before paint, so the menu is never briefly
+  // visible in the wrong place.
+  const threadMenuRef = useRef<HTMLDivElement>(null);
+  const [threadMenuTop, setThreadMenuTop] = useState<number | null>(null);
+  useLayoutEffect(() => {
+    if (!threadMenu) {
+      setThreadMenuTop(null);
+      return;
+    }
+    const el = threadMenuRef.current;
+    if (!el) return;
+    const gap = 8;
+    setThreadMenuTop(Math.max(gap, Math.min(threadMenu.y, window.innerHeight - el.offsetHeight - gap)));
+  }, [threadMenu]);
   const [renameDialog, setRenameDialog] = useState<{ id: string; name: string; error: string | null } | null>(null);
   const [moveDialog, setMoveDialog] = useState<{ id: string; title: string } | null>(null);
 
@@ -4860,10 +4882,11 @@ export function App() {
       )}
       {threadMenu && (
         <div
+          ref={threadMenuRef}
           data-threadmenu
           style={{
             position: "fixed",
-            top: threadMenu.y,
+            top: threadMenuTop ?? threadMenu.y,
             left: Math.max(8, Math.min(threadMenu.x - 208, window.innerWidth - 224)),
             width: 208,
             background: "linear-gradient(160deg, color-mix(in srgb, var(--fg) 5%, transparent), transparent 42%), color-mix(in srgb, var(--panel) 91%, transparent)",
