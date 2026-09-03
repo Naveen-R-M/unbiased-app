@@ -1986,6 +1986,7 @@ async function reassertRaise(root: string): Promise<void> {
   const appName = axRaised.get(root);
   if (!appName || !ax?.alive) return;
   try {
+    console.log(`[ax] raise ${appName} (re-assert after an approval card)`);
     await ax.request("raise", { app: appName }, 3_000);
   } catch {
     // the app may have quit; the next read will say so plainly
@@ -2086,6 +2087,7 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         return axText(apps.map((x) => `${x.name}${x.frontmost ? " [frontmost]" : ""}${x.bundleId ? ` (${x.bundleId})` : ""}`).join("\n") || "(no apps)", true);
       }
       case "computer_raise": {
+        console.log(`[ax] raise ${appName} (the model asked)`);
         axRaised.set(root, appName);
         const r = await ax.request("raise", { app: appName });
         const diff = String(r.diff ?? "");
@@ -2102,6 +2104,7 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
           offscreen: Number(w.offscreen ?? 0),
           raisedBefore: axRaised.get(root) === appName,
         })) {
+          console.log(`[ax] raise ${appName} (auto: read found 0 windows here, ${String(w.offscreen)} offscreen)`);
           await ax.request("raise", { app: appName }, 5_000);
           w = await ax.request("windows", { app: appName }, 3_000);
         }
@@ -2132,6 +2135,7 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         return axText(`${head}\n\n${label} (${String(r.count)} elements${r.truncated ? ", truncated — use query or depth" : ""}):\n${body}`, true);
       }
       case "computer_act": {
+        console.log(`[ax] act ${appName} ${JSON.stringify({ id: a.id, action: a.action, key: a.key, value: typeof a.value === "string" ? "<set>" : undefined })}`);
         const modes = ["action", "value", "key"].filter((k) => a[k] !== undefined);
         if (modes.length !== 1) return axText("Pass exactly one of action, value, or key.", false);
         let r;
