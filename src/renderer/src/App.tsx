@@ -7726,6 +7726,48 @@ function FileViewer({
   );
 }
 
+/** The entry transition for a popover or modal, as a mounted flag.
+ *
+ *  The flag has to start false and flip true for the transition to have a
+ *  "from" state to animate out of, and rAF is the natural way to wait for the
+ *  frame that paints it — keyframes restart from zero when re-triggered, which
+ *  a fast-toggled menu cannot afford.
+ *
+ *  The trap is that rAF does NOT fire while the page is not being painted, so
+ *  the flag never flips and the panel is left at `opacity: 0` forever.
+ *  Measured in the live app with the window occluded: the + menu mounted as an
+ *  invisible 796x261 element above the composer and still swallowed every
+ *  click, which reads exactly like a dead button.
+ *
+ *  A timer is NOT a fix for this — Chromium throttles a hidden page's
+ *  sub-second timers to roughly one-minute alignment, which was measured too.
+ *  The real answer is that an unpainted page has no animation to play: skip
+ *  straight to shown, and flip on any visibility change so a window that
+ *  comes back has its menus already up. */
+function useEntryTransition(open = true): boolean {
+  const [shown, setShown] = useState(false);
+  useEffect(() => {
+    if (!open) {
+      setShown(false);
+      return;
+    }
+    if (document.visibilityState !== "visible") {
+      setShown(true);
+      return;
+    }
+    const frame = requestAnimationFrame(() => setShown(true));
+    // Going hidden mid-animation would strand the flag as surely as opening
+    // hidden does; either direction, being shown is the safe state.
+    const onVisibilityChange = () => setShown(true);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      cancelAnimationFrame(frame);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
+  }, [open]);
+  return shown;
+}
+
 function ChatPane({
   paneId,
   connected,
@@ -7862,19 +7904,9 @@ function ChatPane({
   // The + button's popup menu, plus whether the clipboard held an image
   // when it was opened (drives the "Image from clipboard" item's state).
   const [plusOpen, setPlusOpen] = useState(false);
-  // Entry state for the + menu. A transition off a mounted flag rather than a
-  // keyframe: keyframes restart from zero when re-triggered, and this menu can
-  // be toggled fast. Set on the next frame so the browser has a "from" to
-  // animate out of.
-  const [plusShown, setPlusShown] = useState(false);
-  useEffect(() => {
-    if (!plusOpen) {
-      setPlusShown(false);
-      return;
-    }
-    const id = requestAnimationFrame(() => setPlusShown(true));
-    return () => cancelAnimationFrame(id);
-  }, [plusOpen]);
+  // Entry state for the + menu. See useEntryTransition: a mounted flag rather
+  // than a keyframe, because this menu can be toggled fast.
+  const plusShown = useEntryTransition(plusOpen);
   // The menu panel hangs off the composer box (full width), not the +
   // button, so outside-click must spare both.
   const plusRef = useRef<HTMLSpanElement>(null);
@@ -12715,11 +12747,7 @@ function McpPanel({ onClose }: { onClose: () => void }) {
   // earns motion where the + menu did not — but it is still under the 300ms
   // ceiling, and it scales from its own centre rather than from a trigger:
   // a modal is not anchored to anything, so origin-awareness does not apply.
-  const [shown, setShown] = useState(false);
-  useEffect(() => {
-    const id = requestAnimationFrame(() => setShown(true));
-    return () => cancelAnimationFrame(id);
-  }, []);
+  const shown = useEntryTransition();
 
   // Form state
   const [fName, setFName] = useState("");
