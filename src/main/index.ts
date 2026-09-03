@@ -54,6 +54,7 @@ import {
   AxError,
   appOfStep,
   axConsent,
+  offerScreenshotTools,
   axLooksInstalled,
   axNeedsFocus,
   describeAxAction,
@@ -1474,7 +1475,13 @@ function dynamicToolCommandText(tool: string | undefined, rawArgs: unknown): str
  * machine without agent-browser installed.
  */
 function threadDynamicTools(): Record<string, unknown>[] | undefined {
-  const tools = [...(ax?.alive ? AX_TOOLS : []), ...COMPUTER_USE_TOOLS, ...SCHEDULE_TOOLS, ...MEMORY_TOOLS, ...(agentBrowserTools() ?? [])];
+  const tools = [
+    ...(ax?.alive ? AX_TOOLS : []),
+    ...(offerScreenshotTools({ axAlive: ax?.alive === true }) ? COMPUTER_USE_TOOLS : []),
+    ...SCHEDULE_TOOLS,
+    ...MEMORY_TOOLS,
+    ...(agentBrowserTools() ?? []),
+  ];
   return tools.length ? (tools as Record<string, unknown>[]) : undefined;
 }
 
@@ -1956,6 +1963,29 @@ let ax: AxClient | null = null;
 /** Conversations that granted desktop control for the session, so "allow for
  *  session" means it. Same shape as browserNetGrants. */
 const axGrants = new Set<string>();
+/** The app each conversation last brought forward, so an approval that steals
+ *  the Space back can be undone. */
+const axRaised = new Map<string, string>();
+
+/** The mode to gate a LOCAL desktop action by. threadAccessModes records what
+ *  a thread started under, because codex fixes its own approvalPolicy at
+ *  thread/start and cannot be changed after — but this app's own cards are not
+ *  bound by that, and the pill the user just set is what they meant. */
+function liveAccessMode(root: string): AccessMode {
+  return accessMode || threadAccessModes.get(root) || "ask";
+}
+
+/** Put back a raise that an approval card undid. Cheap when nothing was
+ *  raised, and silent on failure: this is a convenience, not a step. */
+async function reassertRaise(root: string): Promise<void> {
+  const appName = axRaised.get(root);
+  if (!appName || !ax?.alive) return;
+  try {
+    await ax.request("raise", { app: appName }, 3_000);
+  } catch {
+    // the app may have quit; the next read will say so plainly
+  }
+}
 /** id -> element line per app, accumulated from every tree and diff the model
  *  saw, so an approval can say WHICH element is about to be pressed. */
 const axLines = new Map<string, Map<number, string>>();
@@ -2021,7 +2051,7 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
   // The access mode already decided this: full is approvalPolicy "never", and
   // a card there ignores what the user set. Mode first, then the grant.
   const root = rootThreadOf(threadId);
-  const mode = threadAccessModes.get(root) ?? accessMode;
+  const mode = liveAccessMode(root);
   if (axConsent({ tool, mode, granted: axGrants.has(root) }) === "ask") {
     const decision = await requestLocalApproval(
       threadId,
@@ -2035,6 +2065,7 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
     );
     if (decision === "decline") return axText("The user declined this computer action. Do not retry it unless they ask.", false);
     if (decision === "acceptForSession") axGrants.add(root);
+    await reassertRaise(root); // the card took the Space back; put it right
   }
 
   void axIconFor(appName); // warm the cache; the row picks it up next read
@@ -2050,6 +2081,7 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         return axText(apps.map((x) => `${x.name}${x.frontmost ? " [frontmost]" : ""}${x.bundleId ? ` (${x.bundleId})` : ""}`).join("\n") || "(no apps)", true);
       }
       case "computer_raise": {
+        axRaised.set(root, appName);
         const r = await ax.request("raise", { app: appName });
         const diff = String(r.diff ?? "");
         remember(diff);
@@ -2119,6 +2151,14 @@ async function handleComputerUseCall(
   } catch (err) {
     return { contentItems: [{ type: "inputText", text: err instanceof Error ? err.message : String(err) }], success: false };
   }
+  // The same gate the AX tools use: full access means no card, and a session
+  // grant covers the conversation. Without this, five screenshot-tool calls in
+  // a Full-access conversation each raised a card — and every card stole the
+  // Space back, undoing the raise before it.
+  const root = rootThreadOf(threadId);
+  if (axConsent({ tool, mode: liveAccessMode(root), granted: axGrants.has(root) }) === "allow") {
+    return runComputerAction(action, threadId);
+  }
   const decision = await requestLocalApproval(
     threadId,
     computerApprovalCommand(action),
@@ -2126,8 +2166,9 @@ async function handleComputerUseCall(
       "This gives Pareto one-time access to the primary display or desktop input.",
       "Visible desktop content and the action result may be added to this conversation and sent to the model.",
       "Review the action carefully, especially before typing or clicking in another app.",
+      "Allowing for the session covers further desktop reads and actions in this conversation.",
     ].join("\n"),
-    { allowForSession: false, kind: "computer" },
+    { kind: "computer" },
   );
   if (decision === "decline") {
     return {
@@ -2135,6 +2176,15 @@ async function handleComputerUseCall(
       success: false,
     };
   }
+  if (decision === "acceptForSession") axGrants.add(root);
+  // A card lives in this app's window, which is usually on the user's own
+  // Space — approving it switches back and undoes any raise that preceded it.
+  // Measured: 16 raises in one task, each one re-doing what a card had undone.
+  await reassertRaise(root);
+  return runComputerAction(action, threadId);
+}
+
+async function runComputerAction(action: ComputerAction, threadId: string | null): Promise<DynamicToolResponse> {
   const result = await computerUse.run(action);
   const recovery = !result.ok && result.permission
     ? await offerComputerPermissionSettings(threadId, result.permission)
@@ -6732,6 +6782,11 @@ app.whenReady().then(async () => {
 
   ipcMain.handle("policy:set-mode", (_e, mode: string) => {
     if (mode === "ask" || mode === "auto" || mode === "full") accessMode = mode;
+    // The engine's own approvalPolicy is fixed at thread/start and cannot
+    // follow, but this app's local cards can and should: a user who sets Full
+    // access mid-conversation means it now, not in the next conversation.
+    // Clearing session grants with it, so tightening the mode really tightens.
+    if (accessMode === "ask") axGrants.clear();
     return { mode: accessMode };
   });
 

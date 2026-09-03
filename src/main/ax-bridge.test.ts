@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { AxClient, AxError, appOfStep, axConsent, axNeedsFocus, describeAxAction, indexElementLines, readAxManifest, resolveAxDir } from "./ax-bridge";
+import { AxClient, AxError, appOfStep, axConsent, axNeedsFocus, offerScreenshotTools, describeAxAction, indexElementLines, readAxManifest, resolveAxDir } from "./ax-bridge";
 
 const scratch = () => mkdtempSync(join(tmpdir(), "ax-"));
 
@@ -221,4 +221,29 @@ test("appOfStep names the app a computer step acted on, for its icon", () => {
   assert.equal(appOfStep("computer_app_state", { app: "Finder" }), "Finder");
   assert.equal(appOfStep("computer_apps", {}), null, "listing apps touches no one app");
   assert.equal(appOfStep("memory_save", { app: "Brave" }), null, "not a computer tool");
+});
+
+// ── One consent gate for every desktop tool ────────────────────────────────
+// Measured, 58 calls over 5 minutes: the model reached for the older
+// screenshot tools (computer_key, computer_screenshot, computer_type) and each
+// one raised a card, in a conversation set to Full access, because only the AX
+// tools consulted the mode. Worse, the cards CAUSED the loop: each card lives
+// in the Unbiased window on the user's Space, so approving it switched the
+// Space back and undid the raise that preceded it — 16 raises in one task.
+
+test("the screenshot tools obey the access mode exactly like the AX ones", () => {
+  for (const tool of ["computer_screenshot", "computer_key", "computer_type", "computer_click", "computer_move", "computer_scroll"]) {
+    assert.equal(axConsent({ tool, mode: "full", granted: false }), "allow", `${tool} in full`);
+    assert.equal(axConsent({ tool, mode: "ask", granted: false }), "ask", `${tool} in ask`);
+    assert.equal(axConsent({ tool, mode: "ask", granted: true }), "allow", `${tool} with a session grant`);
+  }
+});
+
+// ── The screenshot tools step aside when the bridge can do better ──────────
+
+test("with the bridge alive, the screenshot tools are not offered", () => {
+  // The model tried Spotlight and command+k only because they were on the
+  // menu; the tree had Slack's DM list the whole time.
+  assert.equal(offerScreenshotTools({ axAlive: true }), false);
+  assert.equal(offerScreenshotTools({ axAlive: false }), true, "without a bridge they are the only way");
 });

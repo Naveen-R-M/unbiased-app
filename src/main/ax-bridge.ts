@@ -106,6 +106,14 @@ export function appOfStep(tool: string, args: Record<string, unknown>): string |
   return app || null;
 }
 
+/** Whether to offer the older screenshot-and-coordinates tools. Not while the
+ *  bridge is alive: the model reached for Spotlight and command+k only because
+ *  they were on the menu, when the tree had the list it needed the whole time.
+ *  Without a bridge they are the only way to touch the desktop at all. */
+export function offerScreenshotTools(opts: { axAlive: boolean }): boolean {
+  return !opts.axAlive;
+}
+
 export type AxResult = Record<string, unknown>;
 type Pending = { resolve: (r: AxResult) => void; reject: (e: Error) => void; timer: NodeJS.Timeout };
 
