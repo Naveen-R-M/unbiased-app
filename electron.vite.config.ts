@@ -8,5 +8,8 @@ export default defineConfig({
   preload: { plugins: [externalizeDepsPlugin()] },
   renderer: {
     plugins: [react()],
+    server: process.env.UNBIASED_DEV_PORT
+      ? { port: Number(process.env.UNBIASED_DEV_PORT), strictPort: true }
+      : undefined,
   },
 });
