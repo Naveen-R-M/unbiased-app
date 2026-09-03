@@ -161,7 +161,11 @@ for (let digit = 0; digit <= 9; digit++) KEY_ALIASES[String(digit)] = `Num${digi
 for (let fn = 1; fn <= 12; fn++) KEY_ALIASES[`f${fn}`] = `F${fn}`;
 
 const MODIFIER_KEYS: Record<ComputerModifier, string> = {
-  command: "LeftCmd",
+  // NOT LeftCmd. nut.js sends Key.LeftCmd to libnut as the string "cmd", and
+  // the macOS binary's flag table holds only control, meta and shift -- so
+  // every Cmd+anything failed with "Invalid key flag specified". LeftSuper is
+  // sent as "meta", which is what the native layer means by Command.
+  command: "LeftSuper",
   control: "LeftControl",
   option: "LeftAlt",
   shift: "LeftShift",
@@ -279,14 +283,26 @@ export function parseComputerAction(tool: string, rawArgs: unknown, display: Com
   }
 }
 
-function inputUnavailable(err: unknown, appName: string): ComputerActionResult {
-  const detail = err instanceof Error ? err.message : String(err);
+/** The one case that IS a permission problem. Reported with `permission` so
+ *  the caller offers the System Settings recovery flow. */
+function accessibilityDenied(appName: string): ComputerActionResult {
   return {
     ok: false,
+    permission: "accessibility",
     message:
       `Desktop input is unavailable because macOS has not granted Accessibility access to ${appName}. ` +
-      `Details: ${detail}`,
+      "Enable it in System Settings > Privacy & Security > Accessibility, then restart the app.",
   };
+}
+
+/** Everything else. Accessibility was already confirmed before nut.js was
+ *  loaded, so a failure past that point is a failure of the action itself and
+ *  must say so: blaming a permission that is granted sends the model off to
+ *  work around a problem that does not exist. Measured: one "Invalid key flag
+ *  specified" reported as a denial cost a task eleven AppleScript detours. */
+function inputFailed(what: string, err: unknown): ComputerActionResult {
+  const detail = err instanceof Error ? err.message : String(err);
+  return { ok: false, message: `${what} failed. Details: ${detail}` };
 }
 
 export function createComputerUseService(deps: ComputerUseDependencies): {
@@ -335,13 +351,13 @@ export function createComputerUseService(deps: ComputerUseDependencies): {
           }
         }
         if (!deps.accessibilityTrusted(true)) {
-          return { ...inputUnavailable("Accessibility permission was not granted.", appName()), permission: "accessibility" };
+          return accessibilityDenied(appName());
         }
         let nut: NutRuntime;
         try {
           nut = await deps.loadNut();
         } catch (err) {
-          return inputUnavailable(err, appName());
+          return inputFailed("Loading the native input module", err);
         }
         try {
           if (action.type === "move") {
@@ -376,7 +392,7 @@ export function createComputerUseService(deps: ComputerUseDependencies): {
             message: `Scrolled at (${action.point.x}, ${action.point.y}) by (${action.deltaX}, ${action.deltaY}).`,
           };
         } catch (err) {
-          return inputUnavailable(err, appName());
+          return inputFailed(`The ${action.type} action`, err);
         }
       });
     });

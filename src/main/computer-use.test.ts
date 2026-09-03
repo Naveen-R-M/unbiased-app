@@ -292,3 +292,79 @@ test("with no name configured the messages fall back to the shipped app's", asyn
   const shot = await service.run({ type: "screenshot" });
   assert.match(shot.message, /allow Unbiased,/);
 });
+
+// ── nut.js errors are not permission problems ──────────────────────────────
+// Measured on a live run: computer_key {"key":"Tab","modifiers":["command"]}
+// failed inside nut.js with "Invalid key flag specified", and the catch-all
+// reported it as "macOS has not granted Accessibility access". The model
+// believed that, abandoned clicking and typing for the rest of the task, and
+// spent eleven shell commands on AppleScript instead. Accessibility was
+// granted the whole time -- the four clicks it did attempt all completed.
+//
+// Two bugs, then. The command modifier was mapped to Key.LeftCmd, which nut.js
+// sends to libnut as "cmd"; the macOS binary's flag table holds only control,
+// meta and shift, so every Cmd+anything failed. And a failure inside an action
+// was described as a missing permission.
+
+/** A nut runtime shaped like the real one on macOS: it knows LeftSuper (which
+ *  nut.js sends as "meta", accepted) but not LeftCmd ("cmd", rejected). */
+function fakeNut(overrides: Partial<Record<"click" | "type", () => Promise<unknown>>> = {}) {
+  const presses: number[][] = [];
+  const nut = {
+    Button: { LEFT: 0, MIDDLE: 1, RIGHT: 2 },
+    Key: { Tab: 1, LeftSuper: 2, LeftControl: 3, LeftAlt: 4, LeftShift: 5, K: 6 } as Record<string, number>,
+    keyboard: {
+      type: overrides.type ?? (async () => undefined),
+      pressKey: async (...keys: number[]) => void presses.push(keys),
+      releaseKey: async () => undefined,
+    },
+    mouse: {
+      setPosition: async () => undefined,
+      click: overrides.click ?? (async () => undefined),
+      scrollDown: async () => undefined,
+      scrollUp: async () => undefined,
+      scrollLeft: async () => undefined,
+      scrollRight: async () => undefined,
+    },
+  };
+  return { nut, presses };
+}
+
+const inputService = (nut: ReturnType<typeof fakeNut>["nut"], loadNut?: () => Promise<never>) =>
+  createComputerUseService({
+    platform: "darwin",
+    appName: () => "Unbiased Dev",
+    getPrimaryDisplay: () => display,
+    capturePrimaryDisplay: async () => ({ dataUrl: "data:image/jpeg;base64,AA==", width: 1440, height: 900 }),
+    accessibilityTrusted: () => true,
+    loadNut: loadNut ?? (async () => nut as never),
+  });
+
+test("Cmd+Tab presses the modifier macOS libnut actually accepts", async () => {
+  const { nut, presses } = fakeNut();
+  const result = await inputService(nut).run({ type: "key", key: "Tab", modifiers: ["command"] });
+  assert.equal(result.ok, true, result.message);
+  // Modifier first, then the key -- and the modifier is LeftSuper (meta), the
+  // only spelling of Command the native layer takes.
+  assert.deepEqual(presses, [[nut.Key.LeftSuper, nut.Key.Tab]]);
+});
+
+test("a failure inside an action is reported as THAT failing, never as a missing permission", async () => {
+  const { nut } = fakeNut({ click: async () => { throw new Error("Invalid key flag specified."); } });
+  const result = await inputService(nut).run({ type: "click", point: { x: 5, y: 5 }, button: "left" });
+  assert.equal(result.ok, false);
+  if (result.ok) return;
+  assert.doesNotMatch(result.message, /Accessibility/, "must not blame a permission that was granted");
+  assert.equal(result.permission, undefined, "must not trigger the System Settings recovery flow");
+  assert.match(result.message, /Invalid key flag specified/);
+});
+
+test("a native module that fails to load is not a permission problem either", async () => {
+  const { nut } = fakeNut();
+  const result = await inputService(nut, async () => { throw new Error("dlopen: image not found"); }).run({ type: "type", text: "hi" });
+  assert.equal(result.ok, false);
+  if (result.ok) return;
+  assert.doesNotMatch(result.message, /Accessibility/);
+  assert.equal(result.permission, undefined);
+  assert.match(result.message, /dlopen/);
+});
