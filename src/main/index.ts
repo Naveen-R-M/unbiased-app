@@ -49,6 +49,7 @@ import { get as httpGet } from "node:http";
 import { EngineClient, engineVersionFromUserAgent, type EngineStatus } from "./engine";
 import { pollDeviceToken, requestDeviceAuthorization } from "./device-auth";
 import { RendererCrashRecovery } from "./crash-recovery";
+import { isProductionBuild } from "./runtime-mode";
 import {
   dueAt,
   isDue,
@@ -92,6 +93,13 @@ import {
   type ComputerPermission,
   type NutRuntime,
 } from "./computer-use";
+
+/** Whether this run is a real shipped build. NOT `app.isPackaged`: the dev
+ *  launcher runs from a signed .app bundle, which makes electron report
+ *  isPackaged === true for a checkout. See ./runtime-mode. */
+function productionBuild(): boolean {
+  return isProductionBuild({ isPackaged: app.isPackaged, devAppName: process.env.UNBIASED_DEV_APP_NAME });
+}
 
 const engine = new EngineClient();
 let win: BrowserWindow | null = null;
@@ -1760,7 +1768,7 @@ function scheduleDevAccessibilityRecovery(): void {
 }
 
 async function completeDevAccessibilityRecovery(): Promise<void> {
-  if (app.isPackaged || (process.env.UNBIASED_DEV_APP_NAME ?? "") !== "Unbiased Dev") return;
+  if (productionBuild() || (process.env.UNBIASED_DEV_APP_NAME ?? "") !== "Unbiased Dev") return;
   const markerPath = devAccessibilityRecoveryMarker();
   if (!existsSync(markerPath)) return;
   let recoveryError = "";
@@ -1800,8 +1808,8 @@ async function offerComputerPermissionSettings(
   permission: ComputerPermission,
 ): Promise<string> {
   const settings = COMPUTER_PERMISSION_SETTINGS[permission];
-  const permissionAppName = app.isPackaged ? "Unbiased" : process.env.UNBIASED_DEV_APP_NAME ?? "Electron";
-  const devAccessibilityRecovery = permission === "accessibility" && !app.isPackaged && permissionAppName === "Unbiased Dev";
+  const permissionAppName = productionBuild() ? "Unbiased" : process.env.UNBIASED_DEV_APP_NAME ?? "Electron";
+  const devAccessibilityRecovery = permission === "accessibility" && !productionBuild() && permissionAppName === "Unbiased Dev";
   const approvalCommand = devAccessibilityRecovery
     ? `/usr/bin/tccutil reset Accessibility ai.unbiased.desktop.dev && /usr/bin/open ${JSON.stringify(settings.uri)}`
     : `/usr/bin/open ${JSON.stringify(settings.uri)}`;
@@ -2591,7 +2599,7 @@ function observeLearning(
 
 async function startLearning(): Promise<void> {
   const dir = resolveSidecarDir({
-    isPackaged: app.isPackaged,
+    isPackaged: productionBuild(),
     resourcesPath: process.resourcesPath,
     appPath: app.getAppPath(),
   });
@@ -3117,7 +3125,7 @@ function threadToEntries(
 function resolveEngineDir(): string {
   const override = process.env.UNBIASED_ENGINE_DIR;
   if (override) return override;
-  if (app.isPackaged) return join(process.resourcesPath, "engine");
+  if (productionBuild()) return join(process.resourcesPath, "engine");
   return join(app.getAppPath(), "..", "unbiased-app-engine", "dist", "bundle");
 }
 
@@ -3156,7 +3164,7 @@ function pushStatus(status: EngineStatus): void {
 function bundledSkillsDir(): string {
   const override = process.env.UNBIASED_SKILLS_DIR?.trim();
   if (override) return override;
-  return app.isPackaged
+  return productionBuild()
     ? join(process.resourcesPath, "skills")
     : join(app.getAppPath(), "resources", "skills");
 }
@@ -3476,7 +3484,7 @@ async function checkForUpdate(): Promise<UpdateInfo | null> {
     return info;
   }
   // Unpackaged runs have no .app to replace — never offer an update in dev.
-  if (!app.isPackaged) return null;
+  if (!productionBuild()) return null;
   try {
     const res = await fetch(`https://api.github.com/repos/${UPDATE_REPO}/releases/latest`, {
       headers: { Accept: "application/vnd.github+json" },
@@ -3532,7 +3540,7 @@ function appBundlePath(): string {
  *  memory-only — so an interrupted update re-downloads from scratch every
  *  time, which is what made a failed update feel like a loop. */
 function recoverStagedUpdate(): void {
-  if (!app.isPackaged) return;
+  if (!productionBuild()) return;
   const staged = stagedPathFor(appBundlePath());
   const plist = join(staged, "Contents/Info.plist");
   if (!existsSync(plist)) return;
@@ -3554,7 +3562,7 @@ function recoverStagedUpdate(): void {
 }
 
 async function installUpdate(info: UpdateInfo): Promise<{ ok: boolean; error?: string }> {
-  if (!app.isPackaged) return { ok: false, error: "updates only apply to the installed app" };
+  if (!productionBuild()) return { ok: false, error: "updates only apply to the installed app" };
   if (updateInstalling) return { ok: false, error: "an update is already installing" };
   updateInstalling = true;
   const tmp = mkdtempSync(join(tmpdir(), "unbiased-update-"));
@@ -3742,7 +3750,7 @@ function send(channel: string, payload: unknown): void {
 /** Launcher icon (rasterized from resources/icon.svg). In development it
  *  lives in the repo; packaged builds must ship it via extraResources. */
 function resolveIconPath(): string {
-  return app.isPackaged
+  return productionBuild()
     ? join(process.resourcesPath, "icon.png")
     : join(app.getAppPath(), "resources", "icon.png");
 }
