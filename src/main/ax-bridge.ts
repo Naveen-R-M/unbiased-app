@@ -109,12 +109,138 @@ const APP_STEP_TOOLS = new Set([
   "computer_set_value",
   "computer_press_key",
   "computer_scroll_view",
+  "computer_do",
 ]);
 
 export function appOfStep(tool: string, args: Record<string, unknown>): string | null {
   if (!APP_STEP_TOOLS.has(tool)) return null;
   const app = typeof args.app === "string" ? args.app.trim() : "";
   return app || null;
+}
+
+/** One step of a batch. Every verb here is an existing single-step tool; a
+ *  batch is only a way to spend one model round trip instead of five. The
+ *  bridge itself needs nothing: a call to it costs 3-70ms over a local pipe
+ *  (measured), while a round trip through the model costs seconds. Batching
+ *  belongs on this side of that gap, not in the bridge. */
+export type BatchStep =
+  | { do: "press"; id: number; waitMs: number }
+  | { do: "set_value"; id: number; text: string; waitMs: number }
+  | { do: "key"; key: string; id?: number; waitMs: number }
+  | { do: "scroll"; id: number; direction: string; amount?: number; waitMs: number }
+  | { do: "act"; id: number; action: string; waitMs: number }
+  | { do: "read"; waitMs: number };
+
+/** Deliberately NOT batchable: launch and raise both take over the user's
+ *  screen, and each deserves its own approval rather than riding along inside
+ *  a list of presses. */
+export const BATCH_VERBS = ["press", "set_value", "key", "scroll", "act", "read"] as const;
+export const MAX_BATCH_STEPS = 10;
+/** Per-step pause, for content that arrives after the action — Maps shows
+ *  "Loading…" for a second or two on the Transit tab. Capped so a batch cannot
+ *  be used to park the desktop tools for a minute. */
+export const MAX_BATCH_WAIT_MS = 4_000;
+
+export function parseBatchSteps(raw: unknown): { steps: BatchStep[] } | { error: string } {
+  if (!Array.isArray(raw)) return { error: "steps must be an array." };
+  if (raw.length === 0) return { error: "steps is empty — pass at least one step." };
+  if (raw.length > MAX_BATCH_STEPS) {
+    return { error: `${raw.length} steps is too many (max ${MAX_BATCH_STEPS}). Send the first ${MAX_BATCH_STEPS}, read the result, then continue.` };
+  }
+  const steps: BatchStep[] = [];
+  for (const [i, entry] of raw.entries()) {
+    const at = `step ${i + 1}`;
+    if (!entry || typeof entry !== "object") return { error: `${at} is not an object.` };
+    const e = entry as Record<string, unknown>;
+    const verb = typeof e.do === "string" ? e.do : "";
+    if (!(BATCH_VERBS as readonly string[]).includes(verb)) {
+      return { error: `${at}: do must be one of ${BATCH_VERBS.join(", ")}${verb ? ` (got "${verb}")` : ""}. Opening or raising an app is not batchable — call computer_launch or computer_raise on its own.` };
+    }
+    const waitRaw = typeof e.wait_ms === "number" ? e.wait_ms : 0;
+    const waitMs = Math.max(0, Math.min(Math.round(waitRaw), MAX_BATCH_WAIT_MS));
+    const id = typeof e.id === "number" ? e.id : null;
+    switch (verb) {
+      case "read":
+        steps.push({ do: "read", waitMs });
+        break;
+      case "key": {
+        if (typeof e.key !== "string" || !e.key) return { error: `${at}: key is required.` };
+        steps.push({ do: "key", key: e.key, ...(id !== null ? { id } : {}), waitMs });
+        break;
+      }
+      case "press": {
+        if (id === null) return { error: `${at}: id is required.` };
+        steps.push({ do: "press", id, waitMs });
+        break;
+      }
+      case "set_value": {
+        if (id === null) return { error: `${at}: id is required.` };
+        if (typeof e.text !== "string") return { error: `${at}: text is required.` };
+        steps.push({ do: "set_value", id, text: e.text, waitMs });
+        break;
+      }
+      case "scroll": {
+        if (id === null) return { error: `${at}: id is required.` };
+        const direction = typeof e.direction === "string" ? e.direction : "";
+        if (!["down", "up", "left", "right"].includes(direction)) {
+          return { error: `${at}: direction must be down, up, left or right.` };
+        }
+        steps.push({ do: "scroll", id, direction, ...(typeof e.amount === "number" ? { amount: e.amount } : {}), waitMs });
+        break;
+      }
+      case "act": {
+        if (id === null) return { error: `${at}: id is required.` };
+        if (typeof e.action !== "string" || !e.action) return { error: `${at}: action is required.` };
+        steps.push({ do: "act", id, action: e.action, waitMs });
+        break;
+      }
+    }
+  }
+  return { steps };
+}
+
+/** One line per step. The user approves the WHOLE sequence with one card, so
+ *  the card has to show every step — a batch must never be a way to slip an
+ *  irreversible press in behind four harmless reads. */
+export function describeBatch(app: string, steps: BatchStep[], lines?: Map<number, string>): string {
+  const clip = (t: string) => (t.length > 48 ? t.slice(0, 48) + "…" : t);
+  const target = (id: number) => {
+    const line = lines?.get(id);
+    return line ? `#${id} — ${clip(line)}` : `#${id}`;
+  };
+  const rendered = steps.map((st, i) => {
+    const n = `${i + 1}.`;
+    const pause = st.waitMs > 0 ? ` (then wait ${st.waitMs}ms)` : "";
+    switch (st.do) {
+      case "read": return `${n} read ${app}${pause}`;
+      case "press": return `${n} press ${target(st.id)}${pause}`;
+      case "set_value": return `${n} set ${target(st.id)} to "${clip(st.text)}"${pause}`;
+      case "key": return `${n} press ${st.key}${st.id !== undefined ? ` in ${target(st.id)}` : ""}${pause}`;
+      case "scroll": return `${n} scroll ${st.direction} at ${target(st.id)}${pause}`;
+      case "act": return `${n} ${st.action} ${target(st.id)}${pause}`;
+    }
+  });
+  return `${steps.length} step(s) in ${app}:\n${rendered.join("\n")}`;
+}
+
+/** What the model is told afterwards. A batch that stops halfway is the case
+ *  that matters: it must be unmistakable which steps ran, which one failed and
+ *  why, and that the rest did NOT run. */
+export function summarizeBatch(opts: {
+  ran: string[];
+  failed: { step: string; message: string } | null;
+  remaining: number;
+  diff: string;
+}): string {
+  const head = opts.failed
+    ? [
+        `Stopped at ${opts.failed.step}: ${opts.failed.message}`,
+        opts.ran.length ? `Ran first: ${opts.ran.join("; ")}.` : "Nothing ran before it.",
+        opts.remaining > 0 ? `The remaining ${opts.remaining} step(s) did NOT run.` : "",
+        "Read the app again before retrying — the ids may have moved.",
+      ].filter(Boolean).join(" ")
+    : `Done: ${opts.ran.join("; ")}.`;
+  return opts.diff ? `${head}\n${opts.diff}` : `${head}\n(nothing in the tree changed)`;
 }
 
 /** The desktop tools the accessibility bridge owns. This list lives next to
@@ -134,6 +260,7 @@ export const AX_TOOL_NAMES = [
   "computer_press_key",
   "computer_scroll_view",
   "computer_act",
+  "computer_do",
 ] as const;
 
 /** The older coordinate-and-screenshot tools, offered only when the bridge is
@@ -307,6 +434,12 @@ export function describeAxAction(tool: string, rawArgs: unknown, lines?: Map<num
       return `Bring ${app} to the front`;
     case "computer_launch":
       return `Open ${app}`;
+    case "computer_do": {
+      const parsed = parseBatchSteps((a as { steps?: unknown }).steps);
+      // A batch whose steps do not parse still has to produce a card, because
+      // the card is shown before the call is made.
+      return "error" in parsed ? `Run steps in ${app}` : describeBatch(app, parsed.steps, lines);
+    }
     case "computer_press":
     case "computer_set_value":
     case "computer_press_key":

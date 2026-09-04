@@ -51,6 +51,9 @@ import {
   shouldOpenAccessibilitySettings,
   axNotTrustedText,
   routesToAx,
+  parseBatchSteps,
+  summarizeBatch,
+  MAX_BATCH_STEPS,
 } from "./ax-bridge";
 import { isProductionBuild } from "./runtime-mode";
 import {
@@ -1240,6 +1243,16 @@ const COMPUTER_USE_TOOLS = [
 // by element id. Declared only while the bridge is running — see
 // threadDynamicTools. Measured against real Brave: the task that took the
 // screenshot tools 27 calls and 6.7 minutes took this path 8 calls and 9.3s.
+/** Which way a named direction pushes the wheel. Negative dy reveals content
+ *  further DOWN, which is what a reader means by "scroll down"; keeping that
+ *  convention in one table means the batch and the single verb cannot drift. */
+const SCROLL_DELTAS: Record<string, { dx: number; dy: number }> = {
+  down: { dx: 0, dy: -1 },
+  up: { dx: 0, dy: 1 },
+  right: { dx: -1, dy: 0 },
+  left: { dx: 1, dy: 0 },
+};
+
 const AX_TOOLS = [
   {
     type: "function",
@@ -1343,6 +1356,40 @@ const AX_TOOLS = [
         amount: { type: "integer", description: "Lines to scroll (default 5)." },
       },
       required: ["app", "id", "direction"],
+    },
+  },
+  {
+    type: "function",
+    name: "computer_do",
+    description:
+      "Run several steps on ONE app in a single call, in order, and get back what changed. Use this whenever you already know the next few moves — filling a field and committing it, pressing a tab and reading the result, scrolling and reading. It saves a whole round trip per step, which is the main cost of operating an app. " +
+      "Each step is {do, ...}: do=\"press\" with id; do=\"set_value\" with id and text; do=\"key\" with key (and optional id to aim it); do=\"scroll\" with id and direction; do=\"act\" with id and action; do=\"read\" to re-read the app. Add wait_ms to a step to pause after it, for content that loads (a tab that shows \"Loading…\"). " +
+      `Up to ${MAX_BATCH_STEPS} steps. It STOPS at the first step that fails and tells you which one — the rest do not run, so do not assume they did. ` +
+      "Opening or raising an app is not batchable: call computer_launch or computer_raise on its own. Do NOT batch steps whose ids you have not read yet, or steps that depend on what an earlier step reveals — read first, then batch what you can see.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        app: { type: "string" },
+        steps: {
+          type: "array",
+          description: "The steps to run, in order.",
+          items: {
+            type: "object",
+            properties: {
+              do: { type: "string", enum: ["press", "set_value", "key", "scroll", "act", "read"] },
+              id: { type: "integer", description: "Element id from computer_app_state." },
+              text: { type: "string", description: "With do=set_value." },
+              key: { type: "string", enum: ["return", "tab", "escape", "space", "delete", "up", "down", "left", "right"], description: "With do=key." },
+              direction: { type: "string", enum: ["down", "up", "left", "right"], description: "With do=scroll." },
+              amount: { type: "integer", description: "With do=scroll: lines (default 5)." },
+              action: { type: "string", description: "With do=act: one of the actions the element listed in braces." },
+              wait_ms: { type: "integer", description: "Pause this many ms after the step, for content that loads." },
+            },
+            required: ["do"],
+          },
+        },
+      },
+      required: ["app", "steps"],
     },
   },
   {
@@ -1511,6 +1558,10 @@ function dynamicToolCommandText(tool: string | undefined, rawArgs: unknown): str
   if (t === "computer_raise") return `raise ${String(args.app)}`;
   if (t === "computer_app_state") return typeof args.query === "string" ? `find "${args.query}" in ${String(args.app)}` : `read ${String(args.app)}`;
   if (t === "computer_launch") return `open ${String(args.app)}`;
+  if (t === "computer_do") {
+    const n = Array.isArray(args.steps) ? args.steps.length : 0;
+    return `${n} step${n === 1 ? "" : "s"} in ${String(args.app)}`;
+  }
   if (t === "computer_press") return `press #${String(args.id)} in ${String(args.app)}`;
   if (t === "computer_set_value") return `set #${String(args.id)} in ${String(args.app)}`;
   if (t === "computer_press_key") return `press ${typeof args.key === "string" ? args.key : "key"} in ${String(args.app)}`;
@@ -2248,19 +2299,75 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
           true,
         );
       }
+      case "computer_do": {
+        const parsed = parseBatchSteps(a.steps);
+        if ("error" in parsed) return axText(parsed.error, false);
+        const steps = parsed.steps;
+        axLog(`do ${appName} ${steps.length} step(s): ${steps.map((x) => x.do).join(",")}`);
+        const ran: string[] = [];
+        let failed: { step: string; message: string } | null = null;
+        // One bridge call per step. That is the cheap round trip — 3-70ms over
+        // a local pipe — and collapsing them into ONE model round trip is the
+        // entire point of this tool.
+        for (const [i, st] of steps.entries()) {
+          const label = `step ${i + 1} (${st.do})`;
+          try {
+            switch (st.do) {
+              case "read":
+                await ax.request("tree", { app: appName, interactive: true });
+                break;
+              case "press":
+                await ax.request("act", { app: appName, id: st.id, action: "press" });
+                break;
+              case "act":
+                await ax.request("act", { app: appName, id: st.id, action: st.action });
+                break;
+              case "set_value":
+                await ax.request("setValue", { app: appName, id: st.id, value: st.text });
+                break;
+              case "key":
+                await ax.request("key", { app: appName, key: st.key, ...(st.id !== undefined ? { id: st.id } : {}) });
+                break;
+              case "scroll": {
+                const amount = typeof st.amount === "number" && st.amount > 0 ? Math.min(st.amount, 40) : 5;
+                const d = SCROLL_DELTAS[st.direction];
+                if (!d) throw new Error(`unknown direction "${st.direction}"`);
+                await ax.request("scroll", { app: appName, id: st.id, dx: d.dx * amount, dy: d.dy * amount });
+                break;
+              }
+            }
+            ran.push(label);
+            if (st.waitMs > 0) await new Promise((r) => setTimeout(r, st.waitMs));
+          } catch (err) {
+            failed = { step: label, message: err instanceof AxError ? err.message : String(err) };
+            break;
+          }
+        }
+        // The diff is taken once, at the end, against whatever the model last
+        // read — so it shows the NET effect of the sequence rather than a
+        // step-by-step replay nobody asked for.
+        let diff = "";
+        try {
+          const r = await ax.request("tree", { app: appName, interactive: true });
+          diff = String(r.diff ?? r.tree ?? "");
+          remember(diff);
+        } catch {
+          // A batch that closed the window it was working in has no tree left
+          // to show. The step log above still says what ran.
+        }
+        return axText(
+          summarizeBatch({ ran, failed, remaining: steps.length - ran.length - (failed ? 1 : 0), diff }),
+          failed === null,
+        );
+      }
       case "computer_scroll_view": {
         const amount = typeof a.amount === "number" && a.amount > 0 ? Math.min(a.amount, 40) : 5;
         // Negative wheel1 reveals content further DOWN, which is what a reader
         // means by "scroll down". Naming the direction rather than a signed
         // number keeps that convention out of the model's head.
         const dir = String(a.direction ?? "down");
-        const deltas: Record<string, { dx: number; dy: number }> = {
-          down: { dx: 0, dy: -amount },
-          up: { dx: 0, dy: amount },
-          right: { dx: -amount, dy: 0 },
-          left: { dx: amount, dy: 0 },
-        };
-        const d = deltas[dir];
+        const unit = SCROLL_DELTAS[dir];
+        const d = unit ? { dx: unit.dx * amount, dy: unit.dy * amount } : undefined;
         if (!d) return axText(`Unknown direction "${dir}". Use down, up, left, or right.`, false);
         axLog(`scroll ${appName} id=${String(a.id)} ${dir} ${amount}`);
         const r = await ax.request("scroll", { app: appName, id: a.id, dx: d.dx, dy: d.dy });
@@ -3197,6 +3304,8 @@ const COMPUTER_DIRECTIVE =
   "cannot see the user's own windows or tabs, which is the opposite of what they asked for. This applies even when the " +
   "task involves a website behind a login: if it is open in a browser they are already running, computer_app_state reads " +
   "it and computer_press operates it. " +
+  "When you already know the next few moves, send them together with computer_do rather than one call at a time — " +
+  "filling a field and committing it, or pressing a tab and reading the result, is one call, not two. " +
   // Measured, on a task that should have taken four calls: the model shelled
   // out to `open -a Maps`, and never came back. Twenty shell calls, osascript,
   // JXA, and finally a hand-written Swift program that dumped the very tree

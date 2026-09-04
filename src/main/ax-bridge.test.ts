@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-import { AX_TOOL_NAMES, SCREENSHOT_TOOL_NAMES, routesToAx, AxClient, AxError, appOfStep, axConsent, axNeedsFocus, offerScreenshotTools, shouldRecoverRaise, describeAxAction, indexElementLines, readAxManifest, resolveAxDir, shouldOpenAccessibilitySettings, axNotTrustedText } from "./ax-bridge";
+import { AX_TOOL_NAMES, SCREENSHOT_TOOL_NAMES, routesToAx, parseBatchSteps, describeBatch, summarizeBatch, MAX_BATCH_STEPS, AxClient, AxError, appOfStep, axConsent, axNeedsFocus, offerScreenshotTools, shouldRecoverRaise, describeAxAction, indexElementLines, readAxManifest, resolveAxDir, shouldOpenAccessibilitySettings, axNotTrustedText } from "./ax-bridge";
 
 const scratch = () => mkdtempSync(join(tmpdir(), "ax-"));
 
@@ -404,4 +404,119 @@ test("the directive never names a tool that does not exist", () => {
   const wrongFamily = mentioned.filter((n) => (SCREENSHOT_TOOL_NAMES as readonly string[]).includes(n));
   assert.deepEqual(wrongFamily, [],
     `the directive points at coordinate-based tools that are not offered while the bridge runs: ${wrongFamily.join(", ")}`);
+});
+
+// ── Batching ──────────────────────────────────────────────────────────────
+// A bridge call costs 3-70ms over a local pipe; a model round trip costs
+// seconds. Batching exists to spend one of the expensive kind instead of five.
+
+test("a batch parses the verbs it supports", () => {
+  const r = parseBatchSteps([
+    { do: "set_value", id: 4, text: "Planet Fitness" },
+    { do: "key", key: "return", wait_ms: 800 },
+    { do: "read" },
+  ]);
+  assert.ok("steps" in r, `expected steps, got ${JSON.stringify(r)}`);
+  if (!("steps" in r)) return;
+  assert.equal(r.steps.length, 3);
+  assert.deepEqual(r.steps[0], { do: "set_value", id: 4, text: "Planet Fitness", waitMs: 0 });
+  assert.deepEqual(r.steps[1], { do: "key", key: "return", waitMs: 800 });
+});
+
+test("opening or raising an app cannot ride inside a batch", () => {
+  // Both take over the user's screen. Each deserves its own approval rather
+  // than being item 4 of a list the user skimmed.
+  for (const verb of ["launch", "raise"]) {
+    const r = parseBatchSteps([{ do: verb, app: "Maps" }]);
+    assert.ok("error" in r, `${verb} should be rejected`);
+    if ("error" in r) assert.match(r.error, /not batchable/);
+  }
+});
+
+test("a batch refuses steps that cannot run, naming which one", () => {
+  const cases: [unknown, RegExp][] = [
+    [[], /empty/],
+    ["press", /must be an array/],
+    [[{ do: "press" }], /step 1: id is required/],
+    [[{ do: "read" }, { do: "set_value", id: 2 }], /step 2: text is required/],
+    [[{ do: "scroll", id: 2, direction: "sideways" }], /step 1: direction must be/],
+    [[{ do: "act", id: 2 }], /step 1: action is required/],
+    [[{ do: "key" }], /step 1: key is required/],
+    [[{ do: "read" }, "nope"], /step 2 is not an object/],
+  ];
+  for (const [input, pattern] of cases) {
+    const r = parseBatchSteps(input);
+    assert.ok("error" in r, `${JSON.stringify(input)} should have failed`);
+    if ("error" in r) assert.match(r.error, pattern);
+  }
+});
+
+test("a batch is capped, and says how to continue instead of just refusing", () => {
+  const tooMany = Array.from({ length: MAX_BATCH_STEPS + 1 }, () => ({ do: "read" }));
+  const r = parseBatchSteps(tooMany);
+  assert.ok("error" in r);
+  if ("error" in r) {
+    assert.match(r.error, new RegExp(`max ${MAX_BATCH_STEPS}`));
+    assert.match(r.error, /then continue/, "a bare refusal leaves the model stuck");
+  }
+  const atLimit = parseBatchSteps(Array.from({ length: MAX_BATCH_STEPS }, () => ({ do: "read" })));
+  assert.ok("steps" in atLimit, "the limit itself must be allowed");
+});
+
+test("a per-step wait is clamped, never negative and never long", () => {
+  const r = parseBatchSteps([{ do: "read", wait_ms: 999_999 }, { do: "read", wait_ms: -5 }]);
+  assert.ok("steps" in r);
+  if (!("steps" in r)) return;
+  assert.ok(r.steps[0].waitMs <= 4_000, `clamped, got ${r.steps[0].waitMs}`);
+  assert.equal(r.steps[1].waitMs, 0);
+});
+
+test("the approval card shows every step, not just a count", () => {
+  // One card approves the whole sequence, so a batch must never be a way to
+  // slip an irreversible press in behind four harmless reads.
+  const lines = new Map([[4, 'search text field "Apple Maps"'], [9, 'button "Send"']]);
+  const parsed = parseBatchSteps([
+    { do: "set_value", id: 4, text: "hello" },
+    { do: "key", key: "return" },
+    { do: "press", id: 9 },
+  ]);
+  assert.ok("steps" in parsed);
+  if (!("steps" in parsed)) return;
+  const card = describeBatch("Slack", parsed.steps, lines);
+  assert.match(card, /3 step\(s\) in Slack/);
+  assert.match(card, /1\. set #4 — search text field/);
+  assert.match(card, /2\. press return/);
+  assert.match(card, /3\. press #9 — button "Send"/, "the destructive step must be visible on the card");
+  assert.equal(card.split("\n").length, 4, "one line per step plus the header");
+});
+
+test("a batch that stops halfway says so unmistakably", () => {
+  const out = summarizeBatch({
+    ran: ["step 1 (set_value)"],
+    failed: { step: "step 2 (press)", message: "No element 9 in the last snapshot of this app." },
+    remaining: 2,
+    diff: "~4 text field = hello",
+  });
+  assert.match(out, /Stopped at step 2 \(press\)/);
+  assert.match(out, /Ran first: step 1 \(set_value\)/);
+  assert.match(out, /remaining 2 step\(s\) did NOT run/, "the model must not assume the rest happened");
+  assert.match(out, /ids may have moved/);
+  assert.match(out, /~4 text field = hello/, "what did change still has to be reported");
+});
+
+test("a batch that fails on its first step says nothing ran", () => {
+  const out = summarizeBatch({
+    ran: [],
+    failed: { step: "step 1 (press)", message: "No element 99." },
+    remaining: 2,
+    diff: "",
+  });
+  assert.match(out, /Nothing ran before it/);
+  assert.match(out, /nothing in the tree changed/);
+});
+
+test("a batch that changed nothing visible says that, rather than looking successful", () => {
+  const out = summarizeBatch({ ran: ["step 1 (press)"], failed: null, remaining: 0, diff: "" });
+  assert.match(out, /^Done: step 1 \(press\)\./);
+  assert.match(out, /nothing in the tree changed/);
 });
