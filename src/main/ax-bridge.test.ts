@@ -1,9 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { AxClient, AxError, appOfStep, axConsent, axNeedsFocus, offerScreenshotTools, shouldRecoverRaise, describeAxAction, indexElementLines, readAxManifest, resolveAxDir, shouldOpenAccessibilitySettings, axNotTrustedText } from "./ax-bridge";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+import { AX_TOOL_NAMES, SCREENSHOT_TOOL_NAMES, routesToAx, AxClient, AxError, appOfStep, axConsent, axNeedsFocus, offerScreenshotTools, shouldRecoverRaise, describeAxAction, indexElementLines, readAxManifest, resolveAxDir, shouldOpenAccessibilitySettings, axNotTrustedText } from "./ax-bridge";
 
 const scratch = () => mkdtempSync(join(tmpdir(), "ax-"));
 
@@ -148,11 +151,18 @@ test("the index accumulates: a diff updates one line and keeps the rest", () => 
 });
 
 test("set and key read as what they are", () => {
+  assert.equal(describeAxAction("computer_set_value", { app: "Brave", id: 13, text: "https://youtube.com" }, indexElementLines(TREE)),
+    'Set #13 in Brave — text field "Address and search bar" = youtube.com {press} to "https://youtube.com"');
+  assert.equal(describeAxAction("computer_press_key", { app: "Brave", key: "return" }), "Press return in Brave");
+  assert.equal(describeAxAction("computer_app_state", { app: "Brave" }), "Read the UI of Brave");
+});
+
+test("the old computer_act shape still means what it said, rather than a silent press", () => {
+  // value and key used to ride on computer_act. Splitting the verbs must not
+  // turn a model's stale habit into the wrong action performed quietly.
   assert.equal(describeAxAction("computer_act", { app: "Brave", id: 13, value: "https://youtube.com" }, indexElementLines(TREE)),
     'Set #13 in Brave — text field "Address and search bar" = youtube.com {press} to "https://youtube.com"');
   assert.equal(describeAxAction("computer_act", { app: "Brave", key: "return" }), "Press return in Brave");
-  assert.equal(describeAxAction("computer_app_state", { app: "Brave" }), "Read the UI of Brave");
-
 });
 
 // ── Consent policy ─────────────────────────────────────────────────────────
@@ -293,4 +303,105 @@ test("the not-trusted message names the row that is actually in the pane", () =>
   const notOpened = axNotTrustedText("Unbiased", false);
   assert.match(notOpened, /System Settings > Privacy & Security > Accessibility/,
     "if the pane could not be opened, the message has to say where to go");
+});
+
+// ── Opening an app, and the split verbs ────────────────────────────────────
+// A model with no way to open an app reaches for a shell, and once there it
+// does not come back. These are the tools that close that door, plus the
+// transcript details that make them legible.
+
+test("every desktop tool that names an app is attributed to it, so its row shows that app's icon", () => {
+  for (const tool of ["computer_launch", "computer_press", "computer_set_value", "computer_press_key", "computer_scroll_view", "computer_act", "computer_app_state", "computer_raise"]) {
+    assert.equal(appOfStep(tool, { app: "Maps" }), "Maps", `${tool} should be attributed to Maps`);
+  }
+  assert.equal(appOfStep("computer_apps", { app: "Maps" }), null, "listing apps is not an action in one app");
+  assert.equal(appOfStep("shell", { app: "Maps" }), null, "unknown tools are not desktop steps");
+});
+
+test("an approval card names the verb and the control, never the raw tool name", () => {
+  const lines = new Map([[10, 'search field "Apple Maps"']]);
+  assert.equal(describeAxAction("computer_launch", { app: "Maps" }), "Open Maps");
+  assert.match(describeAxAction("computer_press", { app: "Maps", id: 10 }, lines), /^Press #10 in Maps — search field/);
+  assert.match(describeAxAction("computer_set_value", { app: "Maps", id: 10, text: "Planet Fitness" }, lines), /Set #10 in Maps .* to "Planet Fitness"/);
+  assert.equal(describeAxAction("computer_press_key", { app: "Maps", key: "return" }), "Press return in Maps");
+  assert.equal(describeAxAction("computer_scroll_view", { app: "Maps", id: 10, direction: "down" }), "Scroll down in Maps");
+  assert.equal(describeAxAction("computer_act", { app: "Maps", id: 10, action: "show menu" }, lines).startsWith("show menu #10"), true);
+  for (const tool of ["computer_launch", "computer_press", "computer_set_value", "computer_press_key", "computer_scroll_view"]) {
+    assert.notEqual(describeAxAction(tool, { app: "Maps", id: 10 }), tool, `${tool} fell through to its own name`);
+  }
+});
+
+test("computer_type describes the field it is filling even with no remembered line", () => {
+  // The card can be shown before any read of that app in this conversation,
+  // so it has to be readable without one.
+  assert.equal(describeAxAction("computer_set_value", { app: "Slack", id: 4, text: "Hi" }), 'Set #4 in Slack to "Hi"');
+});
+
+test("opening an app is gated like every other desktop tool", () => {
+  for (const tool of ["computer_launch", "computer_scroll_view", "computer_press", "computer_set_value", "computer_press_key"]) {
+    assert.equal(axConsent({ tool, mode: "ask", granted: false }), "ask", `${tool} must ask the first time`);
+    assert.equal(axConsent({ tool, mode: "full", granted: false }), "allow", `${tool} must not ask in Full access`);
+    assert.equal(axConsent({ tool, mode: "ask", granted: true }), "allow", `${tool} rides the session grant`);
+  }
+});
+
+// ── Routing: the bug that cost twelve minutes ─────────────────────────────
+// Two families of desktop tools, dispatched by NAME. A name in both goes to
+// whichever the router checks first — and they take different arguments
+// entirely, an element id versus screen coordinates. When five AX tools were
+// declared without being added to the routing list, every one of them reached
+// the coordinate handler and reported "click at undefined, undefined". The
+// model could not open an app, and spent twelve minutes trying Finder menus.
+
+test("no desktop tool name belongs to both families", () => {
+  const shared = AX_TOOL_NAMES.filter((n) => (SCREENSHOT_TOOL_NAMES as readonly string[]).includes(n));
+  assert.deepEqual(shared, [],
+    `these names would dispatch to whichever handler is checked first: ${shared.join(", ")}`);
+});
+
+test("every tool the app declares to the model is routed", () => {
+  // The real invariant, and the one that broke: AX_TOOLS in index.ts is the
+  // list handed to the model, AX_TOOL_NAMES is the list the router consults,
+  // and nothing tied them together. index.ts cannot be imported here (it pulls
+  // in electron), so read the declarations out of the source and compare.
+  const src = readFileSync(join(__dirname, "index.ts"), "utf8");
+  const block = src.slice(src.indexOf("const AX_TOOLS = ["), src.indexOf("\n];", src.indexOf("const AX_TOOLS = [")));
+  const declared = [...block.matchAll(/name:\s*"(computer_[a-z_]+)"/g)].map((m) => m[1]);
+  assert.ok(declared.length >= 9, `expected the AX tool declarations, found ${declared.length}`);
+  const unrouted = declared.filter((n) => !routesToAx(n));
+  assert.deepEqual(unrouted, [],
+    `declared to the model but dispatched to the screenshot handler instead: ${unrouted.join(", ")}`);
+});
+
+test("the screenshot tools do not route to the accessibility handler", () => {
+  for (const name of SCREENSHOT_TOOL_NAMES) {
+    assert.equal(routesToAx(name), false, `${name} is coordinate-based and must not reach the AX handler`);
+  }
+  assert.equal(routesToAx("browser_navigate"), false, "unrelated tools are not desktop tools");
+});
+
+test("the tools a model needs to operate an app are all present", () => {
+  // Losing any one of these is what sends a model to the shell, or to
+  // improvising through Finder. Named individually so a deletion is loud.
+  for (const needed of ["computer_launch", "computer_app_state", "computer_press", "computer_set_value", "computer_press_key", "computer_scroll_view"]) {
+    assert.ok((AX_TOOL_NAMES as readonly string[]).includes(needed), `${needed} is missing`);
+  }
+});
+
+test("the directive never names a tool that does not exist", () => {
+  // Renaming the verbs left the directive telling the model to call
+  // computer_click, which by then was the coordinate-based tool it is not
+  // offered. Prose that names tools has to be checked like code.
+  const src = readFileSync(join(__dirname, "index.ts"), "utf8");
+  const start = src.indexOf("const COMPUTER_DIRECTIVE");
+  const directive = src.slice(start, src.indexOf("approval.\";", start));
+  const known = new Set<string>([...AX_TOOL_NAMES, ...SCREENSHOT_TOOL_NAMES]);
+  const mentioned = [...new Set(directive.match(/computer_[a-z_]+/g) ?? [])];
+  assert.ok(mentioned.length > 0, "expected the directive to name some tools");
+  const unknown = mentioned.filter((n) => !known.has(n));
+  assert.deepEqual(unknown, [], `the directive names tools that do not exist: ${unknown.join(", ")}`);
+  // It must also steer to the ACCESSIBILITY family, never the fallback one.
+  const wrongFamily = mentioned.filter((n) => (SCREENSHOT_TOOL_NAMES as readonly string[]).includes(n));
+  assert.deepEqual(wrongFamily, [],
+    `the directive points at coordinate-based tools that are not offered while the bridge runs: ${wrongFamily.join(", ")}`);
 });

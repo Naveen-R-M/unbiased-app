@@ -100,10 +100,58 @@ export function axNeedsFocus(tool: string, _args: Record<string, unknown>): bool
 
 /** The app a computer step acted on, so the transcript can show that app's own
  *  icon instead of a generic terminal glyph. */
+const APP_STEP_TOOLS = new Set([
+  "computer_app_state",
+  "computer_act",
+  "computer_raise",
+  "computer_launch",
+  "computer_press",
+  "computer_set_value",
+  "computer_press_key",
+  "computer_scroll_view",
+]);
+
 export function appOfStep(tool: string, args: Record<string, unknown>): string | null {
-  if (tool !== "computer_app_state" && tool !== "computer_act" && tool !== "computer_raise") return null;
+  if (!APP_STEP_TOOLS.has(tool)) return null;
   const app = typeof args.app === "string" ? args.app.trim() : "";
   return app || null;
+}
+
+/** The desktop tools the accessibility bridge owns. This list lives next to
+ *  the routing helper on purpose. It used to be a hand-maintained Set beside
+ *  the declarations in index.ts, and the two drifted: five tools were added to
+ *  the declarations and not to the Set, so every one of them fell through to
+ *  the coordinate-based screenshot handler — "click at undefined, undefined" —
+ *  and a model spent twelve minutes trying to open an app whose launch verb
+ *  silently went nowhere. One list, one test, one startup check. */
+export const AX_TOOL_NAMES = [
+  "computer_apps",
+  "computer_app_state",
+  "computer_raise",
+  "computer_launch",
+  "computer_press",
+  "computer_set_value",
+  "computer_press_key",
+  "computer_scroll_view",
+  "computer_act",
+] as const;
+
+/** The older coordinate-and-screenshot tools, offered only when the bridge is
+ *  not running. No name may appear in both lists. Dispatch is by name, so a
+ *  shared name goes to whichever family the router checks first, regardless of
+ *  which one the model thought it was calling — and the two take completely
+ *  different arguments (an element id versus screen coordinates). */
+export const SCREENSHOT_TOOL_NAMES = [
+  "computer_screenshot",
+  "computer_click",
+  "computer_type",
+  "computer_move",
+  "computer_key",
+  "computer_scroll",
+] as const;
+
+export function routesToAx(tool: string): boolean {
+  return (AX_TOOL_NAMES as readonly string[]).includes(tool);
 }
 
 /** Whether to put the user in front of the Accessibility switch. macOS will not
@@ -257,12 +305,25 @@ export function describeAxAction(tool: string, rawArgs: unknown, lines?: Map<num
       return `Read the UI of ${app}`;
     case "computer_raise":
       return `Bring ${app} to the front`;
+    case "computer_launch":
+      return `Open ${app}`;
+    case "computer_press":
+    case "computer_set_value":
+    case "computer_press_key":
+    case "computer_scroll_view":
     case "computer_act": {
       const id = typeof a.id === "number" ? a.id : null;
       const line = id !== null ? lines?.get(id) ?? null : null;
       const target = id !== null ? `#${id} in ${app}${line ? ` — ${clip(line)}` : ""}` : app;
-      if (typeof a.key === "string") return `Press ${a.key} in ${app}`;
-      if (typeof a.value === "string") return `Set ${target} to "${clip(a.value)}"`;
+      if (tool === "computer_scroll_view") return `Scroll ${typeof a.direction === "string" ? a.direction : "down"} in ${app}`;
+      // The verb comes from the tool now, but a model with older habits still
+      // sends value/key on computer_act. Those are routed rather than silently
+      // turned into a press, so the card has to describe them truthfully too.
+      const text = typeof a.text === "string" ? a.text : typeof a.value === "string" ? a.value : null;
+      const key = typeof a.key === "string" ? a.key : null;
+      if (tool === "computer_press_key" || (tool === "computer_act" && key)) return `Press ${key ?? "a key"} in ${app}`;
+      if (tool === "computer_set_value" || (tool === "computer_act" && text !== null)) return `Set ${target} to "${clip(text ?? "")}"`;
+      if (tool === "computer_press") return `Press ${target}`;
       return `${typeof a.action === "string" ? a.action : "press"} ${target}`;
     }
     default:

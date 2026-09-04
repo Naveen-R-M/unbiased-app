@@ -50,6 +50,7 @@ import {
   resolveAxDir,
   shouldOpenAccessibilitySettings,
   axNotTrustedText,
+  routesToAx,
 } from "./ax-bridge";
 import { isProductionBuild } from "./runtime-mode";
 import {
@@ -1239,7 +1240,6 @@ const COMPUTER_USE_TOOLS = [
 // by element id. Declared only while the bridge is running — see
 // threadDynamicTools. Measured against real Brave: the task that took the
 // screenshot tools 27 calls and 6.7 minutes took this path 8 calls and 9.3s.
-const AX_TOOL_NAMES = new Set(["computer_apps", "computer_app_state", "computer_raise", "computer_act"]);
 const AX_TOOLS = [
   {
     type: "function",
@@ -1282,24 +1282,95 @@ const AX_TOOLS = [
   },
   {
     type: "function",
-    name: "computer_act",
+    name: "computer_launch",
     description:
-      "Act on an element by the id computer_app_state returned. Exactly one of: action (an action the element listed in braces, e.g. press, or focus), value (set a text field), key (a real key event: return, tab, escape, space, delete, up, down, left, right — use key=return to commit a browser address bar after setting its value). " +
-      "PREFER pressing the control the tree names over a keyboard shortcut: a video player exposes button \"Play (k)\", so press that id. A key WITHOUT id goes wherever keyboard focus already is and will type into whatever field is focused; pass id with key to aim it at an element, which is focused first. " +
-      "Works on a background app without ever taking the user's screen, key events included. Returns the diff of what changed, so you need not read again.",
+      "Open an app that is not running yet, by name or bundle id — \"Maps\", \"Slack\", \"com.apple.Maps\". USE THIS, never a shell command: it waits until the app is actually READABLE rather than merely running, and returns its element tree, so the next step can act immediately. Launching by shell returns before the app is in the accessibility tree, and the read that follows fails. " +
+      "Harmless if the app is already running — it says so and reads it. This brings the app to the front, which is what opening an app means.",
+    inputSchema: {
+      type: "object",
+      properties: { app: { type: "string", description: "App name or bundle id, e.g. \"Maps\"." } },
+      required: ["app"],
+    },
+  },
+  {
+    type: "function",
+    name: "computer_press",
+    description:
+      "Press an element by the id computer_app_state returned — a button, a link, a tab, a search result, a menu item. This is the ordinary way to operate an app: the tree names the controls, so press the one you want instead of guessing a keyboard shortcut. Works on a background app without taking the user's screen. Returns the diff of what changed, so you need not read again.",
+    inputSchema: {
+      type: "object",
+      properties: { app: { type: "string" }, id: { type: "integer", description: "Element id from computer_app_state." } },
+      required: ["app", "id"],
+    },
+  },
+  {
+    type: "function",
+    name: "computer_set_value",
+    description:
+      "Set a text field's contents by element id — a search box, an address bar, a message input. Replaces what is there. This does NOT submit: follow it with computer_key key=return when the field needs committing (a search box, a browser address bar, a chat input).",
+    inputSchema: {
+      type: "object",
+      properties: { app: { type: "string" }, id: { type: "integer" }, text: { type: "string", description: "The text to put in the field." } },
+      required: ["app", "id", "text"],
+    },
+  },
+  {
+    type: "function",
+    name: "computer_press_key",
+    description:
+      "Send one real key event. Use it for what pressing a control cannot express: committing a field with return, dismissing with escape, moving with tab or the arrows. Pass id to aim the key at an element, which is focused first — WITHOUT id it goes wherever keyboard focus already happens to be, which may be another field entirely. Reaches a background app without taking the user's screen.",
     inputSchema: {
       type: "object",
       properties: {
         app: { type: "string" },
-        id: { type: "integer", description: "Element id from computer_app_state. With key, that element is focused first so the keystroke lands there." },
-        action: { type: "string" },
-        value: { type: "string" },
         key: { type: "string", enum: ["return", "tab", "escape", "space", "delete", "up", "down", "left", "right"] },
+        id: { type: "integer", description: "Focus this element first, so the keystroke lands there." },
       },
-      required: ["app"],
+      required: ["app", "key"],
+    },
+  },
+  {
+    type: "function",
+    name: "computer_scroll_view",
+    description:
+      "Scroll the container an element sits in, to reveal content that is not on screen — the rest of a list, a results panel, a long page. Pass the id of an element inside the thing you want scrolled. Read again afterwards to see what appeared.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        app: { type: "string" },
+        id: { type: "integer", description: "An element inside the container to scroll." },
+        direction: { type: "string", enum: ["down", "up", "left", "right"], description: "Which way to reveal more content." },
+        amount: { type: "integer", description: "Lines to scroll (default 5)." },
+      },
+      required: ["app", "id", "direction"],
+    },
+  },
+  {
+    type: "function",
+    name: "computer_act",
+    description:
+      "Perform a NAMED action other than a plain press — the actions an element lists in braces, e.g. \"show menu\", \"cancel\", \"scroll to visible\", \"focus\". For an ordinary press use computer_click, to fill a field use computer_type, and to send a key use computer_key.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        app: { type: "string" },
+        id: { type: "integer", description: "Element id from computer_app_state." },
+        action: { type: "string", description: "One of the actions the element listed in braces." },
+      },
+      required: ["app", "id", "action"],
     },
   },
 ];
+// Declared and routed must be the same set. They were not, once: five tools
+// were declared here and never added to the routing list, so each of them
+// silently reached the coordinate-based screenshot handler, which wants screen
+// coordinates and got none. A tool broken that way is invisible — it answers,
+// just wrongly — so fail at startup rather than at the twelfth minute of
+// somebody's task.
+for (const t of AX_TOOLS) {
+  if (!routesToAx(t.name)) throw new Error(`AX tool ${t.name} is declared but not routed — add it to AX_TOOL_NAMES in ax-bridge.ts`);
+}
+
 
 // Scheduling, offered to the model as a dynamic tool — the same extension
 // point the browser uses, so no new machinery is involved.
@@ -1439,6 +1510,11 @@ function dynamicToolCommandText(tool: string | undefined, rawArgs: unknown): str
   if (t === "computer_apps") return "list apps";
   if (t === "computer_raise") return `raise ${String(args.app)}`;
   if (t === "computer_app_state") return typeof args.query === "string" ? `find "${args.query}" in ${String(args.app)}` : `read ${String(args.app)}`;
+  if (t === "computer_launch") return `open ${String(args.app)}`;
+  if (t === "computer_press") return `press #${String(args.id)} in ${String(args.app)}`;
+  if (t === "computer_set_value") return `set #${String(args.id)} in ${String(args.app)}`;
+  if (t === "computer_press_key") return `press ${typeof args.key === "string" ? args.key : "key"} in ${String(args.app)}`;
+  if (t === "computer_scroll_view") return `scroll ${typeof args.direction === "string" ? args.direction : "down"} in ${String(args.app)}`;
   if (t === "computer_act") {
     if (typeof args.key === "string") return `press ${args.key} in ${String(args.app)}`;
     if (typeof args.value === "string") return `set #${String(args.id)} in ${String(args.app)}`;
@@ -2156,17 +2232,68 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         const label = r.tree !== undefined ? "tree" : "changes since last read";
         return axText(`${head}\n\n${label} (${String(r.count)} elements${r.truncated ? ", truncated — use query or depth" : ""}):\n${body}`, true);
       }
+      case "computer_launch": {
+        axLog(`launch ${appName}`);
+        // A foreground launch puts the app where the work is, so treat it as
+        // this conversation's raised app: the read-side recovery then knows
+        // to put it back if it drifts off-Space between two actions.
+        axRaised.set(root, appName);
+        const r = await ax.request("launch", { app: appName }, 25_000);
+        const tree = String(r.tree ?? "");
+        remember(tree);
+        const already = r.alreadyRunning === true;
+        const hint = typeof r.hint === "string" ? `\n${r.hint}` : "";
+        return axText(
+          `${appName} is ${already ? "already running" : "open"} and readable.${hint}\n${tree}`,
+          true,
+        );
+      }
+      case "computer_scroll_view": {
+        const amount = typeof a.amount === "number" && a.amount > 0 ? Math.min(a.amount, 40) : 5;
+        // Negative wheel1 reveals content further DOWN, which is what a reader
+        // means by "scroll down". Naming the direction rather than a signed
+        // number keeps that convention out of the model's head.
+        const dir = String(a.direction ?? "down");
+        const deltas: Record<string, { dx: number; dy: number }> = {
+          down: { dx: 0, dy: -amount },
+          up: { dx: 0, dy: amount },
+          right: { dx: -amount, dy: 0 },
+          left: { dx: amount, dy: 0 },
+        };
+        const d = deltas[dir];
+        if (!d) return axText(`Unknown direction "${dir}". Use down, up, left, or right.`, false);
+        axLog(`scroll ${appName} id=${String(a.id)} ${dir} ${amount}`);
+        const r = await ax.request("scroll", { app: appName, id: a.id, dx: d.dx, dy: d.dy });
+        const diff = String(r.diff ?? "");
+        remember(diff);
+        return axText(`Scrolled ${dir}.\n${diff || "(nothing changed — the container may not scroll, or is already at the end)"}`, true);
+      }
+      case "computer_press":
+      case "computer_set_value":
+      case "computer_press_key":
       case "computer_act": {
-        axLog(`act ${appName} ${JSON.stringify({ id: a.id, action: a.action, key: a.key, value: typeof a.value === "string" ? "<set>" : undefined })}`);
-        const modes = ["action", "value", "key"].filter((k) => a[k] !== undefined);
-        if (modes.length !== 1) return axText("Pass exactly one of action, value, or key.", false);
         let r;
-        if (typeof a.key === "string") {
+        // computer_act used to carry value and key. A model that still sends
+        // them must not get a silent press instead of what it asked for, so
+        // route on the argument when the old shape shows up.
+        const legacyKey = tool === "computer_act" && typeof a.key === "string";
+        const legacyValue = tool === "computer_act" && typeof a.value === "string";
+        if (tool === "computer_press_key" || legacyKey) {
+          if (typeof a.key !== "string") return axText("key is required.", false);
+          axLog(`key ${appName} ${a.key}${typeof a.id === "number" ? ` -> #${a.id}` : ""}`);
           // Nothing raises: a key posted to the pid reaches a background app.
           r = await ax.request("key", { app: appName, key: a.key, ...(typeof a.id === "number" ? { id: a.id } : {}) });
+        } else if (tool === "computer_set_value" || legacyValue) {
+          const text = typeof a.text === "string" ? a.text : typeof a.value === "string" ? a.value : null;
+          if (text === null) return axText("text is required.", false);
+          axLog(`type ${appName} #${String(a.id)} <set>`);
+          r = await ax.request("setValue", { app: appName, id: a.id, value: text });
+        } else {
+          const action = tool === "computer_press" ? "press" : String(a.action ?? "");
+          if (!action) return axText("action is required. Use one of the actions the element listed in braces.", false);
+          axLog(`act ${appName} #${String(a.id)} ${action}`);
+          r = await ax.request("act", { app: appName, id: a.id, action });
         }
-        else if (typeof a.value === "string") r = await ax.request("setValue", { app: appName, id: a.id, value: a.value });
-        else r = await ax.request("act", { app: appName, id: a.id, action: String(a.action) });
         const diff = String(r.diff ?? "");
         remember(diff);
         return axText(`Done.\n${diff}`, true);
@@ -3064,11 +3191,24 @@ const PLAN_DIRECTIVE =
 
 const COMPUTER_DIRECTIVE =
   "COMPUTER is selected for this turn. The user has explicitly chosen the computer tools, so use them: start with " +
-  "computer_apps or computer_app_state and work through the apps ALREADY OPEN on their machine. " +
+  "computer_apps or computer_app_state and work through the apps on their machine. If the app you need is not running, " +
+  "call computer_launch — it waits until the app is readable and hands you its tree. " +
   "Do NOT call browser_connect or the other browser_* tools for this turn — those open a SEPARATE browser window and " +
   "cannot see the user's own windows or tabs, which is the opposite of what they asked for. This applies even when the " +
   "task involves a website behind a login: if it is open in a browser they are already running, computer_app_state reads " +
-  "it and computer_act operates it. Every desktop action still requires explicit user approval.";
+  "it and computer_press operates it. " +
+  // Measured, on a task that should have taken four calls: the model shelled
+  // out to `open -a Maps`, and never came back. Twenty shell calls, osascript,
+  // JXA, and finally a hand-written Swift program that dumped the very tree
+  // computer_app_state returns for free — then it reported route figures it
+  // had never read, because it never actually operated the app.
+  "Do NOT drive the desktop with the shell for this turn. No `open`, no `osascript`, no AppleScript or JXA, no URL " +
+  "schemes, and never write a program to inspect the UI: the computer_* tools ARE that capability, and a shell detour " +
+  "loses the element ids that make the next step possible. Operate the app the way a person would — type into its " +
+  "search field, press its results, press its tabs — rather than constructing a URL that guesses at what the user meant. " +
+  "Report only what you actually read. Every number, name, distance, time or price in your answer must appear in a tool " +
+  "result from this turn; if the app never showed it, say what you could not get instead of filling the gap. " +
+  "Every desktop action still requires explicit user approval.";
 
 // Work-in mode for NEW project chats: the live checkout, or an isolated
 // git worktree created per conversation (agent works on its own branch,
@@ -5212,7 +5352,7 @@ function wireNotifications(): void {
           ? handleScheduleToolCall(tool, args, approvalThread)
           : tool.startsWith("memory_")
             ? handleMemoryToolCall(tool, args, approvalThread)
-            : AX_TOOL_NAMES.has(tool)
+            : routesToAx(tool)
               ? handleAxCall(tool, args, approvalThread)
             : tool.startsWith("computer_")
               ? handleComputerUseCall(tool, args, approvalThread)
