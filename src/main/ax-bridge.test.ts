@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-import { AX_TOOL_NAMES, SCREENSHOT_TOOL_NAMES, routesToAx, parseBatchSteps, describeBatch, summarizeBatch, MAX_BATCH_STEPS, AxClient, AxError, appOfStep, axConsent, axNeedsFocus, offerScreenshotTools, shouldRecoverRaise, describeAxAction, indexElementLines, readAxManifest, resolveAxDir, shouldOpenAccessibilitySettings, axNotTrustedText } from "./ax-bridge";
+import { AX_TOOL_NAMES, SCREENSHOT_TOOL_NAMES, routesToAx, parseBatchSteps, describeBatch, summarizeBatch, MAX_BATCH_STEPS, AxClient, AxError, appOfStep, axConsent, axNeedsFocus, offerScreenshotTools, shouldRecoverRaise, describeAxAction, indexElementLines, readAxManifest, resolveAxDir, shouldOpenAccessibilitySettings, axNotTrustedText, RAISE_DESCRIPTION, APP_STATE_SPACE_SENTENCE, LAUNCH_FRONT_SENTENCE, withSpaceGuidance } from "./ax-bridge";
 
 const scratch = () => mkdtempSync(join(tmpdir(), "ax-"));
 
@@ -56,7 +56,8 @@ test("the dev fallback finds a sibling checkout from a worktree, not just a plai
 
 // ── The client, against a fake bridge ──────────────────────────────────────
 // A shell script exec'ing node on a small script: hello answers, "echo" echoes,
-// "boom" errors, "slow" never answers, "die" exits.
+// "boom" errors, "slow" never answers, "die" exits, "hangHelloOnce" makes the
+// next hello go unanswered.
 
 function fakeBridge(): ReturnType<typeof readAxManifest> {
   const dir = join(scratch(), "dist");
@@ -65,14 +66,16 @@ function fakeBridge(): ReturnType<typeof readAxManifest> {
     join(dir, "fake.js"),
     `
 let hellos = 0;
+let hang = false;
 const rl = require("node:readline").createInterface({ input: process.stdin });
 rl.on("line", (line) => {
   const { id, method, params } = JSON.parse(line);
   // The real bridge decides crossSpace lazily: undecided (false) at start,
   // true once it has proved the private path. Model that: the first hello
   // says false, every later one true. "hellos" is test-only, like "echo".
-  if (method === "hello") { hellos += 1; return console.log(JSON.stringify({ id, result: { name: "unbiased-ax", protocolVersion: 1, trusted: true, crossSpace: hellos >= 2 } })); }
+  if (method === "hello") { if (hang) { hang = false; return; } hellos += 1; return console.log(JSON.stringify({ id, result: { name: "unbiased-ax", protocolVersion: 1, trusted: true, crossSpace: hellos >= 2 } })); }
   if (method === "hellos") return console.log(JSON.stringify({ id, result: { hellos } }));
+  if (method === "hangHelloOnce") { hang = true; return console.log(JSON.stringify({ id, result: {} })); }
   if (method === "boom") return console.log(JSON.stringify({ id, error: { code: "no_such_app", message: "No running app matches" } }));
   if (method === "slow") return;
   if (method === "die") process.exit(3);
@@ -114,6 +117,24 @@ test("a later hello can turn cross-Space on, and the client follows it", async (
   assert.equal(n.hellos, 2, "exactly two hellos: start, then one refresh");
   assert.equal(await c.refreshCrossSpace(), false, "no flip the second time");
   assert.equal((await c.request("hellos", {})).hellos, 2, "once true, refresh is a no-op and sends nothing");
+});
+
+test("a hello that goes unanswered is not a flip, and the flag stays where it was", async (t) => {
+  // The bridge can be busy (a tree of a browser with fifty tabs) when the
+  // prelude asks. Silence must read as "still undecided", never as a verdict,
+  // and the next ask must still be able to flip it.
+  const m = fakeBridge();
+  assert.ok(m && !("error" in m));
+  const c = new AxClient(m);
+  t.after(() => c.stop());
+  await c.start();
+  await c.request("hangHelloOnce", {});
+  c.helloTimeoutMs = 200;
+  assert.equal(await c.refreshCrossSpace(), false, "a hello that times out is not a flip");
+  assert.equal(c.crossSpace, false, "and the flag stays where it was");
+  assert.equal(await c.refreshCrossSpace(), true, "the next hello is answered and flips it");
+  assert.equal(c.crossSpace, true);
+  assert.equal((await c.request("hellos", {})).hellos, 2, "the dropped hello was never answered, so it is not counted");
 });
 
 test("a request gets its own answer back, matched by id, and an error becomes an AxError with its code", async () => {
@@ -546,4 +567,24 @@ test("a batch that changed nothing visible says that, rather than looking succes
   const out = summarizeBatch({ ran: ["step 1 (press)"], failed: null, remaining: 0, diff: "" });
   assert.match(out, /^Done: step 1 \(press\)\./);
   assert.match(out, /nothing in the tree changed/);
+});
+
+// ── Space guidance in the tool descriptions ────────────────────────────────
+// With cross-Space on, telling the model to raise before reading is telling it
+// to take the user's screen for nothing.
+
+test("with cross-Space on, no description sends the model to raise", () => {
+  const raise = { name: "computer_raise", description: RAISE_DESCRIPTION };
+  const state = { name: "computer_app_state", description: "Read stuff. " + APP_STATE_SPACE_SENTENCE + "More." };
+  const launch = { name: "computer_launch", description: "Open it. " + LAUNCH_FRONT_SENTENCE };
+  const other = { name: "computer_apps", description: "List running apps." };
+
+  for (const t of [raise, state, launch, other]) assert.deepEqual(withSpaceGuidance(t, false), t, "off: byte-identical to today");
+
+  assert.ok(!withSpaceGuidance(raise, true).description.includes("exactly one case"));
+  assert.ok(withSpaceGuidance(raise, true).description.includes("only when the user asked to SEE"));
+  assert.ok(!withSpaceGuidance(state, true).description.includes("call computer_raise"));
+  assert.ok(withSpaceGuidance(state, true).description.includes("never raise"));
+  assert.ok(!withSpaceGuidance(launch, true).description.includes("brings the app to the front"));
+  assert.deepEqual(withSpaceGuidance(other, true), other, "tools with nothing to say about Spaces are untouched");
 });

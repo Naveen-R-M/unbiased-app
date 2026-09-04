@@ -54,6 +54,10 @@ import {
   parseBatchSteps,
   summarizeBatch,
   MAX_BATCH_STEPS,
+  APP_STATE_SPACE_SENTENCE,
+  RAISE_DESCRIPTION,
+  LAUNCH_FRONT_SENTENCE,
+  withSpaceGuidance,
 } from "./ax-bridge";
 import { isProductionBuild } from "./runtime-mode";
 import {
@@ -1270,7 +1274,7 @@ const AX_TOOLS = [
       "Reach for this BEFORE computer_screenshot: it answers what is on screen, which tab is selected, and where a control is, as text. "
       + "It works on a BACKGROUND app on any Space and never takes over the user's screen. " +
       "Ids are stable per app until an element disappears. After the first read of an app the result is a DIFF (~ changed, + added, removed by id) unless full=true. " +
-      "If the result says every window is on another Space, the app is NOT in the tree — call computer_raise once, then read again. If windows ARE listed, work with them and do not raise. Pass query to search for one control by title instead of reading everything. " +
+      APP_STATE_SPACE_SENTENCE + "Pass query to search for one control by title instead of reading everything. " +
       "Web page content inside a browser needs web=true. Use computer_screenshot when you need to SEE something the tree cannot express — whether a video is actually playing, a canvas, a rendered chart — and one confirming screenshot at the end of a visual task is worth taking.",
     inputSchema: {
       type: "object",
@@ -1290,7 +1294,7 @@ const AX_TOOLS = [
     type: "function",
     name: "computer_raise",
     description:
-      "Bring an app to the front, switching Spaces if its windows are elsewhere. This TAKES OVER the user's screen, so use it in exactly one case: computer_app_state reported that every window of the app is on another Space, which means the app is not in the tree and cannot be read or acted on until it is raised. Never raise to read or press an app whose windows are already listed. This always requires explicit user approval.",
+      RAISE_DESCRIPTION,
     inputSchema: { type: "object", properties: { app: { type: "string" } }, required: ["app"] },
   },
   {
@@ -1298,7 +1302,7 @@ const AX_TOOLS = [
     name: "computer_launch",
     description:
       "Open an app that is not running yet, by name or bundle id — \"Maps\", \"Slack\", \"com.apple.Maps\". USE THIS, never a shell command: it waits until the app is actually READABLE rather than merely running, and returns its element tree, so the next step can act immediately. Launching by shell returns before the app is in the accessibility tree, and the read that follows fails. " +
-      "Harmless if the app is already running — it says so and reads it. This brings the app to the front, which is what opening an app means.",
+      "Harmless if the app is already running — it says so and reads it. " + LAUNCH_FRONT_SENTENCE,
     inputSchema: {
       type: "object",
       properties: { app: { type: "string", description: "App name or bundle id, e.g. \"Maps\"." } },
@@ -1599,7 +1603,7 @@ function dynamicToolCommandText(tool: string | undefined, rawArgs: unknown): str
  */
 function threadDynamicTools(): Record<string, unknown>[] | undefined {
   const tools = [
-    ...(ax?.alive ? AX_TOOLS : []),
+    ...(ax?.alive ? AX_TOOLS.map((t) => withSpaceGuidance(t, ax!.crossSpace)) : []),
     ...(offerScreenshotTools({ axAlive: ax?.alive === true }) ? COMPUTER_USE_TOOLS : []),
     ...SCHEDULE_TOOLS,
     ...MEMORY_TOOLS,
@@ -2296,10 +2300,11 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
       }
       case "computer_launch": {
         axLog(`launch ${appName}`);
-        // A foreground launch puts the app where the work is, so treat it as
-        // this conversation's raised app: the read-side recovery then knows
-        // to put it back if it drifts off-Space between two actions.
-        axRaised.set(root, appName);
+        // Without cross-Space the launch is foreground and the app is now where
+        // the work is, so treat it as this conversation's raised app for the
+        // read-side recovery. With it, the launch is background and there is
+        // nothing to put back.
+        if (!ax.crossSpace) axRaised.set(root, appName);
         const r = await ax.request("launch", { app: appName }, 25_000);
         const tree = String(r.tree ?? "");
         remember(tree);

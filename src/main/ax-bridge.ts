@@ -10,6 +10,9 @@ import { createInterface } from "node:readline";
 
 export const AX_PROTOCOL_VERSION = 1;
 export const AX_REQUEST_TIMEOUT_MS = 10_000;
+/** A hello while the cross-Space verdict is undecided runs the bridge's
+ *  self-check, budgeted at five seconds — hence twice that. */
+export const AX_HELLO_TIMEOUT_MS = 10_000;
 
 export type AxManifest = { entryPath: string; args: string[]; version: string; protocolVersion: number };
 
@@ -345,6 +348,9 @@ export class AxClient {
    *  The bridge decides this lazily and can turn it on after start — see
    *  refreshCrossSpace. */
   crossSpace = false;
+  /** How long refreshCrossSpace waits for its hello. A field, not a
+   *  constructor argument, so a test can shorten it without a new ctor shape. */
+  helloTimeoutMs = AX_HELLO_TIMEOUT_MS;
 
   constructor(
     private readonly manifest: AxManifest,
@@ -392,16 +398,14 @@ export class AxClient {
    *  one time the flag turns on. */
   async refreshCrossSpace(): Promise<boolean> {
     if (this.crossSpace || !this.alive) return false;
-    const before = this.crossSpace;
     try {
-      // When the verdict is undecided and the process is trusted, this hello
-      // runs the bridge's self-check, budgeted at five seconds — hence 10 s.
-      this.readHello(await this.request("hello", {}, 10_000));
+      this.readHello(await this.request("hello", {}, this.helloTimeoutMs));
     } catch {
       // the bridge may be busy or gone; the next read will say so
       return false;
     }
-    return !before && this.crossSpace;
+    // The early return guaranteed the flag was false, so true here is the flip.
+    return this.crossSpace;
   }
 
   /** `timeoutMs` overrides the client default for one call: a `windows` read
@@ -493,6 +497,37 @@ export function describeAxAction(tool: string, rawArgs: unknown, lines?: Map<num
       if (tool === "computer_press") return `Press ${target}`;
       return `${typeof a.action === "string" ? a.action : "press"} ${target}`;
     }
+    default:
+      return tool;
+  }
+}
+
+/** The parts of the tool descriptions that are about Spaces, and what they
+ *  become once the bridge reads across them. Kept here, not in index.ts, so
+ *  they are tested; index.ts builds its literal AX_TOOLS from the "off"
+ *  versions and rewrites at the point the list is handed to the model. */
+export const APP_STATE_SPACE_SENTENCE =
+  "If the result says every window is on another Space, the app is NOT in the tree — call computer_raise once, then read again. If windows ARE listed, work with them and do not raise. ";
+export const APP_STATE_SPACE_SENTENCE_CROSS =
+  "Windows on another Space are in the tree and work like any other — never raise to read or act; a window line marked [other Space] is still fully usable. ";
+export const RAISE_DESCRIPTION =
+  "Bring an app to the front, switching Spaces if its windows are elsewhere. This TAKES OVER the user's screen, so use it in exactly one case: computer_app_state reported that every window of the app is on another Space, which means the app is not in the tree and cannot be read or acted on until it is raised. Never raise to read or press an app whose windows are already listed. This always requires explicit user approval.";
+export const RAISE_DESCRIPTION_CROSS =
+  "Bring an app to the front, switching Spaces if its windows are elsewhere. This TAKES OVER the user's screen. Reading and acting never need it — every window is in the tree wherever it is — so use it only when the user asked to SEE the app. This always requires explicit user approval.";
+export const LAUNCH_FRONT_SENTENCE =
+  "This brings the app to the front, which is what opening an app means.";
+export const LAUNCH_FRONT_SENTENCE_CROSS =
+  "It opens in the background: the tree is readable without bringing the app forward, and the user keeps their screen.";
+
+export function withSpaceGuidance<T extends { name: string; description: string }>(tool: T, crossSpace: boolean): T {
+  if (!crossSpace) return tool;
+  switch (tool.name) {
+    case "computer_raise":
+      return { ...tool, description: RAISE_DESCRIPTION_CROSS };
+    case "computer_app_state":
+      return { ...tool, description: tool.description.replace(APP_STATE_SPACE_SENTENCE, APP_STATE_SPACE_SENTENCE_CROSS) };
+    case "computer_launch":
+      return { ...tool, description: tool.description.replace(LAUNCH_FRONT_SENTENCE, LAUNCH_FRONT_SENTENCE_CROSS) };
     default:
       return tool;
   }
