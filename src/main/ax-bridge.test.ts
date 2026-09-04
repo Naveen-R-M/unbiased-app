@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { AxClient, AxError, appOfStep, axConsent, axNeedsFocus, offerScreenshotTools, shouldRecoverRaise, describeAxAction, indexElementLines, readAxManifest, resolveAxDir } from "./ax-bridge";
+import { AxClient, AxError, appOfStep, axConsent, axNeedsFocus, offerScreenshotTools, shouldRecoverRaise, describeAxAction, indexElementLines, readAxManifest, resolveAxDir, shouldOpenAccessibilitySettings, axNotTrustedText } from "./ax-bridge";
 
 const scratch = () => mkdtempSync(join(tmpdir(), "ax-"));
 
@@ -263,4 +263,34 @@ test("a read that comes back empty retries once, but only for an app we raised b
     "windows are here; nothing to recover");
   assert.equal(shouldRecoverRaise({ windowsHere: 0, offscreen: 0, raisedBefore: true }), false,
     "the app has no windows at all — raising will not conjure one");
+});
+
+// ── The missing Accessibility grant ────────────────────────────────────────
+// The one failure the user cannot fix from the transcript. Nothing the app
+// does can grant it, so the app opens the pane and gets out of the way.
+
+test("the Accessibility pane opens for a missing grant, and only once", () => {
+  assert.equal(shouldOpenAccessibilitySettings({ code: "not_trusted", openedBefore: false }), true);
+  assert.equal(shouldOpenAccessibilitySettings({ code: "not_trusted", openedBefore: true }), false,
+    "the pane is already open; opening it again steals focus from the switch they are reaching for");
+  assert.equal(shouldOpenAccessibilitySettings({ code: "no_such_app", openedBefore: false }), false,
+    "a mistyped app name is not a permission problem");
+  assert.equal(shouldOpenAccessibilitySettings({ code: null, openedBefore: false }), false,
+    "a crash or a timeout is not a permission problem either");
+});
+
+test("the not-trusted message names the row that is actually in the pane", () => {
+  const shipped = axNotTrustedText("Unbiased", true);
+  assert.match(shipped, /Unbiased/);
+  assert.match(shipped, /now open/, "it should say the pane is already open, not give directions to it");
+  assert.doesNotMatch(shipped, /computer_screenshot/,
+    "the screenshot tools are not offered while the bridge is alive — do not send the model after a tool it does not have");
+
+  // A dev build is "Electron" in System Settings, not "Unbiased". Naming the
+  // wrong row sends the user hunting for an entry that is not there.
+  assert.match(axNotTrustedText("Electron", true), /Electron/);
+
+  const notOpened = axNotTrustedText("Unbiased", false);
+  assert.match(notOpened, /System Settings > Privacy & Security > Accessibility/,
+    "if the pane could not be opened, the message has to say where to go");
 });

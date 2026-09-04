@@ -48,6 +48,8 @@ import {
   indexElementLines,
   readAxManifest,
   resolveAxDir,
+  shouldOpenAccessibilitySettings,
+  axNotTrustedText,
 } from "./ax-bridge";
 import { isProductionBuild } from "./runtime-mode";
 import {
@@ -1967,6 +1969,11 @@ const axGrants = new Set<string>();
  *  the Space back can be undone. */
 const axRaised = new Map<string, string>();
 
+/** Whether the Accessibility pane has already been opened for the user this
+ *  run. Reset when the app restarts, which is also when a fresh grant takes
+ *  effect, so a second run after a refused grant opens it again. */
+let axSettingsOpened = false;
+
 /** The mode to gate a LOCAL desktop action by. threadAccessModes records what
  *  a thread started under, because codex fixes its own approvalPolicy at
  *  thread/start and cannot be changed after — but this app's own cards are not
@@ -2168,10 +2175,21 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         return axText(`Unknown tool ${tool}`, false);
     }
   } catch (err) {
-    // The bridge's errors already say what to do: not_trusted names the pane,
-    // no_such_element says to read again, no_such_app says to list apps.
-    const msg = err instanceof AxError ? `${err.message}${err.code === "not_trusted" ? " Fall back to computer_screenshot for now." : ""}` : String(err);
-    return axText(msg, false);
+    // The bridge's errors already say what to do: no_such_element says to read
+    // again, no_such_app says to list apps. not_trusted is the one the user
+    // cannot act on from the transcript, so open the pane for them instead of
+    // printing directions to it.
+    const code = err instanceof AxError ? err.code : null;
+    if (shouldOpenAccessibilitySettings({ code, openedBefore: axSettingsOpened })) {
+      axSettingsOpened = true;
+      // The native prompt registers the app in the pane's list; without it a
+      // never-granted app may not have a row to switch on at all.
+      systemPreferences.isTrustedAccessibilityClient(true);
+      await openComputerPermissionSettings("accessibility", (uri) => shell.openExternal(uri));
+      axLog("opened the Accessibility pane: the bridge is running but not trusted");
+    }
+    if (code === "not_trusted") return axText(axNotTrustedText(computerPermissionAppName(), axSettingsOpened), false);
+    return axText(err instanceof AxError ? err.message : String(err), false);
   }
 }
 
