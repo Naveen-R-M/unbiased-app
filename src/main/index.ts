@@ -58,6 +58,7 @@ import {
   RAISE_DESCRIPTION,
   LAUNCH_FRONT_SENTENCE,
   withSpaceGuidance,
+  otherSpaceNote,
 } from "./ax-bridge";
 import { isProductionBuild } from "./runtime-mode";
 import {
@@ -1420,9 +1421,14 @@ const AX_TOOLS = [
 // silently reached the coordinate-based screenshot handler, which wants screen
 // coordinates and got none. A tool broken that way is invisible — it answers,
 // just wrongly — so fail at startup rather than at the twelfth minute of
-// somebody's task.
+// somebody's task. The same goes for the three descriptions withSpaceGuidance
+// rewrites: it replaces a sentence by value, so a future edit that retypes
+// the sentence instead of using the constant makes it a silent no-op.
 for (const t of AX_TOOLS) {
   if (!routesToAx(t.name)) throw new Error(`AX tool ${t.name} is declared but not routed — add it to AX_TOOL_NAMES in ax-bridge.ts`);
+  if (["computer_raise", "computer_app_state", "computer_launch"].includes(t.name) && withSpaceGuidance(t, true).description === t.description) {
+    throw new Error(`AX tool ${t.name}'s description no longer carries its Space sentence — withSpaceGuidance would be a no-op; build it from the constants in ax-bridge.ts`);
+  }
 }
 
 
@@ -2277,6 +2283,7 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         const head = [
           windowsText ? `windows:\n${windowsText}` : (ax.crossSpace ? "windows: none" : "windows: none on this Space"),
           typeof w.hint === "string" ? w.hint : "",
+          otherSpaceNote(ax.crossSpace, windowsText),
         ].filter(Boolean).join("\n");
         if (!windowsText && offscreen > 0) return axText(head, true);
         const opts: Record<string, unknown> = {

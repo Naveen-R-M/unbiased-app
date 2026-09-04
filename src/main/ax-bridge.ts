@@ -532,3 +532,13 @@ export function withSpaceGuidance<T extends { name: string; description: string 
       return tool;
   }
 }
+
+/** What the read appends when it lists windows on another Space. The tool
+ *  descriptions are fixed when a thread starts, so a thread opened while the
+ *  bridge was still undecided keeps the "off" text — which tells the model to
+ *  raise when every window is elsewhere, exactly what a read full of
+ *  [other Space] lines looks like. The result is composed per call, so the
+ *  guidance there is always current. Empty when there is nothing to say. */
+export function otherSpaceNote(crossSpace: boolean, windowsText: string): string {
+  return crossSpace && windowsText.includes("[other Space]") ? "Windows marked [other Space] are in the tree and readable; do not raise." : "";
+}

@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-import { AX_TOOL_NAMES, SCREENSHOT_TOOL_NAMES, routesToAx, parseBatchSteps, describeBatch, summarizeBatch, MAX_BATCH_STEPS, AxClient, AxError, appOfStep, axConsent, axNeedsFocus, offerScreenshotTools, shouldRecoverRaise, describeAxAction, indexElementLines, readAxManifest, resolveAxDir, shouldOpenAccessibilitySettings, axNotTrustedText, RAISE_DESCRIPTION, APP_STATE_SPACE_SENTENCE, LAUNCH_FRONT_SENTENCE, withSpaceGuidance } from "./ax-bridge";
+import { AX_TOOL_NAMES, SCREENSHOT_TOOL_NAMES, routesToAx, parseBatchSteps, describeBatch, summarizeBatch, MAX_BATCH_STEPS, AxClient, AxError, appOfStep, axConsent, axNeedsFocus, offerScreenshotTools, shouldRecoverRaise, describeAxAction, indexElementLines, readAxManifest, resolveAxDir, shouldOpenAccessibilitySettings, axNotTrustedText, RAISE_DESCRIPTION, APP_STATE_SPACE_SENTENCE, LAUNCH_FRONT_SENTENCE, withSpaceGuidance, otherSpaceNote } from "./ax-bridge";
 
 const scratch = () => mkdtempSync(join(tmpdir(), "ax-"));
 
@@ -587,4 +587,14 @@ test("with cross-Space on, no description sends the model to raise", () => {
   assert.ok(withSpaceGuidance(state, true).description.includes("never raise"));
   assert.ok(!withSpaceGuidance(launch, true).description.includes("brings the app to the front"));
   assert.deepEqual(withSpaceGuidance(other, true), other, "tools with nothing to say about Spaces are untouched");
+});
+
+test("the read itself says off-Space windows are readable, and only when that is true", () => {
+  // Descriptions are fixed per thread start; the result is composed per call.
+  // A thread that began while the bridge was undecided still reads the "off"
+  // raise text, so the read has to carry the correction itself.
+  const elsewhere = '1 "X" @0,0 1x1 [other Space]';
+  assert.equal(otherSpaceNote(true, elsewhere), "Windows marked [other Space] are in the tree and readable; do not raise.");
+  assert.equal(otherSpaceNote(false, elsewhere), "", "without cross-Space the marker is not in play and the hint covers that path");
+  assert.equal(otherSpaceNote(true, '1 "X" @0,0 1x1 [focused]'), "", "nothing to say when every window is here");
 });
