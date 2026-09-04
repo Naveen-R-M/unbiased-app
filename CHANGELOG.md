@@ -6,6 +6,13 @@ Format matters: `## <version> — <date>`, then `### <section>`, then `-` bullet
 
 Write for the person using the app, not the person who wrote the code.
 
+## 1.9.2 — September 3, 2026
+
+### Fixed
+
+- **Accessibility permission now survives an update.** macOS ties this permission to a fingerprint of the exact app file, and every release produced a new fingerprint — so after each update the row in System Settings kept its name and its switch, while macOS quietly denied the app behind it. Desktop control would insist the permission was missing no matter how many times you flipped the switch. The app now identifies itself to macOS by name instead of by fingerprint, which is what the development build and the accessibility helper have always done.
+- Updating to this version needs the permission granted one last time, because the update itself is still judged by the old rule. In **System Settings → Privacy & Security → Accessibility**, select **Unbiased**, remove it with the **−** button, then reopen the app and allow it when asked. Removing the row is the part that matters; toggling it off and on leaves the stale record in place. It will hold through every update after this one.
+
 ## 1.9.1 — September 3, 2026
 
 ### Fixed
