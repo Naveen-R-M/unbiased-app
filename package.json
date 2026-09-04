@@ -30,6 +30,13 @@
         ]
       },
       {
+        "from": "../unbiased-ax/dist",
+        "to": "ax",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
         "from": "resources/skills",
         "to": "skills",
         "filter": [
