@@ -1309,7 +1309,8 @@ const AX_TOOLS = [
     type: "function",
     name: "computer_press",
     description:
-      "Press an element by the id computer_app_state returned — a button, a link, a tab, a search result, a menu item. This is the ordinary way to operate an app: the tree names the controls, so press the one you want instead of guessing a keyboard shortcut. Works on a background app without taking the user's screen. Returns the diff of what changed, so you need not read again.",
+      "Press an element by the id computer_app_state returned — a button, a link, a tab, a search result, a menu item. This is the ordinary way to operate an app: the tree names the controls, so press the one you want instead of guessing a keyboard shortcut. Works on a background app without taking the user's screen. " +
+      "It WAITS for the app to react and returns what changed, so do NOT follow it with computer_app_state — pressing a search result returns the place card, pressing a tab returns that tab's contents. Read again only if the result says nothing changed and you expected something.",
     inputSchema: {
       type: "object",
       properties: { app: { type: "string" }, id: { type: "integer", description: "Element id from computer_app_state." } },
@@ -1320,7 +1321,8 @@ const AX_TOOLS = [
     type: "function",
     name: "computer_set_value",
     description:
-      "Set a text field's contents by element id — a search box, an address bar, a message input. Replaces what is there. This does NOT submit: follow it with computer_key key=return when the field needs committing (a search box, a browser address bar, a chat input).",
+      "Set a text field's contents by element id — a search box, an address bar, a message input. Replaces what is there. This does NOT submit: follow it with computer_key key=return when the field needs committing (a search box, a browser address bar, a chat input)." +
+      "It waits for the app to react and returns what changed, so do not read again straight afterwards.",
     inputSchema: {
       type: "object",
       properties: { app: { type: "string" }, id: { type: "integer" }, text: { type: "string", description: "The text to put in the field." } },
@@ -1331,7 +1333,8 @@ const AX_TOOLS = [
     type: "function",
     name: "computer_press_key",
     description:
-      "Send one real key event. Use it for what pressing a control cannot express: committing a field with return, dismissing with escape, moving with tab or the arrows. Pass id to aim the key at an element, which is focused first — WITHOUT id it goes wherever keyboard focus already happens to be, which may be another field entirely. Reaches a background app without taking the user's screen.",
+      "Send one real key event. Use it for what pressing a control cannot express: committing a field with return, dismissing with escape, moving with tab or the arrows. Pass id to aim the key at an element, which is focused first — WITHOUT id it goes wherever keyboard focus already happens to be, which may be another field entirely. Reaches a background app without taking the user's screen." +
+      "It waits for the app to react and returns what changed — committing a search with return comes back with the results in it, so do not read again straight afterwards.",
     inputSchema: {
       type: "object",
       properties: {
