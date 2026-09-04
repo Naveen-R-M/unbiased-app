@@ -6,6 +6,28 @@ Format matters: `## <version> — <date>`, then `### <section>`, then `-` bullet
 
 Write for the person using the app, not the person who wrote the code.
 
+## 1.9.0 — September 3, 2026
+
+### New
+
+- **Desktop control.** Pareto can work in your other Mac apps — read what is on screen, click, type, use menus and keyboard shortcuts — from the conversation you are already in. It reads an app through macOS Accessibility rather than by looking at pixels, so it works from the app's own structure: it knows a button is a button and what it is called, instead of inferring it from a picture. Steps land on the control you meant, and work that used to cost a screenshot and a guess per step now costs neither. Turn it on with **Computer** below the message box. macOS asks for Accessibility permission the first time, and Pareto falls back to screenshots if it is not granted.
+- Each desktop step shows the icon of the app it acted in, so a run that touches three apps reads as three apps rather than one undifferentiated list of clicks.
+
+### Improved
+
+- Desktop control asks your approval once per conversation, not once per action, and the request names the app and the specific control it is about to touch. In **Full access** it does not ask at all. Setting the mode back to **Ask** part-way through takes the approval back with it.
+- Listing which apps are running never needs approval — it reads nothing from inside them.
+- An app sitting on another Mission Control Space cannot be read from where you are, so Pareto brings it forward once and then works there. Apps already on your Space are worked on where they are, without pulling focus away from you.
+
+### Fixed
+
+- Keyboard shortcuts that use ⌘ now work. Copy, paste, select-all and every other Command shortcut were being sent as a key macOS does not have, so they silently did nothing.
+- Screenshots no longer fail on large displays. A full-resolution capture could exceed the request limit and return an error instead of an image; captures are now scaled to fit, and clicks and screenshots finally agree on one set of coordinates.
+- A window whose renderer crashes now recovers instead of leaving you with a blank grey rectangle you have to force-quit.
+- Menus and popovers no longer open invisible when the window has been in the background.
+- The menu on a conversation near the bottom of the sidebar stays on screen instead of opening past the edge.
+- When a desktop action is blocked by permissions, the message names the app you actually need to find in System Settings, and errors that were not about permissions at all stop claiming they were.
+
 ## 1.8.2 — September 2, 2026
 
 ### Improved
