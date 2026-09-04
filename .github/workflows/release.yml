@@ -57,6 +57,7 @@ jobs:
           repositories: |
             unbiased-app
             unbiased-app-engine
+            unbiased-ax
             unbiased-app-releases
 
       # The engine must sit BESIDE the app: package.json's extraResources
@@ -67,6 +68,16 @@ jobs:
           repository: circuitandchisel/unbiased-app-engine
           token: ${{ steps.app-token.outputs.token }}
           path: unbiased-app-engine
+
+      # The accessibility bridge must sit BESIDE the app too: extraResources
+      # copies from ../unbiased-ax/dist. Without it `npm run dist` fails at
+      # the copy, which would only show up on a tag push.
+      - name: checkout accessibility bridge
+        uses: actions/checkout@v4
+        with:
+          repository: circuitandchisel/unbiased-ax
+          token: ${{ steps.app-token.outputs.token }}
+          path: unbiased-ax
 
       - uses: actions/setup-go@v5
         with:
@@ -87,6 +98,19 @@ jobs:
       # engine.lock checksum gate (public openai/codex release — no secret).
       - name: build engine bundle
         working-directory: unbiased-app-engine
+        run: make bundle
+
+      # Same gate the engine gets, for the same reason: a tag can be pushed on
+      # any commit. The bridge's tests need no framework — CommandLineTools
+      # ships neither XCTest nor Swift Testing, so they are an executable.
+      - name: bridge tests
+        working-directory: unbiased-ax
+        run: make test
+
+      # Produces dist/unbiased-ax (ad-hoc signed, stable identifier) and
+      # dist/manifest.json, which is what extraResources copies.
+      - name: build bridge bundle
+        working-directory: unbiased-ax
         run: make bundle
 
       # electron-builder names the DMG from package.json's version, NOT the
@@ -115,6 +139,18 @@ jobs:
       - name: build DMG
         working-directory: unbiased-app
         run: npm run dist
+
+      # The bridge is spawned at runtime from Contents/Resources/ax; if the
+      # copy silently did not happen, the app ships without desktop control
+      # and nothing else fails. Check it explicitly.
+      - name: verify the bridge shipped
+        working-directory: unbiased-app
+        run: |
+          bin="release/mac-arm64/Unbiased.app/Contents/Resources/ax/unbiased-ax"
+          [ -x "$bin" ] || { echo "::error::$bin missing from the packaged app"; exit 1; }
+          echo '{"id":1,"method":"hello"}' | "$bin" | grep -q '"protocolVersion":1' || {
+            echo "::error::the packaged bridge did not answer hello"; exit 1; }
+          echo "bridge shipped and answers: $bin"
 
       - name: checksums
         working-directory: unbiased-app/release
