@@ -26,5 +26,15 @@ Commit: `feat(ax): computer_app_state and computer_act tools`.
 ### Task 2: Live verification
 `npm run dev` from this worktree (the launcher now forwards env; the resolver finds `../../../unbiased-ax/dist` by walking up). Prompt: *Play a youtube video from the opened tab in my brave browser.* Success: the rollout shows `computer_app_state` / `computer_act` calls, no `computer_screenshot` before the first act, and Brave's title ends in "Audio playing". Record call count and wall time in the PR.
 
-### Task 3: PR
+### Task 3 (done): ship the bridge
+
+`extraResources` copies `../unbiased-ax/dist` to `Contents/Resources/ax`, which
+is exactly where `resolveAxDir` looks when packaged. The existing `afterPack`
+ad-hoc signer already seals it: it deep-signs the whole bundle, and an
+unsigned nested binary is what makes macOS call an app "damaged".
+
+Building the app therefore needs a sibling `unbiased-ax` checkout with
+`make bundle` run in it, the same standing requirement the engine has had.
+
+### Task 4: PR
 Base `main`. Body: the measured before/after and the run's tool sequence.
