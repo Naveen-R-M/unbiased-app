@@ -6,6 +6,12 @@ Format matters: `## <version> — <date>`, then `### <section>`, then `-` bullet
 
 Write for the person using the app, not the person who wrote the code.
 
+## 1.9.1 — September 3, 2026
+
+### Fixed
+
+- When macOS has not granted Accessibility access, the app now opens **Privacy & Security → Accessibility** for you instead of printing directions to it. Desktop control cannot grant itself that permission — a person has to switch it on — so the app puts you in front of the switch and says one line, rather than walking you through a window it was perfectly able to open. It also registers the app in that list, so there is a row to switch on even if it has never been granted before.
+
 ## 1.9.0 — September 3, 2026
 
 ### New
