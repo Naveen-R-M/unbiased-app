@@ -57,7 +57,6 @@ jobs:
           repositories: |
             unbiased-app
             unbiased-app-engine
-            unbiased-ax
             unbiased-app-releases
 
       # The engine must sit BESIDE the app: package.json's extraResources
@@ -72,11 +71,14 @@ jobs:
       # The accessibility bridge must sit BESIDE the app too: extraResources
       # copies from ../unbiased-ax/dist. Without it `npm run dist` fails at
       # the copy, which would only show up on a tag push.
+      # No token: unbiased-ax is public, so this needs no App installation and
+      # cannot fail on a permissions change elsewhere. If it is ever made
+      # private, add `token: ${{ steps.app-token.outputs.token }}` here and
+      # `unbiased-ax` to the token's repositories list above.
       - name: checkout accessibility bridge
         uses: actions/checkout@v4
         with:
           repository: circuitandchisel/unbiased-ax
-          token: ${{ steps.app-token.outputs.token }}
           path: unbiased-ax
 
       - uses: actions/setup-go@v5
