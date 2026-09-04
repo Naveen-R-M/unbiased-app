@@ -319,9 +319,13 @@ export function offerScreenshotTools(opts: { axAlive: boolean }): boolean {
  *  that app coming forward once, and it drifting back off-Space between two
  *  actions is not a new decision — it is the same one, undone. Measured: one
  *  working run spent a third of its calls re-asking for a raise it had
- *  already been given. */
-export function shouldRecoverRaise(s: { windowsHere: number; offscreen: number; raisedBefore: boolean }): boolean {
-  return s.raisedBefore && s.windowsHere === 0 && s.offscreen > 0;
+ *  already been given.
+ *  Never when the bridge reads across Spaces: the window is in the tree where
+ *  it is, and "0 windows here" is no longer a problem to recover from.
+ *  Measured before that: 9 automatic raises in four minutes, each one undoing
+ *  the user's return to their own Space. */
+export function shouldRecoverRaise(s: { windowsHere: number; offscreen: number; raisedBefore: boolean; crossSpace: boolean }): boolean {
+  return !s.crossSpace && s.raisedBefore && s.windowsHere === 0 && s.offscreen > 0;
 }
 
 export type AxResult = Record<string, unknown>;
@@ -384,16 +388,20 @@ export class AxClient {
    *  on the first trusted call that finds an app to witness with, so a bridge
    *  spawned before the Accessibility grant, or on an empty Space, says false
    *  at start and true later. One cheap IPC while false; nothing once true.
-   *  Silent on failure: the flag simply stays where it was. */
-  async refreshCrossSpace(): Promise<void> {
-    if (this.crossSpace || !this.alive) return;
+   *  Silent on failure: the flag simply stays where it was. Returns true the
+   *  one time the flag turns on. */
+  async refreshCrossSpace(): Promise<boolean> {
+    if (this.crossSpace || !this.alive) return false;
+    const before = this.crossSpace;
     try {
       // When the verdict is undecided and the process is trusted, this hello
       // runs the bridge's self-check, budgeted at five seconds — hence 10 s.
       this.readHello(await this.request("hello", {}, 10_000));
     } catch {
       // the bridge may be busy or gone; the next read will say so
+      return false;
     }
+    return !before && this.crossSpace;
   }
 
   /** `timeoutMs` overrides the client default for one call: a `windows` read

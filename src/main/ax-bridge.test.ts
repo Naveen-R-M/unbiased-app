@@ -86,34 +86,34 @@ rl.on("line", (line) => {
   return readAxManifest(dir);
 }
 
-test("start performs the handshake and reports trust and cross-Space", async () => {
+test("start performs the handshake and reports trust and cross-Space", async (t) => {
   const m = fakeBridge();
   assert.ok(m && !("error" in m));
   const c = new AxClient(m);
+  t.after(() => c.stop());
   const hello = await c.start();
   assert.equal(hello.trusted, true);
   assert.equal(hello.crossSpace, false, "the fake's first hello is undecided — the client must not assume true");
   assert.equal(c.crossSpace, false);
   assert.equal(c.alive, true);
-  c.stop();
 });
 
-test("a later hello can turn cross-Space on, and the client follows it", async () => {
+test("a later hello can turn cross-Space on, and the client follows it", async (t) => {
   // The bridge decides its verdict lazily: spawned before the Accessibility
   // grant it says false, and says true once it has proved the private path.
   // The app must pick that up without a restart.
   const m = fakeBridge();
   assert.ok(m && !("error" in m));
   const c = new AxClient(m);
+  t.after(() => c.stop());
   await c.start();
   assert.equal(c.crossSpace, false);
-  await c.refreshCrossSpace();
+  assert.equal(await c.refreshCrossSpace(), true, "reports the flip");
   assert.equal(c.crossSpace, true, "the second hello said true");
   const n = await c.request("hellos", {});
   assert.equal(n.hellos, 2, "exactly two hellos: start, then one refresh");
-  await c.refreshCrossSpace();
+  assert.equal(await c.refreshCrossSpace(), false, "no flip the second time");
   assert.equal((await c.request("hellos", {})).hellos, 2, "once true, refresh is a no-op and sends nothing");
-  c.stop();
 });
 
 test("a request gets its own answer back, matched by id, and an error becomes an AxError with its code", async () => {
@@ -290,14 +290,16 @@ test("with the bridge alive, the screenshot tools are not offered", () => {
 // raise again. If this conversation already raised that app, the read should
 // recover by itself.
 
-test("a read that comes back empty retries once, but only for an app we raised before", () => {
-  assert.equal(shouldRecoverRaise({ windowsHere: 0, offscreen: 12, raisedBefore: true }), true);
-  assert.equal(shouldRecoverRaise({ windowsHere: 0, offscreen: 12, raisedBefore: false }), false,
+test("a read that comes back empty retries once, but only for an app we raised before, and never across Spaces", () => {
+  assert.equal(shouldRecoverRaise({ windowsHere: 0, offscreen: 12, raisedBefore: true, crossSpace: false }), true);
+  assert.equal(shouldRecoverRaise({ windowsHere: 0, offscreen: 12, raisedBefore: false, crossSpace: false }), false,
     "never raise an app the model has not already chosen to bring forward");
-  assert.equal(shouldRecoverRaise({ windowsHere: 2, offscreen: 12, raisedBefore: true }), false,
+  assert.equal(shouldRecoverRaise({ windowsHere: 2, offscreen: 12, raisedBefore: true, crossSpace: false }), false,
     "windows are here; nothing to recover");
-  assert.equal(shouldRecoverRaise({ windowsHere: 0, offscreen: 0, raisedBefore: true }), false,
+  assert.equal(shouldRecoverRaise({ windowsHere: 0, offscreen: 0, raisedBefore: true, crossSpace: false }), false,
     "the app has no windows at all — raising will not conjure one");
+  assert.equal(shouldRecoverRaise({ windowsHere: 0, offscreen: 12, raisedBefore: true, crossSpace: true }), false,
+    "with cross-Space on the window is readable where it is; measured 9 automatic raises in 4 minutes before this");
 });
 
 // ── The missing Accessibility grant ────────────────────────────────────────

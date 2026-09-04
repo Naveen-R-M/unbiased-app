@@ -2113,10 +2113,12 @@ function liveAccessMode(root: string): AccessMode {
 }
 
 /** Put back a raise that an approval card undid. Cheap when nothing was
- *  raised, and silent on failure: this is a convenience, not a step. */
+ *  raised, and silent on failure: this is a convenience, not a step. Nothing
+ *  to put back when the bridge reads across Spaces — the card did not take
+ *  anything the work needed. */
 async function reassertRaise(root: string): Promise<void> {
   const appName = axRaised.get(root);
-  if (!appName || !ax?.alive) return;
+  if (!appName || !ax?.alive || ax.crossSpace) return;
   try {
     axLog(`raise ${appName} (re-assert after an approval card)`);
     await ax.request("raise", { app: appName }, 3_000);
@@ -2202,6 +2204,11 @@ function axText(text: string, success: boolean): DynamicToolResponse {
 async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | null): Promise<DynamicToolResponse> {
   if (!ax?.alive) await startAxBridge(); // it may have died; one attempt to bring it back
   if (!ax?.alive) return axText("The accessibility bridge is not running. Use computer_screenshot instead.", false);
+  // Ask the bridge again whether it reads across Spaces while it says no: free
+  // once it says yes. Before the card and before reassertRaise, which is gated
+  // on it — and before `windows`, whose 3s timeout must not pay the bridge's
+  // self-check on the first trusted call.
+  if (await ax.refreshCrossSpace()) axLog("cross-Space turned on");
   const a = (rawArgs && typeof rawArgs === "object" ? rawArgs : {}) as Record<string, unknown>;
   const appName = typeof a.app === "string" ? a.app.trim() : "";
   if (tool !== "computer_apps" && !appName) return axText("app is required. Call computer_apps to list running apps.", false);
@@ -2247,7 +2254,6 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         return axText(`${appName} is in front and its windows are now readable.\n${diff}`, true);
       }
       case "computer_app_state": {
-        await ax.refreshCrossSpace(); // free once true; picks up a verdict decided after start
         let w = await ax.request("windows", { app: appName }, 3_000);
         // An app this conversation already raised can drift back off-Space
         // between two actions. That is the raise being undone, not a new
@@ -2256,6 +2262,7 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
           windowsHere: ((w.windows as unknown[]) ?? []).length,
           offscreen: Number(w.offscreen ?? 0),
           raisedBefore: axRaised.get(root) === appName,
+          crossSpace: ax.crossSpace,
         })) {
           axLog(`raise ${appName} (auto: read found 0 windows here, ${String(w.offscreen)} offscreen)`);
           await ax.request("raise", { app: appName }, 5_000);
@@ -2264,7 +2271,7 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         const offscreen = Number(w.offscreen ?? 0);
         const windowsText = String(w.text ?? "");
         const head = [
-          windowsText ? `windows:\n${windowsText}` : "windows: none on this Space",
+          windowsText ? `windows:\n${windowsText}` : (ax.crossSpace ? "windows: none" : "windows: none on this Space"),
           typeof w.hint === "string" ? w.hint : "",
         ].filter(Boolean).join("\n");
         if (!windowsText && offscreen > 0) return axText(head, true);
