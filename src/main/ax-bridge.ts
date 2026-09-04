@@ -106,6 +106,31 @@ export function appOfStep(tool: string, args: Record<string, unknown>): string |
   return app || null;
 }
 
+/** Whether to put the user in front of the Accessibility switch. macOS will not
+ *  grant this from code — a person has to flip it — so the most the app can do
+ *  is open the pane. Once per session: a second open yanks focus back out of
+ *  the very window they are standing in, and the first one already got them
+ *  there. */
+export function shouldOpenAccessibilitySettings(opts: { code: string | null; openedBefore: boolean }): boolean {
+  return opts.code === "not_trusted" && !opts.openedBefore;
+}
+
+/** What the model is told when the grant is missing. Deliberately not a list of
+ *  steps: the pane is already open in front of the user, and a five-bullet
+ *  walkthrough of a window they are looking at reads as noise. It also no
+ *  longer says to fall back to computer_screenshot — those tools are not
+ *  offered while the bridge is alive, so that was an instruction to use a tool
+ *  the model does not have. */
+export function axNotTrustedText(appName: string, opened: boolean): string {
+  const next = opened
+    ? `System Settings is now open at Privacy & Security > Accessibility. In one short sentence, tell the user to switch ${appName} on there and say when it is done.`
+    : `Tell the user, in one short sentence, to switch ${appName} on in System Settings > Privacy & Security > Accessibility.`;
+  return (
+    `macOS has not granted Accessibility access to ${appName}, so the desktop tools cannot read or operate other apps. ` +
+    `${next} Do not list the steps, and do not retry the desktop tools until they say it is granted.`
+  );
+}
+
 /** Whether to offer the older screenshot-and-coordinates tools. Not while the
  *  bridge is alive: the model reached for Spotlight and command+k only because
  *  they were on the menu, when the tree had the list it needed the whole time.
