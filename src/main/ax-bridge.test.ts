@@ -64,10 +64,15 @@ function fakeBridge(): ReturnType<typeof readAxManifest> {
   writeFileSync(
     join(dir, "fake.js"),
     `
+let hellos = 0;
 const rl = require("node:readline").createInterface({ input: process.stdin });
 rl.on("line", (line) => {
   const { id, method, params } = JSON.parse(line);
-  if (method === "hello") return console.log(JSON.stringify({ id, result: { name: "unbiased-ax", protocolVersion: 1, trusted: true } }));
+  // The real bridge decides crossSpace lazily: undecided (false) at start,
+  // true once it has proved the private path. Model that: the first hello
+  // says false, every later one true. "hellos" is test-only, like "echo".
+  if (method === "hello") { hellos += 1; return console.log(JSON.stringify({ id, result: { name: "unbiased-ax", protocolVersion: 1, trusted: true, crossSpace: hellos >= 2 } })); }
+  if (method === "hellos") return console.log(JSON.stringify({ id, result: { hellos } }));
   if (method === "boom") return console.log(JSON.stringify({ id, error: { code: "no_such_app", message: "No running app matches" } }));
   if (method === "slow") return;
   if (method === "die") process.exit(3);
@@ -81,13 +86,33 @@ rl.on("line", (line) => {
   return readAxManifest(dir);
 }
 
-test("start performs the handshake and reports trust", async () => {
+test("start performs the handshake and reports trust and cross-Space", async () => {
   const m = fakeBridge();
   assert.ok(m && !("error" in m));
   const c = new AxClient(m);
   const hello = await c.start();
   assert.equal(hello.trusted, true);
+  assert.equal(hello.crossSpace, false, "the fake's first hello is undecided — the client must not assume true");
+  assert.equal(c.crossSpace, false);
   assert.equal(c.alive, true);
+  c.stop();
+});
+
+test("a later hello can turn cross-Space on, and the client follows it", async () => {
+  // The bridge decides its verdict lazily: spawned before the Accessibility
+  // grant it says false, and says true once it has proved the private path.
+  // The app must pick that up without a restart.
+  const m = fakeBridge();
+  assert.ok(m && !("error" in m));
+  const c = new AxClient(m);
+  await c.start();
+  assert.equal(c.crossSpace, false);
+  await c.refreshCrossSpace();
+  assert.equal(c.crossSpace, true, "the second hello said true");
+  const n = await c.request("hellos", {});
+  assert.equal(n.hellos, 2, "exactly two hellos: start, then one refresh");
+  await c.refreshCrossSpace();
+  assert.equal((await c.request("hellos", {})).hellos, 2, "once true, refresh is a no-op and sends nothing");
   c.stop();
 });
 

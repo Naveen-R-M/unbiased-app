@@ -336,13 +336,18 @@ export class AxClient {
   private nextId = 1;
   alive = false;
   trusted = false;
+  /** Whether the bridge reads windows on other Spaces. False means today's
+   *  behaviour: reads carry raise hints and the app keeps its raise recovery.
+   *  The bridge decides this lazily and can turn it on after start — see
+   *  refreshCrossSpace. */
+  crossSpace = false;
 
   constructor(
     private readonly manifest: AxManifest,
     private readonly timeoutMs = AX_REQUEST_TIMEOUT_MS,
   ) {}
 
-  async start(): Promise<{ trusted: boolean; version: string }> {
+  async start(): Promise<{ trusted: boolean; crossSpace: boolean; version: string }> {
     const proc = spawn(this.manifest.entryPath, this.manifest.args, { stdio: ["pipe", "pipe", "pipe"] });
     this.proc = proc;
     this.alive = true;
@@ -366,8 +371,29 @@ export class AxClient {
       this.stop();
       throw new AxError("protocol", `bridge speaks protocol ${String(hello.protocolVersion)}`);
     }
+    this.readHello(hello);
+    return { trusted: this.trusted, crossSpace: this.crossSpace, version: this.manifest.version };
+  }
+
+  private readHello(hello: AxResult): void {
     this.trusted = hello.trusted === true;
-    return { trusted: this.trusted, version: this.manifest.version };
+    this.crossSpace = hello.crossSpace === true;
+  }
+
+  /** Ask again whether the bridge reads across Spaces. Its verdict is decided
+   *  on the first trusted call that finds an app to witness with, so a bridge
+   *  spawned before the Accessibility grant, or on an empty Space, says false
+   *  at start and true later. One cheap IPC while false; nothing once true.
+   *  Silent on failure: the flag simply stays where it was. */
+  async refreshCrossSpace(): Promise<void> {
+    if (this.crossSpace || !this.alive) return;
+    try {
+      // When the verdict is undecided and the process is trusted, this hello
+      // runs the bridge's self-check, budgeted at five seconds — hence 10 s.
+      this.readHello(await this.request("hello", {}, 10_000));
+    } catch {
+      // the bridge may be busy or gone; the next read will say so
+    }
   }
 
   /** `timeoutMs` overrides the client default for one call: a `windows` read

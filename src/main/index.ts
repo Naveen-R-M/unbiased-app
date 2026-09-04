@@ -2188,7 +2188,7 @@ async function startAxBridge(): Promise<void> {
   try {
     const hello = await client.start();
     ax = client;
-    axLog(`bridge ${hello.version} ready (${hello.trusted ? "trusted" : "NOT trusted: Accessibility not granted"})`);
+    axLog(`bridge ${hello.version} ready (${hello.trusted ? "trusted" : "NOT trusted: Accessibility not granted"}, cross-Space ${hello.crossSpace ? "on" : "off"})`);
   } catch (err) {
     console.warn(`[ax] handshake failed: ${String(err)}`);
     client.stop();
@@ -2247,6 +2247,7 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         return axText(`${appName} is in front and its windows are now readable.\n${diff}`, true);
       }
       case "computer_app_state": {
+        await ax.refreshCrossSpace(); // free once true; picks up a verdict decided after start
         let w = await ax.request("windows", { app: appName }, 3_000);
         // An app this conversation already raised can drift back off-Space
         // between two actions. That is the raise being undone, not a new
