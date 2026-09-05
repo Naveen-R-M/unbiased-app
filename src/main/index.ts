@@ -2137,7 +2137,7 @@ async function reassertRaise(root: string): Promise<void> {
   if (!appName || !ax?.alive || ax.crossSpace) return;
   try {
     axLog(`raise ${appName} (re-assert after an approval card)`);
-    await ax.request("raise", { app: appName }, 3_000);
+    await ax.request("raise", { app: appName, ...axActionOpts(appName) }, 3_000);
   } catch {
     // the app may have quit; the next read will say so plainly
   }
@@ -2153,8 +2153,9 @@ const axIcons = new Map<string, string>();
  *  snapshots the same way. See AxReadOpts. */
 const axReadOpts = new Map<string, AxReadOpts>();
 
-/** The options to send with an action on this app: whatever it was last read
- *  with. Defaults match computer_app_state's own defaults. */
+/** The options to send with anything that snapshots this app — every action,
+ *  and raise, which rewrites the diff baseline just as an action does:
+ *  whatever it was last read with. Defaults match computer_app_state's own. */
 function axActionOpts(appName: string): AxReadOpts {
   return axReadOpts.get(appName) ?? AX_DEFAULT_READ_OPTS;
 }
@@ -2273,7 +2274,7 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
       case "computer_raise": {
         axLog(`raise ${appName} (the model asked)`);
         axRaised.set(root, appName);
-        const r = await ax.request("raise", { app: appName });
+        const r = await ax.request("raise", { app: appName, ...axActionOpts(appName) });
         const diff = String(r.diff ?? "");
         remember(diff);
         return axText(`${appName} is in front and its windows are now readable.\n${diff}`, true);
@@ -2290,7 +2291,7 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
           crossSpace: ax.crossSpace,
         })) {
           axLog(`raise ${appName} (auto: read found 0 windows here, ${String(w.offscreen)} offscreen)`);
-          await ax.request("raise", { app: appName }, 5_000);
+          await ax.request("raise", { app: appName, ...axActionOpts(appName) }, 5_000);
           w = await ax.request("windows", { app: appName }, 3_000);
         }
         const offscreen = Number(w.offscreen ?? 0);

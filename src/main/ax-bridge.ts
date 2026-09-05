@@ -107,7 +107,9 @@ export function axNeedsFocus(tool: string, _args: Record<string, unknown>): bool
  *  with a different filter than the read manufactures a diff: measured on
  *  Maps, one press reported +73 added elements and the next read reported the
  *  same 73 as removed. The model was told the card it had just opened was
- *  gone. Actions must see what the reads see. */
+ *  gone. Anything that ends in the bridge's afterAction — every action, and
+ *  raise with it — takes a snapshot AND stores it as the baseline the next
+ *  diff is measured from, so all of them must see what the reads see. */
 export type AxReadOpts = { interactive: boolean; web: boolean };
 export const AX_DEFAULT_READ_OPTS: AxReadOpts = { interactive: true, web: false };
 export function axReadOptsFrom(args: { interactive?: unknown; web?: unknown }): AxReadOpts {

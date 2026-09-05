@@ -489,15 +489,19 @@ test("every acting bridge call carries the options the app was last read with", 
   // pulls in electron), so read the dispatcher out of the source, the same way
   // the routing test above does, and fail loudly on a call site that forgot.
   const src = readFileSync(join(__dirname, "index.ts"), "utf8");
-  const start = src.indexOf("async function handleAxCall");
-  assert.ok(start > 0, "expected handleAxCall in index.ts");
+  // From reassertRaise, not from handleAxCall: reassertRaise sits above the
+  // dispatcher and raises on its own, and raise ends in the bridge's
+  // afterAction like every other verb — it rewrites the baseline the next
+  // diff is taken against.
+  const start = src.indexOf("async function reassertRaise");
+  assert.ok(start > 0, "expected reassertRaise in index.ts");
   const end = src.indexOf("async function handleComputerUseCall", start);
-  assert.ok(end > start, "expected handleComputerUseCall after handleAxCall");
+  assert.ok(end > start, "expected handleComputerUseCall after the AX dispatch");
   const body = src.slice(start, end);
-  for (const method of ["act", "setValue", "key", "scroll"]) {
+  for (const method of ["act", "setValue", "key", "scroll", "raise"]) {
     const call = `ax.request("${method}", {`;
     let at = body.indexOf(call);
-    assert.ok(at > 0, `expected at least one ax.request("${method}") in handleAxCall`);
+    assert.ok(at > 0, `expected at least one ax.request("${method}") in the AX dispatch`);
     while (at > 0) {
       const near = body.slice(at, at + 120);
       assert.ok(near.includes("axActionOpts"),
