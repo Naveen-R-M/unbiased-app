@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-import { AX_TOOL_NAMES, SCREENSHOT_TOOL_NAMES, routesToAx, parseBatchSteps, describeBatch, summarizeBatch, MAX_BATCH_STEPS, AxClient, AxError, appOfStep, axConsent, axNeedsFocus, screenshotToolsOffered, coordinateToolAllowed, withScreenshotGuidance, SCREENSHOT_FRAME_SENTENCE, axReadOptsFrom, axFilterSwitched, AX_DEFAULT_READ_OPTS, shouldRecoverRaise, describeAxAction, indexElementLines, readAxManifest, resolveAxDir, shouldOpenAccessibilitySettings, axNotTrustedText, RAISE_DESCRIPTION, APP_STATE_SPACE_SENTENCE, LAUNCH_FRONT_SENTENCE, withSpaceGuidance, otherSpaceNote, launchOutcome, renderActionResult, ACTION_NO_CHANGE_SENTENCE, TASK_DISCIPLINE_SENTENCE, type AxCallInfo } from "./ax-bridge";
+import { AX_TOOL_NAMES, SCREENSHOT_TOOL_NAMES, routesToAx, parseBatchSteps, describeBatch, summarizeBatch, MAX_BATCH_STEPS, AxClient, AxError, appOfStep, axConsent, axNeedsFocus, screenshotToolsOffered, coordinateToolAllowed, withScreenshotGuidance, SCREENSHOT_FRAME_SENTENCE, axReadOptsFrom, axFilterSwitched, AX_DEFAULT_READ_OPTS, shouldRecoverRaise, describeAxAction, indexElementLines, readAxManifest, resolveAxDir, shouldOpenAccessibilitySettings, axNotTrustedText, RAISE_DESCRIPTION, APP_STATE_SPACE_SENTENCE, LAUNCH_FRONT_SENTENCE, withSpaceGuidance, otherSpaceNote, launchOutcome, renderActionResult, ACTION_NO_CHANGE_SENTENCE, TASK_DISCIPLINE_SENTENCE, SCREENSHOT_SPACE_SENTENCE, type AxCallInfo } from "./ax-bridge";
 
 const scratch = () => mkdtempSync(join(tmpdir(), "ax-"));
 
@@ -856,4 +856,27 @@ test("every finished request reports its timing and size, errors included", asyn
   assert.ok(echo.ms >= 0 && echo.bytes > 0 && echo.error === null);
   const boom = calls.find((x) => x.method === "boom");
   assert.ok(boom && boom.error && boom.error.includes("No running app"), JSON.stringify(boom));
+});
+
+// Run 3 of the Maps task: the model wanted to look, screenshotted a Space Maps
+// was not on, and raised Maps to see it — twice. The window picture is a tool
+// of its own now, and the display screenshot says so while Spaces are crossed.
+
+test("the window screenshot is an AX tool: routed, described, and read-gated like app_state", () => {
+  assert.ok(routesToAx("computer_app_screenshot"));
+  assert.equal(describeAxAction("computer_app_screenshot", { app: "Maps" }), "Photograph Maps's window");
+  assert.equal(axNeedsFocus("computer_app_screenshot", {}), false, "it never takes the screen");
+  assert.equal(axConsent({ tool: "computer_app_screenshot", mode: "ask", granted: false }), "ask", "window contents reach the model, so it is gated like a read");
+});
+
+test("while Spaces are crossed, computer_screenshot says it cannot see the other Space and names the tool that can", () => {
+  const shot = { name: "computer_screenshot", description: "Capture it. " + SCREENSHOT_FRAME_SENTENCE + " Approval required." };
+  assert.deepEqual(withScreenshotGuidance(shot, "all", false), shot);
+  const crossed = withScreenshotGuidance(shot, "all", true).description;
+  assert.ok(crossed.endsWith(SCREENSHOT_SPACE_SENTENCE), crossed);
+  assert.ok(crossed.includes("computer_app_screenshot"));
+  const both = withScreenshotGuidance(shot, "screenshot-only", true).description;
+  assert.ok(!both.includes(SCREENSHOT_FRAME_SENTENCE) && both.endsWith(SCREENSHOT_SPACE_SENTENCE), "both rewrites compose");
+  const other = { name: "computer_click", description: "Click " + SCREENSHOT_FRAME_SENTENCE };
+  assert.deepEqual(withScreenshotGuidance(other, "all", true), other, "only the screenshot tool speaks about Spaces");
 });

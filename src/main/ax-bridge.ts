@@ -298,6 +298,7 @@ export function summarizeBatch(opts: {
  *  silently went nowhere. One list, one test, one startup check. */
 export const AX_TOOL_NAMES = [
   "computer_apps",
+  "computer_app_screenshot",
   "computer_app_state",
   "computer_raise",
   "computer_launch",
@@ -389,7 +390,7 @@ export function coordinateToolAllowed(tool: string, mode: "all" | "screenshot-on
  *  result, opened the card the first press had already asked for, and on a
  *  settings row toggled Location Tracking back. */
 export const ACTION_NO_CHANGE_SENTENCE =
-  "The app showed no change while the bridge waited for it. Read the app once before repeating this action: the change may have landed late, and the same press twice undoes a toggle or opens a second copy.";
+  "The app accepted the action but showed no change while the bridge waited. Do NOT repeat it on this element: a second press undoes a toggle or opens a second copy, and in the last run five retries of one dead button cost six turns. Take a different path instead: the keyboard (arrow keys and return choose from a list, escape closes), or the app's menu bar, whose items are in the tree and reliably reach every command.";
 
 export function renderActionResult(diff: string): string {
   const body = diff.trim();
@@ -408,9 +409,19 @@ export const SCREENSHOT_FRAME_SENTENCE =
 export const SCREENSHOT_LOOK_ONLY_SENTENCE =
   "Use it to SEE what the tree cannot express — whether a video is actually playing, a canvas, a rendered chart. It is not for aiming: there are no coordinate actions while the accessibility bridge is running, so act through element ids from computer_app_state.";
 
-export function withScreenshotGuidance<T extends { name: string; description: string }>(tool: T, mode: "all" | "screenshot-only"): T {
-  if (mode === "all" || tool.name !== "computer_screenshot") return tool;
-  return { ...tool, description: tool.description.replace(SCREENSHOT_FRAME_SENTENCE, SCREENSHOT_LOOK_ONLY_SENTENCE) };
+/** Appended to computer_screenshot while the bridge reads across Spaces. In
+ *  run 3 of the Maps task the model wanted to LOOK, took a screenshot of a
+ *  Space Maps was not on, and raised Maps to see it — twice. The picture of a
+ *  window on another Space is computer_app_screenshot's job. */
+export const SCREENSHOT_SPACE_SENTENCE =
+  " It shows the CURRENT Space only: an app whose windows are on another Space is not in this picture, and raising it to look takes over the user's screen. To see that app, call computer_app_screenshot instead.";
+
+export function withScreenshotGuidance<T extends { name: string; description: string }>(tool: T, mode: "all" | "screenshot-only", crossSpace = false): T {
+  if (tool.name !== "computer_screenshot") return tool;
+  let description = tool.description;
+  if (mode === "screenshot-only") description = description.replace(SCREENSHOT_FRAME_SENTENCE, SCREENSHOT_LOOK_ONLY_SENTENCE);
+  if (crossSpace) description += SCREENSHOT_SPACE_SENTENCE;
+  return description === tool.description ? tool : { ...tool, description };
 }
 
 /** Whether a read that found nothing should raise and try again by itself.
@@ -625,6 +636,8 @@ export function describeAxAction(tool: string, rawArgs: unknown, lines?: Map<num
       return "List running apps";
     case "computer_app_state":
       return `Read the UI of ${app}`;
+    case "computer_app_screenshot":
+      return `Photograph ${app}'s window`;
     case "computer_raise":
       return `Bring ${app} to the front`;
     case "computer_launch":

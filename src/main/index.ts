@@ -1412,6 +1412,18 @@ const AX_TOOLS = [
   },
   {
     type: "function",
+    name: "computer_app_screenshot",
+    description:
+      "Photograph ONE app's window as an image, wherever the window is — another Space included — without raising it or touching the user's screen. Use it when the tree cannot express what you need to see: a rendered chart, whether a video is playing, how things are laid out. " +
+      "In a window on another Space, content the app only draws while visible (map tiles, video frames, some web views) may be blank; its controls and text are not. Never raise an app just to look at it: use this.",
+    inputSchema: {
+      type: "object",
+      properties: { app: { type: "string" }, window: { type: "integer", description: "Window id from computer_app_state. Default: the focused window." } },
+      required: ["app"],
+    },
+  },
+  {
+    type: "function",
     name: "computer_act",
     description:
       "Perform a NAMED action other than a plain press — the actions an element lists in braces, e.g. \"show menu\", \"cancel\", \"scroll to visible\", \"focus\". For an ordinary press use computer_click, to fill a field use computer_type, and to send a key use computer_key.",
@@ -1634,7 +1646,7 @@ function threadDynamicTools(): Record<string, unknown>[] | undefined {
     ...(ax?.alive ? AX_TOOLS.map((t) => withSpaceGuidance(t, ax!.crossSpace)) : []),
     ...COMPUTER_USE_TOOLS
       .filter((t) => coordinateToolAllowed(t.name, screenshots))
-      .map((t) => withScreenshotGuidance(t, screenshots)),
+      .map((t) => withScreenshotGuidance(t, screenshots, ax?.crossSpace === true)),
     ...SCHEDULE_TOOLS,
     ...MEMORY_TOOLS,
     ...(agentBrowserTools() ?? []),
@@ -2452,6 +2464,20 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         const diff = String(r.diff ?? "");
         remember(diff);
         return axText(`Scrolled ${dir}.\n${diff || "(nothing changed — the container may not scroll, or is already at the end)"}`, true);
+      }
+      case "computer_app_screenshot": {
+        const r = await ax.request("screenshot", { app: appName, ...(typeof a.window === "number" ? { window: a.window } : {}) }, 15_000);
+        const png = String(r.png ?? "");
+        if (!png) return axText("The bridge returned no image.", false);
+        const where = r.onSpace === false ? " (on another Space)" : "";
+        const note = typeof r.note === "string" ? ` ${r.note}` : "";
+        return {
+          contentItems: [
+            { type: "inputText", text: `Window ${String(r.window)} of ${appName}${where}, ${String(r.width)}x${String(r.height)}.${note}` },
+            { type: "inputImage", imageUrl: `data:image/png;base64,${png}` },
+          ],
+          success: true,
+        };
       }
       case "computer_press":
       case "computer_set_value":
