@@ -57,7 +57,9 @@ test("the dev fallback finds a sibling checkout from a worktree, not just a plai
 // ── The client, against a fake bridge ──────────────────────────────────────
 // A shell script exec'ing node on a small script: hello answers, "echo" echoes,
 // "boom" errors, "slow" never answers, "die" exits, "hangHelloOnce" makes the
-// next hello go unanswered.
+// next hello go unanswered, and AX_FAKE_SLOW_HELLO_MS in the inherited env
+// delays the FIRST hello by that many ms (the startup hello is the only one a
+// test cannot arm over the wire, because start() is what spawns the process).
 
 function fakeBridge(): ReturnType<typeof readAxManifest> {
   const dir = join(scratch(), "dist");
@@ -67,13 +69,20 @@ function fakeBridge(): ReturnType<typeof readAxManifest> {
     `
 let hellos = 0;
 let hang = false;
+let slow = Number(process.env.AX_FAKE_SLOW_HELLO_MS || 0);
+// Counted when the reply is SENT, so a delayed hello is counted when it lands.
+const helloReply = (id) => { hellos += 1; console.log(JSON.stringify({ id, result: { name: "unbiased-ax", protocolVersion: 1, trusted: true, crossSpace: hellos >= 2 } })); };
 const rl = require("node:readline").createInterface({ input: process.stdin });
 rl.on("line", (line) => {
   const { id, method, params } = JSON.parse(line);
   // The real bridge decides crossSpace lazily: undecided (false) at start,
   // true once it has proved the private path. Model that: the first hello
   // says false, every later one true. "hellos" is test-only, like "echo".
-  if (method === "hello") { if (hang) { hang = false; return; } hellos += 1; return console.log(JSON.stringify({ id, result: { name: "unbiased-ax", protocolVersion: 1, trusted: true, crossSpace: hellos >= 2 } })); }
+  if (method === "hello") {
+    if (hang) { hang = false; return; }
+    if (slow) { const d = slow; slow = 0; return setTimeout(() => helloReply(id), d); }
+    return helloReply(id);
+  }
   if (method === "hellos") return console.log(JSON.stringify({ id, result: { hellos } }));
   if (method === "hangHelloOnce") { hang = true; return console.log(JSON.stringify({ id, result: {} })); }
   if (method === "boom") return console.log(JSON.stringify({ id, error: { code: "no_such_app", message: "No running app matches" } }));
@@ -135,6 +144,28 @@ test("a hello that goes unanswered is not a flip, and the flag stays where it wa
   assert.equal(await c.refreshCrossSpace(), true, "the next hello is answered and flips it");
   assert.equal(c.crossSpace, true);
   assert.equal((await c.request("hellos", {})).hellos, 2, "the dropped hello was never answered, so it is not counted");
+});
+
+test("the startup hello waits for the bridge's self-check, not just the ordinary request budget", async (t) => {
+  // The bridge is normally spawned already trusted, so the STARTUP hello is the
+  // one that runs its self-check, and a slow app can stretch that past the
+  // ordinary request budget. A timeout there makes startAxBridge kill the
+  // bridge, and every new thread then gets no AX tools at all.
+  const m = fakeBridge();
+  assert.ok(m && !("error" in m));
+  process.env.AX_FAKE_SLOW_HELLO_MS = "800";
+  t.after(() => { delete process.env.AX_FAKE_SLOW_HELLO_MS; });
+  const c = new AxClient(m, 300);
+  c.helloTimeoutMs = 2_000;
+  t.after(() => c.stop());
+  const hello = await c.start();
+  assert.equal(hello.trusted, true, "an 800 ms hello outlives a 300 ms request budget because hello has its own");
+  // And it is the hello budget that saved it: the same slow hello under a
+  // short one times out, exactly as start() did before.
+  const d = new AxClient(m, 300);
+  d.helloTimeoutMs = 300;
+  t.after(() => d.stop());
+  await assert.rejects(d.start(), (e: unknown) => e instanceof AxError && e.code === "timeout");
 });
 
 test("a request gets its own answer back, matched by id, and an error becomes an AxError with its code", async () => {

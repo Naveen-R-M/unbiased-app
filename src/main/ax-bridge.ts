@@ -377,7 +377,10 @@ export class AxClient {
     };
     proc.on("exit", (code, signal) => died(`unbiased-ax exited (${code ?? signal})`));
     proc.on("error", (err) => died(`unbiased-ax failed to start: ${err.message}`));
-    const hello = await this.request("hello", {});
+    // The bridge is normally spawned already trusted, so THIS hello is the one
+    // that runs its cross-Space self-check — give it the self-check's budget,
+    // not the ordinary request budget. A timeout here kills the bridge.
+    const hello = await this.request("hello", {}, this.helloTimeoutMs);
     if (hello.protocolVersion !== AX_PROTOCOL_VERSION) {
       this.stop();
       throw new AxError("protocol", `bridge speaks protocol ${String(hello.protocolVersion)}`);
