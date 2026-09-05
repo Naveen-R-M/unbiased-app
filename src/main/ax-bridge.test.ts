@@ -819,6 +819,8 @@ test("an action with no visible change says to read before repeating, instead of
   assert.ok(out.includes(ACTION_NO_CHANGE_SENTENCE), out);
   assert.ok(!out.includes("(no changes)"), out);
   assert.equal(renderActionResult(""), out);
+  const explained = renderActionResult("(no changes)", "Maps is behind a fullscreen Space.");
+  assert.ok(explained.startsWith("Done. Maps is behind a fullscreen Space. ") && explained.includes(ACTION_NO_CHANGE_SENTENCE), explained);
   assert.equal(renderActionResult("+ 12 button \"Directions\" {press}"), "Done.\n+ 12 button \"Directions\" {press}");
 });
 
@@ -836,7 +838,7 @@ test("the tools the model reads first carry the task-discipline sentence", () =>
     assert.ok(desc.includes("TASK_DISCIPLINE_SENTENCE"), `${name} should spell out scope`);
   }
   assert.ok(!src.includes("axText(`Done.\\n${diff}`"), "the press/act site must render through renderActionResult");
-  assert.ok(src.includes("renderActionResult(diff)"));
+  assert.ok(src.includes("renderActionResult(diff"), "the press/act site renders through renderActionResult");
 });
 
 test("every finished request reports its timing and size, errors included", async () => {
@@ -853,6 +855,7 @@ test("every finished request reports its timing and size, errors included", asyn
   assert.ok(echo, JSON.stringify(calls));
   assert.equal(echo.app, "Maps");
   assert.equal(echo.flags, "interactive,query");
+  assert.equal(echo.marks, "", "a plain echo has nothing to mark");
   assert.ok(echo.ms >= 0 && echo.bytes > 0 && echo.error === null);
   const boom = calls.find((x) => x.method === "boom");
   assert.ok(boom && boom.error && boom.error.includes("No running app"), JSON.stringify(boom));
@@ -885,4 +888,12 @@ test("while Spaces are crossed, raise says looking is not a reason either", () =
   const raise = { name: "computer_raise", description: RAISE_DESCRIPTION };
   const crossed = withSpaceGuidance(raise, true).description;
   assert.ok(crossed.includes("computer_app_screenshot") && crossed.includes("Not to look"), crossed);
+});
+
+test("a launch that showed the app and a blank picture are marked in the call line", async () => {
+  const { describeAxCall } = await import("./ax-bridge");
+  const base = { method: "launch", app: "Maps", ms: 3000, waitedMs: null, bytes: 900, lines: 20, flags: "", marks: "shown", error: null };
+  assert.ok(describeAxCall(base).includes("[shown]"));
+  assert.ok(describeAxCall({ ...base, method: "screenshot", marks: "blank" }).includes("[blank]"));
+  assert.ok(!describeAxCall({ ...base, marks: "" }).includes("["));
 });

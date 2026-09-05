@@ -392,9 +392,12 @@ export function coordinateToolAllowed(tool: string, mode: "all" | "screenshot-on
 export const ACTION_NO_CHANGE_SENTENCE =
   "The app accepted the action but showed no change while the bridge waited. Do NOT repeat it on this element: a second press undoes a toggle or opens a second copy, and in the last run five retries of one dead button cost six turns. Take a different path instead: the keyboard (arrow keys and return choose from a list, escape closes), or the app's menu bar, whose items are in the tree and reliably reach every command.";
 
-export function renderActionResult(diff: string): string {
+export function renderActionResult(diff: string, hint?: string | null): string {
   const body = diff.trim();
-  if (!body || body === "(no changes)") return `Done. ${ACTION_NO_CHANGE_SENTENCE}`;
+  // The bridge's own explanation comes first when it has one: it knows WHY
+  // this app ignored the press (a Catalyst app behind a fullscreen Space) and
+  // which paths work, which is more useful than the generic sentence.
+  if (!body || body === "(no changes)") return `Done. ${hint ? `${hint} ` : ""}${ACTION_NO_CHANGE_SENTENCE}`;
   return `Done.\n${body}`;
 }
 
@@ -458,6 +461,9 @@ export interface AxCallInfo {
   lines: number;
   /** Read options in force, e.g. "interactive,query". */
   flags: string;
+  /** Result facts worth a glance in the log: "shown" for a launch that showed
+   *  the app once, "blank" for a picture with nothing in it. */
+  marks: string;
   error: string | null;
 }
 
@@ -466,7 +472,8 @@ export function describeAxCall(c: AxCallInfo): string {
   const flags = c.flags ? ` [${c.flags}]` : "";
   const waited = c.waitedMs !== null ? ` (waited ${c.waitedMs}ms)` : "";
   const err = c.error ? ` ERROR ${c.error}` : "";
-  return `call ${c.method}${where}${flags} ${c.ms}ms${waited} ${c.lines} lines ${c.bytes}B${err}`;
+  const marks = c.marks ? ` [${c.marks}]` : "";
+  return `call ${c.method}${where}${flags} ${c.ms}ms${waited} ${c.lines} lines ${c.bytes}B${marks}${err}`;
 }
 
 /** One long-running bridge process. Ids and diffs live in that process, so it
@@ -584,6 +591,7 @@ export class AxClient {
         bytes: r ? JSON.stringify(r).length : 0,
         lines: text ? text.split("\n").length : 0,
         flags: flags.join(","),
+        marks: (["shown", "blank"] as const).filter((k) => r?.[k] === true).join(","),
         error: e ? e.message : null,
       });
     } catch {

@@ -2508,7 +2508,7 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         }
         const diff = String(r.diff ?? "");
         remember(diff);
-        return axText(renderActionResult(diff), true);
+        return axText(renderActionResult(diff, typeof r.hint === "string" ? r.hint : null), true);
       }
       default:
         return axText(`Unknown tool ${tool}`, false);
