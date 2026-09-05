@@ -59,6 +59,7 @@ import {
   LAUNCH_FRONT_SENTENCE,
   withSpaceGuidance,
   otherSpaceNote,
+  launchOutcome,
 } from "./ax-bridge";
 import { isProductionBuild } from "./runtime-mode";
 import {
@@ -2317,6 +2318,12 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         remember(tree);
         const already = r.alreadyRunning === true;
         const hint = typeof r.hint === "string" ? `\n${r.hint}` : "";
+        // The bridge answers ok at its deadline as long as the app is RUNNING;
+        // only a window line proves the tree is readable. With cross-Space on
+        // there is never a hint to say otherwise, so the sentence has to.
+        if (launchOutcome(tree) === "running") {
+          return axText(`${appName} is running but no window is readable yet — read it again in a moment.${hint}\n${tree}`, true);
+        }
         return axText(
           `${appName} is ${already ? "already running" : "open"} and readable.${hint}\n${tree}`,
           true,

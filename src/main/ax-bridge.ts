@@ -11,8 +11,9 @@ import { createInterface } from "node:readline";
 export const AX_PROTOCOL_VERSION = 1;
 export const AX_REQUEST_TIMEOUT_MS = 10_000;
 /** A hello while the cross-Space verdict is undecided runs the bridge's
- *  self-check, budgeted at five seconds — hence twice that. */
-export const AX_HELLO_TIMEOUT_MS = 10_000;
+ *  self-check: the bridge budgets it at five seconds and one slow app can
+ *  stretch it; 15 s leaves headroom without hanging a turn. */
+export const AX_HELLO_TIMEOUT_MS = 15_000;
 
 export type AxManifest = { entryPath: string; args: string[]; version: string; protocolVersion: number };
 
@@ -541,4 +542,13 @@ export function withSpaceGuidance<T extends { name: string; description: string 
  *  guidance there is always current. Empty when there is nothing to say. */
 export function otherSpaceNote(crossSpace: boolean, windowsText: string): string {
   return crossSpace && windowsText.includes("[other Space]") ? "Windows marked [other Space] are in the tree and readable; do not raise." : "";
+}
+
+/** What a launch result means. The bridge returns ok:true at its deadline as
+ *  long as the app is RUNNING; only a window line in the tree proves it is
+ *  readable. A tree of the application and its menu bar alone is not. The
+ *  line shape is the bridge's Formatter.line: `<id> <indent><role> "title" …`,
+ *  and a real window renders as one of these three lowercase roles. */
+export function launchOutcome(tree: string): "readable" | "running" {
+  return /^\s*\d+\s+(standard window|window|dialog)\b/m.test(tree) ? "readable" : "running";
 }

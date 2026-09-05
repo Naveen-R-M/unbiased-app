@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-import { AX_TOOL_NAMES, SCREENSHOT_TOOL_NAMES, routesToAx, parseBatchSteps, describeBatch, summarizeBatch, MAX_BATCH_STEPS, AxClient, AxError, appOfStep, axConsent, axNeedsFocus, offerScreenshotTools, shouldRecoverRaise, describeAxAction, indexElementLines, readAxManifest, resolveAxDir, shouldOpenAccessibilitySettings, axNotTrustedText, RAISE_DESCRIPTION, APP_STATE_SPACE_SENTENCE, LAUNCH_FRONT_SENTENCE, withSpaceGuidance, otherSpaceNote } from "./ax-bridge";
+import { AX_TOOL_NAMES, SCREENSHOT_TOOL_NAMES, routesToAx, parseBatchSteps, describeBatch, summarizeBatch, MAX_BATCH_STEPS, AxClient, AxError, appOfStep, axConsent, axNeedsFocus, offerScreenshotTools, shouldRecoverRaise, describeAxAction, indexElementLines, readAxManifest, resolveAxDir, shouldOpenAccessibilitySettings, axNotTrustedText, RAISE_DESCRIPTION, APP_STATE_SPACE_SENTENCE, LAUNCH_FRONT_SENTENCE, withSpaceGuidance, otherSpaceNote, launchOutcome } from "./ax-bridge";
 
 const scratch = () => mkdtempSync(join(tmpdir(), "ax-"));
 
@@ -597,4 +597,15 @@ test("the read itself says off-Space windows are readable, and only when that is
   assert.equal(otherSpaceNote(true, elsewhere), "Windows marked [other Space] are in the tree and readable; do not raise.");
   assert.equal(otherSpaceNote(false, elsewhere), "", "without cross-Space the marker is not in play and the hint covers that path");
   assert.equal(otherSpaceNote(true, '1 "X" @0,0 1x1 [focused]'), "", "nothing to say when every window is here");
+});
+
+// ── What a launch result means ─────────────────────────────────────────────
+// The bridge says ok at its deadline as long as the app is running. Only a
+// window line proves the tree can be worked with; the text must not claim more.
+
+test("a launch is readable only when a window line is in the tree, not when the app merely runs", () => {
+  assert.equal(launchOutcome('2 application "Calculator"\n1   standard window "Calculator" {raise}\n3     scroll area "Edit field"'), "readable");
+  assert.equal(launchOutcome('1 application "Maps"\n2   menu bar\n3     menu bar item "Apple"'), "running",
+    "the application and its menu bar alone prove only that it is running");
+  assert.equal(launchOutcome('1 application "Maps"\n4   dialog "Open" {raise}'), "readable", "a dialog is a window too");
 });
