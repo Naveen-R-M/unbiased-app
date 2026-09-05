@@ -10,6 +10,10 @@ import { createInterface } from "node:readline";
 
 export const AX_PROTOCOL_VERSION = 1;
 export const AX_REQUEST_TIMEOUT_MS = 10_000;
+/** A hello while the cross-Space verdict is undecided runs the bridge's
+ *  self-check: the bridge budgets it at five seconds and one slow app can
+ *  stretch it; 15 s leaves headroom without hanging a turn. */
+export const AX_HELLO_TIMEOUT_MS = 15_000;
 
 export type AxManifest = { entryPath: string; args: string[]; version: string; protocolVersion: number };
 
@@ -98,12 +102,230 @@ export function axNeedsFocus(tool: string, _args: Record<string, unknown>): bool
   return tool === "computer_raise";
 }
 
+/** What a read asked for, remembered per app. The bridge diffs an action's
+ *  after-snapshot against the last one it took, so an action that snapshots
+ *  with a different filter than the read manufactures a diff: measured on
+ *  Maps, one press reported +73 added elements and the next read reported the
+ *  same 73 as removed. The model was told the card it had just opened was
+ *  gone. Anything that ends in the bridge's afterAction — every action, and
+ *  raise with it — takes a snapshot AND stores it as the baseline the next
+ *  diff is measured from, so all of them must see what the reads see. */
+export type AxReadOpts = { interactive: boolean; web: boolean; depth?: number };
+/** Frozen: one object is handed out by reference to every caller that acts on
+ *  an app nothing has read yet, so a single mutation would rewrite the default
+ *  for all of them. */
+export const AX_DEFAULT_READ_OPTS: AxReadOpts = Object.freeze({ interactive: true, web: false });
+export function axReadOptsFrom(args: { interactive?: unknown; web?: unknown; depth?: unknown }): AxReadOpts {
+  return {
+    interactive: args.interactive !== false,
+    web: args.web === true,
+    // depth is a filter like the other two — the bridge reads it in the same
+    // options() — and the read's own reply says "truncated: use query or
+    // depth", so the model is invited to change it. Read at depth 5, press,
+    // and an action snapshotting at the default 14 adds everything deeper;
+    // the next read at 5 removes it all again. Only carried when given: the
+    // bridge's own default (14) is not ours to restate.
+    ...(typeof args.depth === "number" ? { depth: args.depth } : {}),
+  };
+}
+
+/** Whether this read asks for a DIFFERENT view than the last one, which means
+ *  there is no honest diff to show: the bridge would report every element the
+ *  old filter hid as added, and every one the new filter hides as removed —
+ *  the same +73/-73 lie, reached with two reads instead of an action. The
+ *  caller answers by asking for the whole tree instead.
+ *
+ *  An app nothing has read yet counts as the defaults rather than as "no
+ *  baseline": a launch or a raise may already have written one, and it wrote
+ *  it in exactly those defaults (see axActionOpts). */
+export function axFilterSwitched(prev: AxReadOpts | undefined, want: AxReadOpts): boolean {
+  const from = prev ?? AX_DEFAULT_READ_OPTS;
+  return from.interactive !== want.interactive || from.web !== want.web || from.depth !== want.depth;
+}
+
 /** The app a computer step acted on, so the transcript can show that app's own
  *  icon instead of a generic terminal glyph. */
+const APP_STEP_TOOLS = new Set([
+  "computer_app_state",
+  "computer_act",
+  "computer_raise",
+  "computer_launch",
+  "computer_press",
+  "computer_set_value",
+  "computer_press_key",
+  "computer_scroll_view",
+  "computer_do",
+]);
+
 export function appOfStep(tool: string, args: Record<string, unknown>): string | null {
-  if (tool !== "computer_app_state" && tool !== "computer_act" && tool !== "computer_raise") return null;
+  if (!APP_STEP_TOOLS.has(tool)) return null;
   const app = typeof args.app === "string" ? args.app.trim() : "";
   return app || null;
+}
+
+/** One step of a batch. Every verb here is an existing single-step tool; a
+ *  batch is only a way to spend one model round trip instead of five. The
+ *  bridge itself needs nothing: a call to it costs 3-70ms over a local pipe
+ *  (measured), while a round trip through the model costs seconds. Batching
+ *  belongs on this side of that gap, not in the bridge. */
+export type BatchStep =
+  | { do: "press"; id: number; waitMs: number }
+  | { do: "set_value"; id: number; text: string; waitMs: number }
+  | { do: "key"; key: string; id?: number; waitMs: number }
+  | { do: "scroll"; id: number; direction: string; amount?: number; waitMs: number }
+  | { do: "act"; id: number; action: string; waitMs: number }
+  | { do: "read"; waitMs: number };
+
+/** Deliberately NOT batchable: launch and raise both take over the user's
+ *  screen, and each deserves its own approval rather than riding along inside
+ *  a list of presses. */
+export const BATCH_VERBS = ["press", "set_value", "key", "scroll", "act", "read"] as const;
+export const MAX_BATCH_STEPS = 10;
+/** Per-step pause, for content that arrives after the action — Maps shows
+ *  "Loading…" for a second or two on the Transit tab. Capped so a batch cannot
+ *  be used to park the desktop tools for a minute. */
+export const MAX_BATCH_WAIT_MS = 4_000;
+
+export function parseBatchSteps(raw: unknown): { steps: BatchStep[] } | { error: string } {
+  if (!Array.isArray(raw)) return { error: "steps must be an array." };
+  if (raw.length === 0) return { error: "steps is empty — pass at least one step." };
+  if (raw.length > MAX_BATCH_STEPS) {
+    return { error: `${raw.length} steps is too many (max ${MAX_BATCH_STEPS}). Send the first ${MAX_BATCH_STEPS}, read the result, then continue.` };
+  }
+  const steps: BatchStep[] = [];
+  for (const [i, entry] of raw.entries()) {
+    const at = `step ${i + 1}`;
+    if (!entry || typeof entry !== "object") return { error: `${at} is not an object.` };
+    const e = entry as Record<string, unknown>;
+    const verb = typeof e.do === "string" ? e.do : "";
+    if (!(BATCH_VERBS as readonly string[]).includes(verb)) {
+      return { error: `${at}: do must be one of ${BATCH_VERBS.join(", ")}${verb ? ` (got "${verb}")` : ""}. Opening or raising an app is not batchable — call computer_launch or computer_raise on its own.` };
+    }
+    const waitRaw = typeof e.wait_ms === "number" ? e.wait_ms : 0;
+    const waitMs = Math.max(0, Math.min(Math.round(waitRaw), MAX_BATCH_WAIT_MS));
+    const id = typeof e.id === "number" ? e.id : null;
+    switch (verb) {
+      case "read":
+        steps.push({ do: "read", waitMs });
+        break;
+      case "key": {
+        if (typeof e.key !== "string" || !e.key) return { error: `${at}: key is required.` };
+        steps.push({ do: "key", key: e.key, ...(id !== null ? { id } : {}), waitMs });
+        break;
+      }
+      case "press": {
+        if (id === null) return { error: `${at}: id is required.` };
+        steps.push({ do: "press", id, waitMs });
+        break;
+      }
+      case "set_value": {
+        if (id === null) return { error: `${at}: id is required.` };
+        if (typeof e.text !== "string") return { error: `${at}: text is required.` };
+        steps.push({ do: "set_value", id, text: e.text, waitMs });
+        break;
+      }
+      case "scroll": {
+        if (id === null) return { error: `${at}: id is required.` };
+        const direction = typeof e.direction === "string" ? e.direction : "";
+        if (!["down", "up", "left", "right"].includes(direction)) {
+          return { error: `${at}: direction must be down, up, left or right.` };
+        }
+        steps.push({ do: "scroll", id, direction, ...(typeof e.amount === "number" ? { amount: e.amount } : {}), waitMs });
+        break;
+      }
+      case "act": {
+        if (id === null) return { error: `${at}: id is required.` };
+        if (typeof e.action !== "string" || !e.action) return { error: `${at}: action is required.` };
+        steps.push({ do: "act", id, action: e.action, waitMs });
+        break;
+      }
+    }
+  }
+  return { steps };
+}
+
+/** One line per step. The user approves the WHOLE sequence with one card, so
+ *  the card has to show every step — a batch must never be a way to slip an
+ *  irreversible press in behind four harmless reads. */
+export function describeBatch(app: string, steps: BatchStep[], lines?: Map<number, string>): string {
+  const clip = (t: string) => (t.length > 48 ? t.slice(0, 48) + "…" : t);
+  const target = (id: number) => {
+    const line = lines?.get(id);
+    return line ? `#${id} — ${clip(line)}` : `#${id}`;
+  };
+  const rendered = steps.map((st, i) => {
+    const n = `${i + 1}.`;
+    const pause = st.waitMs > 0 ? ` (then wait ${st.waitMs}ms)` : "";
+    switch (st.do) {
+      case "read": return `${n} read ${app}${pause}`;
+      case "press": return `${n} press ${target(st.id)}${pause}`;
+      case "set_value": return `${n} set ${target(st.id)} to "${clip(st.text)}"${pause}`;
+      case "key": return `${n} press ${st.key}${st.id !== undefined ? ` in ${target(st.id)}` : ""}${pause}`;
+      case "scroll": return `${n} scroll ${st.direction} at ${target(st.id)}${pause}`;
+      case "act": return `${n} ${st.action} ${target(st.id)}${pause}`;
+    }
+  });
+  return `${steps.length} step(s) in ${app}:\n${rendered.join("\n")}`;
+}
+
+/** What the model is told afterwards. A batch that stops halfway is the case
+ *  that matters: it must be unmistakable which steps ran, which one failed and
+ *  why, and that the rest did NOT run. */
+export function summarizeBatch(opts: {
+  ran: string[];
+  failed: { step: string; message: string } | null;
+  remaining: number;
+  diff: string;
+}): string {
+  const head = opts.failed
+    ? [
+        `Stopped at ${opts.failed.step}: ${opts.failed.message}`,
+        opts.ran.length ? `Ran first: ${opts.ran.join("; ")}.` : "Nothing ran before it.",
+        opts.remaining > 0 ? `The remaining ${opts.remaining} step(s) did NOT run.` : "",
+        "Read the app again before retrying — the ids may have moved.",
+      ].filter(Boolean).join(" ")
+    : `Done: ${opts.ran.join("; ")}.`;
+  return opts.diff ? `${head}\n${opts.diff}` : `${head}\n(nothing in the tree changed)`;
+}
+
+/** The desktop tools the accessibility bridge owns. This list lives next to
+ *  the routing helper on purpose. It used to be a hand-maintained Set beside
+ *  the declarations in index.ts, and the two drifted: five tools were added to
+ *  the declarations and not to the Set, so every one of them fell through to
+ *  the coordinate-based screenshot handler — "click at undefined, undefined" —
+ *  and a model spent twelve minutes trying to open an app whose launch verb
+ *  silently went nowhere. One list, one test, one startup check. */
+export const AX_TOOL_NAMES = [
+  "computer_apps",
+  "computer_app_state",
+  "computer_raise",
+  "computer_launch",
+  "computer_press",
+  "computer_set_value",
+  "computer_press_key",
+  "computer_scroll_view",
+  "computer_act",
+  "computer_do",
+] as const;
+
+/** The older coordinate-and-screenshot tools. All of them when there is no
+ *  bridge; while one is alive only computer_screenshot survives, because
+ *  looking is the one thing the tree cannot replace — see
+ *  screenshotToolsOffered. No name may appear in both lists. Dispatch is by
+ *  name, so a shared name goes to whichever family the router checks first,
+ *  regardless of which one the model thought it was calling — and the two take
+ *  completely different arguments (an element id versus screen coordinates). */
+export const SCREENSHOT_TOOL_NAMES = [
+  "computer_screenshot",
+  "computer_click",
+  "computer_type",
+  "computer_move",
+  "computer_key",
+  "computer_scroll",
+] as const;
+
+export function routesToAx(tool: string): boolean {
+  return (AX_TOOL_NAMES as readonly string[]).includes(tool);
 }
 
 /** Whether to put the user in front of the Accessibility switch. macOS will not
@@ -118,9 +340,9 @@ export function shouldOpenAccessibilitySettings(opts: { code: string | null; ope
 /** What the model is told when the grant is missing. Deliberately not a list of
  *  steps: the pane is already open in front of the user, and a five-bullet
  *  walkthrough of a window they are looking at reads as noise. It also no
- *  longer says to fall back to computer_screenshot — those tools are not
- *  offered while the bridge is alive, so that was an instruction to use a tool
- *  the model does not have. */
+ *  longer says to fall back to computer_screenshot: a picture of the pane the
+ *  user is already looking at does not get the switch flipped, and the point
+ *  of this message is the switch. */
 export function axNotTrustedText(appName: string, opened: boolean): string {
   const next = opened
     ? `System Settings is now open at Privacy & Security > Accessibility. In one short sentence, tell the user to switch ${appName} on there and say when it is done.`
@@ -131,12 +353,43 @@ export function axNotTrustedText(appName: string, opened: boolean): string {
   );
 }
 
-/** Whether to offer the older screenshot-and-coordinates tools. Not while the
- *  bridge is alive: the model reached for Spotlight and command+k only because
- *  they were on the menu, when the tree had the list it needed the whole time.
- *  Without a bridge they are the only way to touch the desktop at all. */
-export function offerScreenshotTools(opts: { axAlive: boolean }): boolean {
-  return !opts.axAlive;
+/** Which of the older screenshot tools to offer. The coordinate and typing
+ *  verbs stay off while the bridge is alive — measured: the model reached for
+ *  Spotlight and command+k when they were on the menu, while the tree had the
+ *  list it needed the whole time. computer_screenshot is different: it is the
+ *  only way to SEE something the tree cannot express, computer_app_state's own
+ *  description tells the model to reach for it, and without it a stuck model
+ *  raises the app to look — measured, once, in a run that otherwise never
+ *  raised. Without a bridge they are all that can touch the desktop. */
+export function screenshotToolsOffered(opts: { axAlive: boolean }): "all" | "screenshot-only" {
+  return opts.axAlive ? "screenshot-only" : "all";
+}
+
+/** Whether a coordinate or typing verb may actually RUN. Withholding a tool
+ *  from the declarations is not the same as disabling it: the dispatcher sends
+ *  every computer_* name that is not an AX tool to the coordinate handler, and
+ *  in Full access the consent gate answers "allow" — so a model that remembers
+ *  computer_type from an earlier turn, or simply invents it, types at the
+ *  desktop with no card and no bridge behind it. That is the Spotlight and
+ *  command+k path this whole split exists to close, so the same decision has
+ *  to be made twice: once when the menu is built, once at the door. */
+export function coordinateToolAllowed(tool: string, mode: "all" | "screenshot-only"): boolean {
+  return mode === "all" || tool === "computer_screenshot";
+}
+
+/** computer_screenshot's description, in two halves. With the bridge alive the
+ *  image is for LOOKING; there is no coordinate verb left to aim with, and a
+ *  description that promises "the exact coordinate frame to use for later
+ *  computer actions" is an invitation to call a tool that is now refused.
+ *  Swapped by value, exactly like the Space sentences. */
+export const SCREENSHOT_FRAME_SENTENCE =
+  "The result states the exact coordinate frame to use for later computer actions; it is scaled down from the display, so never assume the display resolution.";
+export const SCREENSHOT_LOOK_ONLY_SENTENCE =
+  "Use it to SEE what the tree cannot express — whether a video is actually playing, a canvas, a rendered chart. It is not for aiming: there are no coordinate actions while the accessibility bridge is running, so act through element ids from computer_app_state.";
+
+export function withScreenshotGuidance<T extends { name: string; description: string }>(tool: T, mode: "all" | "screenshot-only"): T {
+  if (mode === "all" || tool.name !== "computer_screenshot") return tool;
+  return { ...tool, description: tool.description.replace(SCREENSHOT_FRAME_SENTENCE, SCREENSHOT_LOOK_ONLY_SENTENCE) };
 }
 
 /** Whether a read that found nothing should raise and try again by itself.
@@ -144,9 +397,13 @@ export function offerScreenshotTools(opts: { axAlive: boolean }): boolean {
  *  that app coming forward once, and it drifting back off-Space between two
  *  actions is not a new decision — it is the same one, undone. Measured: one
  *  working run spent a third of its calls re-asking for a raise it had
- *  already been given. */
-export function shouldRecoverRaise(s: { windowsHere: number; offscreen: number; raisedBefore: boolean }): boolean {
-  return s.raisedBefore && s.windowsHere === 0 && s.offscreen > 0;
+ *  already been given.
+ *  Never when the bridge reads across Spaces: the window is in the tree where
+ *  it is, and "0 windows here" is no longer a problem to recover from.
+ *  Measured before that: 9 automatic raises in four minutes, each one undoing
+ *  the user's return to their own Space. */
+export function shouldRecoverRaise(s: { windowsHere: number; offscreen: number; raisedBefore: boolean; crossSpace: boolean }): boolean {
+  return !s.crossSpace && s.raisedBefore && s.windowsHere === 0 && s.offscreen > 0;
 }
 
 export type AxResult = Record<string, unknown>;
@@ -161,13 +418,21 @@ export class AxClient {
   private nextId = 1;
   alive = false;
   trusted = false;
+  /** Whether the bridge reads windows on other Spaces. False means today's
+   *  behaviour: reads carry raise hints and the app keeps its raise recovery.
+   *  The bridge decides this lazily and can turn it on after start — see
+   *  refreshCrossSpace. */
+  crossSpace = false;
+  /** How long refreshCrossSpace waits for its hello. A field, not a
+   *  constructor argument, so a test can shorten it without a new ctor shape. */
+  helloTimeoutMs = AX_HELLO_TIMEOUT_MS;
 
   constructor(
     private readonly manifest: AxManifest,
     private readonly timeoutMs = AX_REQUEST_TIMEOUT_MS,
   ) {}
 
-  async start(): Promise<{ trusted: boolean; version: string }> {
+  async start(): Promise<{ trusted: boolean; crossSpace: boolean; version: string }> {
     const proc = spawn(this.manifest.entryPath, this.manifest.args, { stdio: ["pipe", "pipe", "pipe"] });
     this.proc = proc;
     this.alive = true;
@@ -186,13 +451,39 @@ export class AxClient {
     };
     proc.on("exit", (code, signal) => died(`unbiased-ax exited (${code ?? signal})`));
     proc.on("error", (err) => died(`unbiased-ax failed to start: ${err.message}`));
-    const hello = await this.request("hello", {});
+    // The bridge is normally spawned already trusted, so THIS hello is the one
+    // that runs its cross-Space self-check — give it the self-check's budget,
+    // not the ordinary request budget. A timeout here kills the bridge.
+    const hello = await this.request("hello", {}, this.helloTimeoutMs);
     if (hello.protocolVersion !== AX_PROTOCOL_VERSION) {
       this.stop();
       throw new AxError("protocol", `bridge speaks protocol ${String(hello.protocolVersion)}`);
     }
+    this.readHello(hello);
+    return { trusted: this.trusted, crossSpace: this.crossSpace, version: this.manifest.version };
+  }
+
+  private readHello(hello: AxResult): void {
     this.trusted = hello.trusted === true;
-    return { trusted: this.trusted, version: this.manifest.version };
+    this.crossSpace = hello.crossSpace === true;
+  }
+
+  /** Ask again whether the bridge reads across Spaces. Its verdict is decided
+   *  on the first trusted call that finds an app to witness with, so a bridge
+   *  spawned before the Accessibility grant, or on an empty Space, says false
+   *  at start and true later. One cheap IPC while false; nothing once true.
+   *  Silent on failure: the flag simply stays where it was. Returns true the
+   *  one time the flag turns on. */
+  async refreshCrossSpace(): Promise<boolean> {
+    if (this.crossSpace || !this.alive) return false;
+    try {
+      this.readHello(await this.request("hello", {}, this.helloTimeoutMs));
+    } catch {
+      // the bridge may be busy or gone; the next read will say so
+      return false;
+    }
+    // The early return guaranteed the flag was false, so true here is the flip.
+    return this.crossSpace;
   }
 
   /** `timeoutMs` overrides the client default for one call: a `windows` read
@@ -257,15 +548,84 @@ export function describeAxAction(tool: string, rawArgs: unknown, lines?: Map<num
       return `Read the UI of ${app}`;
     case "computer_raise":
       return `Bring ${app} to the front`;
+    case "computer_launch":
+      return `Open ${app}`;
+    case "computer_do": {
+      const parsed = parseBatchSteps((a as { steps?: unknown }).steps);
+      // A batch whose steps do not parse still has to produce a card, because
+      // the card is shown before the call is made.
+      return "error" in parsed ? `Run steps in ${app}` : describeBatch(app, parsed.steps, lines);
+    }
+    case "computer_press":
+    case "computer_set_value":
+    case "computer_press_key":
+    case "computer_scroll_view":
     case "computer_act": {
       const id = typeof a.id === "number" ? a.id : null;
       const line = id !== null ? lines?.get(id) ?? null : null;
       const target = id !== null ? `#${id} in ${app}${line ? ` — ${clip(line)}` : ""}` : app;
-      if (typeof a.key === "string") return `Press ${a.key} in ${app}`;
-      if (typeof a.value === "string") return `Set ${target} to "${clip(a.value)}"`;
+      if (tool === "computer_scroll_view") return `Scroll ${typeof a.direction === "string" ? a.direction : "down"} in ${app}`;
+      // The verb comes from the tool now, but a model with older habits still
+      // sends value/key on computer_act. Those are routed rather than silently
+      // turned into a press, so the card has to describe them truthfully too.
+      const text = typeof a.text === "string" ? a.text : typeof a.value === "string" ? a.value : null;
+      const key = typeof a.key === "string" ? a.key : null;
+      if (tool === "computer_press_key" || (tool === "computer_act" && key)) return `Press ${key ?? "a key"} in ${app}`;
+      if (tool === "computer_set_value" || (tool === "computer_act" && text !== null)) return `Set ${target} to "${clip(text ?? "")}"`;
+      if (tool === "computer_press") return `Press ${target}`;
       return `${typeof a.action === "string" ? a.action : "press"} ${target}`;
     }
     default:
       return tool;
   }
+}
+
+/** The parts of the tool descriptions that are about Spaces, and what they
+ *  become once the bridge reads across them. Kept here, not in index.ts, so
+ *  they are tested; index.ts builds its literal AX_TOOLS from the "off"
+ *  versions and rewrites at the point the list is handed to the model. */
+export const APP_STATE_SPACE_SENTENCE =
+  "If the result says every window is on another Space, the app is NOT in the tree — call computer_raise once, then read again. If windows ARE listed, work with them and do not raise. ";
+export const APP_STATE_SPACE_SENTENCE_CROSS =
+  "Windows on another Space are in the tree and work like any other — never raise to read or act; a window line marked [other Space] is still fully usable. ";
+export const RAISE_DESCRIPTION =
+  "Bring an app to the front, switching Spaces if its windows are elsewhere. This TAKES OVER the user's screen, so use it in exactly one case: computer_app_state reported that every window of the app is on another Space, which means the app is not in the tree and cannot be read or acted on until it is raised. Never raise to read or press an app whose windows are already listed. This always requires explicit user approval.";
+export const RAISE_DESCRIPTION_CROSS =
+  "Bring an app to the front, switching Spaces if its windows are elsewhere. This TAKES OVER the user's screen. Reading and acting never need it — every window is in the tree wherever it is — so use it only when the user asked to SEE the app. This always requires explicit user approval.";
+export const LAUNCH_FRONT_SENTENCE =
+  "This brings the app to the front, which is what opening an app means.";
+export const LAUNCH_FRONT_SENTENCE_CROSS =
+  "It opens in the background: the tree is readable without bringing the app forward, and the user keeps their screen.";
+
+export function withSpaceGuidance<T extends { name: string; description: string }>(tool: T, crossSpace: boolean): T {
+  if (!crossSpace) return tool;
+  switch (tool.name) {
+    case "computer_raise":
+      return { ...tool, description: RAISE_DESCRIPTION_CROSS };
+    case "computer_app_state":
+      return { ...tool, description: tool.description.replace(APP_STATE_SPACE_SENTENCE, APP_STATE_SPACE_SENTENCE_CROSS) };
+    case "computer_launch":
+      return { ...tool, description: tool.description.replace(LAUNCH_FRONT_SENTENCE, LAUNCH_FRONT_SENTENCE_CROSS) };
+    default:
+      return tool;
+  }
+}
+
+/** What the read appends when it lists windows on another Space. The tool
+ *  descriptions are fixed when a thread starts, so a thread opened while the
+ *  bridge was still undecided keeps the "off" text — which tells the model to
+ *  raise when every window is elsewhere, exactly what a read full of
+ *  [other Space] lines looks like. The result is composed per call, so the
+ *  guidance there is always current. Empty when there is nothing to say. */
+export function otherSpaceNote(crossSpace: boolean, windowsText: string): string {
+  return crossSpace && windowsText.includes("[other Space]") ? "Windows marked [other Space] are in the tree and readable; do not raise." : "";
+}
+
+/** What a launch result means. The bridge returns ok:true at its deadline as
+ *  long as the app is RUNNING; only a window line in the tree proves it is
+ *  readable. A tree of the application and its menu bar alone is not. The
+ *  line shape is the bridge's Formatter.line: `<id> <indent><role> "title" …`,
+ *  and a real window renders as one of these three lowercase roles. */
+export function launchOutcome(tree: string): "readable" | "running" {
+  return /^\s*\d+\s+(standard window|window|dialog)\b/m.test(tree) ? "readable" : "running";
 }
