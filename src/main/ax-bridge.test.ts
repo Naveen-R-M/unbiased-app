@@ -553,18 +553,22 @@ test("every bridge call that rewrites the diff baseline carries the read's optio
   for (const method of ["act", "setValue", "key", "scroll", "raise", "launch", "tree", "find"]) {
     // Any receiver, not just `ax.` — `ax!.request(...)` slipped through a
     // marker that spelled the variable out, which is how a call site added
-    // later would most plausibly be written. The engine's own request() names
-    // are all slash-namespaced ("turn/start"), so none of these can collide.
-    const marker = `.request("${method}"`;
-    let at = src.indexOf(marker);
-    assert.ok(at > 0, `expected at least one .request("${method}") in index.ts`);
-    while (at > 0) {
-      const call = bridgeCallAt(src, src.indexOf("(", at));
+    // later would most plausibly be written. And any whitespace after the
+    // paren: a call Prettier wraps onto its own lines is the same call, but a
+    // literal marker sees nothing there at all, so the site simply vanishes
+    // from the scan while the count of the OTHER sites keeps the test green.
+    // The engine's own request() names are all slash-namespaced
+    // ("turn/start"), so none of these can collide.
+    const marker = new RegExp(`\\.request\\(\\s*"${method}"`, "g");
+    const hits = [...src.matchAll(marker)];
+    assert.ok(hits.length > 0, `expected at least one .request("${method}") in index.ts`);
+    for (const hit of hits) {
+      // Anchored on this hit, so each site resolves independently.
+      const call = bridgeCallAt(src, (hit.index ?? 0) + hit[0].indexOf("("));
       const carrier = carriedByOpts.has(method) ? /axActionOpts|\bopts\b/ : /axActionOpts/;
       assert.match(call.replace(/\s+/g, " "), carrier,
         `this ${method} call snapshots in a different view than the read did, so the next diff will be a lie` +
         (carriedByOpts.has(method) ? " (carry ...axActionOpts(appName), or the read's own opts)" : " (carry ...axActionOpts(appName))"));
-      at = src.indexOf(marker, at + marker.length);
     }
   }
 });
