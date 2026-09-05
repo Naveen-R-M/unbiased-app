@@ -14,7 +14,7 @@ const defaultAppRoot = join(launcherRoot, "default-app");
 const defaultAppAsar = join(launcherApp, "Contents", "Resources", "default_app.asar");
 const version = require(join(root, "node_modules", "electron", "package.json")).version;
 const markerPath = join(launcherRoot, "version");
-const launcherRevision = "9";
+const launcherRevision = "10";
 
 function run(command, args) {
   const result = require("node:child_process").spawnSync(command, args, { stdio: "inherit" });
@@ -110,6 +110,13 @@ function prepareMacLauncher() {
       // Not set by the launcher, but the engine path cannot be resolved from
       // a git worktree without it — see resolveEngineDir.
       `  --env "UNBIASED_ENGINE_DIR=$UNBIASED_ENGINE_DIR" \\`,
+      // Same for the accessibility bridge: resolveAxDir walks up from the app
+      // path and finds the FIRST unbiased-ax/dist, which from a worktree is the
+      // main checkout's — whatever was built there last, not what you are
+      // testing. UNBIASED_AX_DEBUG=1 turns on the diagnostic log both here and
+      // in the bridge, which inherits this environment when we spawn it.
+      `  --env "UNBIASED_AX_DIR=$UNBIASED_AX_DIR" \\`,
+      `  --env "UNBIASED_AX_DEBUG=$UNBIASED_AX_DEBUG" \\`,
       `  --args "$entry" "$@"`,
       "",
     ].join("\n"),
