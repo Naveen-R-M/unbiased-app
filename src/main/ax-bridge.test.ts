@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-import { AX_TOOL_NAMES, SCREENSHOT_TOOL_NAMES, routesToAx, parseBatchSteps, describeBatch, summarizeBatch, MAX_BATCH_STEPS, AxClient, AxError, appOfStep, axConsent, axNeedsFocus, screenshotToolsOffered, axReadOptsFrom, AX_DEFAULT_READ_OPTS, shouldRecoverRaise, describeAxAction, indexElementLines, readAxManifest, resolveAxDir, shouldOpenAccessibilitySettings, axNotTrustedText, RAISE_DESCRIPTION, APP_STATE_SPACE_SENTENCE, LAUNCH_FRONT_SENTENCE, withSpaceGuidance, otherSpaceNote, launchOutcome } from "./ax-bridge";
+import { AX_TOOL_NAMES, SCREENSHOT_TOOL_NAMES, routesToAx, parseBatchSteps, describeBatch, summarizeBatch, MAX_BATCH_STEPS, AxClient, AxError, appOfStep, axConsent, axNeedsFocus, screenshotToolsOffered, coordinateToolAllowed, withScreenshotGuidance, SCREENSHOT_FRAME_SENTENCE, axReadOptsFrom, axFilterSwitched, AX_DEFAULT_READ_OPTS, shouldRecoverRaise, describeAxAction, indexElementLines, readAxManifest, resolveAxDir, shouldOpenAccessibilitySettings, axNotTrustedText, RAISE_DESCRIPTION, APP_STATE_SPACE_SENTENCE, LAUNCH_FRONT_SENTENCE, withSpaceGuidance, otherSpaceNote, launchOutcome } from "./ax-bridge";
 
 const scratch = () => mkdtempSync(join(tmpdir(), "ax-"));
 
@@ -337,8 +337,9 @@ test("with the bridge alive the model can still SEE, but not click by coordinate
   // in a run that otherwise never raised.
   assert.equal(screenshotToolsOffered({ axAlive: true }), "screenshot-only");
   assert.equal(screenshotToolsOffered({ axAlive: false }), "all");
-  // "screenshot-only" is spelled in index.ts as a filter on a name. A rename
-  // there would take the eyes away again, silently, while computer_app_state's
+  // "screenshot-only" is spelled in index.ts as coordinateToolAllowed over the
+  // declarations, so the tool has to still BE there under that name. A rename
+  // would take the eyes away again, silently, while computer_app_state's
   // description still tells the model to reach for them.
   const src = readFileSync(join(__dirname, "index.ts"), "utf8");
   const at = src.indexOf("const COMPUTER_USE_TOOLS = [");
@@ -478,37 +479,142 @@ test("an action snapshots the way the app last read, or the diff is a lie", () =
   assert.deepEqual(axReadOptsFrom({ interactive: false }), { interactive: false, web: false });
   assert.deepEqual(axReadOptsFrom({ web: true }), { interactive: true, web: true });
   assert.deepEqual(axReadOptsFrom({ interactive: false, web: true }), { interactive: false, web: true });
+  // depth filters the same tree the same way, and the read's own reply invites
+  // the model to change it ("truncated — use query or depth").
+  assert.deepEqual(axReadOptsFrom({ depth: 5 }), { interactive: true, web: false, depth: 5 });
+  assert.deepEqual(axReadOptsFrom({ depth: "5" }), { interactive: true, web: false },
+    "a depth that is not a number is not a filter — leave the bridge its own default");
   // Measured: a read with interactive:true followed by an action with no
   // options reported +73 elements added and then the same 73 removed.
   assert.deepEqual(AX_DEFAULT_READ_OPTS, { interactive: true, web: false });
+  assert.ok(Object.isFrozen(AX_DEFAULT_READ_OPTS),
+    "it is handed out by reference to every action on an unread app; one mutation would rewrite the default for all of them");
 });
 
-test("every acting bridge call carries the options the app was last read with", () => {
-  // The helper is only half the fix: it has to be spread into every call site
-  // that produces a post-action snapshot. index.ts cannot be imported here (it
-  // pulls in electron), so read the dispatcher out of the source, the same way
-  // the routing test above does, and fail loudly on a call site that forgot.
+test("a read that CHANGES the filter has no honest diff, so it asks for the whole tree", () => {
+  // The lie the rest of this commit kills, reached with two reads instead of
+  // an action: read interactive:true (46 nodes), read interactive:false (119
+  // nodes, brand-new ids), read true again — "- removed:" the 73 that were
+  // never gone. Fix C's description actively invites that middle read.
+  const on = { interactive: true, web: false };
+  assert.equal(axFilterSwitched(on, { interactive: false, web: false }), true);
+  assert.equal(axFilterSwitched(on, { interactive: true, web: true }), true);
+  assert.equal(axFilterSwitched({ interactive: true, web: false, depth: 5 }, on), true, "depth is a filter too");
+  assert.equal(axFilterSwitched(on, { interactive: true, web: false, depth: 5 }), true);
+  assert.equal(axFilterSwitched(on, on), false, "the same view twice is exactly when a diff is honest");
+  assert.equal(axFilterSwitched({ interactive: true, web: false, depth: 5 }, { interactive: true, web: false, depth: 5 }), false);
+  // An app nothing has read yet is not "no baseline": a launch or a raise may
+  // have written one, and it wrote it in the defaults.
+  assert.equal(axFilterSwitched(undefined, { interactive: false, web: false }), true,
+    "the first read after a launch, asking for static text, is a changed filter — the launch tree was interactive-only");
+  assert.equal(axFilterSwitched(undefined, { interactive: true, web: false }), false);
+});
+
+/** The text of one call: from `ax.request(` forward to its matching `)`, with
+ *  depth balanced and quoted strings skipped. A fixed character window was the
+ *  first attempt and it was wrong twice over — reformatting a call across
+ *  lines failed it, and a longer call (a legitimate `keepFront: true`) failed
+ *  it too, with eight characters of margin. A call is a call however it is
+ *  spelled. */
+function bridgeCallAt(src: string, open: number): string {
+  let depth = 0;
+  let quote: string | null = null;
+  for (let i = open; i < src.length; i++) {
+    const c = src[i];
+    if (quote) {
+      if (c === "\\") i++;
+      else if (c === quote) quote = null;
+      continue;
+    }
+    if (c === '"' || c === "'" || c === "`") quote = c;
+    else if (c === "(") depth++;
+    else if (c === ")" && --depth === 0) return src.slice(open, i + 1);
+  }
+  return src.slice(open);
+}
+
+test("every bridge call that rewrites the diff baseline carries the read's options", () => {
+  // index.ts cannot be imported here (it pulls in electron), so read it as
+  // source, the same way the routing test above does.
+  //
+  // Every method below stores its snapshot as the bridge's `last[app]` — the
+  // baseline the NEXT diff is measured against (Dispatcher.swift: afterAction
+  // for the acting verbs and raise, directly for tree, find and launch). One
+  // that snapshots in a different view than the reads manufactures change:
+  // measured on Maps, +73 added and then the same 73 removed.
+  //
+  // The WHOLE file, not one function: reassertRaise raises from above the
+  // dispatcher, and a new call site added below handleComputerUseCall would
+  // have slipped past a range-limited scan entirely.
   const src = readFileSync(join(__dirname, "index.ts"), "utf8");
-  // From reassertRaise, not from handleAxCall: reassertRaise sits above the
-  // dispatcher and raises on its own, and raise ends in the bridge's
-  // afterAction like every other verb — it rewrites the baseline the next
-  // diff is taken against.
-  const start = src.indexOf("async function reassertRaise");
-  assert.ok(start > 0, "expected reassertRaise in index.ts");
-  const end = src.indexOf("async function handleComputerUseCall", start);
-  assert.ok(end > start, "expected handleComputerUseCall after the AX dispatch");
-  const body = src.slice(start, end);
-  for (const method of ["act", "setValue", "key", "scroll", "raise"]) {
-    const call = `ax.request("${method}", {`;
-    let at = body.indexOf(call);
-    assert.ok(at > 0, `expected at least one ax.request("${method}") in the AX dispatch`);
+  // find and tree are the read's own calls; they carry the freshly built opts
+  // object, which IS the recorded view. Everything else must ask for it.
+  const carriedByOpts = new Set(["tree", "find"]);
+  for (const method of ["act", "setValue", "key", "scroll", "raise", "launch", "tree", "find"]) {
+    // Any receiver, not just `ax.` — `ax!.request(...)` slipped through a
+    // marker that spelled the variable out, which is how a call site added
+    // later would most plausibly be written. The engine's own request() names
+    // are all slash-namespaced ("turn/start"), so none of these can collide.
+    const marker = `.request("${method}"`;
+    let at = src.indexOf(marker);
+    assert.ok(at > 0, `expected at least one .request("${method}") in index.ts`);
     while (at > 0) {
-      const near = body.slice(at, at + 120);
-      assert.ok(near.includes("axActionOpts"),
-        `this ${method} call snapshots with different options than the read did: ${near.split("\n")[0]}`);
-      at = body.indexOf(call, at + call.length);
+      const call = bridgeCallAt(src, src.indexOf("(", at));
+      const carrier = carriedByOpts.has(method) ? /axActionOpts|\bopts\b/ : /axActionOpts/;
+      assert.match(call.replace(/\s+/g, " "), carrier,
+        `this ${method} call snapshots in a different view than the read did, so the next diff will be a lie` +
+        (carriedByOpts.has(method) ? " (carry ...axActionOpts(appName), or the read's own opts)" : " (carry ...axActionOpts(appName))"));
+      at = src.indexOf(marker, at + marker.length);
     }
   }
+});
+
+test("a read records its filter before anything snapshots, and takes a whole tree when it changed", () => {
+  const src = readFileSync(join(__dirname, "index.ts"), "utf8");
+  const start = src.indexOf('case "computer_app_state": {');
+  assert.ok(start > 0, "expected the computer_app_state case in index.ts");
+  const block = src.slice(start, src.indexOf('case "computer_launch"', start));
+  const recorded = block.indexOf("axReadOpts.set(");
+  const firstCall = block.indexOf("ax.request(");
+  assert.ok(recorded > 0 && firstCall > 0, "expected the read to record its filter and to call the bridge");
+  assert.ok(recorded < firstCall,
+    "record the filter BEFORE the auto-recovery raise: that raise snapshots and rewrites the baseline, and would write it in the previous read's view");
+  assert.match(block, /full:\s*a\.full === true \|\| switched/,
+    "a read that changed the filter has no honest diff — it has to ask for the whole tree");
+});
+
+test("a withheld verb is refused when it is called anyway, not merely left off the menu", () => {
+  // Withholding is declaration-only: index.ts routes every computer_* name
+  // that is not an AX tool to the coordinate handler, and in Full access the
+  // consent gate answers "allow". A remembered or hallucinated computer_type
+  // would otherwise reach the desktop with no card at all.
+  for (const t of ["computer_type", "computer_click", "computer_key", "computer_move", "computer_scroll"]) {
+    assert.equal(coordinateToolAllowed(t, "screenshot-only"), false, `${t} must not run while the bridge is alive`);
+    assert.equal(coordinateToolAllowed(t, "all"), true, `${t} is all there is without a bridge`);
+  }
+  assert.equal(coordinateToolAllowed("computer_screenshot", "screenshot-only"), true, "looking is the one that survives");
+  assert.equal(coordinateToolAllowed("computer_screenshot", "all"), true);
+
+  // And the door is actually wired to it, before the consent gate.
+  const src = readFileSync(join(__dirname, "index.ts"), "utf8");
+  const body = src.slice(src.indexOf("async function handleComputerUseCall"));
+  const gate = body.indexOf("coordinateToolAllowed");
+  const consent = body.indexOf("axConsent");
+  assert.ok(gate > 0, "handleComputerUseCall does not consult coordinateToolAllowed — the tools are off the menu but still executable");
+  assert.ok(gate < consent, "the refusal has to come before the consent gate, which says allow in Full access");
+});
+
+test("with the bridge alive, the screenshot description stops promising coordinates", () => {
+  const shot = { name: "computer_screenshot", description: "Capture it. " + SCREENSHOT_FRAME_SENTENCE + " Approval required." };
+  const other = { name: "computer_click", description: "Click " + SCREENSHOT_FRAME_SENTENCE };
+  assert.deepEqual(withScreenshotGuidance(shot, "all"), shot, "without a bridge the frame is exactly what it is for");
+  assert.deepEqual(withScreenshotGuidance(other, "screenshot-only"), other, "the swap is for the one tool that survives");
+  const swapped = withScreenshotGuidance(shot, "screenshot-only").description;
+  assert.ok(!swapped.includes("coordinate frame to use for later computer actions"),
+    "it must not point the model at verbs that are now refused");
+  assert.ok(swapped.includes("SEE what the tree cannot express") && swapped.includes("element ids"));
+  assert.ok(swapped.startsWith("Capture it. ") && swapped.endsWith(" Approval required."),
+    "one sentence swapped by value, the rest of the description untouched");
 });
 
 test("the screenshot tools do not route to the accessibility handler", () => {

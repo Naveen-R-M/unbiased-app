@@ -110,10 +110,37 @@ export function axNeedsFocus(tool: string, _args: Record<string, unknown>): bool
  *  gone. Anything that ends in the bridge's afterAction — every action, and
  *  raise with it — takes a snapshot AND stores it as the baseline the next
  *  diff is measured from, so all of them must see what the reads see. */
-export type AxReadOpts = { interactive: boolean; web: boolean };
-export const AX_DEFAULT_READ_OPTS: AxReadOpts = { interactive: true, web: false };
-export function axReadOptsFrom(args: { interactive?: unknown; web?: unknown }): AxReadOpts {
-  return { interactive: args.interactive !== false, web: args.web === true };
+export type AxReadOpts = { interactive: boolean; web: boolean; depth?: number };
+/** Frozen: one object is handed out by reference to every caller that acts on
+ *  an app nothing has read yet, so a single mutation would rewrite the default
+ *  for all of them. */
+export const AX_DEFAULT_READ_OPTS: AxReadOpts = Object.freeze({ interactive: true, web: false });
+export function axReadOptsFrom(args: { interactive?: unknown; web?: unknown; depth?: unknown }): AxReadOpts {
+  return {
+    interactive: args.interactive !== false,
+    web: args.web === true,
+    // depth is a filter like the other two — the bridge reads it in the same
+    // options() — and the read's own reply says "truncated: use query or
+    // depth", so the model is invited to change it. Read at depth 5, press,
+    // and an action snapshotting at the default 14 adds everything deeper;
+    // the next read at 5 removes it all again. Only carried when given: the
+    // bridge's own default (14) is not ours to restate.
+    ...(typeof args.depth === "number" ? { depth: args.depth } : {}),
+  };
+}
+
+/** Whether this read asks for a DIFFERENT view than the last one, which means
+ *  there is no honest diff to show: the bridge would report every element the
+ *  old filter hid as added, and every one the new filter hides as removed —
+ *  the same +73/-73 lie, reached with two reads instead of an action. The
+ *  caller answers by asking for the whole tree instead.
+ *
+ *  An app nothing has read yet counts as the defaults rather than as "no
+ *  baseline": a launch or a raise may already have written one, and it wrote
+ *  it in exactly those defaults (see axActionOpts). */
+export function axFilterSwitched(prev: AxReadOpts | undefined, want: AxReadOpts): boolean {
+  const from = prev ?? AX_DEFAULT_READ_OPTS;
+  return from.interactive !== want.interactive || from.web !== want.web || from.depth !== want.depth;
 }
 
 /** The app a computer step acted on, so the transcript can show that app's own
@@ -336,6 +363,33 @@ export function axNotTrustedText(appName: string, opened: boolean): string {
  *  raised. Without a bridge they are all that can touch the desktop. */
 export function screenshotToolsOffered(opts: { axAlive: boolean }): "all" | "screenshot-only" {
   return opts.axAlive ? "screenshot-only" : "all";
+}
+
+/** Whether a coordinate or typing verb may actually RUN. Withholding a tool
+ *  from the declarations is not the same as disabling it: the dispatcher sends
+ *  every computer_* name that is not an AX tool to the coordinate handler, and
+ *  in Full access the consent gate answers "allow" — so a model that remembers
+ *  computer_type from an earlier turn, or simply invents it, types at the
+ *  desktop with no card and no bridge behind it. That is the Spotlight and
+ *  command+k path this whole split exists to close, so the same decision has
+ *  to be made twice: once when the menu is built, once at the door. */
+export function coordinateToolAllowed(tool: string, mode: "all" | "screenshot-only"): boolean {
+  return mode === "all" || tool === "computer_screenshot";
+}
+
+/** computer_screenshot's description, in two halves. With the bridge alive the
+ *  image is for LOOKING; there is no coordinate verb left to aim with, and a
+ *  description that promises "the exact coordinate frame to use for later
+ *  computer actions" is an invitation to call a tool that is now refused.
+ *  Swapped by value, exactly like the Space sentences. */
+export const SCREENSHOT_FRAME_SENTENCE =
+  "The result states the exact coordinate frame to use for later computer actions; it is scaled down from the display, so never assume the display resolution.";
+export const SCREENSHOT_LOOK_ONLY_SENTENCE =
+  "Use it to SEE what the tree cannot express — whether a video is actually playing, a canvas, a rendered chart. It is not for aiming: there are no coordinate actions while the accessibility bridge is running, so act through element ids from computer_app_state.";
+
+export function withScreenshotGuidance<T extends { name: string; description: string }>(tool: T, mode: "all" | "screenshot-only"): T {
+  if (mode === "all" || tool.name !== "computer_screenshot") return tool;
+  return { ...tool, description: tool.description.replace(SCREENSHOT_FRAME_SENTENCE, SCREENSHOT_LOOK_ONLY_SENTENCE) };
 }
 
 /** Whether a read that found nothing should raise and try again by itself.

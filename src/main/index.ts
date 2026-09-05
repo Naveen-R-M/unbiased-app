@@ -41,7 +41,10 @@ import {
   appOfStep,
   axConsent,
   screenshotToolsOffered,
+  coordinateToolAllowed,
+  withScreenshotGuidance,
   axReadOptsFrom,
+  axFilterSwitched,
   AX_DEFAULT_READ_OPTS,
   type AxReadOpts,
   shouldRecoverRaise,
@@ -1428,6 +1431,15 @@ const AX_TOOLS = [
 // somebody's task. The same goes for the three descriptions withSpaceGuidance
 // rewrites: it replaces a sentence by value, so a future edit that retypes
 // the sentence instead of using the constant makes it a silent no-op.
+// The same for computer_screenshot's coordinate-frame sentence: it is replaced
+// by value while the bridge is alive, so a retyped description would leave the
+// model reading "the exact coordinate frame to use for later computer actions"
+// about the one tool whose coordinate verbs are refused.
+for (const t of COMPUTER_USE_TOOLS) {
+  if (t.name === "computer_screenshot" && withScreenshotGuidance(t, "screenshot-only").description === t.description) {
+    throw new Error("computer_screenshot's description no longer carries SCREENSHOT_FRAME_SENTENCE — withScreenshotGuidance would be a no-op; build it from the constant in ax-bridge.ts");
+  }
+}
 for (const t of AX_TOOLS) {
   if (!routesToAx(t.name)) throw new Error(`AX tool ${t.name} is declared but not routed — add it to AX_TOOL_NAMES in ax-bridge.ts`);
   if (["computer_raise", "computer_app_state", "computer_launch"].includes(t.name) && withSpaceGuidance(t, true).description === t.description) {
@@ -1612,11 +1624,14 @@ function dynamicToolCommandText(tool: string | undefined, rawArgs: unknown): str
  * machine without agent-browser installed.
  */
 function threadDynamicTools(): Record<string, unknown>[] | undefined {
+  // The same value decides what is on the menu and what handleComputerUseCall
+  // will actually run, so a withheld verb cannot come back through the door.
+  const screenshots = screenshotToolsOffered({ axAlive: ax?.alive === true });
   const tools = [
     ...(ax?.alive ? AX_TOOLS.map((t) => withSpaceGuidance(t, ax!.crossSpace)) : []),
-    ...(screenshotToolsOffered({ axAlive: ax?.alive === true }) === "all"
-      ? COMPUTER_USE_TOOLS
-      : COMPUTER_USE_TOOLS.filter((t) => t.name === "computer_screenshot")),
+    ...COMPUTER_USE_TOOLS
+      .filter((t) => coordinateToolAllowed(t.name, screenshots))
+      .map((t) => withScreenshotGuidance(t, screenshots)),
     ...SCHEDULE_TOOLS,
     ...MEMORY_TOOLS,
     ...(agentBrowserTools() ?? []),
@@ -2155,7 +2170,10 @@ const axReadOpts = new Map<string, AxReadOpts>();
 
 /** The options to send with anything that snapshots this app — every action,
  *  and raise, which rewrites the diff baseline just as an action does:
- *  whatever it was last read with. Defaults match computer_app_state's own. */
+ *  whatever it was last read with. Defaults match computer_app_state's own,
+ *  so a launch of an app nothing has read returns an interactive-only tree —
+ *  intended: it is the baseline the first read is diffed against, and a read
+ *  that disagrees with its own baseline is the bug this all exists to fix. */
 function axActionOpts(appName: string): AxReadOpts {
   return axReadOpts.get(appName) ?? AX_DEFAULT_READ_OPTS;
 }
@@ -2280,6 +2298,13 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         return axText(`${appName} is in front and its windows are now readable.\n${diff}`, true);
       }
       case "computer_app_state": {
+        // Record BEFORE anything snapshots. The auto-recovery raise below ends
+        // in the bridge's afterAction, which writes the baseline the read a few
+        // lines later is diffed against — in the PREVIOUS read's view, unless
+        // this runs first.
+        const want = axReadOptsFrom(a);
+        const switched = axFilterSwitched(axReadOpts.get(appName), want);
+        axReadOpts.set(appName, want);
         let w = await ax.request("windows", { app: appName }, 3_000);
         // An app this conversation already raised can drift back off-Space
         // between two actions. That is the raise being undone, not a new
@@ -2304,15 +2329,15 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         if (!windowsText && offscreen > 0) return axText(head, true);
         const opts: Record<string, unknown> = {
           app: appName,
-          interactive: a.interactive !== false,
-          web: a.web === true,
-          full: a.full === true,
-          ...(typeof a.depth === "number" ? { depth: a.depth } : {}),
+          // Spread rather than rebuilt, so the view this read asks for and the
+          // view every action after it uses are one object, not two that can
+          // drift.
+          ...want,
+          // a changed filter has no honest diff — the bridge would report every
+          // element the old filter hid as added, and every one the new filter
+          // hides as removed
+          full: a.full === true || switched,
         };
-        // Every action that follows snapshots the way this read did. Otherwise
-        // the bridge diffs two different views of the tree and reports the
-        // difference between the FILTERS as change in the app.
-        axReadOpts.set(appName, axReadOptsFrom(a));
         if (typeof a.query === "string" && a.query.trim()) {
           const r = await ax.request("find", { ...opts, title: a.query.trim(), ...(typeof a.role === "string" ? { role: a.role } : {}) });
           const matches = (r.matches as string[]) ?? [];
@@ -2481,6 +2506,23 @@ async function handleComputerUseCall(
   rawArgs: unknown,
   threadId: string | null,
 ): Promise<DynamicToolResponse> {
+  // Leaving a tool off the menu does not disable it. Every computer_* name
+  // that is not an AX tool arrives here, and in Full access the consent gate
+  // below says "allow" — so a model that remembers computer_type from an
+  // earlier turn, or invents it, would type at the desktop with no card. The
+  // refusal names what to use instead, because the model is usually reaching
+  // for this after a read it could have acted on directly.
+  if (!coordinateToolAllowed(tool, screenshotToolsOffered({ axAlive: ax?.alive === true }))) {
+    return {
+      contentItems: [{
+        type: "inputText",
+        text:
+          "Coordinate and typing actions are off while the accessibility bridge is running. " +
+          "Read with computer_app_state and act on element ids with computer_press, computer_act, computer_set_value or computer_press_key.",
+      }],
+      success: false,
+    };
+  }
   let action: ComputerAction;
   try {
     action = parseComputerAction(tool, rawArgs, computerUse.getPrimaryDisplay());
