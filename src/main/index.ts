@@ -40,7 +40,10 @@ import {
   AxError,
   appOfStep,
   axConsent,
-  offerScreenshotTools,
+  screenshotToolsOffered,
+  axReadOptsFrom,
+  AX_DEFAULT_READ_OPTS,
+  type AxReadOpts,
   shouldRecoverRaise,
   axLooksInstalled,
   axNeedsFocus,
@@ -1284,7 +1287,7 @@ const AX_TOOLS = [
         app: { type: "string", description: "App name, name prefix, bundle id, or pid — e.g. \"Brave\"." },
         query: { type: "string", description: "Find elements whose title or value contains this, instead of returning the whole tree." },
         role: { type: "string", description: "With query: restrict to a role, e.g. \"text field\", \"link\", \"button\", \"tab\"." },
-        interactive: { type: "boolean", default: true, description: "Only controls a user can operate. Set false to include static text." },
+        interactive: { type: "boolean", default: true, description: "True (default) lists only controls you can operate. Set FALSE when you are reading information rather than looking for something to press: values, labels, prices, distances, times and ratings are static text, and true hides them. Measured on a Maps place card: 46 elements with true, 119 with false — the distance was only in the second." },
         web: { type: "boolean", default: false, description: "Include web page content in browsers (Chromium builds it on request)." },
         full: { type: "boolean", default: false, description: "Return the whole tree even when a diff is available." },
         depth: { type: "integer", description: "Maximum tree depth (default 14)." },
@@ -1611,7 +1614,9 @@ function dynamicToolCommandText(tool: string | undefined, rawArgs: unknown): str
 function threadDynamicTools(): Record<string, unknown>[] | undefined {
   const tools = [
     ...(ax?.alive ? AX_TOOLS.map((t) => withSpaceGuidance(t, ax!.crossSpace)) : []),
-    ...(offerScreenshotTools({ axAlive: ax?.alive === true }) ? COMPUTER_USE_TOOLS : []),
+    ...(screenshotToolsOffered({ axAlive: ax?.alive === true }) === "all"
+      ? COMPUTER_USE_TOOLS
+      : COMPUTER_USE_TOOLS.filter((t) => t.name === "computer_screenshot")),
     ...SCHEDULE_TOOLS,
     ...MEMORY_TOOLS,
     ...(agentBrowserTools() ?? []),
@@ -2144,6 +2149,15 @@ const axLines = new Map<string, Map<number, string>>();
  *  shows it beside each step, so "press #643 in Brave" carries Brave's icon
  *  rather than a terminal glyph. */
 const axIcons = new Map<string, string>();
+/** The options each app was last READ with, so every action that follows
+ *  snapshots the same way. See AxReadOpts. */
+const axReadOpts = new Map<string, AxReadOpts>();
+
+/** The options to send with an action on this app: whatever it was last read
+ *  with. Defaults match computer_app_state's own defaults. */
+function axActionOpts(appName: string): AxReadOpts {
+  return axReadOpts.get(appName) ?? AX_DEFAULT_READ_OPTS;
+}
 
 /** Diagnostics. The console is the normal home, but the dev launcher runs the
  *  app through `open -W -n`, which discards stdout — an instrumented run this
@@ -2294,6 +2308,10 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
           full: a.full === true,
           ...(typeof a.depth === "number" ? { depth: a.depth } : {}),
         };
+        // Every action that follows snapshots the way this read did. Otherwise
+        // the bridge diffs two different views of the tree and reports the
+        // difference between the FILTERS as change in the app.
+        axReadOpts.set(appName, axReadOptsFrom(a));
         if (typeof a.query === "string" && a.query.trim()) {
           const r = await ax.request("find", { ...opts, title: a.query.trim(), ...(typeof a.role === "string" ? { role: a.role } : {}) });
           const matches = (r.matches as string[]) ?? [];
@@ -2313,7 +2331,7 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         // read-side recovery. With it, the launch is background and there is
         // nothing to put back.
         if (!ax.crossSpace) axRaised.set(root, appName);
-        const r = await ax.request("launch", { app: appName }, 25_000);
+        const r = await ax.request("launch", { app: appName, ...axActionOpts(appName) }, 25_000);
         const tree = String(r.tree ?? "");
         remember(tree);
         const already = r.alreadyRunning === true;
@@ -2344,25 +2362,25 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
           try {
             switch (st.do) {
               case "read":
-                await ax.request("tree", { app: appName, interactive: true });
+                await ax.request("tree", { app: appName, ...axActionOpts(appName) });
                 break;
               case "press":
-                await ax.request("act", { app: appName, id: st.id, action: "press" });
+                await ax.request("act", { app: appName, id: st.id, action: "press", ...axActionOpts(appName) });
                 break;
               case "act":
-                await ax.request("act", { app: appName, id: st.id, action: st.action });
+                await ax.request("act", { app: appName, id: st.id, action: st.action, ...axActionOpts(appName) });
                 break;
               case "set_value":
-                await ax.request("setValue", { app: appName, id: st.id, value: st.text });
+                await ax.request("setValue", { app: appName, id: st.id, value: st.text, ...axActionOpts(appName) });
                 break;
               case "key":
-                await ax.request("key", { app: appName, key: st.key, ...(st.id !== undefined ? { id: st.id } : {}) });
+                await ax.request("key", { app: appName, key: st.key, ...(st.id !== undefined ? { id: st.id } : {}), ...axActionOpts(appName) });
                 break;
               case "scroll": {
                 const amount = typeof st.amount === "number" && st.amount > 0 ? Math.min(st.amount, 40) : 5;
                 const d = SCROLL_DELTAS[st.direction];
                 if (!d) throw new Error(`unknown direction "${st.direction}"`);
-                await ax.request("scroll", { app: appName, id: st.id, dx: d.dx * amount, dy: d.dy * amount });
+                await ax.request("scroll", { app: appName, id: st.id, dx: d.dx * amount, dy: d.dy * amount, ...axActionOpts(appName) });
                 break;
               }
             }
@@ -2378,7 +2396,7 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         // step-by-step replay nobody asked for.
         let diff = "";
         try {
-          const r = await ax.request("tree", { app: appName, interactive: true });
+          const r = await ax.request("tree", { app: appName, ...axActionOpts(appName) });
           diff = String(r.diff ?? r.tree ?? "");
           remember(diff);
         } catch {
@@ -2400,7 +2418,7 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         const d = unit ? { dx: unit.dx * amount, dy: unit.dy * amount } : undefined;
         if (!d) return axText(`Unknown direction "${dir}". Use down, up, left, or right.`, false);
         axLog(`scroll ${appName} id=${String(a.id)} ${dir} ${amount}`);
-        const r = await ax.request("scroll", { app: appName, id: a.id, dx: d.dx, dy: d.dy });
+        const r = await ax.request("scroll", { app: appName, id: a.id, dx: d.dx, dy: d.dy, ...axActionOpts(appName) });
         const diff = String(r.diff ?? "");
         remember(diff);
         return axText(`Scrolled ${dir}.\n${diff || "(nothing changed — the container may not scroll, or is already at the end)"}`, true);
@@ -2419,17 +2437,17 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
           if (typeof a.key !== "string") return axText("key is required.", false);
           axLog(`key ${appName} ${a.key}${typeof a.id === "number" ? ` -> #${a.id}` : ""}`);
           // Nothing raises: a key posted to the pid reaches a background app.
-          r = await ax.request("key", { app: appName, key: a.key, ...(typeof a.id === "number" ? { id: a.id } : {}) });
+          r = await ax.request("key", { app: appName, key: a.key, ...(typeof a.id === "number" ? { id: a.id } : {}), ...axActionOpts(appName) });
         } else if (tool === "computer_set_value" || legacyValue) {
           const text = typeof a.text === "string" ? a.text : typeof a.value === "string" ? a.value : null;
           if (text === null) return axText("text is required.", false);
           axLog(`type ${appName} #${String(a.id)} <set>`);
-          r = await ax.request("setValue", { app: appName, id: a.id, value: text });
+          r = await ax.request("setValue", { app: appName, id: a.id, value: text, ...axActionOpts(appName) });
         } else {
           const action = tool === "computer_press" ? "press" : String(a.action ?? "");
           if (!action) return axText("action is required. Use one of the actions the element listed in braces.", false);
           axLog(`act ${appName} #${String(a.id)} ${action}`);
-          r = await ax.request("act", { app: appName, id: a.id, action });
+          r = await ax.request("act", { app: appName, id: a.id, action, ...axActionOpts(appName) });
         }
         const diff = String(r.diff ?? "");
         remember(diff);

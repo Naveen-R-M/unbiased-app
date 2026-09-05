@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-import { AX_TOOL_NAMES, SCREENSHOT_TOOL_NAMES, routesToAx, parseBatchSteps, describeBatch, summarizeBatch, MAX_BATCH_STEPS, AxClient, AxError, appOfStep, axConsent, axNeedsFocus, offerScreenshotTools, shouldRecoverRaise, describeAxAction, indexElementLines, readAxManifest, resolveAxDir, shouldOpenAccessibilitySettings, axNotTrustedText, RAISE_DESCRIPTION, APP_STATE_SPACE_SENTENCE, LAUNCH_FRONT_SENTENCE, withSpaceGuidance, otherSpaceNote, launchOutcome } from "./ax-bridge";
+import { AX_TOOL_NAMES, SCREENSHOT_TOOL_NAMES, routesToAx, parseBatchSteps, describeBatch, summarizeBatch, MAX_BATCH_STEPS, AxClient, AxError, appOfStep, axConsent, axNeedsFocus, screenshotToolsOffered, axReadOptsFrom, AX_DEFAULT_READ_OPTS, shouldRecoverRaise, describeAxAction, indexElementLines, readAxManifest, resolveAxDir, shouldOpenAccessibilitySettings, axNotTrustedText, RAISE_DESCRIPTION, APP_STATE_SPACE_SENTENCE, LAUNCH_FRONT_SENTENCE, withSpaceGuidance, otherSpaceNote, launchOutcome } from "./ax-bridge";
 
 const scratch = () => mkdtempSync(join(tmpdir(), "ax-"));
 
@@ -326,13 +326,25 @@ test("the screenshot tools obey the access mode exactly like the AX ones", () =>
   }
 });
 
-// ── The screenshot tools step aside when the bridge can do better ──────────
+// ── The coordinate verbs step aside; the eyes stay ─────────────────────────
 
-test("with the bridge alive, the screenshot tools are not offered", () => {
+test("with the bridge alive the model can still SEE, but not click by coordinate", () => {
   // The model tried Spotlight and command+k only because they were on the
-  // menu; the tree had Slack's DM list the whole time.
-  assert.equal(offerScreenshotTools({ axAlive: true }), false);
-  assert.equal(offerScreenshotTools({ axAlive: false }), true, "without a bridge they are the only way");
+  // menu; the tree had Slack's DM list the whole time. Those are the typing
+  // and coordinate verbs. computer_screenshot is the opposite case: it is the
+  // only way to look at something the tree cannot express, and a model told to
+  // look while holding no looking tool raised the app instead — measured once,
+  // in a run that otherwise never raised.
+  assert.equal(screenshotToolsOffered({ axAlive: true }), "screenshot-only");
+  assert.equal(screenshotToolsOffered({ axAlive: false }), "all");
+  // "screenshot-only" is spelled in index.ts as a filter on a name. A rename
+  // there would take the eyes away again, silently, while computer_app_state's
+  // description still tells the model to reach for them.
+  const src = readFileSync(join(__dirname, "index.ts"), "utf8");
+  const at = src.indexOf("const COMPUTER_USE_TOOLS = [");
+  const block = src.slice(at, src.indexOf("\n];", at));
+  assert.ok(block.includes('name: "computer_screenshot"'),
+    "COMPUTER_USE_TOOLS no longer declares computer_screenshot — the filter that keeps it would yield nothing");
 });
 
 // ── Recovering a Space we already asked for ────────────────────────────────
@@ -373,7 +385,7 @@ test("the not-trusted message names the row that is actually in the pane", () =>
   assert.match(shipped, /Unbiased/);
   assert.match(shipped, /now open/, "it should say the pane is already open, not give directions to it");
   assert.doesNotMatch(shipped, /computer_screenshot/,
-    "the screenshot tools are not offered while the bridge is alive — do not send the model after a tool it does not have");
+    "a picture of the pane the user is already looking at does not flip the switch this message exists to ask for");
 
   // A dev build is "Electron" in System Settings, not "Unbiased". Naming the
   // wrong row sends the user hunting for an entry that is not there.
@@ -450,6 +462,49 @@ test("every tool the app declares to the model is routed", () => {
   const unrouted = declared.filter((n) => !routesToAx(n));
   assert.deepEqual(unrouted, [],
     `declared to the model but dispatched to the screenshot handler instead: ${unrouted.join(", ")}`);
+});
+
+// ── An action must see what the read saw ──────────────────────────────────
+// The bridge diffs an action's after-snapshot against the last snapshot it
+// took. Reads sent interactive:true; every action sent no options at all, so
+// the two snapshots were different views of the same tree and the difference
+// between the views was reported as change. Measured on a Maps place card: one
+// press came back "+73 added", and the very next read came back with the same
+// 73 ids "removed". The model was told the card it had just opened was gone,
+// said so, and pressed again — nine calls to undo one lie.
+
+test("an action snapshots the way the app last read, or the diff is a lie", () => {
+  assert.deepEqual(axReadOptsFrom({}), { interactive: true, web: false }, "same defaults as computer_app_state");
+  assert.deepEqual(axReadOptsFrom({ interactive: false }), { interactive: false, web: false });
+  assert.deepEqual(axReadOptsFrom({ web: true }), { interactive: true, web: true });
+  assert.deepEqual(axReadOptsFrom({ interactive: false, web: true }), { interactive: false, web: true });
+  // Measured: a read with interactive:true followed by an action with no
+  // options reported +73 elements added and then the same 73 removed.
+  assert.deepEqual(AX_DEFAULT_READ_OPTS, { interactive: true, web: false });
+});
+
+test("every acting bridge call carries the options the app was last read with", () => {
+  // The helper is only half the fix: it has to be spread into every call site
+  // that produces a post-action snapshot. index.ts cannot be imported here (it
+  // pulls in electron), so read the dispatcher out of the source, the same way
+  // the routing test above does, and fail loudly on a call site that forgot.
+  const src = readFileSync(join(__dirname, "index.ts"), "utf8");
+  const start = src.indexOf("async function handleAxCall");
+  assert.ok(start > 0, "expected handleAxCall in index.ts");
+  const end = src.indexOf("async function handleComputerUseCall", start);
+  assert.ok(end > start, "expected handleComputerUseCall after handleAxCall");
+  const body = src.slice(start, end);
+  for (const method of ["act", "setValue", "key", "scroll"]) {
+    const call = `ax.request("${method}", {`;
+    let at = body.indexOf(call);
+    assert.ok(at > 0, `expected at least one ax.request("${method}") in handleAxCall`);
+    while (at > 0) {
+      const near = body.slice(at, at + 120);
+      assert.ok(near.includes("axActionOpts"),
+        `this ${method} call snapshots with different options than the read did: ${near.split("\n")[0]}`);
+      at = body.indexOf(call, at + call.length);
+    }
+  }
 });
 
 test("the screenshot tools do not route to the accessibility handler", () => {

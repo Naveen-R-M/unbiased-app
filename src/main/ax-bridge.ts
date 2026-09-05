@@ -102,6 +102,18 @@ export function axNeedsFocus(tool: string, _args: Record<string, unknown>): bool
   return tool === "computer_raise";
 }
 
+/** What a read asked for, remembered per app. The bridge diffs an action's
+ *  after-snapshot against the last one it took, so an action that snapshots
+ *  with a different filter than the read manufactures a diff: measured on
+ *  Maps, one press reported +73 added elements and the next read reported the
+ *  same 73 as removed. The model was told the card it had just opened was
+ *  gone. Actions must see what the reads see. */
+export type AxReadOpts = { interactive: boolean; web: boolean };
+export const AX_DEFAULT_READ_OPTS: AxReadOpts = { interactive: true, web: false };
+export function axReadOptsFrom(args: { interactive?: unknown; web?: unknown }): AxReadOpts {
+  return { interactive: args.interactive !== false, web: args.web === true };
+}
+
 /** The app a computer step acted on, so the transcript can show that app's own
  *  icon instead of a generic terminal glyph. */
 const APP_STEP_TOOLS = new Set([
@@ -267,11 +279,13 @@ export const AX_TOOL_NAMES = [
   "computer_do",
 ] as const;
 
-/** The older coordinate-and-screenshot tools, offered only when the bridge is
- *  not running. No name may appear in both lists. Dispatch is by name, so a
- *  shared name goes to whichever family the router checks first, regardless of
- *  which one the model thought it was calling — and the two take completely
- *  different arguments (an element id versus screen coordinates). */
+/** The older coordinate-and-screenshot tools. All of them when there is no
+ *  bridge; while one is alive only computer_screenshot survives, because
+ *  looking is the one thing the tree cannot replace — see
+ *  screenshotToolsOffered. No name may appear in both lists. Dispatch is by
+ *  name, so a shared name goes to whichever family the router checks first,
+ *  regardless of which one the model thought it was calling — and the two take
+ *  completely different arguments (an element id versus screen coordinates). */
 export const SCREENSHOT_TOOL_NAMES = [
   "computer_screenshot",
   "computer_click",
@@ -297,9 +311,9 @@ export function shouldOpenAccessibilitySettings(opts: { code: string | null; ope
 /** What the model is told when the grant is missing. Deliberately not a list of
  *  steps: the pane is already open in front of the user, and a five-bullet
  *  walkthrough of a window they are looking at reads as noise. It also no
- *  longer says to fall back to computer_screenshot — those tools are not
- *  offered while the bridge is alive, so that was an instruction to use a tool
- *  the model does not have. */
+ *  longer says to fall back to computer_screenshot: a picture of the pane the
+ *  user is already looking at does not get the switch flipped, and the point
+ *  of this message is the switch. */
 export function axNotTrustedText(appName: string, opened: boolean): string {
   const next = opened
     ? `System Settings is now open at Privacy & Security > Accessibility. In one short sentence, tell the user to switch ${appName} on there and say when it is done.`
@@ -310,12 +324,16 @@ export function axNotTrustedText(appName: string, opened: boolean): string {
   );
 }
 
-/** Whether to offer the older screenshot-and-coordinates tools. Not while the
- *  bridge is alive: the model reached for Spotlight and command+k only because
- *  they were on the menu, when the tree had the list it needed the whole time.
- *  Without a bridge they are the only way to touch the desktop at all. */
-export function offerScreenshotTools(opts: { axAlive: boolean }): boolean {
-  return !opts.axAlive;
+/** Which of the older screenshot tools to offer. The coordinate and typing
+ *  verbs stay off while the bridge is alive — measured: the model reached for
+ *  Spotlight and command+k when they were on the menu, while the tree had the
+ *  list it needed the whole time. computer_screenshot is different: it is the
+ *  only way to SEE something the tree cannot express, computer_app_state's own
+ *  description tells the model to reach for it, and without it a stuck model
+ *  raises the app to look — measured, once, in a run that otherwise never
+ *  raised. Without a bridge they are all that can touch the desktop. */
+export function screenshotToolsOffered(opts: { axAlive: boolean }): "all" | "screenshot-only" {
+  return opts.axAlive ? "screenshot-only" : "all";
 }
 
 /** Whether a read that found nothing should raise and try again by itself.
