@@ -2467,14 +2467,15 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
       }
       case "computer_app_screenshot": {
         const r = await ax.request("screenshot", { app: appName, ...(typeof a.window === "number" ? { window: a.window } : {}) }, 15_000);
-        const png = String(r.png ?? "");
-        if (!png) return axText("The bridge returned no image.", false);
+        const image = String(r.image ?? r.png ?? "");
+        if (!image) return axText("The bridge returned no image.", false);
+        const mime = typeof r.mime === "string" ? r.mime : "image/png";
         const where = r.onSpace === false ? " (on another Space)" : "";
         const note = typeof r.note === "string" ? ` ${r.note}` : "";
         return {
           contentItems: [
             { type: "inputText", text: `Window ${String(r.window)} of ${appName}${where}, ${String(r.width)}x${String(r.height)}.${note}` },
-            { type: "inputImage", imageUrl: `data:image/png;base64,${png}` },
+            { type: "inputImage", imageUrl: `data:${mime};base64,${image}` },
           ],
           success: true,
         };

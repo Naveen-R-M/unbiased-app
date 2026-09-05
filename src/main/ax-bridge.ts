@@ -683,7 +683,7 @@ export const APP_STATE_SPACE_SENTENCE_CROSS =
 export const RAISE_DESCRIPTION =
   "Bring an app to the front, switching Spaces if its windows are elsewhere. This TAKES OVER the user's screen, so use it in exactly one case: computer_app_state reported that every window of the app is on another Space, which means the app is not in the tree and cannot be read or acted on until it is raised. Never raise to read or press an app whose windows are already listed. This always requires explicit user approval.";
 export const RAISE_DESCRIPTION_CROSS =
-  "Bring an app to the front, switching Spaces if its windows are elsewhere. This TAKES OVER the user's screen. Reading and acting never need it — every window is in the tree wherever it is — so use it only when the user asked to SEE the app. This always requires explicit user approval.";
+  "Bring an app to the front, switching Spaces if its windows are elsewhere. This TAKES OVER the user's screen. Reading and acting never need it — every window is in the tree wherever it is — so use it only when the user asked to SEE the app. Not to look at it either: computer_app_screenshot photographs the window where it is, and what that picture leaves blank is content the app draws only on screen — report that to the user rather than raising. This always requires explicit user approval.";
 export const LAUNCH_FRONT_SENTENCE =
   "This brings the app to the front, which is what opening an app means.";
 export const LAUNCH_FRONT_SENTENCE_CROSS =

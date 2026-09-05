@@ -880,3 +880,9 @@ test("while Spaces are crossed, computer_screenshot says it cannot see the other
   const other = { name: "computer_click", description: "Click " + SCREENSHOT_FRAME_SENTENCE };
   assert.deepEqual(withScreenshotGuidance(other, "all", true), other, "only the screenshot tool speaks about Spaces");
 });
+
+test("while Spaces are crossed, raise says looking is not a reason either", () => {
+  const raise = { name: "computer_raise", description: RAISE_DESCRIPTION };
+  const crossed = withSpaceGuidance(raise, true).description;
+  assert.ok(crossed.includes("computer_app_screenshot") && crossed.includes("Not to look"), crossed);
+});
