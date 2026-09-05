@@ -285,6 +285,7 @@ export function summarizeBatch(opts: {
         "Read the app again before retrying — the ids may have moved.",
       ].filter(Boolean).join(" ")
     : `Done: ${opts.ran.join("; ")}.`;
+  if (opts.diff.trim() === "(no changes)") return `${head}\n${ACTION_NO_CHANGE_SENTENCE}`;
   return opts.diff ? `${head}\n${opts.diff}` : `${head}\n(nothing in the tree changed)`;
 }
 
@@ -382,6 +383,26 @@ export function coordinateToolAllowed(tool: string, mode: "all" | "screenshot-on
  *  description that promises "the exact coordinate frame to use for later
  *  computer actions" is an invitation to call a tool that is now refused.
  *  Swapped by value, exactly like the Space sentences. */
+/** What an action reports when the bridge's wait ran out with the tree
+ *  unchanged. "(no changes)" is a fine answer to a READ; after an ACTION the
+ *  model heard it as "nothing there" and pressed again — which, on a Maps
+ *  result, opened the card the first press had already asked for, and on a
+ *  settings row toggled Location Tracking back. */
+export const ACTION_NO_CHANGE_SENTENCE =
+  "The app showed no change while the bridge waited for it. Read the app once before repeating this action: the change may have landed late, and the same press twice undoes a toggle or opens a second copy.";
+
+export function renderActionResult(diff: string): string {
+  const body = diff.trim();
+  if (!body || body === "(no changes)") return `Done. ${ACTION_NO_CHANGE_SENTENCE}`;
+  return `Done.\n${body}`;
+}
+
+/** Scope, spelled out on the tools the model reads first. The Maps run spent
+ *  five of sixteen turns verifying walking, transit and cycling nobody asked
+ *  about and one enabling Location Tracking on its own. */
+export const TASK_DISCIPLINE_SENTENCE =
+  "Do only what was asked and stop when the asked-for result is on screen: do not change the app's settings (location, permissions, preferences), do not verify alternatives the user did not ask about, and do not repeat an action to be sure it took. ";
+
 export const SCREENSHOT_FRAME_SENTENCE =
   "The result states the exact coordinate frame to use for later computer actions; it is scaled down from the display, so never assume the display resolution.";
 export const SCREENSHOT_LOOK_ONLY_SENTENCE =
@@ -409,6 +430,34 @@ export function shouldRecoverRaise(s: { windowsHere: number; offscreen: number; 
 export type AxResult = Record<string, unknown>;
 type Pending = { resolve: (r: AxResult) => void; reject: (e: Error) => void; timer: NodeJS.Timeout };
 
+/** One finished bridge call, for diagnostics. The point is to see where a
+ *  slow task spends its time: the Maps run that took 2m36s had ~16 model turns
+ *  and every bridge call under two seconds, but the log only showed acting
+ *  calls, with start times and nothing else — so reads were invisible and
+ *  bridge time could not be told from model time. */
+export interface AxCallInfo {
+  method: string;
+  app: string | null;
+  /** Wall time of the round trip, including the bridge's settle wait. */
+  ms: number;
+  /** How long the bridge waited for the app to react (actions only). */
+  waitedMs: number | null;
+  /** Size of the reply and lines in the tree or diff it carried. */
+  bytes: number;
+  lines: number;
+  /** Read options in force, e.g. "interactive,query". */
+  flags: string;
+  error: string | null;
+}
+
+export function describeAxCall(c: AxCallInfo): string {
+  const where = c.app ? ` ${c.app}` : "";
+  const flags = c.flags ? ` [${c.flags}]` : "";
+  const waited = c.waitedMs !== null ? ` (waited ${c.waitedMs}ms)` : "";
+  const err = c.error ? ` ERROR ${c.error}` : "";
+  return `call ${c.method}${where}${flags} ${c.ms}ms${waited} ${c.lines} lines ${c.bytes}B${err}`;
+}
+
 /** One long-running bridge process. Ids and diffs live in that process, so it
  *  is spawned once and kept. A request that gets no answer times out rather
  *  than hanging a turn; an exit rejects everything in flight. */
@@ -426,6 +475,8 @@ export class AxClient {
   /** How long refreshCrossSpace waits for its hello. A field, not a
    *  constructor argument, so a test can shorten it without a new ctor shape. */
   helloTimeoutMs = AX_HELLO_TIMEOUT_MS;
+  /** Called once per finished request with its timing and size. */
+  onCall: ((call: AxCallInfo) => void) | null = null;
 
   constructor(
     private readonly manifest: AxManifest,
@@ -491,14 +542,42 @@ export class AxClient {
   request(method: string, params: Record<string, unknown>, timeoutMs = this.timeoutMs): Promise<AxResult> {
     if (!this.alive || !this.proc?.stdin) return Promise.reject(new AxError("bridge_exited", "unbiased-ax is not running"));
     const id = this.nextId++;
+    const started = Date.now();
     return new Promise<AxResult>((resolve, reject) => {
+      const done = (r: AxResult | null, e: Error | null) => {
+        this.report(method, params, started, r, e);
+        if (e) reject(e);
+        else resolve(r ?? {});
+      };
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        reject(new AxError("timeout", `${method} did not answer within ${timeoutMs}ms`));
+        done(null, new AxError("timeout", `${method} did not answer within ${timeoutMs}ms`));
       }, timeoutMs);
-      this.pending.set(id, { resolve, reject, timer });
+      this.pending.set(id, { resolve: (r) => done(r, null), reject: (e) => done(null, e), timer });
       this.proc!.stdin!.write(JSON.stringify({ id, method, params }) + "\n");
     });
+  }
+
+  private report(method: string, params: Record<string, unknown>, started: number, r: AxResult | null, e: Error | null): void {
+    if (!this.onCall) return;
+    const text = typeof r?.diff === "string" ? r.diff : typeof r?.tree === "string" ? r.tree : null;
+    const flags: string[] = [];
+    for (const k of ["full", "web", "interactive"]) if (params[k] === true) flags.push(k);
+    if (typeof params.query === "string") flags.push("query");
+    try {
+      this.onCall({
+        method,
+        app: typeof params.app === "string" ? params.app : null,
+        ms: Date.now() - started,
+        waitedMs: typeof r?.waitedMs === "number" ? r.waitedMs : null,
+        bytes: r ? JSON.stringify(r).length : 0,
+        lines: text ? text.split("\n").length : 0,
+        flags: flags.join(","),
+        error: e ? e.message : null,
+      });
+    } catch {
+      // diagnostics must never break a request
+    }
   }
 
   private onLine(line: string): void {

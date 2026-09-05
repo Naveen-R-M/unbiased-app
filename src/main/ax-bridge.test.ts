@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-import { AX_TOOL_NAMES, SCREENSHOT_TOOL_NAMES, routesToAx, parseBatchSteps, describeBatch, summarizeBatch, MAX_BATCH_STEPS, AxClient, AxError, appOfStep, axConsent, axNeedsFocus, screenshotToolsOffered, coordinateToolAllowed, withScreenshotGuidance, SCREENSHOT_FRAME_SENTENCE, axReadOptsFrom, axFilterSwitched, AX_DEFAULT_READ_OPTS, shouldRecoverRaise, describeAxAction, indexElementLines, readAxManifest, resolveAxDir, shouldOpenAccessibilitySettings, axNotTrustedText, RAISE_DESCRIPTION, APP_STATE_SPACE_SENTENCE, LAUNCH_FRONT_SENTENCE, withSpaceGuidance, otherSpaceNote, launchOutcome } from "./ax-bridge";
+import { AX_TOOL_NAMES, SCREENSHOT_TOOL_NAMES, routesToAx, parseBatchSteps, describeBatch, summarizeBatch, MAX_BATCH_STEPS, AxClient, AxError, appOfStep, axConsent, axNeedsFocus, screenshotToolsOffered, coordinateToolAllowed, withScreenshotGuidance, SCREENSHOT_FRAME_SENTENCE, axReadOptsFrom, axFilterSwitched, AX_DEFAULT_READ_OPTS, shouldRecoverRaise, describeAxAction, indexElementLines, readAxManifest, resolveAxDir, shouldOpenAccessibilitySettings, axNotTrustedText, RAISE_DESCRIPTION, APP_STATE_SPACE_SENTENCE, LAUNCH_FRONT_SENTENCE, withSpaceGuidance, otherSpaceNote, launchOutcome, renderActionResult, ACTION_NO_CHANGE_SENTENCE, TASK_DISCIPLINE_SENTENCE, type AxCallInfo } from "./ax-bridge";
 
 const scratch = () => mkdtempSync(join(tmpdir(), "ax-"));
 
@@ -808,4 +808,52 @@ test("a launch is readable only when a window line is in the tree, not when the 
   assert.equal(launchOutcome('1 application "Maps"\n2   menu bar\n3     menu bar item "Apple"'), "running",
     "the application and its menu bar alone prove only that it is running");
   assert.equal(launchOutcome('1 application "Maps"\n4   dialog "Open" {raise}'), "readable", "a dialog is a window too");
+});
+
+// An action that reports "(no changes)" is not a read that found nothing.
+// In the Maps run the model heard it as "nothing there" and pressed again.
+
+test("an action with no visible change says to read before repeating, instead of a bare (no changes)", () => {
+  const out = renderActionResult("(no changes)");
+  assert.ok(out.startsWith("Done."), out);
+  assert.ok(out.includes(ACTION_NO_CHANGE_SENTENCE), out);
+  assert.ok(!out.includes("(no changes)"), out);
+  assert.equal(renderActionResult(""), out);
+  assert.equal(renderActionResult("+ 12 button \"Directions\" {press}"), "Done.\n+ 12 button \"Directions\" {press}");
+});
+
+test("a batch that ends with no visible change gets the same guidance", () => {
+  const out = summarizeBatch({ ran: ["press #3"], failed: null, remaining: 0, diff: "(no changes)" });
+  assert.ok(out.includes(ACTION_NO_CHANGE_SENTENCE), out);
+});
+
+test("the tools the model reads first carry the task-discipline sentence", () => {
+  const src = readFileSync(join(__dirname, "index.ts"), "utf8");
+  for (const name of ["computer_app_state", "computer_do"]) {
+    const start = src.indexOf(`name: "${name}"`);
+    assert.ok(start > 0, name);
+    const desc = src.slice(start, src.indexOf("inputSchema", start));
+    assert.ok(desc.includes("TASK_DISCIPLINE_SENTENCE"), `${name} should spell out scope`);
+  }
+  assert.ok(!src.includes("axText(`Done.\\n${diff}`"), "the press/act site must render through renderActionResult");
+  assert.ok(src.includes("renderActionResult(diff)"));
+});
+
+test("every finished request reports its timing and size, errors included", async () => {
+  const m = fakeBridge();
+  assert.ok(m && !("error" in m));
+  const c = new AxClient(m);
+  const calls: AxCallInfo[] = [];
+  c.onCall = (x) => calls.push(x);
+  await c.start();
+  await c.request("echo", { app: "Maps", interactive: true, query: "Directions" });
+  await assert.rejects(c.request("boom", { app: "Maps" }));
+  c.stop();
+  const echo = calls.find((x) => x.method === "echo");
+  assert.ok(echo, JSON.stringify(calls));
+  assert.equal(echo.app, "Maps");
+  assert.equal(echo.flags, "interactive,query");
+  assert.ok(echo.ms >= 0 && echo.bytes > 0 && echo.error === null);
+  const boom = calls.find((x) => x.method === "boom");
+  assert.ok(boom && boom.error && boom.error.includes("No running app"), JSON.stringify(boom));
 });

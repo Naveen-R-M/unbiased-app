@@ -36,6 +36,9 @@ import { EngineClient, engineVersionFromUserAgent, type EngineStatus } from "./e
 import { pollDeviceToken, requestDeviceAuthorization } from "./device-auth";
 import { RendererCrashRecovery } from "./crash-recovery";
 import {
+  renderActionResult,
+  TASK_DISCIPLINE_SENTENCE,
+  describeAxCall,
   AxClient,
   AxError,
   appOfStep,
@@ -1280,7 +1283,7 @@ const AX_TOOLS = [
       "THIS IS THE TOOL FOR APPS THE USER ALREADY HAS OPEN — their running browser and its existing tabs included, so a site they are already signed into (Slack, Gmail, a dashboard) is read and operated here, in their own window. The browser_* tools open a separate browser instead and cannot see any of it. " +
       "Act on those ids: the controls are named, so press them rather than guessing keyboard shortcuts. " +
       "Reach for this BEFORE computer_screenshot: it answers what is on screen, which tab is selected, and where a control is, as text. "
-      + "It works on a BACKGROUND app on any Space and never takes over the user's screen. " +
+      + "It works on a BACKGROUND app on any Space and never takes over the user's screen. " + TASK_DISCIPLINE_SENTENCE +
       "Ids are stable per app until an element disappears. After the first read of an app the result is a DIFF (~ changed, + added, removed by id) unless full=true. " +
       APP_STATE_SPACE_SENTENCE + "Pass query to search for one control by title instead of reading everything. " +
       "Web page content inside a browser needs web=true. Use computer_screenshot when you need to SEE something the tree cannot express — whether a video is actually playing, a canvas, a rendered chart — and one confirming screenshot at the end of a visual task is worth taking.",
@@ -1380,7 +1383,7 @@ const AX_TOOLS = [
       "Run several steps on ONE app in a single call, in order, and get back what changed. Use this whenever you already know the next few moves — filling a field and committing it, pressing a tab and reading the result, scrolling and reading. It saves a whole round trip per step, which is the main cost of operating an app. " +
       "Each step is {do, ...}: do=\"press\" with id; do=\"set_value\" with id and text; do=\"key\" with key (and optional id to aim it); do=\"scroll\" with id and direction; do=\"act\" with id and action; do=\"read\" to re-read the app. Add wait_ms to a step to pause after it, for content that loads (a tab that shows \"Loading…\"). " +
       `Up to ${MAX_BATCH_STEPS} steps. It STOPS at the first step that fails and tells you which one — the rest do not run, so do not assume they did. ` +
-      "Opening or raising an app is not batchable: call computer_launch or computer_raise on its own. Do NOT batch steps whose ids you have not read yet, or steps that depend on what an earlier step reveals — read first, then batch what you can see.",
+      "Opening or raising an app is not batchable: call computer_launch or computer_raise on its own. Do NOT batch steps whose ids you have not read yet, or steps that depend on what an earlier step reveals — read first, then batch what you can see. " + TASK_DISCIPLINE_SENTENCE.trim(),
     inputSchema: {
       type: "object",
       properties: {
@@ -2231,6 +2234,7 @@ async function startAxBridge(): Promise<void> {
     return;
   }
   const client = new AxClient(manifest);
+  client.onCall = (c) => axLog(describeAxCall(c));
   try {
     const hello = await client.start();
     ax = client;
@@ -2477,7 +2481,7 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         }
         const diff = String(r.diff ?? "");
         remember(diff);
-        return axText(`Done.\n${diff}`, true);
+        return axText(renderActionResult(diff), true);
       }
       default:
         return axText(`Unknown tool ${tool}`, false);
