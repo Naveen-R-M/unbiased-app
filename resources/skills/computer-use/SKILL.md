@@ -83,11 +83,16 @@ segmented tabs. It does not affect typing into a field, keys you post, or menu
 bar items, because none of those go through hit-testing.
 
 **Do not press it again, and do not raise the app.** Raising un-parks the window
-only while that app is in front. It re-parks the moment focus moves on, so a
-raise costs the user their screen and buys nothing. The bridge refuses the
-first raise you ask for after a press died this way, and tells you the keyboard
-route instead. A window in this state is also marked `[parked]` when you read
-its windows, so you can see it coming.
+only while that app is in front. It re-parks the moment focus moves on: one run
+raised, and eleven seconds later the next press was dead again. The bridge
+refuses the first raise you ask for while a window is parked, and tells you the
+keyboard route instead. A window in this state is also marked `[parked]` when
+you read its windows, so you can see it coming.
+
+**Do not try to move or resize the window either.** Parking follows which app
+is ACTIVE, not where the window sits, so another Space does not help and
+neither does `Window > Move & Resize`. One run spent five turns in that menu
+and finished without the route it was asked for.
 
 **Do this instead.**
 
