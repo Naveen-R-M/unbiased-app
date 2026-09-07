@@ -549,6 +549,53 @@ export function parkedReadNote(windows: unknown): string | null {
   );
 }
 
+/** One single-action desktop call, remembered so a run of them can be noticed.
+ *
+ *  Measured on a Figma icon built with native shapes: 91 key presses and 63
+ *  value sets, nearly all one per model turn, and turns were running at 15
+ *  seconds. Setting one shape's position, size and colour is five turns done
+ *  singly and one done as a batch. computer_do already existed and was barely
+ *  used, and telling the model to batch has the same record as every other
+ *  piece of advice here, so the app notices the run and hands back the literal
+ *  call instead. */
+export interface RecentEdit {
+  tool: string;
+  app: string;
+  id?: number;
+  text?: string;
+  key?: string;
+  action?: string;
+}
+
+export const BATCH_NUDGE_AFTER = 3;
+
+function asStep(e: RecentEdit): Record<string, unknown> | null {
+  switch (e.tool) {
+    case "computer_press": return e.id === undefined ? null : { do: "press", id: e.id };
+    case "computer_act": return e.id === undefined || !e.action ? null : { do: "act", id: e.id, action: e.action };
+    case "computer_set_value": return e.id === undefined || e.text === undefined ? null : { do: "set_value", id: e.id, text: e.text };
+    case "computer_press_key": return !e.key ? null : { do: "key", key: e.key, ...(e.id !== undefined ? { id: e.id } : {}) };
+    default: return null;
+  }
+}
+
+/** The trailing run of single edits on ONE app, as the call that would have
+ *  done them together. Null until there are enough of them to be worth saying. */
+export function batchNudge(recent: RecentEdit[]): string | null {
+  if (recent.length === 0) return null;
+  const app = recent[recent.length - 1].app;
+  const run: RecentEdit[] = [];
+  for (let i = recent.length - 1; i >= 0 && recent[i].app === app; i -= 1) run.unshift(recent[i]);
+  if (run.length < BATCH_NUDGE_AFTER) return null;
+  const steps = run.map(asStep);
+  if (steps.some((st) => st === null)) return null;
+  return (
+    `You have sent ${run.length} separate actions to ${app} in a row, and each one costs a whole turn. ` +
+    `They fit in one call: computer_do {"app":${JSON.stringify(app)},"steps":${JSON.stringify(steps)}}. ` +
+    "Batch the moves you already know — setting one object's position, size and colour is one call, not five."
+  );
+}
+
 export function renderActionResult(diff: string, hint?: string | null, nextCall?: string | null): string {
   const body = diff.trim();
   // The bridge's own explanation comes first when it has one: it knows WHY the

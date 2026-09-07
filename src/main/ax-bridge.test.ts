@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-import { AX_TOOL_NAMES, SCREENSHOT_TOOL_NAMES, routesToAx, parseBatchSteps, describeBatch, summarizeBatch, MAX_BATCH_STEPS, AxClient, AxError, appOfStep, axConsent, axNeedsFocus, screenshotToolsOffered, coordinateToolAllowed, withScreenshotGuidance, SCREENSHOT_FRAME_SENTENCE, axReadOptsFrom, axFilterSwitched, AX_DEFAULT_READ_OPTS, shouldRecoverRaise, describeAxAction, indexElementLines, readAxManifest, resolveAxDir, shouldOpenAccessibilitySettings, axNotTrustedText, RAISE_DESCRIPTION, APP_STATE_SPACE_SENTENCE, LAUNCH_FRONT_SENTENCE, withSpaceGuidance, otherSpaceNote, launchOutcome, renderActionResult, ACTION_NO_CHANGE_SENTENCE, TASK_DISCIPLINE_SENTENCE, SCREENSHOT_SPACE_SENTENCE, parseCandidates, describeCandidates, parkedNextCall, parkedReadNote, skillBody, skillPreamble, shouldSendSkill, prependSkill, MAX_SKILL_PREAMBLE, candidateWorked, summarizeCandidates, MAX_CANDIDATES, MAX_CANDIDATE_STEPS, type AxCallInfo } from "./ax-bridge";
+import { AX_TOOL_NAMES, SCREENSHOT_TOOL_NAMES, routesToAx, parseBatchSteps, describeBatch, summarizeBatch, MAX_BATCH_STEPS, AxClient, AxError, appOfStep, axConsent, axNeedsFocus, screenshotToolsOffered, coordinateToolAllowed, withScreenshotGuidance, SCREENSHOT_FRAME_SENTENCE, axReadOptsFrom, axFilterSwitched, AX_DEFAULT_READ_OPTS, shouldRecoverRaise, describeAxAction, indexElementLines, readAxManifest, resolveAxDir, shouldOpenAccessibilitySettings, axNotTrustedText, RAISE_DESCRIPTION, APP_STATE_SPACE_SENTENCE, LAUNCH_FRONT_SENTENCE, withSpaceGuidance, otherSpaceNote, launchOutcome, renderActionResult, ACTION_NO_CHANGE_SENTENCE, TASK_DISCIPLINE_SENTENCE, SCREENSHOT_SPACE_SENTENCE, parseCandidates, describeCandidates, parkedNextCall, parkedReadNote, batchNudge, BATCH_NUDGE_AFTER, type RecentEdit, skillBody, skillPreamble, shouldSendSkill, prependSkill, MAX_SKILL_PREAMBLE, candidateWorked, summarizeCandidates, MAX_CANDIDATES, MAX_CANDIDATE_STEPS, type AxCallInfo } from "./ax-bridge";
 
 const scratch = () => mkdtempSync(join(tmpdir(), "ax-"));
 
@@ -549,7 +549,15 @@ test("every bridge call that rewrites the diff baseline carries the read's optio
   const src = readFileSync(join(__dirname, "index.ts"), "utf8");
   // find and tree are the read's own calls; they carry the freshly built opts
   // object, which IS the recorded view. Everything else must ask for it.
-  const carriedByOpts = new Set(["tree", "find"]);
+  //
+  // `opts` is allowed as the carrier anywhere, because every definition of it
+  // is checked below to BE the recorded view — spelled out here, a batch step
+  // that folds `settle: false` into an axActionOpts spread reads as a call
+  // with no options at all, and the guard fails on a call that is correct.
+  for (const [, def] of src.matchAll(/const opts(?::[^=]+)? = \{([\s\S]*?)\n *\};?/g)) {
+    assert.match(def, /axActionOpts|\.\.\.want/,
+      `this opts object is neither the read's own view (...want) nor the recorded one (axActionOpts), so the calls carrying it snapshot in a view of their own: ${def.trim().slice(0, 80)}`);
+  }
   for (const method of ["act", "setValue", "key", "scroll", "raise", "launch", "tree", "find"]) {
     // Any receiver, not just `ax.` — `ax!.request(...)` slipped through a
     // marker that spelled the variable out, which is how a call site added
@@ -565,10 +573,8 @@ test("every bridge call that rewrites the diff baseline carries the read's optio
     for (const hit of hits) {
       // Anchored on this hit, so each site resolves independently.
       const call = bridgeCallAt(src, (hit.index ?? 0) + hit[0].indexOf("("));
-      const carrier = carriedByOpts.has(method) ? /axActionOpts|\bopts\b/ : /axActionOpts/;
-      assert.match(call.replace(/\s+/g, " "), carrier,
-        `this ${method} call snapshots in a different view than the read did, so the next diff will be a lie` +
-        (carriedByOpts.has(method) ? " (carry ...axActionOpts(appName), or the read's own opts)" : " (carry ...axActionOpts(appName))"));
+      assert.match(call.replace(/\s+/g, " "), /axActionOpts|\bopts\b/,
+        `this ${method} call snapshots in a different view than the read did, so the next diff will be a lie (carry ...axActionOpts(appName), or an opts object built from it)`);
     }
   }
 });
@@ -1145,4 +1151,66 @@ test("the pointer handler refuses a missing path or anchor before it reaches the
   assert.ok(body.includes("id is required"));
   assert.ok(body.includes("Landed at"), "the reply reports where the fractions landed");
   assert.ok(body.includes('"pointer"'), "and it goes to the bridge's pointer verb");
+});
+
+// A Figma icon built from native shapes: 91 key presses and 63 value sets,
+// nearly all one per turn, at 15 seconds a turn. computer_do existed and was
+// barely used, so the app notices the run and hands back the literal call.
+
+test("a run of single edits on one app becomes the batch call that would have done them", () => {
+  const recent: RecentEdit[] = [
+    { tool: "computer_set_value", app: "Figma", id: 10, text: "500" },
+    { tool: "computer_set_value", app: "Figma", id: 11, text: "65" },
+    { tool: "computer_set_value", app: "Figma", id: 12, text: "280" },
+  ];
+  const out = batchNudge(recent);
+  assert.ok(out, "three in a row is worth saying");
+  assert.ok(out.includes("3 separate actions to Figma"), out);
+  assert.ok(out.includes('computer_do {"app":"Figma","steps":[{"do":"set_value","id":10,"text":"500"}'), out);
+  assert.ok(out.includes("not five"), out);
+});
+
+test("it stays quiet below the threshold, and starts the count again on a different app", () => {
+  assert.equal(batchNudge([]), null);
+  const two: RecentEdit[] = [
+    { tool: "computer_press", app: "Figma", id: 1 },
+    { tool: "computer_press", app: "Figma", id: 2 },
+  ];
+  assert.equal(batchNudge(two), null, `fewer than ${BATCH_NUDGE_AFTER} is not a pattern`);
+  const switched: RecentEdit[] = [
+    { tool: "computer_press", app: "Maps", id: 1 },
+    { tool: "computer_press", app: "Maps", id: 2 },
+    { tool: "computer_press", app: "Figma", id: 3 },
+  ];
+  assert.equal(batchNudge(switched), null, "only the trailing run on one app counts");
+});
+
+test("every batchable verb is rendered as its step, and an unbatchable one cancels the nudge", () => {
+  const mixed: RecentEdit[] = [
+    { tool: "computer_press", app: "Figma", id: 5 },
+    { tool: "computer_act", app: "Figma", id: 6, action: "show menu" },
+    { tool: "computer_press_key", app: "Figma", key: "return" },
+  ];
+  const out = batchNudge(mixed);
+  assert.ok(out, String(out));
+  assert.ok(out.includes('{"do":"press","id":5}') && out.includes('{"do":"act","id":6,"action":"show menu"}') && out.includes('{"do":"key","key":"return"}'), out);
+  const withRaise: RecentEdit[] = [...mixed, { tool: "computer_raise", app: "Figma" }];
+  assert.equal(batchNudge(withRaise), null, "raise is not batchable, so there is no single call to suggest");
+});
+
+test("the nudge is said once per conversation and a batch resets the count", () => {
+  const src = readFileSync(join(__dirname, "index.ts"), "utf8");
+  assert.ok(src.includes("axBatchNudged.has(root) ? null : batchNudge(axRecentEdits)"), "once per conversation");
+  assert.ok(src.includes("axRecentEdits = []; // the caller batched"), "batching clears the run");
+  assert.ok(src.includes("axRecentEdits.push({"), "single actions are recorded");
+});
+
+test("a batch skips the settle wait on every step but the last", () => {
+  const src = readFileSync(join(__dirname, "index.ts"), "utf8");
+  assert.ok(src.includes("runBatchStep(appName: string, st: BatchStep, settle = true)"));
+  assert.ok(src.includes("settle: false"), "the flag reaches the bridge");
+  assert.ok(src.includes("runBatchStep(appName, st, i === steps.length - 1)"), "only the last step settles");
+  // Candidates are judged BY their diffs, so they must keep the wait.
+  const runner = src.slice(src.indexOf("async function runCandidates"), src.indexOf("async function handleAxCall"));
+  assert.ok(runner.includes("runBatchStep(appName, st)") && !runner.includes("settle: false"), "candidate routes still settle");
 });

@@ -23,6 +23,14 @@ result returns the card it opened; pressing a tab returns that tab's contents.
 one call. Use it as soon as the next few moves are certain: fill a field, send
 Return, read. Each avoided round trip is seconds off the task.
 
+A turn costs about fifteen seconds whatever it carries, so the unit of work is
+the turn, not the action. Setting one shape's x, y, width, height and colour is
+ONE call with five steps, not five calls. Measured on a Figma icon: 372 actions
+arrived nearly one per turn and the run took 23 minutes, where the same actions
+batched by shape would have been about 40 turns. Every step in a batch also
+skips the wait for the app to react — only the last one waits — so a batch of
+five is faster than five singles by more than the round trips alone.
+
 **Read again only when the ids you need are not in front of you**, or when an
 action reports that nothing changed and you expected something.
 
@@ -172,6 +180,27 @@ ask for the pen, use the pen.
 Design tools expose exact position, size, stroke weight and colour as fields in
 the tree — set those by id afterwards, which is faster and more accurate than
 trying to click precisely.
+
+## Keep your measurements in a file
+
+Long visual work accumulates facts worth more than one turn: the colours you
+sampled, the coordinates of each shape, which ids belong to which layer, what
+you have finished. A long conversation gets compacted, and then those facts are
+gone while the task is not — measured, a run re-derived the same palette three
+times because each summary kept the plan and dropped the numbers.
+
+So write them down as you get them. A small file in the working directory,
+whatever shape suits the job:
+
+    # unbiased logo, Figma frame "Unbiased"
+    palette: outer #1B4B8F, inner #E8F0FA, mark #F5A623
+    circle: 500x500 at 320,180  DONE
+    arc: 180x180 at 480,340     stroke 12  DONE
+    text: not started
+
+Re-read it after any compaction, and before you decide you are finished. This
+is also how you answer "is it done?" honestly: the file says what you actually
+completed, and the tree says whether it is still there.
 
 ## Pictures
 

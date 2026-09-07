@@ -41,6 +41,9 @@ import {
   parseCandidates,
   parkedNextCall,
   parkedReadNote,
+  batchNudge,
+  BATCH_NUDGE_AFTER,
+  type RecentEdit,
   shouldSendSkill,
   skillPreamble,
   prependSkill,
@@ -2324,23 +2327,31 @@ function axText(text: string, success: boolean): DynamicToolResponse {
 
 /** One batch step, as a bridge call. Shared by both batch shapes so a verb can
  *  never mean two things depending on which one ran it. */
-async function runBatchStep(appName: string, st: BatchStep): Promise<AxResult> {
+/** One batch step, as a bridge call. Shared by both batch shapes so a verb can
+ *  never mean two things depending on which one ran it.
+ *
+ *  `settle` false on every step but the last: a batch reports its NET effect
+ *  at the end, so waiting for each step's reaction buys a diff nobody reads.
+ *  Measured on a Figma icon built out of inspector fields — 372 actions and
+ *  253 seconds of settle waiting, a fifth of the run. */
+async function runBatchStep(appName: string, st: BatchStep, settle = true): Promise<AxResult> {
+  const opts = { ...axActionOpts(appName), ...(settle ? {} : { settle: false }) };
   switch (st.do) {
     case "read":
-      return await ax!.request("tree", { app: appName, ...axActionOpts(appName) });
+      return await ax!.request("tree", { app: appName, ...opts });
     case "press":
-      return await ax!.request("act", { app: appName, id: st.id, action: "press", ...axActionOpts(appName) });
+      return await ax!.request("act", { app: appName, id: st.id, action: "press", ...opts });
     case "act":
-      return await ax!.request("act", { app: appName, id: st.id, action: st.action, ...axActionOpts(appName) });
+      return await ax!.request("act", { app: appName, id: st.id, action: st.action, ...opts });
     case "set_value":
-      return await ax!.request("setValue", { app: appName, id: st.id, value: st.text, ...axActionOpts(appName) });
+      return await ax!.request("setValue", { app: appName, id: st.id, value: st.text, ...opts });
     case "key":
-      return await ax!.request("key", { app: appName, key: st.key, ...(st.id !== undefined ? { id: st.id } : {}), ...axActionOpts(appName) });
+      return await ax!.request("key", { app: appName, key: st.key, ...(st.id !== undefined ? { id: st.id } : {}), ...opts });
     case "scroll": {
       const amount = typeof st.amount === "number" && st.amount > 0 ? Math.min(st.amount, 40) : 5;
       const d = SCROLL_DELTAS[st.direction];
       if (!d) throw new Error(`unknown direction "${st.direction}"`);
-      return await ax!.request("scroll", { app: appName, id: st.id, dx: d.dx * amount, dy: d.dy * amount, ...axActionOpts(appName) });
+      return await ax!.request("scroll", { app: appName, id: st.id, dx: d.dx * amount, dy: d.dy * amount, ...opts });
     }
   }
 }
@@ -2541,6 +2552,7 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         const parsed = parseBatchSteps(a.steps);
         if ("error" in parsed) return axText(parsed.error, false);
         const steps = parsed.steps;
+        axRecentEdits = []; // the caller batched; nothing to nudge about
         axLog(`do ${appName} ${steps.length} step(s): ${steps.map((x) => x.do).join(",")}`);
         const ran: string[] = [];
         let failed: { step: string; message: string } | null = null;
@@ -2550,7 +2562,7 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         for (const [i, st] of steps.entries()) {
           const label = `step ${i + 1} (${st.do})`;
           try {
-            await runBatchStep(appName, st);
+            await runBatchStep(appName, st, i === steps.length - 1);
             ran.push(label);
             if (st.waitMs > 0) await new Promise((r) => setTimeout(r, st.waitMs));
           } catch (err) {
@@ -2663,12 +2675,29 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         }
         const diff = String(r.diff ?? "");
         remember(diff);
+        axRecentEdits.push({
+          tool,
+          app: appName,
+          ...(typeof a.id === "number" ? { id: a.id } : {}),
+          ...(typeof a.text === "string" ? { text: a.text } : {}),
+          ...(typeof a.key === "string" ? { key: a.key } : {}),
+          ...(typeof a.action === "string" ? { action: a.action } : {}),
+        });
+        if (axRecentEdits.length > BATCH_NUDGE_AFTER * 2) axRecentEdits = axRecentEdits.slice(-BATCH_NUDGE_AFTER * 2);
+        const nudge = axBatchNudged.has(root) ? null : batchNudge(axRecentEdits);
+        if (nudge) {
+          axBatchNudged.add(root);
+          axLog(`nudged ${appName} toward computer_do after ${axRecentEdits.length} single actions`);
+        }
         const hint = typeof r.hint === "string" ? r.hint : null;
         // Only for the verbs that go through hit-testing. Telling a caller that
         // just sent a key to send a key is noise, and it is the click that
         // dies on a parked window.
         const clicked = tool === "computer_press" || tool === "computer_act" || tool === "computer_set_value";
-        return axText(renderActionResult(diff, hint, hint && clicked ? parkedNextCall(appName) : null), true);
+        return axText(
+          [renderActionResult(diff, hint, hint && clicked ? parkedNextCall(appName) : null), nudge].filter(Boolean).join("\n"),
+          true,
+        );
       }
       default:
         return axText(`Unknown tool ${tool}`, false);
@@ -4075,6 +4104,12 @@ function computerUseSkillText(): string | null {
 
 /** Conversations that have already been handed the skill. */
 const axSkillSent = new Set<string>();
+
+/** The trailing run of single-action desktop calls, and the conversations that
+ *  have already been shown the batch nudge. See batchNudge: said once, because
+ *  a reminder on every action would be noise. */
+let axRecentEdits: RecentEdit[] = [];
+const axBatchNudged = new Set<string>();
 
 function globalSkillsDir(): string {
   return join(app.getPath("home"), ".unbiased", "skills");
