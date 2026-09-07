@@ -41,6 +41,9 @@ import {
   parseCandidates,
   parkedNextCall,
   parkedReadNote,
+  shouldSendSkill,
+  skillPreamble,
+  prependSkill,
   MAX_CANDIDATES,
   candidateWorked,
   summarizeCandidates,
@@ -3980,6 +3983,26 @@ function bundledSkillsDir(): string {
     ? join(process.resourcesPath, "skills")
     : join(app.getAppPath(), "resources", "skills");
 }
+/** The computer-use skill's text, read once from the bundled directory the
+ *  engine is also given. Cached: a conversation asks for it at most once, but
+ *  a long session has many conversations. */
+let computerUseSkillCache: string | null | undefined;
+function computerUseSkillText(): string | null {
+  if (computerUseSkillCache !== undefined) return computerUseSkillCache;
+  try {
+    computerUseSkillCache = readFileSync(join(bundledSkillsDir(), "computer-use", "SKILL.md"), "utf8");
+  } catch (err) {
+    // Not fatal: the tools still carry their own descriptions, and the skill
+    // is still listed for the model to open itself.
+    console.warn("[skills] computer-use skill unreadable, first-call preamble disabled:", String(err));
+    computerUseSkillCache = null;
+  }
+  return computerUseSkillCache;
+}
+
+/** Conversations that have already been handed the skill. */
+const axSkillSent = new Set<string>();
+
 function globalSkillsDir(): string {
   return join(app.getPath("home"), ".unbiased", "skills");
 }
@@ -5672,11 +5695,25 @@ function wireNotifications(): void {
             : tool.startsWith("computer_")
               ? handleComputerUseCall(tool, args, approvalThread)
               : handleAgentBrowserCall(tool, args, approvalThread);
+        // The first desktop call of a conversation carries the computer-use
+        // skill. See skillPreamble: the model does open it on its own, but
+        // reactively, mid-task, after it has already stalled.
+        const skillRoot = rootThreadOf(approvalThread);
+        const sendSkill = shouldSendSkill(tool, axSkillSent.has(skillRoot));
         void call
           .catch((err) => ({
             contentItems: [{ type: "inputText" as const, text: `tool crashed: ${String(err)}` }],
             success: false,
           }))
+          .then((response) => {
+            if (!sendSkill) return response;
+            const text = computerUseSkillText();
+            const preamble = text ? skillPreamble(text) : null;
+            if (!preamble) return response;
+            axSkillSent.add(skillRoot);
+            axLog(`sent the computer-use skill with the first desktop call (${tool})`);
+            return prependSkill(response, preamble);
+          })
           .then((response) => engine.respond(msg.id, response));
         return;
       }

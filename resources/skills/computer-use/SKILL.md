@@ -5,6 +5,9 @@ description: How to drive the user's own macOS apps with the computer_ tools —
 
 # Driving the user's apps
 
+You are handed this with your first desktop call of a conversation, so read it
+before you act rather than after something fails.
+
 These tools operate the apps already open on the user's Mac, as text. An app is
 a tree of elements, each with an id, and you act on ids. The screen stays where
 the user left it: reading and acting work on a background app, on any Space,

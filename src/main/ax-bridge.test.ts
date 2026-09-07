@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-import { AX_TOOL_NAMES, SCREENSHOT_TOOL_NAMES, routesToAx, parseBatchSteps, describeBatch, summarizeBatch, MAX_BATCH_STEPS, AxClient, AxError, appOfStep, axConsent, axNeedsFocus, screenshotToolsOffered, coordinateToolAllowed, withScreenshotGuidance, SCREENSHOT_FRAME_SENTENCE, axReadOptsFrom, axFilterSwitched, AX_DEFAULT_READ_OPTS, shouldRecoverRaise, describeAxAction, indexElementLines, readAxManifest, resolveAxDir, shouldOpenAccessibilitySettings, axNotTrustedText, RAISE_DESCRIPTION, APP_STATE_SPACE_SENTENCE, LAUNCH_FRONT_SENTENCE, withSpaceGuidance, otherSpaceNote, launchOutcome, renderActionResult, ACTION_NO_CHANGE_SENTENCE, TASK_DISCIPLINE_SENTENCE, SCREENSHOT_SPACE_SENTENCE, parseCandidates, describeCandidates, parkedNextCall, parkedReadNote, candidateWorked, summarizeCandidates, MAX_CANDIDATES, MAX_CANDIDATE_STEPS, type AxCallInfo } from "./ax-bridge";
+import { AX_TOOL_NAMES, SCREENSHOT_TOOL_NAMES, routesToAx, parseBatchSteps, describeBatch, summarizeBatch, MAX_BATCH_STEPS, AxClient, AxError, appOfStep, axConsent, axNeedsFocus, screenshotToolsOffered, coordinateToolAllowed, withScreenshotGuidance, SCREENSHOT_FRAME_SENTENCE, axReadOptsFrom, axFilterSwitched, AX_DEFAULT_READ_OPTS, shouldRecoverRaise, describeAxAction, indexElementLines, readAxManifest, resolveAxDir, shouldOpenAccessibilitySettings, axNotTrustedText, RAISE_DESCRIPTION, APP_STATE_SPACE_SENTENCE, LAUNCH_FRONT_SENTENCE, withSpaceGuidance, otherSpaceNote, launchOutcome, renderActionResult, ACTION_NO_CHANGE_SENTENCE, TASK_DISCIPLINE_SENTENCE, SCREENSHOT_SPACE_SENTENCE, parseCandidates, describeCandidates, parkedNextCall, parkedReadNote, skillBody, skillPreamble, shouldSendSkill, prependSkill, MAX_SKILL_PREAMBLE, candidateWorked, summarizeCandidates, MAX_CANDIDATES, MAX_CANDIDATE_STEPS, type AxCallInfo } from "./ax-bridge";
 
 const scratch = () => mkdtempSync(join(tmpdir(), "ax-"));
 
@@ -1043,4 +1043,68 @@ test("the read result carries the note, next to the Space guidance", () => {
   const head = src.slice(src.indexOf("const head = ["), src.indexOf("].filter(Boolean).join"));
   assert.ok(head.includes("parkedReadNote(w.windows)"), `the read head must carry it: ${head}`);
   assert.ok(head.includes("otherSpaceNote"), "and still carry the Space note");
+});
+
+// The model does open the skill on its own — twice in the measured runs — but
+// both times mid-task, after it had already stalled, once costing 16 seconds.
+// So the first desktop call of a conversation hands it over.
+
+test("the frontmatter is stripped, because it addresses the loader and not the reader", () => {
+  const body = skillBody("---\nname: computer-use\ndescription: x\n---\n\n# Driving apps\n\nBody here.\n");
+  assert.equal(body, "# Driving apps\n\nBody here.");
+  assert.ok(!body.includes("description:"));
+});
+
+test("a file with no frontmatter is passed through, and an empty one sends nothing", () => {
+  assert.equal(skillBody("# Just a heading"), "# Just a heading");
+  assert.equal(skillPreamble("   \n  "), null);
+  assert.equal(skillPreamble("---\nname: x\n---\n"), null, "frontmatter alone is not content");
+});
+
+test("the preamble is framed so it cannot be read as tool output, and the result stays last", () => {
+  const preamble = skillPreamble("---\nname: computer-use\n---\n# Guide\nDo this.");
+  assert.ok(preamble && preamble.startsWith("=== How to drive desktop apps"), String(preamble));
+  assert.ok(preamble.includes("sent once per conversation"), preamble);
+  assert.ok(preamble.trimEnd().endsWith("=== end ==="), preamble);
+  const out = prependSkill({ contentItems: [{ type: "inputText", text: "the tree" }], success: true }, preamble);
+  assert.equal(out.contentItems.length, 2);
+  assert.equal((out.contentItems[0] as { text: string }).text, preamble);
+  assert.equal((out.contentItems[1] as { text: string }).text, "the tree", "the tool result is still the last thing read");
+  assert.equal(out.success, true);
+});
+
+test("a runaway skill file cannot flood a turn", () => {
+  const body = skillBody("x".repeat(MAX_SKILL_PREAMBLE + 5_000));
+  assert.ok(body.length <= MAX_SKILL_PREAMBLE + 20, String(body.length));
+  assert.ok(body.endsWith("(truncated)"));
+});
+
+test("it goes with a desktop tool, once, and never with anything else", () => {
+  assert.equal(shouldSendSkill("computer_app_state", false), true);
+  assert.equal(shouldSendSkill("computer_apps", false), true, "listing apps is often the first call");
+  assert.equal(shouldSendSkill("computer_screenshot", false), true, "the screenshot family counts too");
+  assert.equal(shouldSendSkill("computer_app_state", true), false, "once per conversation");
+  assert.equal(shouldSendSkill("schedule_create", false), false);
+  assert.equal(shouldSendSkill("memory_write", false), false);
+  assert.equal(shouldSendSkill("browser_navigate", false), false);
+});
+
+test("the real bundled skill survives the round trip", () => {
+  const md = readFileSync(join(__dirname, "..", "..", "resources", "skills", "computer-use", "SKILL.md"), "utf8");
+  const preamble = skillPreamble(md);
+  assert.ok(preamble, "the shipped skill must produce a preamble");
+  assert.ok(!preamble.includes("description: How to drive"), "frontmatter gone");
+  for (const needle of ["Stage Manager", "PARKED", "computer_app_screenshot", "menu bar"]) {
+    assert.ok(preamble.includes(needle) || preamble.toLowerCase().includes(needle.toLowerCase()), `lost ${needle}`);
+  }
+  assert.ok(preamble.length < MAX_SKILL_PREAMBLE, `the shipped skill is ${preamble.length} bytes and must not be truncated`);
+});
+
+test("the dispatch site sends it once, before the tool result", () => {
+  const src = readFileSync(join(__dirname, "index.ts"), "utf8");
+  assert.ok(src.includes("shouldSendSkill(tool, axSkillSent.has(skillRoot))"), "decided per conversation");
+  assert.ok(src.includes("axSkillSent.add(skillRoot)"), "and only once");
+  assert.ok(src.includes("prependSkill(response, preamble)"));
+  // An unreadable file must not break a turn.
+  assert.ok(src.includes("first-call preamble disabled"), "a missing skill file degrades quietly");
 });

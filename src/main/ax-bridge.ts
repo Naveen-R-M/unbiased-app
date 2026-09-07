@@ -484,6 +484,45 @@ export function parkedNextCall(app: string): string {
   );
 }
 
+/** The computer-use skill, delivered with the first desktop call of a
+ *  conversation instead of hoping the model opens it.
+ *
+ *  It does open it — twice in the runs measured on 2026-09-06 — but both times
+ *  by shelling out to `cat` in the middle of a task, after it had already
+ *  stalled, once costing sixteen seconds. Nothing makes a listed skill the
+ *  first thing read, so the constraint arrived after the first failure rather
+ *  than before the first action. Handing it over on the first call costs its
+ *  length once per conversation and removes that whole detour.
+ *
+ *  The file is the single source of truth; this only strips the frontmatter,
+ *  which is addressed to the skill loader rather than to the reader, and
+ *  frames the rest so it cannot be mistaken for tool output. */
+export const MAX_SKILL_PREAMBLE = 16_000;
+
+export function skillBody(markdown: string): string {
+  const withoutFrontmatter = markdown.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, "");
+  const trimmed = withoutFrontmatter.trim();
+  return trimmed.length > MAX_SKILL_PREAMBLE ? `${trimmed.slice(0, MAX_SKILL_PREAMBLE)}\n…(truncated)` : trimmed;
+}
+
+export function skillPreamble(markdown: string): string | null {
+  const body = skillBody(markdown);
+  if (!body) return null;
+  return `=== How to drive desktop apps (read this before acting; sent once per conversation) ===\n${body}\n=== end ===`;
+}
+
+/** Whether this call should carry it: a desktop tool, and not sent yet. */
+export function shouldSendSkill(tool: string, alreadySent: boolean): boolean {
+  if (alreadySent) return false;
+  return routesToAx(tool) || tool.startsWith("computer_");
+}
+
+/** Put it in front of whatever the tool returned, as its own block, so the
+ *  result itself is still the last thing read. */
+export function prependSkill<T extends { contentItems: { type: string }[] }>(response: T, preamble: string): T {
+  return { ...response, contentItems: [{ type: "inputText" as const, text: preamble }, ...response.contentItems] };
+}
+
 /** One line at the top of a read when the app's window is parked.
  *
  *  Until now this was discovered by pressing something and watching it fail.
