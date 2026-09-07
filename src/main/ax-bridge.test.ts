@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-import { AX_TOOL_NAMES, SCREENSHOT_TOOL_NAMES, routesToAx, parseBatchSteps, describeBatch, summarizeBatch, MAX_BATCH_STEPS, AxClient, AxError, appOfStep, axConsent, axNeedsFocus, screenshotToolsOffered, coordinateToolAllowed, withScreenshotGuidance, SCREENSHOT_FRAME_SENTENCE, axReadOptsFrom, axFilterSwitched, AX_DEFAULT_READ_OPTS, shouldRecoverRaise, describeAxAction, indexElementLines, readAxManifest, resolveAxDir, shouldOpenAccessibilitySettings, axNotTrustedText, RAISE_DESCRIPTION, APP_STATE_SPACE_SENTENCE, LAUNCH_FRONT_SENTENCE, withSpaceGuidance, otherSpaceNote, launchOutcome, renderActionResult, ACTION_NO_CHANGE_SENTENCE, TASK_DISCIPLINE_SENTENCE, SCREENSHOT_SPACE_SENTENCE, parseCandidates, describeCandidates, parkedNextCall, parkedReadNote, batchNudge, BATCH_NUDGE_AFTER, type RecentEdit, skillBody, skillPreamble, shouldSendSkill, prependSkill, MAX_SKILL_PREAMBLE, candidateWorked, summarizeCandidates, MAX_CANDIDATES, MAX_CANDIDATE_STEPS, type AxCallInfo } from "./ax-bridge";
+import { AX_TOOL_NAMES, SCREENSHOT_TOOL_NAMES, routesToAx, parseBatchSteps, describeBatch, summarizeBatch, MAX_BATCH_STEPS, AxClient, AxError, appOfStep, axConsent, axNeedsFocus, screenshotToolsOffered, coordinateToolAllowed, withScreenshotGuidance, SCREENSHOT_FRAME_SENTENCE, axReadOptsFrom, axFilterSwitched, AX_DEFAULT_READ_OPTS, shouldRecoverRaise, describeAxAction, indexElementLines, readAxManifest, resolveAxDir, shouldOpenAccessibilitySettings, axNotTrustedText, RAISE_DESCRIPTION, APP_STATE_SPACE_SENTENCE, LAUNCH_FRONT_SENTENCE, withSpaceGuidance, otherSpaceNote, launchOutcome, renderActionResult, ACTION_NO_CHANGE_SENTENCE, TASK_DISCIPLINE_SENTENCE, SCREENSHOT_SPACE_SENTENCE, parseCandidates, describeCandidates, parkedNextCall, parkedReadNote, batchNudge, traceStep, BATCH_NUDGE_AFTER, type RecentEdit, skillBody, skillPreamble, shouldSendSkill, prependSkill, MAX_SKILL_PREAMBLE, candidateWorked, summarizeCandidates, MAX_CANDIDATES, MAX_CANDIDATE_STEPS, type AxCallInfo } from "./ax-bridge";
 
 const scratch = () => mkdtempSync(join(tmpdir(), "ax-"));
 
@@ -1213,4 +1213,66 @@ test("a batch skips the settle wait on every step but the last", () => {
   // Candidates are judged BY their diffs, so they must keep the wait.
   const runner = src.slice(src.indexOf("async function runCandidates"), src.indexOf("async function handleAxCall"));
   assert.ok(runner.includes("runBatchStep(appName, st)") && !runner.includes("settle: false"), "candidate routes still settle");
+});
+
+// Codex's densest turn on the same Figma icon ran 17 primitive actions: four
+// inspector fields, each click + select-all + type + Return, then a colour
+// click. A ten-step cap split that across turns at ~15s each.
+
+test("a batch takes 30 steps, and says what to do with more", () => {
+  const step = { do: "press", id: 1 };
+  const at30 = parseBatchSteps(Array.from({ length: 30 }, () => step));
+  assert.ok(!("error" in at30), "30 fits a shape's whole geometry");
+  const at31 = parseBatchSteps(Array.from({ length: 31 }, () => step));
+  assert.ok("error" in at31 && at31.error.includes("max 30"), JSON.stringify(at31));
+});
+
+test("a batch key step carries a tool shortcut and its modifiers", () => {
+  // Both were unreachable in a batch before: the schema enum listed nine named
+  // keys, so "p" (Figma's pen) was invalid, and modifiers were dropped without
+  // a word — which made the select-all remedy for an appending field
+  // inexpressible as a batch at all.
+  const r = parseBatchSteps([
+    { do: "key", key: "p" },
+    { do: "key", key: "a", modifiers: ["command"], id: 88 },
+  ]);
+  assert.ok(!("error" in r), JSON.stringify(r));
+  assert.deepEqual(r.steps[0], { do: "key", key: "p", waitMs: 0 });
+  assert.deepEqual(r.steps[1], { do: "key", key: "a", id: 88, modifiers: ["command"], waitMs: 0 });
+});
+
+test("an unknown modifier is refused by name rather than dropped", () => {
+  const r = parseBatchSteps([{ do: "key", key: "a", modifiers: ["cmd"] }]);
+  assert.ok("error" in r && r.error.includes("cmd") && r.error.includes("command"), JSON.stringify(r));
+});
+
+test("the trace names the field and value, not just the verb", () => {
+  assert.equal(traceStep({ do: "set_value", id: 109, text: "180", waitMs: 0 }), 'set_value #109 = "180"');
+  assert.equal(traceStep({ do: "key", key: "a", modifiers: ["command"], id: 88, waitMs: 0 }), "key command+a in #88");
+  assert.equal(traceStep({ do: "act", id: 6, action: "show menu", waitMs: 0 }), 'act #6 "show menu"');
+  assert.equal(traceStep({ do: "press", id: 22, waitMs: 0 }), "press #22");
+  assert.equal(traceStep({ do: "read", waitMs: 0 }), "read");
+});
+
+test("a multi-step batch does not claim more than it watched", () => {
+  const ran = ["step 1 (set_value #88 = \"550\")", "step 2 (press #12)"];
+  const many = summarizeBatch({ ran, failed: null, remaining: 0, diff: "~ 12 button", unwatched: true });
+  assert.ok(many.includes("Every value written was read back"), many);
+  assert.ok(many.includes("presses were not watched individually"), many);
+  // A single step DID settle and its diff is its own, so the caveat would be
+  // false there.
+  const one = summarizeBatch({ ran: [ran[0]], failed: null, remaining: 0, diff: "~ 88", unwatched: true });
+  assert.ok(!one.includes("not watched"), one);
+});
+
+test("a stopped batch still reports which steps ran and which did not", () => {
+  const out = summarizeBatch({
+    ran: ["step 1 (set_value #88 = \"550\")"],
+    failed: { step: "step 2 (set_value #109 = \"180\")", message: 'setValue did not land: asked for "180", the field now reads "120180"' },
+    remaining: 3,
+    diff: "~ 88 stepper",
+  });
+  assert.ok(out.includes("Stopped at step 2 (set_value #109"), out);
+  assert.ok(out.includes("120180"), out);
+  assert.ok(out.includes("The remaining 3 step(s) did NOT run."), out);
 });

@@ -171,7 +171,7 @@ export function appOfStep(tool: string, args: Record<string, unknown>): string |
 export type BatchStep =
   | { do: "press"; id: number; waitMs: number }
   | { do: "set_value"; id: number; text: string; waitMs: number }
-  | { do: "key"; key: string; id?: number; waitMs: number }
+  | { do: "key"; key: string; id?: number; modifiers?: string[]; waitMs: number }
   | { do: "scroll"; id: number; direction: string; amount?: number; waitMs: number }
   | { do: "act"; id: number; action: string; waitMs: number }
   | { do: "read"; waitMs: number };
@@ -179,8 +179,15 @@ export type BatchStep =
 /** Deliberately NOT batchable: launch and raise both take over the user's
  *  screen, and each deserves its own approval rather than riding along inside
  *  a list of presses. */
+export const KEY_MODIFIERS = ["command", "shift", "option", "control"];
 export const BATCH_VERBS = ["press", "set_value", "key", "scroll", "act", "read"] as const;
-export const MAX_BATCH_STEPS = 10;
+/** Measured against Codex on the same Figma icon: its densest single turn ran
+ *  17 primitive actions (four fields, each a click + select-all + type +
+ *  Return, then a colour click). A cap of 10 split work like that across turns
+ *  at ~15s each, which was the whole cost being optimised away. 30 fits any
+ *  one shape's geometry and colour with room to spare, and every step is still
+ *  an approved bridge primitive with its own refusals. */
+export const MAX_BATCH_STEPS = 30;
 /** Per-step pause, for content that arrives after the action — Maps shows
  *  "Loading…" for a second or two on the Transit tab. Capped so a batch cannot
  *  be used to park the desktop tools for a minute. */
@@ -210,7 +217,14 @@ export function parseBatchSteps(raw: unknown): { steps: BatchStep[] } | { error:
         break;
       case "key": {
         if (typeof e.key !== "string" || !e.key) return { error: `${at}: key is required.` };
-        steps.push({ do: "key", key: e.key, ...(id !== null ? { id } : {}), waitMs });
+        // Modifiers belong in a batch as much as anywhere: clearing a field
+        // before typing is command+a, and without this the batch dropped them
+        // silently — so the one remedy for a field that appends instead of
+        // replacing could not be expressed as a batch at all.
+        const mods = Array.isArray(e.modifiers) ? e.modifiers.filter((m): m is string => typeof m === "string") : [];
+        const bad = mods.filter((m) => !KEY_MODIFIERS.includes(m));
+        if (bad.length) return { error: `${at}: unknown modifier(s) ${bad.join(", ")}. Use ${KEY_MODIFIERS.join(", ")}.` };
+        steps.push({ do: "key", key: e.key, ...(id !== null ? { id } : {}), ...(mods.length ? { modifiers: mods } : {}), waitMs });
         break;
       }
       case "press": {
@@ -347,11 +361,31 @@ export function describeBatch(app: string, steps: BatchStep[], lines?: Map<numbe
 /** What the model is told afterwards. A batch that stops halfway is the case
  *  that matters: it must be unmistakable which steps ran, which one failed and
  *  why, and that the rest did NOT run. */
+/** What one step did, for the trace: the verb plus the thing it acted on. A
+ *  failure at "step 3" is unreadable when the other 29 steps are also just
+ *  numbers; "step 3 (set_value #109 = 180)" says which field to look at. */
+export function traceStep(st: BatchStep): string {
+  switch (st.do) {
+    case "read": return "read";
+    case "key": return `key ${st.modifiers?.length ? st.modifiers.join("+") + "+" : ""}${st.key}${st.id !== undefined ? ` in #${st.id}` : ""}`;
+    case "press": return `press #${st.id}`;
+    case "act": return `act #${st.id} "${st.action}"`;
+    case "set_value": return `set_value #${st.id} = ${JSON.stringify(st.text)}`;
+    case "scroll": return `scroll #${st.id} ${st.direction ?? ""}`.trim();
+    default: return (st as { do: string }).do;
+  }
+}
+
 export function summarizeBatch(opts: {
   ran: string[];
   failed: { step: string; message: string } | null;
   remaining: number;
   diff: string;
+  /** True when mid-sequence steps skipped their settle wait, so the only
+   *  evidence about them is the closing diff. Said out loud rather than
+   *  implied: a press that quietly did nothing at step 4 is invisible here,
+   *  and a summary that reads "Done" for all 30 would be overclaiming. */
+  unwatched?: boolean;
 }): string {
   const head = opts.failed
     ? [
@@ -360,7 +394,12 @@ export function summarizeBatch(opts: {
         opts.remaining > 0 ? `The remaining ${opts.remaining} step(s) did NOT run.` : "",
         "Read the app again before retrying — the ids may have moved.",
       ].filter(Boolean).join(" ")
-    : `Done: ${opts.ran.join("; ")}.`;
+    : [
+        `Done: ${opts.ran.join("; ")}.`,
+        opts.unwatched && opts.ran.length > 1
+          ? "Every value written was read back; the presses were not watched individually, so check the diff below for what they did."
+          : "",
+      ].filter(Boolean).join(" ");
   if (opts.diff.trim() === "(no changes)") return `${head}\n${ACTION_NO_CHANGE_SENTENCE}`;
   return opts.diff ? `${head}\n${opts.diff}` : `${head}\n(nothing in the tree changed)`;
 }

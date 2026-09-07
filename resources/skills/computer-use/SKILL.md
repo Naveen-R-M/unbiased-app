@@ -23,6 +23,11 @@ result returns the card it opened; pressing a tab returns that tab's contents.
 one call. Use it as soon as the next few moves are certain: fill a field, send
 Return, read. Each avoided round trip is seconds off the task.
 
+`computer_do` takes up to **30 steps**, and a step can be anything the single
+tools do: a tool shortcut (`{"do":"key","key":"p"}`), a modified key
+(`{"do":"key","key":"a","modifiers":["command"]}` to clear a field before
+typing), a value, a press, a read.
+
 A turn costs about fifteen seconds whatever it carries, so the unit of work is
 the turn, not the action. Setting one shape's x, y, width, height and colour is
 ONE call with five steps, not five calls. Measured on a Figma icon: 372 actions
@@ -175,6 +180,14 @@ app, say to the user that drawing needs the screen, and do it.
 drawing, and substituting one for the other is answering a different request.
 Both are fine when the user asks for the artwork rather than the act; when they
 ask for the pen, use the pen.
+
+**Every value you write is read back.** If a field kept its old text and
+appended yours to it — `120` given `180` becomes `120180`, which really happens
+in Figma — the batch stops there and tells you, instead of letting the next
+twenty steps build on a wrong number. Clear the field first when that happens:
+`command+a`, `delete`, then the value, all in the same call. Presses cannot be
+checked this way, so read the diff a batch returns rather than assuming all
+thirty steps did something.
 
 **Then fix the numbers in the app.** Clicking gives you an approximate path.
 Design tools expose exact position, size, stroke weight and colour as fields in

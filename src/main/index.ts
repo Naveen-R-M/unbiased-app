@@ -76,6 +76,7 @@ import {
   routesToAx,
   parseBatchSteps,
   summarizeBatch,
+  traceStep,
   MAX_BATCH_STEPS,
   APP_STATE_SPACE_SENTENCE,
   RAISE_DESCRIPTION,
@@ -1406,7 +1407,7 @@ const AX_TOOLS = [
     description:
       "Run several steps on ONE app in a single call, in order, and get back what changed. Use this whenever you already know the next few moves — filling a field and committing it, pressing a tab and reading the result, scrolling and reading. It saves a whole round trip per step, which is the main cost of operating an app. " +
       "Each step is {do, ...}: do=\"press\" with id; do=\"set_value\" with id and text; do=\"key\" with key (and optional id to aim it); do=\"scroll\" with id and direction; do=\"act\" with id and action; do=\"read\" to re-read the app. Add wait_ms to a step to pause after it, for content that loads (a tab that shows \"Loading…\"). " +
-      `Up to ${MAX_BATCH_STEPS} steps. It STOPS at the first step that fails and tells you which one — the rest do not run, so do not assume they did. ` +
+      `Up to ${MAX_BATCH_STEPS} steps — use them: one shape's position, size, colour and commit is ONE call, not five. It STOPS at the first step that fails and tells you which one — the rest do not run, so do not assume they did. Every set_value is read back, so a field that kept its old text and appended to it stops the run there instead of corrupting everything computed after it. ` +
       "Opening or raising an app is not batchable: call computer_launch or computer_raise on its own. Do NOT batch steps whose ids you have not read yet, or steps that depend on what an earlier step reveals — read first, then batch what you can see. " +
       `Pass candidates instead of steps when you can see several plausible ways to reach ONE state and cannot tell which the app will honour: press the result row, or send down then return, or type the whole intent into the search field. Each candidate is a route — a step or a short list of steps — they are tried in order, and it stops at the first that changes the app, telling you what each one did. That is a model turn saved per wrong guess. Read the diff and confirm the state is the one you wanted; "it changed something" is not "it worked". Actions only, never for anything you would not want to happen twice. ` +
       TASK_DISCIPLINE_SENTENCE.trim(),
@@ -1428,7 +1429,17 @@ const AX_TOOLS = [
               do: { type: "string", enum: ["press", "set_value", "key", "scroll", "act", "read"] },
               id: { type: "integer", description: "Element id from computer_app_state." },
               text: { type: "string", description: "With do=set_value." },
-              key: { type: "string", enum: ["return", "tab", "escape", "space", "delete", "up", "down", "left", "right"], description: "With do=key." },
+              // The same key surface as computer_press_key. It used to be an
+              // enum of nine named keys here, so a tool shortcut ("p" for
+              // Figma's pen) and a select-all could not appear in a batch at
+              // all — measured: one Figma task sent 91 key presses one per
+              // turn, every one of which was legal only as a single call.
+              key: { type: "string", description: "With do=key: one letter (a-z), one digit, shortcut punctuation, or a named key — return, tab, escape, space, delete, up, down, left, right." },
+              modifiers: {
+                type: "array",
+                description: "With do=key: held around the keystroke — command, shift, option, control.",
+                items: { type: "string", enum: ["command", "shift", "option", "control"] },
+              },
               direction: { type: "string", enum: ["down", "up", "left", "right"], description: "With do=scroll." },
               amount: { type: "integer", description: "With do=scroll: lines (default 5)." },
               action: { type: "string", description: "With do=act: one of the actions the element listed in braces." },
@@ -2346,7 +2357,7 @@ async function runBatchStep(appName: string, st: BatchStep, settle = true): Prom
     case "set_value":
       return await ax!.request("setValue", { app: appName, id: st.id, value: st.text, ...opts });
     case "key":
-      return await ax!.request("key", { app: appName, key: st.key, ...(st.id !== undefined ? { id: st.id } : {}), ...opts });
+      return await ax!.request("key", { app: appName, key: st.key, ...(st.id !== undefined ? { id: st.id } : {}), ...(st.modifiers?.length ? { modifiers: st.modifiers } : {}), ...opts });
     case "scroll": {
       const amount = typeof st.amount === "number" && st.amount > 0 ? Math.min(st.amount, 40) : 5;
       const d = SCROLL_DELTAS[st.direction];
@@ -2560,7 +2571,7 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         // a local pipe — and collapsing them into ONE model round trip is the
         // entire point of this tool.
         for (const [i, st] of steps.entries()) {
-          const label = `step ${i + 1} (${st.do})`;
+          const label = `step ${i + 1} (${traceStep(st)})`;
           try {
             await runBatchStep(appName, st, i === steps.length - 1);
             ran.push(label);
@@ -2583,7 +2594,10 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
           // to show. The step log above still says what ran.
         }
         return axText(
-          summarizeBatch({ ran, failed, remaining: steps.length - ran.length - (failed ? 1 : 0), diff }),
+          summarizeBatch({
+            ran, failed, remaining: steps.length - ran.length - (failed ? 1 : 0), diff,
+            unwatched: steps.length > 1,
+          }),
           failed === null,
         );
       }
