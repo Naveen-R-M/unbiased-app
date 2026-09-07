@@ -84,7 +84,10 @@ bar items, because none of those go through hit-testing.
 
 **Do not press it again, and do not raise the app.** Raising un-parks the window
 only while that app is in front. It re-parks the moment focus moves on, so a
-raise costs the user their screen and buys nothing.
+raise costs the user their screen and buys nothing. The bridge refuses the
+first raise you ask for after a press died this way, and tells you the keyboard
+route instead. A window in this state is also marked `[parked]` when you read
+its windows, so you can see it coming.
 
 **Do this instead.**
 
@@ -103,7 +106,8 @@ raise costs the user their screen and buys nothing.
 All three are worth sending together as candidates in one call, in that order,
 rather than finding out one turn at a time. Keep down and return in one route:
 down only moves the selection, so a route that stops there has not opened
-anything.
+anything. When a click dies this way the reply ends with the exact call to
+send next — send that.
 
 Measured on a parked Maps window: search field, `down`, `return` produced the
 full driving route with three calls, no clicking, and no change to the screen.

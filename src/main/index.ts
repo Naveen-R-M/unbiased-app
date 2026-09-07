@@ -39,6 +39,7 @@ import {
   type BatchStep,
   type AxResult,
   parseCandidates,
+  parkedNextCall,
   MAX_CANDIDATES,
   candidateWorked,
   summarizeCandidates,
@@ -2584,7 +2585,12 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         }
         const diff = String(r.diff ?? "");
         remember(diff);
-        return axText(renderActionResult(diff, typeof r.hint === "string" ? r.hint : null), true);
+        const hint = typeof r.hint === "string" ? r.hint : null;
+        // Only for the verbs that go through hit-testing. Telling a caller that
+        // just sent a key to send a key is noise, and it is the click that
+        // dies on a parked window.
+        const clicked = tool === "computer_press" || tool === "computer_act" || tool === "computer_set_value";
+        return axText(renderActionResult(diff, hint, hint && clicked ? parkedNextCall(appName) : null), true);
       }
       default:
         return axText(`Unknown tool ${tool}`, false);

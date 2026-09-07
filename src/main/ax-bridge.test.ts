@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-import { AX_TOOL_NAMES, SCREENSHOT_TOOL_NAMES, routesToAx, parseBatchSteps, describeBatch, summarizeBatch, MAX_BATCH_STEPS, AxClient, AxError, appOfStep, axConsent, axNeedsFocus, screenshotToolsOffered, coordinateToolAllowed, withScreenshotGuidance, SCREENSHOT_FRAME_SENTENCE, axReadOptsFrom, axFilterSwitched, AX_DEFAULT_READ_OPTS, shouldRecoverRaise, describeAxAction, indexElementLines, readAxManifest, resolveAxDir, shouldOpenAccessibilitySettings, axNotTrustedText, RAISE_DESCRIPTION, APP_STATE_SPACE_SENTENCE, LAUNCH_FRONT_SENTENCE, withSpaceGuidance, otherSpaceNote, launchOutcome, renderActionResult, ACTION_NO_CHANGE_SENTENCE, TASK_DISCIPLINE_SENTENCE, SCREENSHOT_SPACE_SENTENCE, parseCandidates, describeCandidates, candidateWorked, summarizeCandidates, MAX_CANDIDATES, MAX_CANDIDATE_STEPS, type AxCallInfo } from "./ax-bridge";
+import { AX_TOOL_NAMES, SCREENSHOT_TOOL_NAMES, routesToAx, parseBatchSteps, describeBatch, summarizeBatch, MAX_BATCH_STEPS, AxClient, AxError, appOfStep, axConsent, axNeedsFocus, screenshotToolsOffered, coordinateToolAllowed, withScreenshotGuidance, SCREENSHOT_FRAME_SENTENCE, axReadOptsFrom, axFilterSwitched, AX_DEFAULT_READ_OPTS, shouldRecoverRaise, describeAxAction, indexElementLines, readAxManifest, resolveAxDir, shouldOpenAccessibilitySettings, axNotTrustedText, RAISE_DESCRIPTION, APP_STATE_SPACE_SENTENCE, LAUNCH_FRONT_SENTENCE, withSpaceGuidance, otherSpaceNote, launchOutcome, renderActionResult, ACTION_NO_CHANGE_SENTENCE, TASK_DISCIPLINE_SENTENCE, SCREENSHOT_SPACE_SENTENCE, parseCandidates, describeCandidates, parkedNextCall, candidateWorked, summarizeCandidates, MAX_CANDIDATES, MAX_CANDIDATE_STEPS, type AxCallInfo } from "./ax-bridge";
 
 const scratch = () => mkdtempSync(join(tmpdir(), "ax-"));
 
@@ -974,4 +974,35 @@ test("steps and candidates are different shapes and cannot be sent together", ()
   assert.ok(src.includes("Pass steps for a sequence or candidates for alternatives, not both."));
   assert.ok(src.includes("runCandidates(appName, routes.candidates, remember)"));
   assert.ok(MAX_CANDIDATES < MAX_BATCH_STEPS, "the route cap is tighter than the sequence cap");
+});
+
+// Prose lost. Three texts told the model to use the keyboard on a parked
+// window and it raised twice anyway, so the reply now ends with the call.
+
+test("a click that died on a parked window ends with the exact call to send next", () => {
+  const hint = "Stage Manager has parked Maps's window in the side strip as a thumbnail.";
+  const out = renderActionResult("(no changes)", hint, parkedNextCall("Maps"));
+  assert.ok(out.startsWith("Done. " + hint), out);
+  assert.ok(out.includes(ACTION_NO_CHANGE_SENTENCE), out);
+  assert.ok(out.trimEnd().endsWith('computer_do {"app":"Maps","steps":[{"do":"key","key":"down"},{"do":"key","key":"return"}]}'), out);
+});
+
+test("down and return are one call, because down alone only moves the selection", () => {
+  const call = parkedNextCall("Maps");
+  const steps = /"steps":(\[.*\])/.exec(call);
+  assert.ok(steps, call);
+  const parsed = JSON.parse(steps[1]) as { do: string; key?: string }[];
+  assert.deepEqual(parsed, [{ do: "key", key: "down" }, { do: "key", key: "return" }]);
+  assert.ok(!call.includes("candidates"), "one measured route beats a set of guesses here");
+});
+
+test("an app name with a quote in it cannot break the call it is embedded in", () => {
+  assert.ok(parkedNextCall('Bob\'s "App"').includes(JSON.stringify('Bob\'s "App"')));
+});
+
+test("nothing is appended when the action worked, or when it was itself a key", () => {
+  assert.equal(renderActionResult("+ 9 heading \"Card\"", "parked", parkedNextCall("Maps")), 'Done.\n+ 9 heading "Card"');
+  const src = readFileSync(join(__dirname, "index.ts"), "utf8");
+  assert.ok(src.includes('tool === "computer_press" || tool === "computer_act" || tool === "computer_set_value"'), "only the verbs that hit-test");
+  assert.ok(src.includes("hint && clicked ? parkedNextCall(appName) : null"));
 });

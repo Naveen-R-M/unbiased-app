@@ -468,12 +468,26 @@ export function coordinateToolAllowed(tool: string, mode: "all" | "screenshot-on
 export const ACTION_NO_CHANGE_SENTENCE =
   "The app accepted the action but showed no change while the bridge waited. Do NOT repeat it on this element: a second press undoes a toggle or opens a second copy, and in the last run five retries of one dead button cost six turns. Take a different path instead: the keyboard (arrow keys and return choose from a list, escape closes), or the app's menu bar, whose items are in the tree and reliably reach every command.";
 
-export function renderActionResult(diff: string, hint?: string | null): string {
+/** The literal call to send after a click died on a parked window.
+ *
+ *  Prose did not work. Three separate texts told the model to use the keyboard
+ *  on a parked window — the bridge's hint, computer_raise's own description
+ *  and the bundled skill — and it sent `down` without `return` and then raised
+ *  twice anyway. A concrete call is followed where a recommendation is not, so
+ *  the reply now ends with the exact thing to send. `down` then `return` in
+ *  ONE call, because down alone only moves the selection. */
+export function parkedNextCall(app: string): string {
+  return `Send exactly this next, in one call: computer_do {"app":${JSON.stringify(app)},"steps":[{"do":"key","key":"down"},{"do":"key","key":"return"}]}`;
+}
+
+export function renderActionResult(diff: string, hint?: string | null, nextCall?: string | null): string {
   const body = diff.trim();
-  // The bridge's own explanation comes first when it has one: it knows WHY
-  // this app ignored the press (a Catalyst app behind a fullscreen Space) and
-  // which paths work, which is more useful than the generic sentence.
-  if (!body || body === "(no changes)") return `Done. ${hint ? `${hint} ` : ""}${ACTION_NO_CHANGE_SENTENCE}`;
+  // The bridge's own explanation comes first when it has one: it knows WHY the
+  // app ignored the press and which paths work, which is more useful than the
+  // generic sentence. The concrete call comes last, where it is read.
+  if (!body || body === "(no changes)") {
+    return [`Done.`, hint, ACTION_NO_CHANGE_SENTENCE, nextCall].filter(Boolean).join(" ");
+  }
   return `Done.\n${body}`;
 }
 
