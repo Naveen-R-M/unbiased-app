@@ -23,13 +23,34 @@ Return, read. Each avoided round trip is seconds off the task.
 **Read again only when the ids you need are not in front of you**, or when an
 action reports that nothing changed and you expected something.
 
+**When you can see several ways to do one thing and cannot tell which the app
+will honour, send them as candidates.** `computer_do` takes `candidates`
+instead of `steps`: alternative routes to one state, tried in order, stopping
+at the first that changes the app. A route is a step or a short list of steps,
+because the one that works is often two moves.
+
+```json
+{"app": "Maps", "candidates": [
+  {"do": "press", "id": 88},
+  [{"do": "key", "key": "down"}, {"do": "key", "key": "return"}]
+]}
+```
+
+Three guesses then cost one turn instead of three. Read the diff afterwards and
+confirm the state is the one you wanted, because "it changed something" is not
+"it worked". Use it only for things you would not mind happening twice.
+
 ## Ids
 
 Ids are stable per app until an element disappears, and they do not survive the
 app rearranging itself. Two rules follow.
 
-- An id the app no longer has is refused immediately, saying to read again. That
-  is cheap. Read and continue rather than guessing a neighbouring number.
+- An id whose control the app rebuilt is re-found for you. If exactly one
+  element still matches what that id described, the action lands on it and the
+  reply gives you the new number to use from then on.
+- An id that matches nothing, or matches two things, is refused immediately and
+  says to read again. That is cheap. Read and continue rather than guessing a
+  neighbouring number.
 - An action the element does not list is refused before it is attempted, and the
   refusal names the actions it does list. Use one of those.
 
@@ -78,6 +99,11 @@ raise costs the user their screen and buys nothing.
    and this works on a parked window.
 3. **Otherwise use the menu bar.** Its items are in the tree and reach every
    command the app has.
+
+All three are worth sending together as candidates in one call, in that order,
+rather than finding out one turn at a time. Keep down and return in one route:
+down only moves the selection, so a route that stops there has not opened
+anything.
 
 Measured on a parked Maps window: search field, `down`, `return` produced the
 full driving route with three calls, no clicking, and no change to the screen.

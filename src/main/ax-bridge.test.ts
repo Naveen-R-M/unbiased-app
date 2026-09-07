@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-import { AX_TOOL_NAMES, SCREENSHOT_TOOL_NAMES, routesToAx, parseBatchSteps, describeBatch, summarizeBatch, MAX_BATCH_STEPS, AxClient, AxError, appOfStep, axConsent, axNeedsFocus, screenshotToolsOffered, coordinateToolAllowed, withScreenshotGuidance, SCREENSHOT_FRAME_SENTENCE, axReadOptsFrom, axFilterSwitched, AX_DEFAULT_READ_OPTS, shouldRecoverRaise, describeAxAction, indexElementLines, readAxManifest, resolveAxDir, shouldOpenAccessibilitySettings, axNotTrustedText, RAISE_DESCRIPTION, APP_STATE_SPACE_SENTENCE, LAUNCH_FRONT_SENTENCE, withSpaceGuidance, otherSpaceNote, launchOutcome, renderActionResult, ACTION_NO_CHANGE_SENTENCE, TASK_DISCIPLINE_SENTENCE, SCREENSHOT_SPACE_SENTENCE, type AxCallInfo } from "./ax-bridge";
+import { AX_TOOL_NAMES, SCREENSHOT_TOOL_NAMES, routesToAx, parseBatchSteps, describeBatch, summarizeBatch, MAX_BATCH_STEPS, AxClient, AxError, appOfStep, axConsent, axNeedsFocus, screenshotToolsOffered, coordinateToolAllowed, withScreenshotGuidance, SCREENSHOT_FRAME_SENTENCE, axReadOptsFrom, axFilterSwitched, AX_DEFAULT_READ_OPTS, shouldRecoverRaise, describeAxAction, indexElementLines, readAxManifest, resolveAxDir, shouldOpenAccessibilitySettings, axNotTrustedText, RAISE_DESCRIPTION, APP_STATE_SPACE_SENTENCE, LAUNCH_FRONT_SENTENCE, withSpaceGuidance, otherSpaceNote, launchOutcome, renderActionResult, ACTION_NO_CHANGE_SENTENCE, TASK_DISCIPLINE_SENTENCE, SCREENSHOT_SPACE_SENTENCE, parseCandidates, describeCandidates, candidateWorked, summarizeCandidates, MAX_CANDIDATES, MAX_CANDIDATE_STEPS, type AxCallInfo } from "./ax-bridge";
 
 const scratch = () => mkdtempSync(join(tmpdir(), "ax-"));
 
@@ -896,4 +896,82 @@ test("a launch that showed the app and a blank picture are marked in the call li
   assert.ok(describeAxCall(base).includes("[shown]"));
   assert.ok(describeAxCall({ ...base, method: "screenshot", marks: "blank" }).includes("[blank]"));
   assert.ok(!describeAxCall({ ...base, marks: "" }).includes("["));
+});
+
+// Candidates: several plausible routes to one state, tried locally, so a wrong
+// guess costs a bridge call instead of a model turn.
+
+test("a candidate is a route: one step or a short list, and two routes minimum", () => {
+  const ok = parseCandidates([{ do: "press", id: 88 }, [{ do: "key", key: "down" }, { do: "key", key: "return" }]]);
+  assert.ok(!("error" in ok), JSON.stringify(ok));
+  assert.equal(ok.candidates.length, 2);
+  assert.equal(ok.candidates[0].length, 1);
+  assert.equal(ok.candidates[1].length, 2, "down then return is ONE route, not two");
+  const one = parseCandidates([{ do: "press", id: 1 }]);
+  assert.ok("error" in one && one.error.includes("at least two"), JSON.stringify(one));
+  const many = parseCandidates(Array.from({ length: MAX_CANDIDATES + 1 }, () => ({ do: "key", key: "return" })));
+  assert.ok("error" in many && many.error.includes("too many"), JSON.stringify(many));
+  const tooDeep = parseCandidates([{ do: "press", id: 1 }, Array.from({ length: MAX_CANDIDATE_STEPS + 1 }, () => ({ do: "key", key: "down" }))]);
+  assert.ok("error" in tooDeep && tooDeep.error.includes("candidate 2"), JSON.stringify(tooDeep));
+});
+
+test("a read can never be a candidate, and the refusal says which one", () => {
+  const bad = parseCandidates([{ do: "press", id: 1 }, [{ do: "key", key: "down" }, { do: "read" }]]);
+  assert.ok("error" in bad && bad.error.includes("candidate 2 step 2") && bad.error.includes("read"), JSON.stringify(bad));
+});
+
+test("a route counts as working only when the settled tree really moved", () => {
+  assert.equal(candidateWorked("+ 12 button \"Directions\""), true);
+  assert.equal(candidateWorked("(no changes)"), false);
+  assert.equal(candidateWorked("  (no changes)  "), false);
+  assert.equal(candidateWorked(""), false);
+});
+
+test("the summary names the winner, what each loser did, and does not overclaim success", () => {
+  const out = summarizeCandidates({
+    tried: [
+      { label: "1. press #23", outcome: "nothing" },
+      { label: "2. key then key", outcome: "worked" },
+    ],
+    winner: 1,
+    diff: "+ 99 heading \"AMC River East 21\"",
+    remaining: 1,
+  });
+  assert.ok(out.includes("Route 2 changed the app"), out);
+  assert.ok(out.includes("check it is the state you wanted"), "changing something is not the same as working");
+  assert.ok(out.includes("1. press #23 did nothing"), out);
+  assert.ok(out.includes("→ 2. key then key changed the app"), out);
+  assert.ok(out.includes("1 later route(s) were not tried"), out);
+  assert.ok(out.includes("AMC River East 21"), out);
+});
+
+test("when nothing worked the model is told that, with the do-not-repeat guidance", () => {
+  const out = summarizeCandidates({
+    tried: [
+      { label: "1. press #23", outcome: "nothing" },
+      { label: "2. act #24", outcome: "Element 24 does not offer \"focus\"" },
+    ],
+    winner: null,
+    diff: "",
+    remaining: 0,
+  });
+  assert.ok(out.startsWith("None of the 2 route(s) changed the app."), out);
+  assert.ok(out.includes("failed: Element 24 does not offer"), out);
+  assert.ok(out.includes(ACTION_NO_CHANGE_SENTENCE), out);
+});
+
+test("the approval card shows routes as alternatives, so one press is never approved as four", () => {
+  const routes = parseCandidates([{ do: "press", id: 88 }, [{ do: "key", key: "down" }, { do: "key", key: "return" }]]);
+  assert.ok(!("error" in routes));
+  const card = describeCandidates("Maps", routes.candidates, new Map([[88, 'button "AMC River East 21"']]));
+  assert.ok(card.startsWith("2 alternative route(s) in Maps, stopping at the first that changes anything:"), card);
+  assert.ok(card.includes("AMC River East 21"), "the card names what would be pressed");
+  assert.ok(/2\.\n/.test(card), `the two-step route is shown as two lines: ${card}`);
+});
+
+test("steps and candidates are different shapes and cannot be sent together", () => {
+  const src = readFileSync(join(__dirname, "index.ts"), "utf8");
+  assert.ok(src.includes("Pass steps for a sequence or candidates for alternatives, not both."));
+  assert.ok(src.includes("runCandidates(appName, routes.candidates, remember)"));
+  assert.ok(MAX_CANDIDATES < MAX_BATCH_STEPS, "the route cap is tighter than the sequence cap");
 });

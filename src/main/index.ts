@@ -36,6 +36,12 @@ import { EngineClient, engineVersionFromUserAgent, type EngineStatus } from "./e
 import { pollDeviceToken, requestDeviceAuthorization } from "./device-auth";
 import { RendererCrashRecovery } from "./crash-recovery";
 import {
+  type BatchStep,
+  type AxResult,
+  parseCandidates,
+  MAX_CANDIDATES,
+  candidateWorked,
+  summarizeCandidates,
   renderActionResult,
   TASK_DISCIPLINE_SENTENCE,
   describeAxCall,
@@ -1383,11 +1389,18 @@ const AX_TOOLS = [
       "Run several steps on ONE app in a single call, in order, and get back what changed. Use this whenever you already know the next few moves — filling a field and committing it, pressing a tab and reading the result, scrolling and reading. It saves a whole round trip per step, which is the main cost of operating an app. " +
       "Each step is {do, ...}: do=\"press\" with id; do=\"set_value\" with id and text; do=\"key\" with key (and optional id to aim it); do=\"scroll\" with id and direction; do=\"act\" with id and action; do=\"read\" to re-read the app. Add wait_ms to a step to pause after it, for content that loads (a tab that shows \"Loading…\"). " +
       `Up to ${MAX_BATCH_STEPS} steps. It STOPS at the first step that fails and tells you which one — the rest do not run, so do not assume they did. ` +
-      "Opening or raising an app is not batchable: call computer_launch or computer_raise on its own. Do NOT batch steps whose ids you have not read yet, or steps that depend on what an earlier step reveals — read first, then batch what you can see. " + TASK_DISCIPLINE_SENTENCE.trim(),
+      "Opening or raising an app is not batchable: call computer_launch or computer_raise on its own. Do NOT batch steps whose ids you have not read yet, or steps that depend on what an earlier step reveals — read first, then batch what you can see. " +
+      `Pass candidates instead of steps when you can see several plausible ways to reach ONE state and cannot tell which the app will honour: press the result row, or send down then return, or type the whole intent into the search field. Each candidate is a route — a step or a short list of steps — they are tried in order, and it stops at the first that changes the app, telling you what each one did. That is a model turn saved per wrong guess. Read the diff and confirm the state is the one you wanted; "it changed something" is not "it worked". Actions only, never for anything you would not want to happen twice. ` +
+      TASK_DISCIPLINE_SENTENCE.trim(),
     inputSchema: {
       type: "object",
       properties: {
         app: { type: "string" },
+        candidates: {
+          type: "array",
+          description: `Instead of steps: alternative routes to ONE state, tried in order, stopping at the first that changes the app. Each entry is a step or a short list of steps, e.g. [{"do":"press","id":88}, [{"do":"key","key":"down"},{"do":"key","key":"return"}]]. Two to ${MAX_CANDIDATES} routes.`,
+          items: { type: "array", items: { type: "object" } },
+        },
         steps: {
           type: "array",
           description: "The steps to run, in order.",
@@ -2261,6 +2274,86 @@ function axText(text: string, success: boolean): DynamicToolResponse {
   return { contentItems: [{ type: "inputText", text }], success };
 }
 
+/** One batch step, as a bridge call. Shared by both batch shapes so a verb can
+ *  never mean two things depending on which one ran it. */
+async function runBatchStep(appName: string, st: BatchStep): Promise<AxResult> {
+  switch (st.do) {
+    case "read":
+      return await ax!.request("tree", { app: appName, ...axActionOpts(appName) });
+    case "press":
+      return await ax!.request("act", { app: appName, id: st.id, action: "press", ...axActionOpts(appName) });
+    case "act":
+      return await ax!.request("act", { app: appName, id: st.id, action: st.action, ...axActionOpts(appName) });
+    case "set_value":
+      return await ax!.request("setValue", { app: appName, id: st.id, value: st.text, ...axActionOpts(appName) });
+    case "key":
+      return await ax!.request("key", { app: appName, key: st.key, ...(st.id !== undefined ? { id: st.id } : {}), ...axActionOpts(appName) });
+    case "scroll": {
+      const amount = typeof st.amount === "number" && st.amount > 0 ? Math.min(st.amount, 40) : 5;
+      const d = SCROLL_DELTAS[st.direction];
+      if (!d) throw new Error(`unknown direction "${st.direction}"`);
+      return await ax!.request("scroll", { app: appName, id: st.id, dx: d.dx * amount, dy: d.dy * amount, ...axActionOpts(appName) });
+    }
+  }
+}
+
+/** Try each route in order and keep the first that changes the app.
+ *
+ *  This is the whole of "speculative execution" that survives contact with a
+ *  real desktop. There is no reset between routes and none is needed: the
+ *  losers are the routes that did nothing, which is precisely why they lost. A
+ *  route that DOES something ends the run, so no side effect is ever followed
+ *  by another attempt.
+ *
+ *  A route is judged as a whole, after all of its steps: down-then-return is
+ *  one route, and stopping at the selection that "down" produced would have
+ *  called a half-finished move a success. Its diffs are joined, because each
+ *  step's diff is measured against the one before it.
+ *
+ *  Approval is unchanged. The card lists every route before any of them runs,
+ *  so this cannot be a way to slip an extra press past the user. */
+async function runCandidates(appName: string, routes: BatchStep[][], remember: (text: string) => void): Promise<DynamicToolResponse> {
+  axLog(`do ${appName} ${routes.length} route(s): ${routes.map((r) => r.map((x) => x.do).join("+")).join(" | ")}`);
+  const tried: { label: string; outcome: "worked" | "nothing" | string }[] = [];
+  let winner: number | null = null;
+  let diff = "";
+  for (const [i, steps] of routes.entries()) {
+    const label = `${i + 1}. ${steps.map((st) => `${st.do}${"id" in st && typeof st.id === "number" ? ` #${st.id}` : ""}`).join(" then ")}`;
+    const diffs: string[] = [];
+    let failure: string | null = null;
+    for (const st of steps) {
+      try {
+        const r = await runBatchStep(appName, st);
+        const stepDiff = String(r.diff ?? "");
+        if (candidateWorked(stepDiff)) diffs.push(stepDiff);
+      } catch (err) {
+        // A step that cannot even be attempted ends this route, not the call:
+        // that is the point of having sent alternatives.
+        failure = err instanceof AxError ? err.message : String(err);
+        break;
+      }
+      if (st.waitMs > 0) await new Promise((r) => setTimeout(r, st.waitMs));
+    }
+    if (failure !== null) {
+      tried.push({ label, outcome: failure });
+      continue;
+    }
+    if (diffs.length > 0) {
+      tried.push({ label, outcome: "worked" });
+      winner = i;
+      diff = diffs.join("\n");
+      break;
+    }
+    tried.push({ label, outcome: "nothing" });
+  }
+  if (diff) remember(diff);
+  return axText(
+    summarizeCandidates({ tried, winner, diff, remaining: routes.length - tried.length }),
+    winner !== null,
+  );
+}
+
+
 async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | null): Promise<DynamicToolResponse> {
   if (!ax?.alive) await startAxBridge(); // it may have died; one attempt to bring it back
   if (!ax?.alive) return axText("The accessibility bridge is not running. Use computer_screenshot instead.", false);
@@ -2390,6 +2483,12 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         );
       }
       case "computer_do": {
+        if (a.candidates !== undefined) {
+          if (a.steps !== undefined) return axText("Pass steps for a sequence or candidates for alternatives, not both.", false);
+          const routes = parseCandidates(a.candidates);
+          if ("error" in routes) return axText(routes.error, false);
+          return await runCandidates(appName, routes.candidates, remember);
+        }
         const parsed = parseBatchSteps(a.steps);
         if ("error" in parsed) return axText(parsed.error, false);
         const steps = parsed.steps;
@@ -2402,30 +2501,7 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         for (const [i, st] of steps.entries()) {
           const label = `step ${i + 1} (${st.do})`;
           try {
-            switch (st.do) {
-              case "read":
-                await ax.request("tree", { app: appName, ...axActionOpts(appName) });
-                break;
-              case "press":
-                await ax.request("act", { app: appName, id: st.id, action: "press", ...axActionOpts(appName) });
-                break;
-              case "act":
-                await ax.request("act", { app: appName, id: st.id, action: st.action, ...axActionOpts(appName) });
-                break;
-              case "set_value":
-                await ax.request("setValue", { app: appName, id: st.id, value: st.text, ...axActionOpts(appName) });
-                break;
-              case "key":
-                await ax.request("key", { app: appName, key: st.key, ...(st.id !== undefined ? { id: st.id } : {}), ...axActionOpts(appName) });
-                break;
-              case "scroll": {
-                const amount = typeof st.amount === "number" && st.amount > 0 ? Math.min(st.amount, 40) : 5;
-                const d = SCROLL_DELTAS[st.direction];
-                if (!d) throw new Error(`unknown direction "${st.direction}"`);
-                await ax.request("scroll", { app: appName, id: st.id, dx: d.dx * amount, dy: d.dy * amount, ...axActionOpts(appName) });
-                break;
-              }
-            }
+            await runBatchStep(appName, st);
             ran.push(label);
             if (st.waitMs > 0) await new Promise((r) => setTimeout(r, st.waitMs));
           } catch (err) {

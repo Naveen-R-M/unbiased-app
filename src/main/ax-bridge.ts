@@ -244,6 +244,82 @@ export function parseBatchSteps(raw: unknown): { steps: BatchStep[] } | { error:
   return { steps };
 }
 
+/** Alternative routes to one state, for the case measured over and over on
+ *  Maps: several plausible ways to get somewhere and no way to tell from the
+ *  tree which one the app will honour. Pressing a search-result row does
+ *  nothing while the window is parked; down then return does; typing the whole
+ *  intent into the field does. Sending those as candidates costs one model
+ *  turn instead of three.
+ *
+ *  A candidate is a SEQUENCE of steps, not a single one, because the route
+ *  that works is often two moves: down selects, return opens. Judging one step
+ *  at a time would have stopped at the selection and called it done.
+ *
+ *  The winner is decided mechanically, by the same test that already decides
+ *  when an action is finished: did the settled tree change materially. No
+ *  success predicate from the caller, because something would have to evaluate
+ *  it, and a string match on a tree the model has not seen yet is a guess. The
+ *  caller reads the diff and judges whether the state is the one it wanted. */
+export const MAX_CANDIDATES = 4;
+export const MAX_CANDIDATE_STEPS = 4;
+
+export function parseCandidates(raw: unknown): { candidates: BatchStep[][] } | { error: string } {
+  if (!Array.isArray(raw)) return { error: "candidates must be an array of routes; each route is a step or a list of steps." };
+  if (raw.length < 2) return { error: "candidates needs at least two routes — with one there is nothing to choose between, so use steps instead." };
+  if (raw.length > MAX_CANDIDATES) {
+    return { error: `${raw.length} candidates is too many (max ${MAX_CANDIDATES}) — every route that does nothing costs a full wait for the app. Send your best ${MAX_CANDIDATES}.` };
+  }
+  const candidates: BatchStep[][] = [];
+  for (const [i, entry] of raw.entries()) {
+    const list = Array.isArray(entry) ? entry : [entry];
+    if (list.length === 0) return { error: `candidate ${i + 1} is empty.` };
+    if (list.length > MAX_CANDIDATE_STEPS) return { error: `candidate ${i + 1} has ${list.length} steps (max ${MAX_CANDIDATE_STEPS}).` };
+    const parsed = parseBatchSteps(list);
+    if ("error" in parsed) return { error: `candidate ${i + 1}: ${parsed.error}` };
+    const read = parsed.steps.findIndex((st) => st.do === "read");
+    if (read >= 0) return { error: `candidate ${i + 1} step ${read + 1} is a read. A read changes nothing, so it can never be the route that works; candidates must be actions.` };
+    candidates.push(parsed.steps);
+  }
+  return { candidates };
+}
+
+/** Whether a candidate's step actually did something. The bridge has already
+ *  waited for the app to settle by the time we see this, so "no changes" means
+ *  the app was asked and declined, not that it is still thinking. */
+export function candidateWorked(diff: string): boolean {
+  const body = diff.trim();
+  return body.length > 0 && body !== "(no changes)";
+}
+
+/** The approval card for a set of routes. It has to be unmistakable that these
+ *  are alternatives and that the run stops at the first that does something,
+ *  so the user is never shown four presses and asked to approve one. */
+export function describeCandidates(app: string, candidates: BatchStep[][], lines?: Map<number, string>): string {
+  const rendered = candidates.map((steps, i) => {
+    const inner = describeBatch(app, steps, lines).split("\n").slice(1).map((l) => `   ${l.replace(/^\d+\.\s*/, "")}`);
+    return `${i + 1}.${inner.length === 1 ? ` ${inner[0].trim()}` : `\n${inner.join("\n")}`}`;
+  });
+  return `${candidates.length} alternative route(s) in ${app}, stopping at the first that changes anything:\n${rendered.join("\n")}`;
+}
+
+export function summarizeCandidates(opts: {
+  tried: { label: string; outcome: "worked" | "nothing" | string }[];
+  winner: number | null;
+  diff: string;
+  remaining: number;
+}): string {
+  const lines = opts.tried.map((t, i) => {
+    const mark = i === (opts.winner ?? -1) ? "→" : " ";
+    const said = t.outcome === "worked" ? "changed the app" : t.outcome === "nothing" ? "did nothing" : `failed: ${t.outcome}`;
+    return `${mark} ${t.label} ${said}`;
+  });
+  const skipped = opts.remaining > 0 ? `\n${opts.remaining} later route(s) were not tried.` : "";
+  if (opts.winner === null) {
+    return `None of the ${opts.tried.length} route(s) changed the app.\n${lines.join("\n")}\n${ACTION_NO_CHANGE_SENTENCE}`;
+  }
+  return `Route ${opts.winner + 1} changed the app. Read the diff and check it is the state you wanted.\n${lines.join("\n")}${skipped}\n${opts.diff}`;
+}
+
 /** One line per step. The user approves the WHOLE sequence with one card, so
  *  the card has to show every step — a batch must never be a way to slip an
  *  irreversible press in behind four harmless reads. */
@@ -654,6 +730,10 @@ export function describeAxAction(tool: string, rawArgs: unknown, lines?: Map<num
       const parsed = parseBatchSteps((a as { steps?: unknown }).steps);
       // A batch whose steps do not parse still has to produce a card, because
       // the card is shown before the call is made.
+      if ((a as { candidates?: unknown }).candidates !== undefined) {
+        const routes = parseCandidates((a as { candidates?: unknown }).candidates);
+        return "error" in routes ? `Try alternatives in ${app}` : describeCandidates(app, routes.candidates, lines);
+      }
       return "error" in parsed ? `Run steps in ${app}` : describeBatch(app, parsed.steps, lines);
     }
     case "computer_press":
