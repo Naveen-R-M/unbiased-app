@@ -1108,3 +1108,41 @@ test("the dispatch site sends it once, before the tool result", () => {
   // An unreadable file must not break a turn.
   assert.ok(src.includes("first-call preamble disabled"), "a missing skill file degrades quietly");
 });
+
+// Drawing. Two agents stalled on the same Figma task: the pen tool is behind
+// the letter `p` with no element, and the canvas has nothing to press.
+
+test("the pointer is an AX tool: routed, gated like an action, and never takes the screen by itself", () => {
+  assert.ok(routesToAx("computer_pointer"));
+  assert.equal(axNeedsFocus("computer_pointer", {}), false, "it does not raise; the bridge refuses when the window is not visible");
+  assert.equal(axConsent({ tool: "computer_pointer", mode: "ask", granted: false }), "ask");
+});
+
+test("the approval card says the pointer MOVES, names the anchor, and distinguishes a drag", () => {
+  const lines = new Map([[33, 'web area "Untitled – Figma"']]);
+  const click = describeAxAction("computer_pointer", { app: "Figma", id: 33, path: [{ x: 0.2, y: 0.2 }, { x: 0.8, y: 0.8 }] }, lines);
+  assert.equal(click, 'Click the pointer at 2 point(s) inside #33 — web area "Untitled – Figma" in Figma');
+  const drag = describeAxAction("computer_pointer", { app: "Figma", id: 33, path: [{ x: 0, y: 0 }], hold: true }, lines);
+  assert.ok(drag.startsWith("Drag the pointer at 1 point(s)"), drag);
+  const bare = describeAxAction("computer_pointer", { app: "Figma", id: 9, path: [] });
+  assert.equal(bare, "Click the pointer at 0 point(s) inside #9 in Figma");
+});
+
+test("a key is one letter, one digit or a named key — no enum to fence the pen out", () => {
+  const src = readFileSync(join(__dirname, "index.ts"), "utf8");
+  const start = src.indexOf('name: "computer_press_key"');
+  const schema = src.slice(start, src.indexOf("required:", start));
+  assert.ok(!schema.includes('enum: ["return"'), "the old enum would have refused p");
+  assert.ok(schema.includes("One letter (a-z)"), schema.slice(0, 400));
+  assert.ok(schema.includes("command"), "modifiers are part of the same call");
+});
+
+test("the pointer handler refuses a missing path or anchor before it reaches the bridge", () => {
+  const src = readFileSync(join(__dirname, "index.ts"), "utf8");
+  const start = src.indexOf('case "computer_pointer"');
+  const body = src.slice(start, src.indexOf('case "computer_app_screenshot"', start));
+  assert.ok(body.includes("path is required"));
+  assert.ok(body.includes("id is required"));
+  assert.ok(body.includes("Landed at"), "the reply reports where the fractions landed");
+  assert.ok(body.includes('"pointer"'), "and it goes to the bridge's pointer verb");
+});

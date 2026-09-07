@@ -137,6 +137,42 @@ If the task truly cannot be done without clicking, say so and tell the user that
 turning Stage Manager off in System Settings under Desktop and Dock removes the
 problem. Do not turn it off yourself.
 
+## Canvases, and drawing
+
+Some surfaces have nothing to press: a design canvas, a whiteboard, a drawing
+area. The tree shows one big element and no controls inside it. Two things get
+you in.
+
+**A tool is usually a letter.** `computer_press_key` takes a single letter or
+digit, with modifiers. This is often the only way to reach a tool at all —
+Figma's pen is `p` and it has no element, no menu item and no other route. Keys
+work on a background app on any Space, because a key event does not care where
+the window is.
+
+**Then aim inside the element with `computer_pointer`.** Points are fractions
+of that element's box, so `{"x":0.5,"y":0.5}` is its centre and you never touch
+a screen pixel or a display scale. Give it the id of the canvas or web area,
+not the window. Several points are separate clicks, which is exactly how a pen
+tool takes a path; `hold=true` makes them one press-drag-release. The reply
+tells you the screen points your fractions landed on, so you can correct your
+geometry from fact rather than guesswork.
+
+**Pointer input is the one thing that needs the window really visible.** It
+aims at real screen coordinates and the app hit-tests them, so it is refused
+when the window is parked or on another Space — a click there would land on
+whatever IS at that spot. So this kind of work is foreground work: raise the
+app, say to the user that drawing needs the screen, and do it.
+
+**If you are asked to draw, draw.** Pasting an SVG or importing a file is not
+drawing, and substituting one for the other is answering a different request.
+Both are fine when the user asks for the artwork rather than the act; when they
+ask for the pen, use the pen.
+
+**Then fix the numbers in the app.** Clicking gives you an approximate path.
+Design tools expose exact position, size, stroke weight and colour as fields in
+the tree — set those by id afterwards, which is faster and more accurate than
+trying to click precisely.
+
 ## Pictures
 
 `computer_app_screenshot` photographs one app's window anywhere, including on

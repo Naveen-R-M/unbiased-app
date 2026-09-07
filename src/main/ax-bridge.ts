@@ -375,6 +375,7 @@ export function summarizeBatch(opts: {
 export const AX_TOOL_NAMES = [
   "computer_apps",
   "computer_app_screenshot",
+  "computer_pointer",
   "computer_app_state",
   "computer_raise",
   "computer_launch",
@@ -813,6 +814,15 @@ export function describeAxAction(tool: string, rawArgs: unknown, lines?: Map<num
       return `Read the UI of ${app}`;
     case "computer_app_screenshot":
       return `Photograph ${app}'s window`;
+    case "computer_pointer": {
+      const path = Array.isArray((a as { path?: unknown }).path) ? ((a as { path: unknown[] }).path) : [];
+      const id = typeof a.id === "number" ? a.id : null;
+      const line = id !== null ? lines?.get(id) : null;
+      const inside = line ? ` inside #${id} — ${clip(line)}` : id !== null ? ` inside #${id}` : "";
+      // The card has to say this MOVES THE POINTER: it is the only desktop
+      // verb that touches the user's own cursor rather than the app's tree.
+      return `${a.hold === true ? "Drag" : "Click"} the pointer at ${path.length} point(s)${inside} in ${app}`;
+    }
     case "computer_raise":
       return `Bring ${app} to the front`;
     case "computer_launch":

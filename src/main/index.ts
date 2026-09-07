@@ -1359,13 +1359,23 @@ const AX_TOOLS = [
     type: "function",
     name: "computer_press_key",
     description:
-      "Send one real key event. Use it for what pressing a control cannot express: committing a field with return, dismissing with escape, moving with tab or the arrows. Pass id to aim the key at an element, which is focused first — WITHOUT id it goes wherever keyboard focus already happens to be, which may be another field entirely. Reaches a background app without taking the user's screen." +
+      "Send one real key event. Use it for what pressing a control cannot express: committing a field with return, dismissing with escape, moving with tab or the arrows, and SELECTING A TOOL by its shortcut. " +
+      "A single letter or digit is a key, which is often the only way in: a design app puts its tools behind one-character shortcuts and exposes no element for them at all, so Figma's pen is \"p\" and nothing else reaches it. modifiers holds command, shift, option or control around the keystroke. " +
+      "Pass id to aim the key at an element, which is focused first — WITHOUT id it goes wherever keyboard focus already happens to be, which may be another field entirely. Reaches a background app on any Space without taking the user's screen, because a key event does not depend on where the window is. " +
       "It waits for the app to react and returns what changed — committing a search with return comes back with the results in it, so do not read again straight afterwards.",
     inputSchema: {
       type: "object",
       properties: {
         app: { type: "string" },
-        key: { type: "string", enum: ["return", "tab", "escape", "space", "delete", "up", "down", "left", "right"] },
+        key: {
+          type: "string",
+          description: "One letter (a-z), one digit, or a named key: return, tab, escape, space, delete, up, down, left, right.",
+        },
+        modifiers: {
+          type: "array",
+          description: "Held around the keystroke: command, shift, option, control.",
+          items: { type: "string", enum: ["command", "shift", "option", "control"] },
+        },
         id: { type: "integer", description: "Focus this element first, so the keystroke lands there." },
       },
       required: ["app", "key"],
@@ -1426,6 +1436,39 @@ const AX_TOOLS = [
         },
       },
       required: ["app", "steps"],
+    },
+  },
+  {
+    type: "function",
+    name: "computer_pointer",
+    description:
+      "Click or drag INSIDE one element, for surfaces that have no controls to press: a design canvas, a drawing area, a map you must place a point on. This is how you draw. " +
+      'Points are FRACTIONS of the anchor element\'s box, never screen pixels: {"x":0,"y":0} is its top-left, {"x":0.5,"y":0.5} its centre, {"x":1,"y":1} its bottom-right. Pass the id of the element you are aiming inside — the canvas or web area, not the window — and the reply tells you the screen points your fractions landed on. ' +
+      "Several points are separate clicks, which is how a pen tool takes a path; add hold=true to make them one press-drag-release instead. modifiers holds shift, option, command or control throughout. " +
+      "This is the ONE verb that needs the window actually visible on this Space, because it aims at real screen coordinates and the app hit-tests them: it is refused when the window is parked or elsewhere, since the click would land on whatever is there instead. So raise the app first for this kind of work and tell the user why. " +
+      "It moves the real pointer. Do not use it to press something that IS in the tree — press that by id.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        app: { type: "string" },
+        id: { type: "integer", description: "The element to aim inside, from computer_app_state. Its box is the coordinate space." },
+        path: {
+          type: "array",
+          description: 'Points in order, each a fraction of the anchor: [{"x":0.25,"y":0.5},{"x":0.75,"y":0.5}].',
+          items: {
+            type: "object",
+            properties: { x: { type: "number" }, y: { type: "number" } },
+            required: ["x", "y"],
+          },
+        },
+        hold: { type: "boolean", description: "True: one drag through every point. False (default): a click at each." },
+        modifiers: {
+          type: "array",
+          description: "Held down throughout: command, shift, option, control.",
+          items: { type: "string", enum: ["command", "shift", "option", "control"] },
+        },
+      },
+      required: ["app", "id", "path"],
     },
   },
   {
@@ -2547,6 +2590,29 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         remember(diff);
         return axText(`Scrolled ${dir}.\n${diff || "(nothing changed — the container may not scroll, or is already at the end)"}`, true);
       }
+      case "computer_pointer": {
+        const path = Array.isArray(a.path) ? a.path : null;
+        if (!path || path.length === 0) return axText('path is required: a list of {x, y} fractions of the anchor element, e.g. [{"x":0.5,"y":0.5}].', false);
+        if (typeof a.id !== "number") return axText("id is required: the element whose box the fractions are measured in.", false);
+        const hold = a.hold === true;
+        const mods = Array.isArray(a.modifiers) ? a.modifiers.filter((m) => typeof m === "string") : [];
+        axLog(`pointer ${appName} #${String(a.id)} ${path.length} point(s)${hold ? " held" : ""}${mods.length ? ` +${mods.join("+")}` : ""}`);
+        const r = await ax.request("pointer", {
+          app: appName,
+          id: a.id,
+          path,
+          ...(hold ? { hold: true } : {}),
+          ...(mods.length ? { modifiers: mods } : {}),
+          ...axActionOpts(appName),
+        }, 60_000);
+        const diff = String(r.diff ?? "");
+        remember(diff);
+        // Where the fractions landed, so a caller can see its own geometry and
+        // correct it without guessing at a display scale.
+        const at = Array.isArray(r.at) ? (r.at as { x: number; y: number }[]) : [];
+        const where = at.length ? `\nLanded at ${at.map((q) => `(${q.x},${q.y})`).join(" ")}.` : "";
+        return axText(`${hold ? "Dragged" : "Clicked"} ${path.length} point(s) in ${appName}.${where}\n${diff || "(nothing in the tree changed — a canvas often shows its result only as a new object, so read the app)"}`, true);
+      }
       case "computer_app_screenshot": {
         const r = await ax.request("screenshot", { app: appName, ...(typeof a.window === "number" ? { window: a.window } : {}) }, 15_000);
         const image = String(r.image ?? r.png ?? "");
@@ -2574,9 +2640,16 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         const legacyValue = tool === "computer_act" && typeof a.value === "string";
         if (tool === "computer_press_key" || legacyKey) {
           if (typeof a.key !== "string") return axText("key is required.", false);
-          axLog(`key ${appName} ${a.key}${typeof a.id === "number" ? ` -> #${a.id}` : ""}`);
+          const mods = Array.isArray(a.modifiers) ? a.modifiers.filter((m) => typeof m === "string") : [];
+          axLog(`key ${appName} ${mods.length ? `${mods.join("+")}+` : ""}${a.key}${typeof a.id === "number" ? ` -> #${a.id}` : ""}`);
           // Nothing raises: a key posted to the pid reaches a background app.
-          r = await ax.request("key", { app: appName, key: a.key, ...(typeof a.id === "number" ? { id: a.id } : {}), ...axActionOpts(appName) });
+          r = await ax.request("key", {
+            app: appName,
+            key: a.key,
+            ...(mods.length ? { modifiers: mods } : {}),
+            ...(typeof a.id === "number" ? { id: a.id } : {}),
+            ...axActionOpts(appName),
+          });
         } else if (tool === "computer_set_value" || legacyValue) {
           const text = typeof a.text === "string" ? a.text : typeof a.value === "string" ? a.value : null;
           if (text === null) return axText("text is required.", false);
