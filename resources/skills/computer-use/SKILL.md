@@ -139,13 +139,21 @@ picture, not a reason to raise the app. The tree still has the text.
 `computer_screenshot` captures the whole display, so it shows the current Space
 only. An app on another Space is not in it.
 
-## Scope
+## Knowing when you are done
 
-Do what was asked, and stop when the result is on screen.
+**When the app shows what was asked for, that is the answer.** Read it out of
+the tree and stop. A request for directions is answered by the route on screen.
+A request to find something is answered when it is on screen. You do not need to
+see it rendered, and you do not need to confirm it a second way.
 
-- Do not change the app's settings. Location, permissions and preferences are
-  the user's, and toggling one to make a task easier is not part of the task.
-- Do not verify alternatives nobody asked for. A request for directions is not a
-  request to compare every travel mode.
-- Do not repeat an action to be sure it took. A second press undoes a toggle or
-  opens a second copy.
+Four runs have ended late rather than wrong. The worst spent a third of its time
+pressing Walk, then Transit, then Drive, then Cycle, then Drive again, for a
+request that named no travel mode at all.
+
+- **Nothing else is part of the task.** Comparing the alternatives, checking the
+  other tabs, and taking a confirming look are all additions.
+- **Do not change the app's settings.** Location, permissions and preferences
+  are the user's, and turning one on to make a task easier is not part of it.
+- **Do not send an action twice to be sure.** A second press undoes a toggle or
+  opens a second copy, and the bridge refuses a repeat that already changed
+  nothing.

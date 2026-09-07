@@ -514,11 +514,20 @@ export function renderActionResult(diff: string, hint?: string | null, nextCall?
   return `Done.\n${body}`;
 }
 
-/** Scope, spelled out on the tools the model reads first. The Maps run spent
- *  five of sixteen turns verifying walking, transit and cycling nobody asked
- *  about and one enabling Location Tracking on its own. */
+/** Scope, spelled out on the tools the model reads first.
+ *
+ *  Measured four times: a run finishes the asked-for task and then keeps
+ *  going. The worst spent 35 of its 127 seconds pressing Walk, Transit, Drive,
+ *  Cycle and Drive again for a request that named no travel mode; another
+ *  enabled Location Tracking on its own.
+ *
+ *  Framed as what FINISHED looks like rather than as a list of prohibitions.
+ *  The prohibition wording lost every time, and a model that knows the answer
+ *  is already on screen has a reason to stop, where one told not to explore
+ *  only has a rule to weigh. Still prose, so still unproven — the mechanisms
+ *  around it are what actually hold. */
 export const TASK_DISCIPLINE_SENTENCE =
-  "Do only what was asked and stop when the asked-for result is on screen: do not change the app's settings (location, permissions, preferences), do not verify alternatives the user did not ask about, and do not repeat an action to be sure it took. ";
+  "When the app already shows what was asked for, that IS the answer: report it from the tree and stop. A request for directions is answered by the route on screen, not by comparing every travel mode; a request to find something is answered when it is on screen. Nothing else is part of the task: do not change the app's settings (location, permissions, preferences), and do not send an action twice to be sure it took. ";
 
 export const SCREENSHOT_FRAME_SENTENCE =
   "The result states the exact coordinate frame to use for later computer actions; it is scaled down from the display, so never assume the display resolution.";
