@@ -979,12 +979,15 @@ test("steps and candidates are different shapes and cannot be sent together", ()
 // Prose lost. Three texts told the model to use the keyboard on a parked
 // window and it raised twice anyway, so the reply now ends with the call.
 
-test("a click that died on a parked window ends with the exact call to send next", () => {
+test("a click that died on a parked window ends with the calls to send next", () => {
   const hint = "Stage Manager has parked Maps's window in the side strip as a thumbnail.";
   const out = renderActionResult("(no changes)", hint, parkedNextCall("Maps"));
   assert.ok(out.startsWith("Done. " + hint), out);
   assert.ok(out.includes(ACTION_NO_CHANGE_SENTENCE), out);
-  assert.ok(out.trimEnd().endsWith('computer_do {"app":"Maps","steps":[{"do":"key","key":"down"},{"do":"key","key":"return"}]}'), out);
+  // Both paths, each concrete: one for choosing out of a list, one for
+  // reaching a control that cannot be pressed at all.
+  assert.ok(out.includes('computer_do {"app":"Maps","steps":[{"do":"key","key":"down"},{"do":"key","key":"return"}]}'), out);
+  assert.ok(out.includes("whole intent") && out.includes('"directions to <place>"'), out);
 });
 
 test("down and return are one call, because down alone only moves the selection", () => {
@@ -994,6 +997,7 @@ test("down and return are one call, because down alone only moves the selection"
   const parsed = JSON.parse(steps[1]) as { do: string; key?: string }[];
   assert.deepEqual(parsed, [{ do: "key", key: "down" }, { do: "key", key: "return" }]);
   assert.ok(!call.includes("candidates"), "one measured route beats a set of guesses here");
+  assert.ok(call.includes("finished action"), "and the second path, for a control that cannot be pressed");
 });
 
 test("an app name with a quote in it cannot break the call it is embedded in", () => {
@@ -1010,10 +1014,14 @@ test("nothing is appended when the action worked, or when it was itself a key", 
 // The parked state used to be discovered by pressing something and watching it
 // fail. One run then spent sixteen seconds shelling out to read the skill.
 
-test("a read of a parked window says so, and names the call rather than the route", () => {
+test("a read of a parked window names the readable/interactable split and both working paths", () => {
   const note = parkedReadNote([{ id: 1, parked: true }]);
-  assert.ok(note && note.startsWith("This window is PARKED"), String(note));
+  assert.ok(note && note.startsWith("[parked] "), String(note));
+  // The distinction that matters: reads are exact, presses may not land.
+  assert.ok(note.includes("READABLE") && note.includes("INTERACTABLE"), note);
   assert.ok(note.includes('[{"do":"key","key":"down"},{"do":"key","key":"return"}]'), note);
+  assert.ok(note.includes('"directions to <place>"'), "the intent query is the path for a control you cannot press");
+  assert.ok(note.includes("menu bar") || note.includes("Menu bar"), note);
   assert.ok(note.includes("Do not raise") && note.includes("move or resize"), note);
 });
 

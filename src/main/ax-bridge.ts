@@ -477,7 +477,11 @@ export const ACTION_NO_CHANGE_SENTENCE =
  *  the reply now ends with the exact thing to send. `down` then `return` in
  *  ONE call, because down alone only moves the selection. */
 export function parkedNextCall(app: string): string {
-  return `Send exactly this next, in one call: computer_do {"app":${JSON.stringify(app)},"steps":[{"do":"key","key":"down"},{"do":"key","key":"return"}]}`;
+  const keys = '[{"do":"key","key":"down"},{"do":"key","key":"return"}]';
+  return (
+    `Send one of these next. To pick the item you meant out of the list: computer_do {"app":${JSON.stringify(app)},"steps":${keys}}. ` +
+    `To reach a control you cannot press, ask the app for the finished action instead of hunting for the button — set its search field to the whole intent (e.g. "directions to <place>", not "<place>") and commit with the same two keys.`
+  );
 }
 
 /** One line at the top of a read when the app's window is parked.
@@ -497,8 +501,10 @@ export function parkedReadNote(windows: unknown): string | null {
   const anyParked = list.some((w) => !!w && typeof w === "object" && (w as { parked?: unknown }).parked === true);
   if (!anyParked) return null;
   return (
-    "This window is PARKED by Stage Manager as a thumbnail: a press on a row, a card button or a tab is accepted and does nothing. " +
-    'Reach it with the keyboard instead — computer_do with steps [{"do":"key","key":"down"},{"do":"key","key":"return"}] — or with a menu bar item, and set text fields directly. ' +
+    "[parked] This window is READABLE but not reliably INTERACTABLE: Stage Manager has shrunk it to a thumbnail, so reads are exact while a press on a row, a card button or a tab is accepted and changes nothing. " +
+    "Two paths do work. " +
+    'To choose from a list: computer_do with steps [{"do":"key","key":"down"},{"do":"key","key":"return"}]. ' +
+    'To reach a control you cannot press: ask the app for the finished action in its search field — set the field to the whole INTENT rather than the object, e.g. "directions to <place>" instead of "<place>", then commit it with those same two keys. Menu bar items are in the tree and also work, and text fields can always be set directly. ' +
     "Do not raise it and do not try to move or resize it: parking follows which app is active, not where the window is."
   );
 }

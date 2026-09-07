@@ -87,6 +87,10 @@ nothing. It affects list rows, the buttons on a place or detail card, and
 segmented tabs. It does not affect typing into a field, keys you post, or menu
 bar items, because none of those go through hit-testing.
 
+**Readable is not interactable, and that is the distinction to hold onto.** The
+tree you read is exact: every element, every title, every value. What you press
+may simply not land. So trust what you read and change how you act.
+
 **Do not press it again, and do not raise the app.** Raising un-parks the window
 only while that app is in front. It re-parks the moment focus moves on: one run
 raised, and eleven seconds later the next press was dead again. The bridge
@@ -101,12 +105,16 @@ and finished without the route it was asked for.
 
 **Do this instead.**
 
-1. **Say the whole intent in the search field, not just the object.** Apps offer
-   the finished action as a suggestion when you ask for it. In Maps, setting the
+1. **Say the whole intent in the search field, not just the object.** This is
+   the one to reach for when the control you need cannot be pressed at all —
+   a button on a card, rather than a row you could arrow onto. Apps offer the
+   finished action as a suggestion when you ask for it. In Maps, setting the
    search field to `directions to AMC River East 21` puts
    `Directions to AMC River East 21, From My Location` at the top of the
    results, which skips the result row, the place card and the directions
-   button in one move.
+   button in one move. Reaching that route panel by pressing the card's drive
+   button is not possible while parked, and one run spent eighty seconds
+   discovering that.
 2. **Commit with the keyboard.** Send `down`, then `return`. Return on its own
    often does not take the suggestion. Arrow keys move through any result list,
    and this works on a parked window.
