@@ -1369,7 +1369,7 @@ const AX_TOOLS = [
         app: { type: "string" },
         key: {
           type: "string",
-          description: "One letter (a-z), one digit, or a named key: return, tab, escape, space, delete, up, down, left, right.",
+          description: "One letter (a-z), one digit, shortcut punctuation such as ] and [ for bring-to-front and send-to-back, or a named key: return, tab, escape, space, delete, up, down, left, right.",
         },
         modifiers: {
           type: "array",
