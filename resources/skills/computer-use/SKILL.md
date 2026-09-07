@@ -183,6 +183,18 @@ A picture that comes back blank means the window has nothing drawn in it, which
 is what a parked or never-shown window looks like. That is a fact about the
 picture, not a reason to raise the app. The tree still has the text.
 
+**A window that fills the display cannot be photographed while it is off
+screen.** macOS keeps no full-size surface for it, and the refusal says so.
+Smaller off-screen windows photograph fine. If you need to see a full-screen
+app, raise it and take a display screenshot with `computer_screenshot`; that
+path works whenever the window is actually visible.
+
+**If a picture does not arrive, do not conclude you are blind and keep
+guessing.** Read the failure: it distinguishes a missing permission from a
+window that cannot be captured where it is, and it names the way round. And
+when a task turns on exact geometry or colour, measuring the source file with a
+shell command beats squinting at any screenshot.
+
 `computer_screenshot` captures the whole display, so it shows the current Space
 only. An app on another Space is not in it.
 
