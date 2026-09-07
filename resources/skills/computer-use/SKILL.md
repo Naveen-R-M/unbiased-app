@@ -71,9 +71,14 @@ out of reach.
 This is the failure worth knowing about, because the wrong reaction to it costs
 more time than anything else in a task.
 
-**What you will see.** The action succeeds and reports no change. The element is
-still in the tree, still looks pressable, and pressing it again does nothing
-either. The reply usually explains why.
+**You will usually be told before you try.** A read of an app whose window is
+parked opens with a line saying so and naming the call to use instead. Act on
+that line rather than pressing something to find out.
+
+**What it looks like if you do press.** The action succeeds and reports no
+change. The element is still in the tree, still looks pressable, and pressing
+it again does nothing either. The reply explains why and ends with the exact
+call to send next.
 
 **What is happening.** Stage Manager parks the windows of apps the user is not
 looking at into the side strip as thumbnails. A window shrunk to a thumbnail

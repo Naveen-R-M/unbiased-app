@@ -480,6 +480,29 @@ export function parkedNextCall(app: string): string {
   return `Send exactly this next, in one call: computer_do {"app":${JSON.stringify(app)},"steps":[{"do":"key","key":"down"},{"do":"key","key":"return"}]}`;
 }
 
+/** One line at the top of a read when the app's window is parked.
+ *
+ *  Until now this was discovered by pressing something and watching it fail.
+ *  Measured: one run shelled out to read the bundled skill mid-task — sixteen
+ *  seconds — after its first attempts stalled, then redid the search from the
+ *  top. Saying it at read time removes the dead press and the whole discovery
+ *  detour, and costs nothing: the `windows` call every read already makes
+ *  carries the flag.
+ *
+ *  It names the call rather than describing the route, for the same reason
+ *  parkedNextCall does: prose about the keyboard was ignored three times, a
+ *  literal call was followed twice. */
+export function parkedReadNote(windows: unknown): string | null {
+  const list = Array.isArray(windows) ? windows : [];
+  const anyParked = list.some((w) => !!w && typeof w === "object" && (w as { parked?: unknown }).parked === true);
+  if (!anyParked) return null;
+  return (
+    "This window is PARKED by Stage Manager as a thumbnail: a press on a row, a card button or a tab is accepted and does nothing. " +
+    'Reach it with the keyboard instead — computer_do with steps [{"do":"key","key":"down"},{"do":"key","key":"return"}] — or with a menu bar item, and set text fields directly. ' +
+    "Do not raise it and do not try to move or resize it: parking follows which app is active, not where the window is."
+  );
+}
+
 export function renderActionResult(diff: string, hint?: string | null, nextCall?: string | null): string {
   const body = diff.trim();
   // The bridge's own explanation comes first when it has one: it knows WHY the

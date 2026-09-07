@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-import { AX_TOOL_NAMES, SCREENSHOT_TOOL_NAMES, routesToAx, parseBatchSteps, describeBatch, summarizeBatch, MAX_BATCH_STEPS, AxClient, AxError, appOfStep, axConsent, axNeedsFocus, screenshotToolsOffered, coordinateToolAllowed, withScreenshotGuidance, SCREENSHOT_FRAME_SENTENCE, axReadOptsFrom, axFilterSwitched, AX_DEFAULT_READ_OPTS, shouldRecoverRaise, describeAxAction, indexElementLines, readAxManifest, resolveAxDir, shouldOpenAccessibilitySettings, axNotTrustedText, RAISE_DESCRIPTION, APP_STATE_SPACE_SENTENCE, LAUNCH_FRONT_SENTENCE, withSpaceGuidance, otherSpaceNote, launchOutcome, renderActionResult, ACTION_NO_CHANGE_SENTENCE, TASK_DISCIPLINE_SENTENCE, SCREENSHOT_SPACE_SENTENCE, parseCandidates, describeCandidates, parkedNextCall, candidateWorked, summarizeCandidates, MAX_CANDIDATES, MAX_CANDIDATE_STEPS, type AxCallInfo } from "./ax-bridge";
+import { AX_TOOL_NAMES, SCREENSHOT_TOOL_NAMES, routesToAx, parseBatchSteps, describeBatch, summarizeBatch, MAX_BATCH_STEPS, AxClient, AxError, appOfStep, axConsent, axNeedsFocus, screenshotToolsOffered, coordinateToolAllowed, withScreenshotGuidance, SCREENSHOT_FRAME_SENTENCE, axReadOptsFrom, axFilterSwitched, AX_DEFAULT_READ_OPTS, shouldRecoverRaise, describeAxAction, indexElementLines, readAxManifest, resolveAxDir, shouldOpenAccessibilitySettings, axNotTrustedText, RAISE_DESCRIPTION, APP_STATE_SPACE_SENTENCE, LAUNCH_FRONT_SENTENCE, withSpaceGuidance, otherSpaceNote, launchOutcome, renderActionResult, ACTION_NO_CHANGE_SENTENCE, TASK_DISCIPLINE_SENTENCE, SCREENSHOT_SPACE_SENTENCE, parseCandidates, describeCandidates, parkedNextCall, parkedReadNote, candidateWorked, summarizeCandidates, MAX_CANDIDATES, MAX_CANDIDATE_STEPS, type AxCallInfo } from "./ax-bridge";
 
 const scratch = () => mkdtempSync(join(tmpdir(), "ax-"));
 
@@ -1005,4 +1005,34 @@ test("nothing is appended when the action worked, or when it was itself a key", 
   const src = readFileSync(join(__dirname, "index.ts"), "utf8");
   assert.ok(src.includes('tool === "computer_press" || tool === "computer_act" || tool === "computer_set_value"'), "only the verbs that hit-test");
   assert.ok(src.includes("hint && clicked ? parkedNextCall(appName) : null"));
+});
+
+// The parked state used to be discovered by pressing something and watching it
+// fail. One run then spent sixteen seconds shelling out to read the skill.
+
+test("a read of a parked window says so, and names the call rather than the route", () => {
+  const note = parkedReadNote([{ id: 1, parked: true }]);
+  assert.ok(note && note.startsWith("This window is PARKED"), String(note));
+  assert.ok(note.includes('[{"do":"key","key":"down"},{"do":"key","key":"return"}]'), note);
+  assert.ok(note.includes("Do not raise") && note.includes("move or resize"), note);
+});
+
+test("nothing is said when no window is parked, whatever the shape of the input", () => {
+  assert.equal(parkedReadNote([{ id: 1, parked: false }]), null);
+  assert.equal(parkedReadNote([{ id: 1 }]), null);
+  assert.equal(parkedReadNote([]), null);
+  assert.equal(parkedReadNote(undefined), null);
+  assert.equal(parkedReadNote("nonsense"), null);
+  assert.equal(parkedReadNote([null, 3, "x"]), null);
+});
+
+test("one parked window among several is enough to say it", () => {
+  assert.ok(parkedReadNote([{ id: 1, parked: false }, { id: 2, parked: true }]));
+});
+
+test("the read result carries the note, next to the Space guidance", () => {
+  const src = readFileSync(join(__dirname, "index.ts"), "utf8");
+  const head = src.slice(src.indexOf("const head = ["), src.indexOf("].filter(Boolean).join"));
+  assert.ok(head.includes("parkedReadNote(w.windows)"), `the read head must carry it: ${head}`);
+  assert.ok(head.includes("otherSpaceNote"), "and still carry the Space note");
 });

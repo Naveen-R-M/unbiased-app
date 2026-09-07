@@ -40,6 +40,7 @@ import {
   type AxResult,
   parseCandidates,
   parkedNextCall,
+  parkedReadNote,
   MAX_CANDIDATES,
   candidateWorked,
   summarizeCandidates,
@@ -2434,6 +2435,7 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         const head = [
           windowsText ? `windows:\n${windowsText}` : (ax.crossSpace ? "windows: none" : "windows: none on this Space"),
           typeof w.hint === "string" ? w.hint : "",
+          parkedReadNote(w.windows),
           otherSpaceNote(ax.crossSpace, windowsText),
         ].filter(Boolean).join("\n");
         if (!windowsText && offscreen > 0) return axText(head, true);
