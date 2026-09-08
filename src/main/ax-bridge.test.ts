@@ -820,6 +820,17 @@ test("an action with no visible change says to read before repeating, instead of
   assert.equal(renderActionResult("+ 12 button \"Directions\" {press}"), "Done.\n+ 12 button \"Directions\" {press}");
 });
 
+// Rollout 01a081a0 (2026-09-08): with no human in the loop, three model turns
+// opened "You're right — let me stop…" in direct reply to this sentence and to
+// the batch caveat, and each began a re-plan. A tool result is evidence, not a
+// reviewer: it says what happened and what else is available.
+test("tool text states facts and options, never scolds or cites past runs", () => {
+  const batch = summarizeBatch({ ran: ["a", "b"], failed: null, remaining: 0, diff: "~ 1", unwatched: true });
+  for (const s of [ACTION_NO_CHANGE_SENTENCE, batch]) {
+    assert.ok(!/\bdo not\b|don't|\bnever\b|in the last run|cost \w+ turns|retries/i.test(s), s);
+  }
+});
+
 test("a batch that ends with no visible change gets the same guidance", () => {
   const out = summarizeBatch({ ran: ["press #3"], failed: null, remaining: 0, diff: "(no changes)" });
   assert.ok(out.includes(ACTION_NO_CHANGE_SENTENCE), out);

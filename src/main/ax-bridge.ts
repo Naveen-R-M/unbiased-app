@@ -554,9 +554,15 @@ export function coordinateToolAllowed(tool: string, mode: "all" | "screenshot-on
  *  unchanged. "(no changes)" is a fine answer to a READ; after an ACTION the
  *  model heard it as "nothing there" and pressed again — which, on a Maps
  *  result, opened the card the first press had already asked for, and on a
- *  settings row toggled Location Tracking back. */
+ *  settings row toggled Location Tracking back.
+ *
+ *  Voice: facts and options, no imperatives and no anecdotes. Rollout 01a081a0
+ *  (2026-09-08) showed the model answering the previous wording — "Do NOT
+ *  repeat it… five retries of one dead button cost six turns" — with
+ *  "You're right — let me stop…" and a re-plan, three times, with no human in
+ *  the loop. A tool result read as a reviewer starts detours. */
 export const ACTION_NO_CHANGE_SENTENCE =
-  "The app accepted the action but showed no change while the bridge waited. Do NOT repeat it on this element: a second press undoes a toggle or opens a second copy, and in the last run five retries of one dead button cost six turns. Take a different path instead: the keyboard (arrow keys and return choose from a list, escape closes), or the app's menu bar, whose items are in the tree and reliably reach every command.";
+  "The app accepted the action and nothing in the tree changed while the bridge waited. The same action again would do the same. Other paths that reach a control: the keyboard (arrows and return choose from a list, escape closes), or a menu bar item — both are in the tree.";
 
 /** The literal call to send after a click died on a parked window.
  *
