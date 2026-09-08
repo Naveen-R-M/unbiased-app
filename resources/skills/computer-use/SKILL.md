@@ -37,7 +37,12 @@ skips the wait for the app to react — only the last one waits — so a batch o
 five is faster than five singles by more than the round trips alone.
 
 **Read again only when the ids you need are not in front of you**, or when an
-action reports that nothing changed and you expected something.
+action reports that nothing changed and you expected something. After a press,
+a click or a batch the reply ends with `Inspector now:` — every settable
+control with its id and current value — so the next field to click is already
+named; do not search for it. To look while you work, put
+`{"do":"screenshot"}` inside the batch: the picture comes back with the same
+result, and a separate screenshot call is a whole turn spent on looking.
 
 **When you can see several ways to do one thing and cannot tell which the app
 will honour, send them as candidates.** `computer_do` takes `candidates`

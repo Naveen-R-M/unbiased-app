@@ -45,6 +45,8 @@ import {
   touchedFieldIds,
   renderFieldValues,
   type FieldValue,
+  renderInspector,
+  type InspectorField,
   BATCH_NUDGE_AFTER,
   type RecentEdit,
   shouldSendSkill,
@@ -1413,8 +1415,8 @@ const AX_TOOLS = [
     name: "computer_do",
     description:
       "Run several steps on ONE app in a single call, in order, and get back what changed. Use this whenever you already know the next few moves — filling a field and committing it, pressing a tab and reading the result, scrolling and reading. It saves a whole round trip per step, which is the main cost of operating an app. " +
-      "Each step is {do, ...}: do=\"press\" with id; do=\"set_value\" with id and text; do=\"key\" with key (and optional id to aim it); do=\"scroll\" with id and direction; do=\"act\" with id and action; do=\"read\" to re-read the app. Add wait_ms to a step to pause after it, for content that loads (a tab that shows \"Loading…\"). " +
-      `Up to ${MAX_BATCH_STEPS} steps — use them: one shape's position, size, colour and commit is ONE call, not five. It STOPS at the first step that fails and tells you which one — the rest do not run, so do not assume they did. After the batch, every field it touched is read back and listed under \"Fields now:\", so you do not need to read the app to check a value you just wrote. ` +
+      "Each step is {do, ...}: do=\"press\" with id; do=\"set_value\" with id and text; do=\"key\" with key (and optional id to aim it); do=\"scroll\" with id and direction; do=\"act\" with id and action; do=\"read\" to re-read the app; do=\"screenshot\" to photograph the window at that point — the picture comes back with the result, so a look costs no extra turn. Add wait_ms to a step to pause after it, for content that loads (a tab that shows \"Loading…\"). " +
+      `Up to ${MAX_BATCH_STEPS} steps — use them: one shape's position, size, colour and commit is ONE call, not five. It STOPS at the first step that fails and tells you which one — the rest do not run, so do not assume they did. After the batch, every field it touched is read back and listed under \"Fields now:\", so you do not need to read the app to check a value you just wrote. The result also ends with \"Inspector now:\" — every settable control with its id and current value — so the next step can be aimed without reading the app. ` +
       "SETTING A VALUE IN A WEB APP'S PANEL (Figma, and anything Chromium): set_value works on an element the tree calls a \"text field\" and is SILENTLY IGNORED on a \"stepper\" — the write appears in the box, the value never changes, and it commits later when focus leaves, which is how a 67 became 100100. For a stepper use the four-step recipe in ONE call: {\"do\":\"pointer\",\"id\":N} then {\"do\":\"key\",\"key\":\"a\",\"modifiers\":[\"command\"]} then {\"do\":\"type\",\"text\":\"460\"} then {\"do\":\"key\",\"key\":\"return\"}. Add clicks:2 to the pointer step if one click does not open the field. Read the value back afterwards: some fields reject what you typed and fall back to 0. " +
       "Opening or raising an app is not batchable: call computer_launch or computer_raise on its own. Do NOT batch steps whose ids you have not read yet, or steps that depend on what an earlier step reveals — read first, then batch what you can see. " +
       `Pass candidates instead of steps when you can see several plausible ways to reach ONE state and cannot tell which the app will honour: press the result row, or send down then return, or type the whole intent into the search field. Each candidate is a route — a step or a short list of steps — they are tried in order, and it stops at the first that changes the app, telling you what each one did. That is a model turn saved per wrong guess. Read the diff and confirm the state is the one you wanted; "it changed something" is not "it worked". Actions only, never for anything you would not want to happen twice. ` +
@@ -1434,7 +1436,7 @@ const AX_TOOLS = [
           items: {
             type: "object",
             properties: {
-              do: { type: "string", enum: ["press", "set_value", "key", "scroll", "act", "read"] },
+              do: { type: "string", enum: ["press", "set_value", "key", "scroll", "act", "read", "screenshot"] },
               id: { type: "integer", description: "Element id from computer_app_state." },
               text: { type: "string", description: "With do=set_value, or with do=type: the whole string to type as real keystrokes." },
               clicks: { type: "integer", description: "With do=pointer: 2 for a double click, which some fields need before they accept typing." },
@@ -1452,6 +1454,7 @@ const AX_TOOLS = [
               direction: { type: "string", enum: ["down", "up", "left", "right"], description: "With do=scroll." },
               amount: { type: "integer", description: "With do=scroll: lines (default 5)." },
               action: { type: "string", description: "With do=act: one of the actions the element listed in braces." },
+              window: { type: "integer", description: "With do=screenshot: window id from computer_app_state (default: the focused window)." },
               wait_ms: { type: "integer", description: "Pause this many ms after the step, for content that loads." },
             },
             required: ["do"],
@@ -2264,6 +2267,26 @@ async function reassertRaise(root: string): Promise<void> {
 /** id -> element line per app, accumulated from every tree and diff the model
  *  saw, so an approval can say WHICH element is about to be pressed. */
 const axLines = new Map<string, Map<number, string>>();
+
+/** The settable controls in the app's latest snapshot, as ids the model can aim
+ *  at next. Sent after every action that can change the selection and after
+ *  every batch. Identical to the last block sent for this app collapses to one
+ *  line, so an unchanged inspector costs almost nothing. Second Figma run,
+ *  2026-09-08: 34 of 90 turns were finds for exactly these ids. */
+const axLastInspector = new Map<string, string>();
+async function inspectorBlock(appName: string): Promise<string | null> {
+  try {
+    const r = await ax!.request("fields", { app: appName }, 3_000);
+    const fields = Array.isArray(r.fields) ? (r.fields as InspectorField[]) : [];
+    const text = renderInspector(fields, r.truncated === true);
+    if (!text) return null;
+    if (axLastInspector.get(appName) === text) return "Inspector unchanged (same ids and values as last listed).";
+    axLastInspector.set(appName, text);
+    return text;
+  } catch {
+    return null; // an older bridge has no `fields`
+  }
+}
 /** app name -> its icon as a data URL, fetched once per app. The transcript
  *  shows it beside each step, so "press #643 in Brave" carries Brave's icon
  *  rather than a terminal glyph. */
@@ -2378,6 +2401,8 @@ async function runBatchStep(appName: string, st: BatchStep, settle = true): Prom
       return await ax!.request("pointer", { app: appName, id: st.id, ...(st.clicks ? { clicks: st.clicks } : {}), ...opts });
     case "key":
       return await ax!.request("key", { app: appName, key: st.key, ...(st.id !== undefined ? { id: st.id } : {}), ...(st.modifiers?.length ? { modifiers: st.modifiers } : {}), ...opts });
+    case "screenshot":
+      return await ax!.request("screenshot", { app: appName, ...(st.window !== undefined ? { window: st.window } : {}) }, 15_000);
     case "scroll": {
       const amount = typeof st.amount === "number" && st.amount > 0 ? Math.min(st.amount, 40) : 5;
       const d = SCROLL_DELTAS[st.direction];
@@ -2598,6 +2623,7 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         axRecentEdits = []; // the caller batched; nothing to nudge about
         axLog(`do ${appName} ${steps.length} step(s): ${steps.map((x) => x.do).join(",")}`);
         const ran: string[] = [];
+        const pictures: AxResult[] = [];
         let failed: { step: string; message: string } | null = null;
         // One bridge call per step. That is the cheap round trip — 3-70ms over
         // a local pipe — and collapsing them into ONE model round trip is the
@@ -2605,7 +2631,8 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         for (const [i, st] of steps.entries()) {
           const label = `step ${i + 1} (${traceStep(st)})`;
           try {
-            await runBatchStep(appName, st, i === steps.length - 1);
+            const stepResult = await runBatchStep(appName, st, i === steps.length - 1);
+            if (st.do === "screenshot") pictures.push(stepResult);
             ran.push(label);
             if (st.waitMs > 0) await new Promise((r) => setTimeout(r, st.waitMs));
           } catch (err) {
@@ -2641,13 +2668,32 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
             // the diff still stands
           }
         }
-        return axText(
+        const inspector = await inspectorBlock(appName);
+        const captions = pictures.map((r, i) => {
+          const where = r.onSpace === false ? ", on another Space" : "";
+          const note = typeof r.note === "string" ? ` ${r.note}` : "";
+          return `Picture ${i + 1}: window ${String(r.window)} of ${appName}, ${String(r.width)}x${String(r.height)}${where}.${note}`;
+        });
+        const text = [
           summarizeBatch({
             ran, failed, remaining: steps.length - ran.length - (failed ? 1 : 0), diff,
             unwatched: steps.length > 1, fields,
           }),
-          failed === null,
-        );
+          inspector,
+          ...captions,
+        ].filter(Boolean).join("\n");
+        return {
+          contentItems: [
+            { type: "inputText", text },
+            ...pictures.flatMap((r) => {
+              const image = String(r.image ?? "");
+              if (!image) return [];
+              const mime = typeof r.mime === "string" ? r.mime : "image/png";
+              return [{ type: "inputImage" as const, imageUrl: `data:${mime};base64,${image}` }];
+            }),
+          ],
+          success: failed === null,
+        };
       }
       case "computer_scroll_view": {
         const amount = typeof a.amount === "number" && a.amount > 0 ? Math.min(a.amount, 40) : 5;
@@ -2690,7 +2736,8 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         const at = Array.isArray(r.at) ? (r.at as { x: number; y: number }[]) : [];
         if (at.length) recordFact(threadId, `${appName} pointer #${String(a.id)} ${hold ? "drag" : "click"} landed ${at.map((q) => `(${q.x},${q.y})`).join(" ")}`);
         const where = at.length ? `\nLanded at ${at.map((q) => `(${q.x},${q.y})`).join(" ")}.` : "";
-        return axText(`${hold ? "Dragged" : "Clicked"} ${path ? `${path.length} point(s)` : "the centre"} in ${appName}.${where}\n${diff || "(nothing in the tree changed — a canvas often shows its result only as a new object, so read the app)"}`, true);
+        const inspector = await inspectorBlock(appName); // a click changes the selection; the inspector follows
+        return axText([`${hold ? "Dragged" : "Clicked"} ${path ? `${path.length} point(s)` : "the centre"} in ${appName}.${where}\n${diff || "(nothing in the tree changed — a canvas often shows its result only as a new object, so read the app)"}`, inspector].filter(Boolean).join("\n"), true);
       }
       case "computer_app_screenshot": {
         const r = await ax.request("screenshot", { app: appName, ...(typeof a.window === "number" ? { window: a.window } : {}) }, 15_000);
@@ -2762,8 +2809,11 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         // just sent a key to send a key is noise, and it is the click that
         // dies on a parked window.
         const clicked = tool === "computer_press" || tool === "computer_act" || tool === "computer_set_value";
+        // A press or a named action can change the selection, which is when the
+        // inspector's ids change; a key or a value write does not.
+        const inspector = tool === "computer_press" || tool === "computer_act" ? await inspectorBlock(appName) : null;
         return axText(
-          [renderActionResult(diff, hint, hint && clicked ? parkedNextCall(appName) : null), nudge].filter(Boolean).join("\n"),
+          [renderActionResult(diff, hint, hint && clicked ? parkedNextCall(appName) : null), inspector, nudge].filter(Boolean).join("\n"),
           true,
         );
       }
@@ -5599,7 +5649,10 @@ function wireNotifications(): void {
               c.gateUsed = false;
               c.thresholdWritten = false;
               checkpointReplayDue.add(root);
-              axLog(`checkpoint: compaction ${c.compactions} on ${root}; replay armed`);
+              // The summary ate the skill too: last run the model re-read it
+              // through the shell, 8KB and a turn. Send it again with the next call.
+              axSkillSent.delete(root);
+              axLog(`checkpoint: compaction ${c.compactions} on ${root}; replay armed, skill re-armed`);
             }
           }
         } else if (item?.type === "fileChange") {

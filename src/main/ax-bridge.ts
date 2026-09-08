@@ -163,6 +163,7 @@ export type BatchStep =
   | { do: "act"; id: number; action: string; waitMs: number }
   | { do: "type"; text: string; id?: number; waitMs: number }
   | { do: "pointer"; id: number; clicks?: number; waitMs: number }
+  | { do: "screenshot"; window?: number; waitMs: number }
   | { do: "read"; waitMs: number };
 
 /** Deliberately NOT batchable: launch and raise both take over the user's
@@ -180,7 +181,7 @@ export const KEY_MODIFIERS = ["command", "shift", "option", "control"];
  *  ignored on a `stepper`, and Codex's own run hit the identical split.
  *
  *  Still NOT batchable: launch and raise, which take over the user's screen. */
-export const BATCH_VERBS = ["press", "set_value", "key", "type", "pointer", "scroll", "act", "read"] as const;
+export const BATCH_VERBS = ["press", "set_value", "key", "type", "pointer", "screenshot", "scroll", "act", "read"] as const;
 /** Measured against Codex on the same Figma icon: its densest single turn ran
  *  17 primitive actions (four fields, each a click + select-all + type +
  *  Return, then a colour click). A cap of 10 split work like that across turns
@@ -215,6 +216,14 @@ export function parseBatchSteps(raw: unknown): { steps: BatchStep[] } | { error:
       case "read":
         steps.push({ do: "read", waitMs });
         break;
+      case "screenshot": {
+        // A look that rides inside the batch. Second Figma run: 12 screenshots,
+        // each a whole turn, when the picture could have come back with the
+        // actions that made it worth taking.
+        const window = typeof e.window === "number" ? e.window : undefined;
+        steps.push({ do: "screenshot", ...(window !== undefined ? { window } : {}), waitMs });
+        break;
+      }
       case "type": {
         if (typeof e.text !== "string" || !e.text) return { error: `${at}: text is required for do=type.` };
         if (e.text.length > MAX_TYPE_LENGTH) {
@@ -363,6 +372,7 @@ export function describeBatch(app: string, steps: BatchStep[], lines?: Map<numbe
     const pause = st.waitMs > 0 ? ` (then wait ${st.waitMs}ms)` : "";
     switch (st.do) {
       case "read": return `${n} read ${app}${pause}`;
+      case "screenshot": return `${n} photograph the window${pause}`;
       case "press": return `${n} press ${target(st.id)}${pause}`;
       case "set_value": return `${n} set ${target(st.id)} to "${clip(st.text)}"${pause}`;
       case "key": return `${n} press ${st.key}${st.id !== undefined ? ` in ${target(st.id)}` : ""}${pause}`;
@@ -382,6 +392,7 @@ export function describeBatch(app: string, steps: BatchStep[], lines?: Map<numbe
 export function traceStep(st: BatchStep): string {
   switch (st.do) {
     case "read": return "read";
+    case "screenshot": return "screenshot";
     case "key": return `key ${st.modifiers?.length ? st.modifiers.join("+") + "+" : ""}${st.key}${st.id !== undefined ? ` in #${st.id}` : ""}`;
     case "press": return `press #${st.id}`;
     case "act": return `act #${st.id} "${st.action}"`;
@@ -420,6 +431,18 @@ export function renderFieldValues(values: FieldValue[]): string {
     return `#${v.id}${what ? ` ${what}` : ""} = ${v.value ?? "(no value)"}`;
   });
   return `Fields now:\n${lines.join("\n")}`;
+}
+
+/** The settable controls in the app's latest snapshot, with their ids. Sent
+ *  after every action that can change the selection and after every batch, so
+ *  the next step can be aimed without a read. Second Figma run, 2026-09-08:
+ *  34 of 90 turns were finds for exactly these ids. */
+export const MAX_INSPECTOR_FIELDS = 40;
+export type InspectorField = { id: number; role: string | null; title: string | null; value: string | null };
+export function renderInspector(fields: InspectorField[], truncated: boolean): string | null {
+  if (!fields.length) return null;
+  const lines = fields.map((f) => `#${f.id}${f.role ? ` ${f.role}` : ""}${f.title ? ` ${JSON.stringify(f.title)}` : ""} = ${f.value ?? ""}`);
+  return ["Inspector now:", ...lines, ...(truncated ? [`(… more than ${MAX_INSPECTOR_FIELDS}; use query for the rest)`] : [])].join("\n");
 }
 
 export function summarizeBatch(opts: {

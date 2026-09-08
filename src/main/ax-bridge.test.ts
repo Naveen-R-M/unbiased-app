@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-import { AX_TOOL_NAMES, SCREENSHOT_TOOL_NAMES, routesToAx, parseBatchSteps, describeBatch, summarizeBatch, MAX_BATCH_STEPS, AxClient, AxError, appOfStep, axConsent, axNeedsFocus, screenshotToolsOffered, coordinateToolAllowed, withScreenshotGuidance, SCREENSHOT_FRAME_SENTENCE, axReadOptsFrom, AX_DEFAULT_READ_OPTS, shouldRecoverRaise, describeAxAction, indexElementLines, readAxManifest, resolveAxDir, shouldOpenAccessibilitySettings, axNotTrustedText, RAISE_DESCRIPTION, APP_STATE_SPACE_SENTENCE, LAUNCH_FRONT_SENTENCE, withSpaceGuidance, otherSpaceNote, launchOutcome, renderActionResult, ACTION_NO_CHANGE_SENTENCE, TASK_DISCIPLINE_SENTENCE, SCREENSHOT_SPACE_SENTENCE, parseCandidates, describeCandidates, parkedNextCall, parkedReadNote, batchNudge, traceStep, MAX_TYPE_LENGTH, type BatchStep, BATCH_NUDGE_AFTER, type RecentEdit, skillBody, skillPreamble, shouldSendSkill, prependSkill, MAX_SKILL_PREAMBLE, candidateWorked, summarizeCandidates, MAX_CANDIDATES, MAX_CANDIDATE_STEPS, type AxCallInfo, touchedFieldIds, renderFieldValues, MAX_FIELDS_READ_BACK, type FieldValue } from "./ax-bridge";
+import { AX_TOOL_NAMES, SCREENSHOT_TOOL_NAMES, routesToAx, parseBatchSteps, describeBatch, summarizeBatch, MAX_BATCH_STEPS, AxClient, AxError, appOfStep, axConsent, axNeedsFocus, screenshotToolsOffered, coordinateToolAllowed, withScreenshotGuidance, SCREENSHOT_FRAME_SENTENCE, axReadOptsFrom, AX_DEFAULT_READ_OPTS, shouldRecoverRaise, describeAxAction, indexElementLines, readAxManifest, resolveAxDir, shouldOpenAccessibilitySettings, axNotTrustedText, RAISE_DESCRIPTION, APP_STATE_SPACE_SENTENCE, LAUNCH_FRONT_SENTENCE, withSpaceGuidance, otherSpaceNote, launchOutcome, renderActionResult, ACTION_NO_CHANGE_SENTENCE, TASK_DISCIPLINE_SENTENCE, SCREENSHOT_SPACE_SENTENCE, parseCandidates, describeCandidates, parkedNextCall, parkedReadNote, batchNudge, traceStep, MAX_TYPE_LENGTH, type BatchStep, BATCH_NUDGE_AFTER, type RecentEdit, skillBody, skillPreamble, shouldSendSkill, prependSkill, MAX_SKILL_PREAMBLE, candidateWorked, summarizeCandidates, MAX_CANDIDATES, MAX_CANDIDATE_STEPS, type AxCallInfo, touchedFieldIds, renderFieldValues, MAX_FIELDS_READ_BACK, type FieldValue, renderInspector, MAX_INSPECTOR_FIELDS, BATCH_VERBS } from "./ax-bridge";
 
 const scratch = () => mkdtempSync(join(tmpdir(), "ax-"));
 
@@ -1380,4 +1380,47 @@ test("computer_do tells the model which field kind takes which route", () => {
   // The description is a TS string literal, so its quotes are escaped in source.
   assert.ok(decl.includes(String.raw`{\"do\":\"type\",\"text\":\"460\"}`), "hand over the literal recipe");
   assert.ok(decl.includes("clicks:2"), "and the double-click fallback");
+});
+
+// Second Figma run, 2026-09-08: 90 turns, of which 34 were finds for the id of an
+// inspector field so the next click could be aimed, 12 were screenshots that
+// each cost a turn, and one re-read the skill through the shell after the
+// compaction had summarized it away. Three mechanisms, one per waste.
+
+test("a screenshot can ride inside a batch, so a look does not cost a turn", () => {
+  assert.ok((BATCH_VERBS as readonly string[]).includes("screenshot"));
+  const r = parseBatchSteps([{ do: "press", id: 4 }, { do: "screenshot" }, { do: "screenshot", window: 2 }]);
+  assert.ok(!("error" in r), JSON.stringify(r));
+  const steps = (r as { steps: BatchStep[] }).steps;
+  assert.deepEqual(steps[1], { do: "screenshot", waitMs: 0 });
+  assert.deepEqual(steps[2], { do: "screenshot", window: 2, waitMs: 0 });
+  assert.equal(traceStep(steps[1]), "screenshot");
+  assert.ok(describeBatch("Figma", steps).includes("photograph"), describeBatch("Figma", steps));
+  assert.deepEqual(touchedFieldIds(steps), [], "a picture touches no field");
+});
+
+test("the inspector block lists settable controls with ids, in tree order, capped", () => {
+  const out = renderInspector([
+    { id: 563, role: "text field", title: "Width", value: "510" },
+    { id: 545, role: "incrementor", title: "X-position", value: "257" },
+    { id: 9, role: "checkbox", title: "Clip content", value: "1" },
+  ], false);
+  assert.equal(out, 'Inspector now:\n#563 text field "Width" = 510\n#545 incrementor "X-position" = 257\n#9 checkbox "Clip content" = 1');
+  assert.equal(renderInspector([], false), null, "nothing settable: no block");
+  const cut = renderInspector([{ id: 1, role: "text field", title: "A", value: "" }], true);
+  assert.ok(cut !== null && cut.endsWith(`(… more than ${MAX_INSPECTOR_FIELDS}; use query for the rest)`), cut ?? "");
+});
+
+test("the three mechanisms are wired: inspector after selection-changing actions and batches, pictures inside batches, the skill re-sent after compaction", () => {
+  const src = readFileSync(join(__dirname, "index.ts"), "utf8");
+  const compaction = src.slice(src.indexOf('item?.type === "contextCompaction"'), src.indexOf('item?.type === "fileChange"'));
+  assert.ok(compaction.includes("axSkillSent.delete(root)"), "a summary eats the skill; the next desktop call must carry it again");
+  const batch = src.slice(src.indexOf('case "computer_do": {'), src.indexOf('case "computer_scroll_view": {'));
+  assert.ok(batch.includes('case "screenshot"') || src.slice(src.indexOf("async function runBatchStep")).includes('case "screenshot"'), "a screenshot step reaches the bridge");
+  assert.ok(batch.includes('type: "inputImage"'), "the batch result carries the pictures it took");
+  assert.ok(batch.includes("inspectorBlock("), "a batch ends with the inspector");
+  const pointer = src.slice(src.indexOf('case "computer_pointer": {'), src.indexOf('case "computer_app_screenshot": {'));
+  assert.ok(pointer.includes("inspectorBlock("), "a click changes the selection; the inspector follows");
+  const press = src.slice(src.indexOf('case "computer_press":'), src.indexOf('default:\n        return axText(`Unknown tool ${tool}`'));
+  assert.ok(press.includes("inspectorBlock("), "a press changes the selection; the inspector follows");
 });
