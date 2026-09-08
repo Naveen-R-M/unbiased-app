@@ -1451,3 +1451,21 @@ test("the three mechanisms are wired: inspector after selection-changing actions
   const press = src.slice(src.indexOf('case "computer_press":'), src.indexOf('default:\n        return axText(`Unknown tool ${tool}`'));
   assert.ok(press.includes("inspectorBlock("), "a press changes the selection; the inspector follows");
 });
+
+// The mechanisms are app-neutral — there is no per-app branching anywhere in
+// the desktop path — but the PROSE had drifted: one third-party app was named
+// nine times across the tool descriptions and the bundled skill, which is
+// tuning the model toward one app in the layer this codebase has repeatedly
+// measured to be the weakest. Evidence belongs in comments, where naming the
+// app makes it checkable; guidance should describe the shape of the problem.
+test("model-facing text describes shapes of apps, not one app by name", () => {
+  const src = readFileSync(join(__dirname, "index.ts"), "utf8");
+  const decls = src.slice(src.indexOf("const AX_TOOLS = ["), src.indexOf("// Declared and routed must be the same set"));
+  const strings = decls.split("\n").filter((l) => !l.trim().startsWith("//")).join("\n");
+  for (const app of ["Figma", "Sketch", "Photoshop", "Illustrator"]) {
+    assert.ok(!strings.includes(app), `tool descriptions name ${app}; say what KIND of app it is instead`);
+  }
+  const skill = readFileSync(join(__dirname, "..", "..", "resources", "skills", "computer-use", "SKILL.md"), "utf8");
+  const named = (skill.match(/Figma/g) ?? []).length;
+  assert.ok(named === 0, `the skill names Figma ${named} time(s); describe the kind of app instead`);
+});

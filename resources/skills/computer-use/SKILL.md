@@ -30,7 +30,7 @@ typing), a value, a press, a read.
 
 A turn costs about fifteen seconds whatever it carries, so the unit of work is
 the turn, not the action. Setting one shape's x, y, width, height and colour is
-ONE call with five steps, not five calls. Measured on a Figma icon: 372 actions
+ONE call with five steps, not five calls. Measured on a drawing task: 372 actions
 arrived nearly one per turn and the run took 23 minutes, where the same actions
 batched by shape would have been about 40 turns. Every step in a batch also
 skips the wait for the app to react — only the last one waits — so a batch of
@@ -162,8 +162,9 @@ area. The tree shows one big element and no controls inside it. Two things get
 you in.
 
 **A tool is usually a letter.** `computer_press_key` takes a single letter or
-digit, with modifiers. This is often the only way to reach a tool at all —
-Figma's pen is `p` and it has no element, no menu item and no other route. Keys
+digit, with modifiers. This is often the only way to reach a tool at all — a
+pen or shape tool is one letter, with no element, no menu item and no other
+route. Keys
 work on a background app on any Space, because a key event does not care where
 the window is.
 
@@ -200,7 +201,7 @@ exactly:
 For a stepper, do what a person does — in ONE call:
 
 ```json
-{"app": "Figma", "steps": [
+{"app": "<the app>", "steps": [
   {"do": "pointer", "id": 84},
   {"do": "key", "key": "a", "modifiers": ["command"]},
   {"do": "type", "text": "-19.6875"},
@@ -250,7 +251,7 @@ saved; the reply carries the exact call. Save, then send the action again.
 What a good note looks like — small, exact, and about the work rather than the
 screen:
 
-    # unbiased logo, Figma frame "Unbiased"
+    # logo, design-app frame "Unbiased"
     palette: outer #1B4B8F, inner #E8F0FA, mark #F5A623
     circle: 500x500 at 320,180  DONE
     arc: 180x180 at 480,340     stroke 12  DONE
