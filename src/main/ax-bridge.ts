@@ -439,10 +439,33 @@ export function renderFieldValues(values: FieldValue[]): string {
  *  34 of 90 turns were finds for exactly these ids. */
 export const MAX_INSPECTOR_FIELDS = 40;
 export type InspectorField = { id: number; role: string | null; title: string | null; value: string | null };
-export function renderInspector(fields: InspectorField[], truncated: boolean): string | null {
+export function renderInspector(fields: InspectorField[], truncated: boolean, previous?: InspectorField[]): string | null {
   if (!fields.length) return null;
-  const lines = fields.map((f) => `#${f.id}${f.role ? ` ${f.role}` : ""}${f.title ? ` ${JSON.stringify(f.title)}` : ""} = ${f.value ?? ""}`);
-  return ["Inspector now:", ...lines, ...(truncated ? [`(… more than ${MAX_INSPECTOR_FIELDS}; use query for the rest)`] : [])].join("\n");
+  const line = (f: InspectorField) => `#${f.id}${f.role ? ` ${f.role}` : ""}${f.title ? ` ${JSON.stringify(f.title)}` : ""} = ${f.value ?? ""}`;
+  const tail = truncated ? [`(… more than ${MAX_INSPECTOR_FIELDS}; use query for the rest)`] : [];
+  if (!previous?.length) return ["Inspector now:", ...fields.map(line), ...tail].join("\n");
+  // Only what moved. Measured 2026-09-08: 49 blocks, ~60KB, a fifth of all tool
+  // output, and most of each block repeated the one before it — two coordinates
+  // changed and thirty lines did not.
+  const was = new Map(previous.map((f) => [f.id, line(f)]));
+  const changed: string[] = [];
+  let same = 0;
+  for (const f of fields) {
+    const now = line(f);
+    if (!was.has(f.id)) changed.push(`+${now}`);
+    else if (was.get(f.id) !== now) changed.push(now);
+    else same += 1;
+    was.delete(f.id);
+  }
+  const gone = [...was.keys()];
+  if (!changed.length && !gone.length) return `Inspector unchanged (${same} fields, same values).`;
+  return [
+    "Inspector changes:",
+    ...changed,
+    ...(gone.length ? [`(gone: ${gone.map((id) => `#${id}`).join(", ")})`] : []),
+    ...(same ? [`(${same} unchanged)`] : []),
+    ...tail,
+  ].join("\n");
 }
 
 export function summarizeBatch(opts: {

@@ -1416,7 +1416,7 @@ const AX_TOOLS = [
     description:
       "Run several steps on ONE app in a single call, in order, and get back what changed. Use this whenever you already know the next few moves — filling a field and committing it, pressing a tab and reading the result, scrolling and reading. It saves a whole round trip per step, which is the main cost of operating an app. " +
       "Each step is {do, ...}: do=\"press\" with id; do=\"set_value\" with id and text; do=\"key\" with key (and optional id to aim it); do=\"scroll\" with id and direction; do=\"act\" with id and action; do=\"read\" to re-read the app; do=\"screenshot\" to photograph the window at that point — the picture comes back with the result, so a look costs no extra turn. Add wait_ms to a step to pause after it, for content that loads (a tab that shows \"Loading…\"). " +
-      `Up to ${MAX_BATCH_STEPS} steps — use them: one shape's position, size, colour and commit is ONE call, not five. It STOPS at the first step that fails and tells you which one — the rest do not run, so do not assume they did. After the batch, every field it touched is read back and listed under \"Fields now:\", so you do not need to read the app to check a value you just wrote. The result also ends with \"Inspector now:\" — every settable control with its id and current value — so the next step can be aimed without reading the app. ` +
+      `Up to ${MAX_BATCH_STEPS} steps — use them: one shape's position, size, colour and commit is ONE call, not five. It STOPS at the first step that fails and tells you which one — the rest do not run, so do not assume they did. After the batch, every field it touched is read back and listed under \"Fields now:\", so you do not need to read the app to check a value you just wrote. The result also ends with the inspector — every settable control with its id and current value the first time, then only what changed — so the next step can be aimed without reading the app. ` +
       "SETTING A VALUE IN A WEB APP'S PANEL (Figma, and anything Chromium): set_value works on an element the tree calls a \"text field\" and is SILENTLY IGNORED on a \"stepper\" — the write appears in the box, the value never changes, and it commits later when focus leaves, which is how a 67 became 100100. For a stepper use the four-step recipe in ONE call: {\"do\":\"pointer\",\"id\":N} then {\"do\":\"key\",\"key\":\"a\",\"modifiers\":[\"command\"]} then {\"do\":\"type\",\"text\":\"460\"} then {\"do\":\"key\",\"key\":\"return\"}. Add clicks:2 to the pointer step if one click does not open the field. Read the value back afterwards: some fields reject what you typed and fall back to 0. " +
       "Opening or raising an app is not batchable: call computer_launch or computer_raise on its own. Do NOT batch steps whose ids you have not read yet, or steps that depend on what an earlier step reveals — read first, then batch what you can see. " +
       `Pass candidates instead of steps when you can see several plausible ways to reach ONE state and cannot tell which the app will honour: press the result row, or send down then return, or type the whole intent into the search field. Each candidate is a route — a step or a short list of steps — they are tried in order, and it stops at the first that changes the app, telling you what each one did. That is a model turn saved per wrong guess. Read the diff and confirm the state is the one you wanted; "it changed something" is not "it worked". Actions only, never for anything you would not want to happen twice. ` +
@@ -2273,15 +2273,13 @@ const axLines = new Map<string, Map<number, string>>();
  *  every batch. Identical to the last block sent for this app collapses to one
  *  line, so an unchanged inspector costs almost nothing. Second Figma run,
  *  2026-09-08: 34 of 90 turns were finds for exactly these ids. */
-const axLastInspector = new Map<string, string>();
+const axLastInspector = new Map<string, InspectorField[]>();
 async function inspectorBlock(appName: string): Promise<string | null> {
   try {
     const r = await ax!.request("fields", { app: appName }, 3_000);
     const fields = Array.isArray(r.fields) ? (r.fields as InspectorField[]) : [];
-    const text = renderInspector(fields, r.truncated === true);
-    if (!text) return null;
-    if (axLastInspector.get(appName) === text) return "Inspector unchanged (same ids and values as last listed).";
-    axLastInspector.set(appName, text);
+    const text = renderInspector(fields, r.truncated === true, axLastInspector.get(appName));
+    if (fields.length) axLastInspector.set(appName, fields);
     return text;
   } catch {
     return null; // an older bridge has no `fields`

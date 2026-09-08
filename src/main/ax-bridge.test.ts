@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-import { AX_TOOL_NAMES, SCREENSHOT_TOOL_NAMES, routesToAx, parseBatchSteps, describeBatch, summarizeBatch, MAX_BATCH_STEPS, AxClient, AxError, appOfStep, axConsent, axNeedsFocus, screenshotToolsOffered, coordinateToolAllowed, withScreenshotGuidance, SCREENSHOT_FRAME_SENTENCE, axReadOptsFrom, AX_DEFAULT_READ_OPTS, shouldRecoverRaise, describeAxAction, indexElementLines, readAxManifest, resolveAxDir, shouldOpenAccessibilitySettings, axNotTrustedText, RAISE_DESCRIPTION, APP_STATE_SPACE_SENTENCE, LAUNCH_FRONT_SENTENCE, withSpaceGuidance, otherSpaceNote, launchOutcome, renderActionResult, ACTION_NO_CHANGE_SENTENCE, TASK_DISCIPLINE_SENTENCE, SCREENSHOT_SPACE_SENTENCE, parseCandidates, describeCandidates, parkedNextCall, parkedReadNote, batchNudge, traceStep, MAX_TYPE_LENGTH, type BatchStep, BATCH_NUDGE_AFTER, type RecentEdit, skillBody, skillPreamble, shouldSendSkill, prependSkill, MAX_SKILL_PREAMBLE, candidateWorked, summarizeCandidates, MAX_CANDIDATES, MAX_CANDIDATE_STEPS, type AxCallInfo, touchedFieldIds, renderFieldValues, MAX_FIELDS_READ_BACK, type FieldValue, renderInspector, MAX_INSPECTOR_FIELDS, BATCH_VERBS } from "./ax-bridge";
+import { AX_TOOL_NAMES, SCREENSHOT_TOOL_NAMES, routesToAx, parseBatchSteps, describeBatch, summarizeBatch, MAX_BATCH_STEPS, AxClient, AxError, appOfStep, axConsent, axNeedsFocus, screenshotToolsOffered, coordinateToolAllowed, withScreenshotGuidance, SCREENSHOT_FRAME_SENTENCE, axReadOptsFrom, AX_DEFAULT_READ_OPTS, shouldRecoverRaise, describeAxAction, indexElementLines, readAxManifest, resolveAxDir, shouldOpenAccessibilitySettings, axNotTrustedText, RAISE_DESCRIPTION, APP_STATE_SPACE_SENTENCE, LAUNCH_FRONT_SENTENCE, withSpaceGuidance, otherSpaceNote, launchOutcome, renderActionResult, ACTION_NO_CHANGE_SENTENCE, TASK_DISCIPLINE_SENTENCE, SCREENSHOT_SPACE_SENTENCE, parseCandidates, describeCandidates, parkedNextCall, parkedReadNote, batchNudge, traceStep, MAX_TYPE_LENGTH, type BatchStep, BATCH_NUDGE_AFTER, type RecentEdit, skillBody, skillPreamble, shouldSendSkill, prependSkill, MAX_SKILL_PREAMBLE, candidateWorked, summarizeCandidates, MAX_CANDIDATES, MAX_CANDIDATE_STEPS, type AxCallInfo, touchedFieldIds, renderFieldValues, MAX_FIELDS_READ_BACK, type FieldValue, renderInspector, MAX_INSPECTOR_FIELDS, BATCH_VERBS, type InspectorField } from "./ax-bridge";
 
 const scratch = () => mkdtempSync(join(tmpdir(), "ax-"));
 
@@ -1397,6 +1397,33 @@ test("a screenshot can ride inside a batch, so a look does not cost a turn", () 
   assert.equal(traceStep(steps[1]), "screenshot");
   assert.ok(describeBatch("Figma", steps).includes("photograph"), describeBatch("Figma", steps));
   assert.deepEqual(touchedFieldIds(steps), [], "a picture touches no field");
+});
+
+// Run 3, 2026-09-08: 49 inspector blocks, ~60KB, about a fifth of all tool
+// output, and it bought a second compaction. Most of each block repeats the
+// block before it — X and Y change, the other thirty lines do not.
+test("an inspector that follows another sends only what changed", () => {
+  const before: InspectorField[] = [
+    { id: 155, role: "incrementor", title: "X-position", value: "0" },
+    { id: 156, role: "incrementor", title: "Y-position", value: "0" },
+    { id: 183, role: "text field", title: "Width", value: "1024" },
+  ];
+  const after: InspectorField[] = [
+    { id: 155, role: "incrementor", title: "X-position", value: "256" },
+    { id: 156, role: "incrementor", title: "Y-position", value: "0" },
+    { id: 183, role: "text field", title: "Width", value: "1024" },
+    { id: 190, role: "check box", title: "Clip content", value: "1" },
+  ];
+  assert.equal(renderInspector(after, false, before),
+    'Inspector changes:\n#155 incrementor "X-position" = 256\n+#190 check box "Clip content" = 1\n(2 unchanged)');
+  // Nothing moved at all: one line, not thirty.
+  assert.equal(renderInspector(before, false, before), "Inspector unchanged (3 fields, same values).");
+  // A field that disappeared is named, because its id is now dead.
+  assert.equal(renderInspector([before[0]], false, before),
+    'Inspector changes:\n(gone: #156, #183)\n(1 unchanged)');
+  // No previous block: the whole thing, as before.
+  const whole = renderInspector(after, false);
+  assert.ok(whole !== null && whole.startsWith("Inspector now:"), whole ?? "");
 });
 
 test("the inspector block lists settable controls with ids, in tree order, capped", () => {
