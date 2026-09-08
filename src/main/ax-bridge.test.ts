@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-import { AX_TOOL_NAMES, SCREENSHOT_TOOL_NAMES, routesToAx, parseBatchSteps, describeBatch, summarizeBatch, MAX_BATCH_STEPS, AxClient, AxError, appOfStep, axConsent, axNeedsFocus, screenshotToolsOffered, coordinateToolAllowed, withScreenshotGuidance, SCREENSHOT_FRAME_SENTENCE, axReadOptsFrom, axFilterSwitched, AX_DEFAULT_READ_OPTS, shouldRecoverRaise, describeAxAction, indexElementLines, readAxManifest, resolveAxDir, shouldOpenAccessibilitySettings, axNotTrustedText, RAISE_DESCRIPTION, APP_STATE_SPACE_SENTENCE, LAUNCH_FRONT_SENTENCE, withSpaceGuidance, otherSpaceNote, launchOutcome, renderActionResult, ACTION_NO_CHANGE_SENTENCE, TASK_DISCIPLINE_SENTENCE, SCREENSHOT_SPACE_SENTENCE, parseCandidates, describeCandidates, parkedNextCall, parkedReadNote, batchNudge, traceStep, BATCH_NUDGE_AFTER, type RecentEdit, skillBody, skillPreamble, shouldSendSkill, prependSkill, MAX_SKILL_PREAMBLE, candidateWorked, summarizeCandidates, MAX_CANDIDATES, MAX_CANDIDATE_STEPS, type AxCallInfo } from "./ax-bridge";
+import { AX_TOOL_NAMES, SCREENSHOT_TOOL_NAMES, routesToAx, parseBatchSteps, describeBatch, summarizeBatch, MAX_BATCH_STEPS, AxClient, AxError, appOfStep, axConsent, axNeedsFocus, screenshotToolsOffered, coordinateToolAllowed, withScreenshotGuidance, SCREENSHOT_FRAME_SENTENCE, axReadOptsFrom, axFilterSwitched, AX_DEFAULT_READ_OPTS, shouldRecoverRaise, describeAxAction, indexElementLines, readAxManifest, resolveAxDir, shouldOpenAccessibilitySettings, axNotTrustedText, RAISE_DESCRIPTION, APP_STATE_SPACE_SENTENCE, LAUNCH_FRONT_SENTENCE, withSpaceGuidance, otherSpaceNote, launchOutcome, renderActionResult, ACTION_NO_CHANGE_SENTENCE, TASK_DISCIPLINE_SENTENCE, SCREENSHOT_SPACE_SENTENCE, parseCandidates, describeCandidates, parkedNextCall, parkedReadNote, batchNudge, traceStep, MAX_TYPE_LENGTH, MAX_BATCH_STEPS, BATCH_NUDGE_AFTER, type RecentEdit, skillBody, skillPreamble, shouldSendSkill, prependSkill, MAX_SKILL_PREAMBLE, candidateWorked, summarizeCandidates, MAX_CANDIDATES, MAX_CANDIDATE_STEPS, type AxCallInfo } from "./ax-bridge";
 
 const scratch = () => mkdtempSync(join(tmpdir(), "ax-"));
 
@@ -1143,11 +1143,14 @@ test("a key is one letter, one digit or a named key — no enum to fence the pen
   assert.ok(schema.includes("command"), "modifiers are part of the same call");
 });
 
-test("the pointer handler refuses a missing path or anchor before it reaches the bridge", () => {
+test("the pointer handler needs an anchor, defaults to its centre, and validates the click count", () => {
   const src = readFileSync(join(__dirname, "index.ts"), "utf8");
   const start = src.indexOf('case "computer_pointer"');
   const body = src.slice(start, src.indexOf('case "computer_app_screenshot"', start));
-  assert.ok(body.includes("path is required"));
+  // A path is now OPTIONAL: clicking a field to put a caret in it is the
+  // commonest use and should not require spelling out {"x":0.5,"y":0.5}.
+  assert.ok(!body.includes("path is required"), "an omitted path means the element's centre");
+  assert.ok(body.includes("clicks must be 1 to"), "a silly click count is refused before the bridge");
   assert.ok(body.includes("id is required"));
   assert.ok(body.includes("Landed at"), "the reply reports where the fractions landed");
   assert.ok(body.includes('"pointer"'), "and it goes to the bridge's pointer verb");
@@ -1275,4 +1278,67 @@ test("a stopped batch still reports which steps ran and which did not", () => {
   assert.ok(out.includes("Stopped at step 2 (set_value #109"), out);
   assert.ok(out.includes("120180"), out);
   assert.ok(out.includes("The remaining 3 step(s) did NOT run."), out);
+});
+
+// Setting a value in a web app's inspector takes four primitives — click the
+// field, select all, type, commit — and until `type` and `pointer` were batch
+// verbs it could not be written as one call. Measured on Figma: set_value
+// lands on a "text field" and is silently ignored on a "stepper".
+
+test("the four-step field recipe parses as a single batch", () => {
+  const r = parseBatchSteps([
+    { do: "pointer", id: 83 },
+    { do: "key", key: "a", modifiers: ["command"] },
+    { do: "type", text: "-19.6875" },
+    { do: "key", key: "return" },
+  ]);
+  assert.ok(!("error" in r), JSON.stringify(r));
+  assert.deepEqual(r.steps[0], { do: "pointer", id: 83, waitMs: 0 });
+  assert.deepEqual(r.steps[2], { do: "type", text: "-19.6875", waitMs: 0 });
+});
+
+test("a pointer step needs an element, and takes a double click", () => {
+  assert.ok("error" in parseBatchSteps([{ do: "pointer" }]), "no id, no target");
+  const two = parseBatchSteps([{ do: "pointer", id: 5, clicks: 2 }]);
+  assert.ok(!("error" in two) && two.steps[0].clicks === 2, JSON.stringify(two));
+  const silly = parseBatchSteps([{ do: "pointer", id: 5, clicks: 99 }]);
+  assert.ok("error" in silly && silly.error.includes("double click"), JSON.stringify(silly));
+});
+
+test("a type step needs text, and refuses a document", () => {
+  assert.ok("error" in parseBatchSteps([{ do: "type" }]));
+  const long = parseBatchSteps([{ do: "type", text: "x".repeat(MAX_TYPE_LENGTH + 1) }]);
+  assert.ok("error" in long && long.error.includes("not a document"), JSON.stringify(long));
+});
+
+test("four fields plus a colour fit one call, which is the point", () => {
+  // Codex's densest turn on the same icon: 4 fields x (click, select all,
+  // type, commit) + 1 colour click = 17 primitives. That has to fit.
+  const steps = [];
+  for (const [id, val] of [[83, "460"], [84, "-19.6875"], [101, "360"], [104, "360"]]) {
+    steps.push({ do: "pointer", id }, { do: "key", key: "a", modifiers: ["command"] },
+               { do: "type", text: val }, { do: "key", key: "return" });
+  }
+  steps.push({ do: "press", id: 126 });
+  assert.equal(steps.length, 17);
+  const r = parseBatchSteps(steps);
+  assert.ok(!("error" in r), JSON.stringify(r));
+  assert.ok(steps.length <= MAX_BATCH_STEPS, `${steps.length} steps must fit the cap of ${MAX_BATCH_STEPS}`);
+});
+
+test("the trace names the typed string and the click", () => {
+  assert.equal(traceStep({ do: "type", text: "460", id: 83, waitMs: 0 }), 'type "460" in #83');
+  assert.equal(traceStep({ do: "pointer", id: 83, clicks: 2, waitMs: 0 }), "click x2 #83");
+  assert.equal(traceStep({ do: "pointer", id: 83, waitMs: 0 }), "click #83");
+});
+
+test("computer_do tells the model which field kind takes which route", () => {
+  const src = readFileSync(join(__dirname, "index.ts"), "utf8");
+  const start = src.indexOf('name: "computer_do"');
+  const decl = src.slice(start, start + 6000);
+  assert.ok(decl.includes("text field") && decl.includes("stepper"), "name both kinds");
+  assert.ok(decl.includes("100100"), "and what going wrong looks like");
+  // The description is a TS string literal, so its quotes are escaped in source.
+  assert.ok(decl.includes(String.raw`{\"do\":\"type\",\"text\":\"460\"}`), "hand over the literal recipe");
+  assert.ok(decl.includes("clicks:2"), "and the double-click fallback");
 });

@@ -181,13 +181,38 @@ drawing, and substituting one for the other is answering a different request.
 Both are fine when the user asks for the artwork rather than the act; when they
 ask for the pen, use the pen.
 
-**Every value you write is read back.** If a field kept its old text and
-appended yours to it — `120` given `180` becomes `120180`, which really happens
-in Figma — the batch stops there and tells you, instead of letting the next
-twenty steps build on a wrong number. Clear the field first when that happens:
-`command+a`, `delete`, then the value, all in the same call. Presses cannot be
-checked this way, so read the diff a batch returns rather than assuming all
-thirty steps did something.
+**A number field in a web app takes four steps, not one.** This is the single
+thing that wastes the most time in a design tool, so it is worth knowing
+exactly:
+
+- The tree calls it a **text field** (width, height, opacity, a hex box):
+  `set_value` works and the value reads back straight away.
+- The tree calls it a **stepper** (x, y, rotation): `set_value` is **silently
+  ignored**. The number appears in the box, the actual value never changes, the
+  tree keeps reporting the old one, and then it commits when focus leaves. That
+  is how a `67` becomes `100100`.
+
+For a stepper, do what a person does — in ONE call:
+
+```json
+{"app": "Figma", "steps": [
+  {"do": "pointer", "id": 84},
+  {"do": "key", "key": "a", "modifiers": ["command"]},
+  {"do": "type", "text": "-19.6875"},
+  {"do": "key", "key": "return"}
+]}
+```
+
+`pointer` with no path clicks the middle of the element. Add `"clicks": 2` if a
+single click does not open the field. Then **read the value back**: a field can
+reject what you typed and fall back to 0, and only a read tells you.
+
+Never open that sequence with `command+a` and `delete` before clicking. With
+focus outside a field, those select every layer in the document and delete
+them — measured, it cleared a canvas mid-task.
+
+Presses cannot be checked this way, so read the diff a batch returns rather
+than assuming all thirty steps did something.
 
 **Then fix the numbers in the app.** Clicking gives you an approximate path.
 Design tools expose exact position, size, stroke weight and colour as fields in

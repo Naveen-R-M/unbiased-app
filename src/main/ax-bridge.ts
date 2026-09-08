@@ -174,13 +174,26 @@ export type BatchStep =
   | { do: "key"; key: string; id?: number; modifiers?: string[]; waitMs: number }
   | { do: "scroll"; id: number; direction: string; amount?: number; waitMs: number }
   | { do: "act"; id: number; action: string; waitMs: number }
+  | { do: "type"; text: string; id?: number; waitMs: number }
+  | { do: "pointer"; id: number; clicks?: number; waitMs: number }
   | { do: "read"; waitMs: number };
 
 /** Deliberately NOT batchable: launch and raise both take over the user's
  *  screen, and each deserves its own approval rather than riding along inside
  *  a list of presses. */
+/** A field value or a short label, matching the bridge's own cap. */
+export const MAX_TYPE_LENGTH = 500;
+/** 2 is a double click, which some controls honour where one click does not. */
+export const MAX_CLICKS = 3;
 export const KEY_MODIFIERS = ["command", "shift", "option", "control"];
-export const BATCH_VERBS = ["press", "set_value", "key", "scroll", "act", "read"] as const;
+/** `type` and `pointer` are here because the only reliable way to set a value
+ *  in a web app's inspector is the four-step recipe — click the field, select
+ *  all, type, commit — and without both verbs it cannot be written as one
+ *  call. Measured on Figma: setValue lands on a `text field` and is silently
+ *  ignored on a `stepper`, and Codex's own run hit the identical split.
+ *
+ *  Still NOT batchable: launch and raise, which take over the user's screen. */
+export const BATCH_VERBS = ["press", "set_value", "key", "type", "pointer", "scroll", "act", "read"] as const;
 /** Measured against Codex on the same Figma icon: its densest single turn ran
  *  17 primitive actions (four fields, each a click + select-all + type +
  *  Return, then a colour click). A cap of 10 split work like that across turns
@@ -215,6 +228,21 @@ export function parseBatchSteps(raw: unknown): { steps: BatchStep[] } | { error:
       case "read":
         steps.push({ do: "read", waitMs });
         break;
+      case "type": {
+        if (typeof e.text !== "string" || !e.text) return { error: `${at}: text is required for do=type.` };
+        if (e.text.length > MAX_TYPE_LENGTH) {
+          return { error: `${at}: text is ${e.text.length} characters (max ${MAX_TYPE_LENGTH}). Type a field value, not a document.` };
+        }
+        steps.push({ do: "type", text: e.text, ...(id !== null ? { id } : {}), waitMs });
+        break;
+      }
+      case "pointer": {
+        if (id === null) return { error: `${at}: id is required for do=pointer — the element to click.` };
+        const clicks = typeof e.clicks === "number" ? Math.round(e.clicks) : 1;
+        if (clicks < 1 || clicks > MAX_CLICKS) return { error: `${at}: clicks must be 1 to ${MAX_CLICKS}; 2 is a double click.` };
+        steps.push({ do: "pointer", id, ...(clicks > 1 ? { clicks } : {}), waitMs });
+        break;
+      }
       case "key": {
         if (typeof e.key !== "string" || !e.key) return { error: `${at}: key is required.` };
         // Modifiers belong in a batch as much as anywhere: clearing a field
@@ -371,6 +399,8 @@ export function traceStep(st: BatchStep): string {
     case "press": return `press #${st.id}`;
     case "act": return `act #${st.id} "${st.action}"`;
     case "set_value": return `set_value #${st.id} = ${JSON.stringify(st.text)}`;
+    case "type": return `type ${JSON.stringify(st.text)}${st.id !== undefined ? ` in #${st.id}` : ""}`;
+    case "pointer": return `click${(st.clicks ?? 1) > 1 ? ` x${st.clicks}` : ""} #${st.id}`;
     case "scroll": return `scroll #${st.id} ${st.direction ?? ""}`.trim();
     default: return (st as { do: string }).do;
   }

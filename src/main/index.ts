@@ -77,6 +77,7 @@ import {
   parseBatchSteps,
   summarizeBatch,
   traceStep,
+  MAX_CLICKS,
   MAX_BATCH_STEPS,
   APP_STATE_SPACE_SENTENCE,
   RAISE_DESCRIPTION,
@@ -1408,6 +1409,7 @@ const AX_TOOLS = [
       "Run several steps on ONE app in a single call, in order, and get back what changed. Use this whenever you already know the next few moves — filling a field and committing it, pressing a tab and reading the result, scrolling and reading. It saves a whole round trip per step, which is the main cost of operating an app. " +
       "Each step is {do, ...}: do=\"press\" with id; do=\"set_value\" with id and text; do=\"key\" with key (and optional id to aim it); do=\"scroll\" with id and direction; do=\"act\" with id and action; do=\"read\" to re-read the app. Add wait_ms to a step to pause after it, for content that loads (a tab that shows \"Loading…\"). " +
       `Up to ${MAX_BATCH_STEPS} steps — use them: one shape's position, size, colour and commit is ONE call, not five. It STOPS at the first step that fails and tells you which one — the rest do not run, so do not assume they did. Every set_value is read back, so a field that kept its old text and appended to it stops the run there instead of corrupting everything computed after it. ` +
+      "SETTING A VALUE IN A WEB APP'S PANEL (Figma, and anything Chromium): set_value works on an element the tree calls a \"text field\" and is SILENTLY IGNORED on a \"stepper\" — the write appears in the box, the value never changes, and it commits later when focus leaves, which is how a 67 became 100100. For a stepper use the four-step recipe in ONE call: {\"do\":\"pointer\",\"id\":N} then {\"do\":\"key\",\"key\":\"a\",\"modifiers\":[\"command\"]} then {\"do\":\"type\",\"text\":\"460\"} then {\"do\":\"key\",\"key\":\"return\"}. Add clicks:2 to the pointer step if one click does not open the field. Read the value back afterwards: some fields reject what you typed and fall back to 0. " +
       "Opening or raising an app is not batchable: call computer_launch or computer_raise on its own. Do NOT batch steps whose ids you have not read yet, or steps that depend on what an earlier step reveals — read first, then batch what you can see. " +
       `Pass candidates instead of steps when you can see several plausible ways to reach ONE state and cannot tell which the app will honour: press the result row, or send down then return, or type the whole intent into the search field. Each candidate is a route — a step or a short list of steps — they are tried in order, and it stops at the first that changes the app, telling you what each one did. That is a model turn saved per wrong guess. Read the diff and confirm the state is the one you wanted; "it changed something" is not "it worked". Actions only, never for anything you would not want to happen twice. ` +
       TASK_DISCIPLINE_SENTENCE.trim(),
@@ -1428,7 +1430,8 @@ const AX_TOOLS = [
             properties: {
               do: { type: "string", enum: ["press", "set_value", "key", "scroll", "act", "read"] },
               id: { type: "integer", description: "Element id from computer_app_state." },
-              text: { type: "string", description: "With do=set_value." },
+              text: { type: "string", description: "With do=set_value, or with do=type: the whole string to type as real keystrokes." },
+              clicks: { type: "integer", description: "With do=pointer: 2 for a double click, which some fields need before they accept typing." },
               // The same key surface as computer_press_key. It used to be an
               // enum of nine named keys here, so a tool shortcut ("p" for
               // Figma's pen) and a select-all could not appear in a batch at
@@ -1474,6 +1477,10 @@ const AX_TOOLS = [
             properties: { x: { type: "number" }, y: { type: "number" } },
             required: ["x", "y"],
           },
+        },
+        clicks: {
+          type: "integer",
+          description: "2 for a double click at each point — a different event from two clicks, and sometimes the only one a control honours (a design app's number fields).",
         },
         hold: { type: "boolean", description: "True: one drag through every point. False (default): a click at each." },
         modifiers: {
@@ -2356,6 +2363,12 @@ async function runBatchStep(appName: string, st: BatchStep, settle = true): Prom
       return await ax!.request("act", { app: appName, id: st.id, action: st.action, ...opts });
     case "set_value":
       return await ax!.request("setValue", { app: appName, id: st.id, value: st.text, ...opts });
+    case "type":
+      return await ax!.request("type", { app: appName, text: st.text, ...(st.id !== undefined ? { id: st.id } : {}), ...opts });
+    case "pointer":
+      // No path: the bridge aims at the element's centre, which is what
+      // clicking a field means.
+      return await ax!.request("pointer", { app: appName, id: st.id, ...(st.clicks ? { clicks: st.clicks } : {}), ...opts });
     case "key":
       return await ax!.request("key", { app: appName, key: st.key, ...(st.id !== undefined ? { id: st.id } : {}), ...(st.modifiers?.length ? { modifiers: st.modifiers } : {}), ...opts });
     case "scroll": {
@@ -2617,16 +2630,20 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         return axText(`Scrolled ${dir}.\n${diff || "(nothing changed — the container may not scroll, or is already at the end)"}`, true);
       }
       case "computer_pointer": {
-        const path = Array.isArray(a.path) ? a.path : null;
-        if (!path || path.length === 0) return axText('path is required: a list of {x, y} fractions of the anchor element, e.g. [{"x":0.5,"y":0.5}].', false);
+        // An omitted path is the element's centre: clicking a field to put a
+        // caret in it is the commonest use, and it should not need x and y.
+        const path = Array.isArray(a.path) && a.path.length > 0 ? a.path : null;
         if (typeof a.id !== "number") return axText("id is required: the element whose box the fractions are measured in.", false);
         const hold = a.hold === true;
+        const clicks = typeof a.clicks === "number" ? Math.round(a.clicks) : 1;
+        if (clicks < 1 || clicks > MAX_CLICKS) return axText(`clicks must be 1 to ${MAX_CLICKS}; 2 is a double click.`, false);
         const mods = Array.isArray(a.modifiers) ? a.modifiers.filter((m) => typeof m === "string") : [];
-        axLog(`pointer ${appName} #${String(a.id)} ${path.length} point(s)${hold ? " held" : ""}${mods.length ? ` +${mods.join("+")}` : ""}`);
+        axLog(`pointer ${appName} #${String(a.id)} ${path ? `${path.length} point(s)` : "centre"}${clicks > 1 ? ` x${clicks}` : ""}${hold ? " held" : ""}${mods.length ? ` +${mods.join("+")}` : ""}`);
         const r = await ax.request("pointer", {
           app: appName,
           id: a.id,
-          path,
+          ...(path ? { path } : {}),
+          ...(clicks > 1 ? { clicks } : {}),
           ...(hold ? { hold: true } : {}),
           ...(mods.length ? { modifiers: mods } : {}),
           ...axActionOpts(appName),
@@ -2637,7 +2654,7 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         // correct it without guessing at a display scale.
         const at = Array.isArray(r.at) ? (r.at as { x: number; y: number }[]) : [];
         const where = at.length ? `\nLanded at ${at.map((q) => `(${q.x},${q.y})`).join(" ")}.` : "";
-        return axText(`${hold ? "Dragged" : "Clicked"} ${path.length} point(s) in ${appName}.${where}\n${diff || "(nothing in the tree changed — a canvas often shows its result only as a new object, so read the app)"}`, true);
+        return axText(`${hold ? "Dragged" : "Clicked"} ${path ? `${path.length} point(s)` : "the centre"} in ${appName}.${where}\n${diff || "(nothing in the tree changed — a canvas often shows its result only as a new object, so read the app)"}`, true);
       }
       case "computer_app_screenshot": {
         const r = await ax.request("screenshot", { app: appName, ...(typeof a.window === "number" ? { window: a.window } : {}) }, 15_000);
