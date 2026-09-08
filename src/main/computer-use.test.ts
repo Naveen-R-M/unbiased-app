@@ -1,5 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readdirSync, readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
 import {
   COMPUTER_CAPTURE_MAX_EDGE,
   COMPUTER_PERMISSION_SETTINGS,
@@ -367,4 +372,37 @@ test("a native module that fails to load is not a permission problem either", as
   assert.doesNotMatch(result.message, /Accessibility/);
   assert.equal(result.permission, undefined);
   assert.match(result.message, /dlopen/);
+});
+
+// The bundled skills are handed to the engine as a directory of SKILL.md files
+// and matched by their frontmatter. A malformed header does not fail loudly —
+// the skill simply never appears — so the shape is asserted here.
+
+test("every bundled skill has the frontmatter the engine matches on", () => {
+  const root = join(__dirname, "..", "..", "resources", "skills");
+  const names = readdirSync(root, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name);
+  assert.ok(names.length > 0, "no bundled skills found");
+  for (const dir of names) {
+    const text = readFileSync(join(root, dir, "SKILL.md"), "utf8");
+    const m = /^---\n([\s\S]*?)\n---\n/.exec(text);
+    assert.ok(m, `${dir}/SKILL.md does not open with a frontmatter block`);
+    const name = /^name:\s*(\S.*)$/m.exec(m[1]);
+    const description = /^description:\s*(\S.*)$/m.exec(m[1]);
+    assert.ok(name, `${dir} has no name`);
+    assert.ok(description, `${dir} has no description`);
+    assert.equal(name[1].trim(), dir, `${dir}: the name must match its directory, or the engine lists it under the wrong one`);
+    assert.ok(description[1].trim().length > 30, `${dir}: the description is what decides when the skill is read`);
+  }
+});
+
+test("the computer-use skill carries the findings that cost the most to learn", () => {
+  const text = readFileSync(join(__dirname, "..", "..", "resources", "skills", "computer-use", "SKILL.md"), "utf8");
+  for (const needle of [
+    "Stage Manager", // why a press is accepted and does nothing
+    "computer_app_screenshot", // how to look without taking the screen
+    "menu bar", // the path that always works on a parked window
+    "do not raise", // the reaction that costs the user their screen
+  ]) {
+    assert.ok(text.toLowerCase().includes(needle.toLowerCase()), `the skill no longer mentions ${needle}`);
+  }
 });

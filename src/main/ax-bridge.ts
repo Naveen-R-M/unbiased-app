@@ -171,16 +171,36 @@ export function appOfStep(tool: string, args: Record<string, unknown>): string |
 export type BatchStep =
   | { do: "press"; id: number; waitMs: number }
   | { do: "set_value"; id: number; text: string; waitMs: number }
-  | { do: "key"; key: string; id?: number; waitMs: number }
+  | { do: "key"; key: string; id?: number; modifiers?: string[]; waitMs: number }
   | { do: "scroll"; id: number; direction: string; amount?: number; waitMs: number }
   | { do: "act"; id: number; action: string; waitMs: number }
+  | { do: "type"; text: string; id?: number; waitMs: number }
+  | { do: "pointer"; id: number; clicks?: number; waitMs: number }
   | { do: "read"; waitMs: number };
 
 /** Deliberately NOT batchable: launch and raise both take over the user's
  *  screen, and each deserves its own approval rather than riding along inside
  *  a list of presses. */
-export const BATCH_VERBS = ["press", "set_value", "key", "scroll", "act", "read"] as const;
-export const MAX_BATCH_STEPS = 10;
+/** A field value or a short label, matching the bridge's own cap. */
+export const MAX_TYPE_LENGTH = 500;
+/** 2 is a double click, which some controls honour where one click does not. */
+export const MAX_CLICKS = 3;
+export const KEY_MODIFIERS = ["command", "shift", "option", "control"];
+/** `type` and `pointer` are here because the only reliable way to set a value
+ *  in a web app's inspector is the four-step recipe — click the field, select
+ *  all, type, commit — and without both verbs it cannot be written as one
+ *  call. Measured on Figma: setValue lands on a `text field` and is silently
+ *  ignored on a `stepper`, and Codex's own run hit the identical split.
+ *
+ *  Still NOT batchable: launch and raise, which take over the user's screen. */
+export const BATCH_VERBS = ["press", "set_value", "key", "type", "pointer", "scroll", "act", "read"] as const;
+/** Measured against Codex on the same Figma icon: its densest single turn ran
+ *  17 primitive actions (four fields, each a click + select-all + type +
+ *  Return, then a colour click). A cap of 10 split work like that across turns
+ *  at ~15s each, which was the whole cost being optimised away. 30 fits any
+ *  one shape's geometry and colour with room to spare, and every step is still
+ *  an approved bridge primitive with its own refusals. */
+export const MAX_BATCH_STEPS = 30;
 /** Per-step pause, for content that arrives after the action — Maps shows
  *  "Loading…" for a second or two on the Transit tab. Capped so a batch cannot
  *  be used to park the desktop tools for a minute. */
@@ -208,9 +228,31 @@ export function parseBatchSteps(raw: unknown): { steps: BatchStep[] } | { error:
       case "read":
         steps.push({ do: "read", waitMs });
         break;
+      case "type": {
+        if (typeof e.text !== "string" || !e.text) return { error: `${at}: text is required for do=type.` };
+        if (e.text.length > MAX_TYPE_LENGTH) {
+          return { error: `${at}: text is ${e.text.length} characters (max ${MAX_TYPE_LENGTH}). Type a field value, not a document.` };
+        }
+        steps.push({ do: "type", text: e.text, ...(id !== null ? { id } : {}), waitMs });
+        break;
+      }
+      case "pointer": {
+        if (id === null) return { error: `${at}: id is required for do=pointer — the element to click.` };
+        const clicks = typeof e.clicks === "number" ? Math.round(e.clicks) : 1;
+        if (clicks < 1 || clicks > MAX_CLICKS) return { error: `${at}: clicks must be 1 to ${MAX_CLICKS}; 2 is a double click.` };
+        steps.push({ do: "pointer", id, ...(clicks > 1 ? { clicks } : {}), waitMs });
+        break;
+      }
       case "key": {
         if (typeof e.key !== "string" || !e.key) return { error: `${at}: key is required.` };
-        steps.push({ do: "key", key: e.key, ...(id !== null ? { id } : {}), waitMs });
+        // Modifiers belong in a batch as much as anywhere: clearing a field
+        // before typing is command+a, and without this the batch dropped them
+        // silently — so the one remedy for a field that appends instead of
+        // replacing could not be expressed as a batch at all.
+        const mods = Array.isArray(e.modifiers) ? e.modifiers.filter((m): m is string => typeof m === "string") : [];
+        const bad = mods.filter((m) => !KEY_MODIFIERS.includes(m));
+        if (bad.length) return { error: `${at}: unknown modifier(s) ${bad.join(", ")}. Use ${KEY_MODIFIERS.join(", ")}.` };
+        steps.push({ do: "key", key: e.key, ...(id !== null ? { id } : {}), ...(mods.length ? { modifiers: mods } : {}), waitMs });
         break;
       }
       case "press": {
@@ -244,6 +286,82 @@ export function parseBatchSteps(raw: unknown): { steps: BatchStep[] } | { error:
   return { steps };
 }
 
+/** Alternative routes to one state, for the case measured over and over on
+ *  Maps: several plausible ways to get somewhere and no way to tell from the
+ *  tree which one the app will honour. Pressing a search-result row does
+ *  nothing while the window is parked; down then return does; typing the whole
+ *  intent into the field does. Sending those as candidates costs one model
+ *  turn instead of three.
+ *
+ *  A candidate is a SEQUENCE of steps, not a single one, because the route
+ *  that works is often two moves: down selects, return opens. Judging one step
+ *  at a time would have stopped at the selection and called it done.
+ *
+ *  The winner is decided mechanically, by the same test that already decides
+ *  when an action is finished: did the settled tree change materially. No
+ *  success predicate from the caller, because something would have to evaluate
+ *  it, and a string match on a tree the model has not seen yet is a guess. The
+ *  caller reads the diff and judges whether the state is the one it wanted. */
+export const MAX_CANDIDATES = 4;
+export const MAX_CANDIDATE_STEPS = 4;
+
+export function parseCandidates(raw: unknown): { candidates: BatchStep[][] } | { error: string } {
+  if (!Array.isArray(raw)) return { error: "candidates must be an array of routes; each route is a step or a list of steps." };
+  if (raw.length < 2) return { error: "candidates needs at least two routes — with one there is nothing to choose between, so use steps instead." };
+  if (raw.length > MAX_CANDIDATES) {
+    return { error: `${raw.length} candidates is too many (max ${MAX_CANDIDATES}) — every route that does nothing costs a full wait for the app. Send your best ${MAX_CANDIDATES}.` };
+  }
+  const candidates: BatchStep[][] = [];
+  for (const [i, entry] of raw.entries()) {
+    const list = Array.isArray(entry) ? entry : [entry];
+    if (list.length === 0) return { error: `candidate ${i + 1} is empty.` };
+    if (list.length > MAX_CANDIDATE_STEPS) return { error: `candidate ${i + 1} has ${list.length} steps (max ${MAX_CANDIDATE_STEPS}).` };
+    const parsed = parseBatchSteps(list);
+    if ("error" in parsed) return { error: `candidate ${i + 1}: ${parsed.error}` };
+    const read = parsed.steps.findIndex((st) => st.do === "read");
+    if (read >= 0) return { error: `candidate ${i + 1} step ${read + 1} is a read. A read changes nothing, so it can never be the route that works; candidates must be actions.` };
+    candidates.push(parsed.steps);
+  }
+  return { candidates };
+}
+
+/** Whether a candidate's step actually did something. The bridge has already
+ *  waited for the app to settle by the time we see this, so "no changes" means
+ *  the app was asked and declined, not that it is still thinking. */
+export function candidateWorked(diff: string): boolean {
+  const body = diff.trim();
+  return body.length > 0 && body !== "(no changes)";
+}
+
+/** The approval card for a set of routes. It has to be unmistakable that these
+ *  are alternatives and that the run stops at the first that does something,
+ *  so the user is never shown four presses and asked to approve one. */
+export function describeCandidates(app: string, candidates: BatchStep[][], lines?: Map<number, string>): string {
+  const rendered = candidates.map((steps, i) => {
+    const inner = describeBatch(app, steps, lines).split("\n").slice(1).map((l) => `   ${l.replace(/^\d+\.\s*/, "")}`);
+    return `${i + 1}.${inner.length === 1 ? ` ${inner[0].trim()}` : `\n${inner.join("\n")}`}`;
+  });
+  return `${candidates.length} alternative route(s) in ${app}, stopping at the first that changes anything:\n${rendered.join("\n")}`;
+}
+
+export function summarizeCandidates(opts: {
+  tried: { label: string; outcome: "worked" | "nothing" | string }[];
+  winner: number | null;
+  diff: string;
+  remaining: number;
+}): string {
+  const lines = opts.tried.map((t, i) => {
+    const mark = i === (opts.winner ?? -1) ? "→" : " ";
+    const said = t.outcome === "worked" ? "changed the app" : t.outcome === "nothing" ? "did nothing" : `failed: ${t.outcome}`;
+    return `${mark} ${t.label} ${said}`;
+  });
+  const skipped = opts.remaining > 0 ? `\n${opts.remaining} later route(s) were not tried.` : "";
+  if (opts.winner === null) {
+    return `None of the ${opts.tried.length} route(s) changed the app.\n${lines.join("\n")}\n${ACTION_NO_CHANGE_SENTENCE}`;
+  }
+  return `Route ${opts.winner + 1} changed the app. Read the diff and check it is the state you wanted.\n${lines.join("\n")}${skipped}\n${opts.diff}`;
+}
+
 /** One line per step. The user approves the WHOLE sequence with one card, so
  *  the card has to show every step — a batch must never be a way to slip an
  *  irreversible press in behind four harmless reads. */
@@ -271,11 +389,33 @@ export function describeBatch(app: string, steps: BatchStep[], lines?: Map<numbe
 /** What the model is told afterwards. A batch that stops halfway is the case
  *  that matters: it must be unmistakable which steps ran, which one failed and
  *  why, and that the rest did NOT run. */
+/** What one step did, for the trace: the verb plus the thing it acted on. A
+ *  failure at "step 3" is unreadable when the other 29 steps are also just
+ *  numbers; "step 3 (set_value #109 = 180)" says which field to look at. */
+export function traceStep(st: BatchStep): string {
+  switch (st.do) {
+    case "read": return "read";
+    case "key": return `key ${st.modifiers?.length ? st.modifiers.join("+") + "+" : ""}${st.key}${st.id !== undefined ? ` in #${st.id}` : ""}`;
+    case "press": return `press #${st.id}`;
+    case "act": return `act #${st.id} "${st.action}"`;
+    case "set_value": return `set_value #${st.id} = ${JSON.stringify(st.text)}`;
+    case "type": return `type ${JSON.stringify(st.text)}${st.id !== undefined ? ` in #${st.id}` : ""}`;
+    case "pointer": return `click${(st.clicks ?? 1) > 1 ? ` x${st.clicks}` : ""} #${st.id}`;
+    case "scroll": return `scroll #${st.id} ${st.direction ?? ""}`.trim();
+    default: return (st as { do: string }).do;
+  }
+}
+
 export function summarizeBatch(opts: {
   ran: string[];
   failed: { step: string; message: string } | null;
   remaining: number;
   diff: string;
+  /** True when mid-sequence steps skipped their settle wait, so the only
+   *  evidence about them is the closing diff. Said out loud rather than
+   *  implied: a press that quietly did nothing at step 4 is invisible here,
+   *  and a summary that reads "Done" for all 30 would be overclaiming. */
+  unwatched?: boolean;
 }): string {
   const head = opts.failed
     ? [
@@ -284,7 +424,13 @@ export function summarizeBatch(opts: {
         opts.remaining > 0 ? `The remaining ${opts.remaining} step(s) did NOT run.` : "",
         "Read the app again before retrying — the ids may have moved.",
       ].filter(Boolean).join(" ")
-    : `Done: ${opts.ran.join("; ")}.`;
+    : [
+        `Done: ${opts.ran.join("; ")}.`,
+        opts.unwatched && opts.ran.length > 1
+          ? "Every value written was read back; the presses were not watched individually, so check the diff below for what they did."
+          : "",
+      ].filter(Boolean).join(" ");
+  if (opts.diff.trim() === "(no changes)") return `${head}\n${ACTION_NO_CHANGE_SENTENCE}`;
   return opts.diff ? `${head}\n${opts.diff}` : `${head}\n(nothing in the tree changed)`;
 }
 
@@ -297,6 +443,8 @@ export function summarizeBatch(opts: {
  *  silently went nowhere. One list, one test, one startup check. */
 export const AX_TOOL_NAMES = [
   "computer_apps",
+  "computer_app_screenshot",
+  "computer_pointer",
   "computer_app_state",
   "computer_raise",
   "computer_launch",
@@ -382,14 +530,185 @@ export function coordinateToolAllowed(tool: string, mode: "all" | "screenshot-on
  *  description that promises "the exact coordinate frame to use for later
  *  computer actions" is an invitation to call a tool that is now refused.
  *  Swapped by value, exactly like the Space sentences. */
+/** What an action reports when the bridge's wait ran out with the tree
+ *  unchanged. "(no changes)" is a fine answer to a READ; after an ACTION the
+ *  model heard it as "nothing there" and pressed again — which, on a Maps
+ *  result, opened the card the first press had already asked for, and on a
+ *  settings row toggled Location Tracking back. */
+export const ACTION_NO_CHANGE_SENTENCE =
+  "The app accepted the action but showed no change while the bridge waited. Do NOT repeat it on this element: a second press undoes a toggle or opens a second copy, and in the last run five retries of one dead button cost six turns. Take a different path instead: the keyboard (arrow keys and return choose from a list, escape closes), or the app's menu bar, whose items are in the tree and reliably reach every command.";
+
+/** The literal call to send after a click died on a parked window.
+ *
+ *  Prose did not work. Three separate texts told the model to use the keyboard
+ *  on a parked window — the bridge's hint, computer_raise's own description
+ *  and the bundled skill — and it sent `down` without `return` and then raised
+ *  twice anyway. A concrete call is followed where a recommendation is not, so
+ *  the reply now ends with the exact thing to send. `down` then `return` in
+ *  ONE call, because down alone only moves the selection. */
+export function parkedNextCall(app: string): string {
+  const keys = '[{"do":"key","key":"down"},{"do":"key","key":"return"}]';
+  return (
+    `Send one of these next. To pick the item you meant out of the list: computer_do {"app":${JSON.stringify(app)},"steps":${keys}}. ` +
+    `To reach a control you cannot press, ask the app for the finished action instead of hunting for the button — set its search field to the whole intent (e.g. "directions to <place>", not "<place>") and commit with the same two keys.`
+  );
+}
+
+/** The computer-use skill, delivered with the first desktop call of a
+ *  conversation instead of hoping the model opens it.
+ *
+ *  It does open it — twice in the runs measured on 2026-09-06 — but both times
+ *  by shelling out to `cat` in the middle of a task, after it had already
+ *  stalled, once costing sixteen seconds. Nothing makes a listed skill the
+ *  first thing read, so the constraint arrived after the first failure rather
+ *  than before the first action. Handing it over on the first call costs its
+ *  length once per conversation and removes that whole detour.
+ *
+ *  The file is the single source of truth; this only strips the frontmatter,
+ *  which is addressed to the skill loader rather than to the reader, and
+ *  frames the rest so it cannot be mistaken for tool output. */
+export const MAX_SKILL_PREAMBLE = 16_000;
+
+export function skillBody(markdown: string): string {
+  const withoutFrontmatter = markdown.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, "");
+  const trimmed = withoutFrontmatter.trim();
+  return trimmed.length > MAX_SKILL_PREAMBLE ? `${trimmed.slice(0, MAX_SKILL_PREAMBLE)}\n…(truncated)` : trimmed;
+}
+
+export function skillPreamble(markdown: string): string | null {
+  const body = skillBody(markdown);
+  if (!body) return null;
+  return `=== How to drive desktop apps (read this before acting; sent once per conversation) ===\n${body}\n=== end ===`;
+}
+
+/** Whether this call should carry it: a desktop tool, and not sent yet. */
+export function shouldSendSkill(tool: string, alreadySent: boolean): boolean {
+  if (alreadySent) return false;
+  return routesToAx(tool) || tool.startsWith("computer_");
+}
+
+/** Put it in front of whatever the tool returned, as its own block, so the
+ *  result itself is still the last thing read. */
+export function prependSkill<T extends { contentItems: { type: string }[] }>(response: T, preamble: string): T {
+  return { ...response, contentItems: [{ type: "inputText" as const, text: preamble }, ...response.contentItems] };
+}
+
+/** One line at the top of a read when the app's window is parked.
+ *
+ *  Until now this was discovered by pressing something and watching it fail.
+ *  Measured: one run shelled out to read the bundled skill mid-task — sixteen
+ *  seconds — after its first attempts stalled, then redid the search from the
+ *  top. Saying it at read time removes the dead press and the whole discovery
+ *  detour, and costs nothing: the `windows` call every read already makes
+ *  carries the flag.
+ *
+ *  It names the call rather than describing the route, for the same reason
+ *  parkedNextCall does: prose about the keyboard was ignored three times, a
+ *  literal call was followed twice. */
+export function parkedReadNote(windows: unknown): string | null {
+  const list = Array.isArray(windows) ? windows : [];
+  const anyParked = list.some((w) => !!w && typeof w === "object" && (w as { parked?: unknown }).parked === true);
+  if (!anyParked) return null;
+  return (
+    "[parked] This window is READABLE but not reliably INTERACTABLE: Stage Manager has shrunk it to a thumbnail, so reads are exact while a press on a row, a card button or a tab is accepted and changes nothing. " +
+    "Two paths do work. " +
+    'To choose from a list: computer_do with steps [{"do":"key","key":"down"},{"do":"key","key":"return"}]. ' +
+    'To reach a control you cannot press: ask the app for the finished action in its search field — set the field to the whole INTENT rather than the object, e.g. "directions to <place>" instead of "<place>", then commit it with those same two keys. Menu bar items are in the tree and also work, and text fields can always be set directly. ' +
+    "Do not raise it and do not try to move or resize it: parking follows which app is active, not where the window is."
+  );
+}
+
+/** One single-action desktop call, remembered so a run of them can be noticed.
+ *
+ *  Measured on a Figma icon built with native shapes: 91 key presses and 63
+ *  value sets, nearly all one per model turn, and turns were running at 15
+ *  seconds. Setting one shape's position, size and colour is five turns done
+ *  singly and one done as a batch. computer_do already existed and was barely
+ *  used, and telling the model to batch has the same record as every other
+ *  piece of advice here, so the app notices the run and hands back the literal
+ *  call instead. */
+export interface RecentEdit {
+  tool: string;
+  app: string;
+  id?: number;
+  text?: string;
+  key?: string;
+  action?: string;
+}
+
+export const BATCH_NUDGE_AFTER = 3;
+
+function asStep(e: RecentEdit): Record<string, unknown> | null {
+  switch (e.tool) {
+    case "computer_press": return e.id === undefined ? null : { do: "press", id: e.id };
+    case "computer_act": return e.id === undefined || !e.action ? null : { do: "act", id: e.id, action: e.action };
+    case "computer_set_value": return e.id === undefined || e.text === undefined ? null : { do: "set_value", id: e.id, text: e.text };
+    case "computer_press_key": return !e.key ? null : { do: "key", key: e.key, ...(e.id !== undefined ? { id: e.id } : {}) };
+    default: return null;
+  }
+}
+
+/** The trailing run of single edits on ONE app, as the call that would have
+ *  done them together. Null until there are enough of them to be worth saying. */
+export function batchNudge(recent: RecentEdit[]): string | null {
+  if (recent.length === 0) return null;
+  const app = recent[recent.length - 1].app;
+  const run: RecentEdit[] = [];
+  for (let i = recent.length - 1; i >= 0 && recent[i].app === app; i -= 1) run.unshift(recent[i]);
+  if (run.length < BATCH_NUDGE_AFTER) return null;
+  const steps = run.map(asStep);
+  if (steps.some((st) => st === null)) return null;
+  return (
+    `You have sent ${run.length} separate actions to ${app} in a row, and each one costs a whole turn. ` +
+    `They fit in one call: computer_do {"app":${JSON.stringify(app)},"steps":${JSON.stringify(steps)}}. ` +
+    "Batch the moves you already know — setting one object's position, size and colour is one call, not five."
+  );
+}
+
+export function renderActionResult(diff: string, hint?: string | null, nextCall?: string | null): string {
+  const body = diff.trim();
+  // The bridge's own explanation comes first when it has one: it knows WHY the
+  // app ignored the press and which paths work, which is more useful than the
+  // generic sentence. The concrete call comes last, where it is read.
+  if (!body || body === "(no changes)") {
+    return [`Done.`, hint, ACTION_NO_CHANGE_SENTENCE, nextCall].filter(Boolean).join(" ");
+  }
+  return `Done.\n${body}`;
+}
+
+/** Scope, spelled out on the tools the model reads first.
+ *
+ *  Measured four times: a run finishes the asked-for task and then keeps
+ *  going. The worst spent 35 of its 127 seconds pressing Walk, Transit, Drive,
+ *  Cycle and Drive again for a request that named no travel mode; another
+ *  enabled Location Tracking on its own.
+ *
+ *  Framed as what FINISHED looks like rather than as a list of prohibitions.
+ *  The prohibition wording lost every time, and a model that knows the answer
+ *  is already on screen has a reason to stop, where one told not to explore
+ *  only has a rule to weigh. Still prose, so still unproven — the mechanisms
+ *  around it are what actually hold. */
+export const TASK_DISCIPLINE_SENTENCE =
+  "When the app already shows what was asked for, that IS the answer: report it from the tree and stop. A request for directions is answered by the route on screen, not by comparing every travel mode; a request to find something is answered when it is on screen. Nothing else is part of the task: do not change the app's settings (location, permissions, preferences), and do not send an action twice to be sure it took. ";
+
 export const SCREENSHOT_FRAME_SENTENCE =
   "The result states the exact coordinate frame to use for later computer actions; it is scaled down from the display, so never assume the display resolution.";
 export const SCREENSHOT_LOOK_ONLY_SENTENCE =
   "Use it to SEE what the tree cannot express — whether a video is actually playing, a canvas, a rendered chart. It is not for aiming: there are no coordinate actions while the accessibility bridge is running, so act through element ids from computer_app_state.";
 
-export function withScreenshotGuidance<T extends { name: string; description: string }>(tool: T, mode: "all" | "screenshot-only"): T {
-  if (mode === "all" || tool.name !== "computer_screenshot") return tool;
-  return { ...tool, description: tool.description.replace(SCREENSHOT_FRAME_SENTENCE, SCREENSHOT_LOOK_ONLY_SENTENCE) };
+/** Appended to computer_screenshot while the bridge reads across Spaces. In
+ *  run 3 of the Maps task the model wanted to LOOK, took a screenshot of a
+ *  Space Maps was not on, and raised Maps to see it — twice. The picture of a
+ *  window on another Space is computer_app_screenshot's job. */
+export const SCREENSHOT_SPACE_SENTENCE =
+  " It shows the CURRENT Space only: an app whose windows are on another Space is not in this picture, and raising it to look takes over the user's screen. To see that app, call computer_app_screenshot instead.";
+
+export function withScreenshotGuidance<T extends { name: string; description: string }>(tool: T, mode: "all" | "screenshot-only", crossSpace = false): T {
+  if (tool.name !== "computer_screenshot") return tool;
+  let description = tool.description;
+  if (mode === "screenshot-only") description = description.replace(SCREENSHOT_FRAME_SENTENCE, SCREENSHOT_LOOK_ONLY_SENTENCE);
+  if (crossSpace) description += SCREENSHOT_SPACE_SENTENCE;
+  return description === tool.description ? tool : { ...tool, description };
 }
 
 /** Whether a read that found nothing should raise and try again by itself.
@@ -409,6 +728,38 @@ export function shouldRecoverRaise(s: { windowsHere: number; offscreen: number; 
 export type AxResult = Record<string, unknown>;
 type Pending = { resolve: (r: AxResult) => void; reject: (e: Error) => void; timer: NodeJS.Timeout };
 
+/** One finished bridge call, for diagnostics. The point is to see where a
+ *  slow task spends its time: the Maps run that took 2m36s had ~16 model turns
+ *  and every bridge call under two seconds, but the log only showed acting
+ *  calls, with start times and nothing else — so reads were invisible and
+ *  bridge time could not be told from model time. */
+export interface AxCallInfo {
+  method: string;
+  app: string | null;
+  /** Wall time of the round trip, including the bridge's settle wait. */
+  ms: number;
+  /** How long the bridge waited for the app to react (actions only). */
+  waitedMs: number | null;
+  /** Size of the reply and lines in the tree or diff it carried. */
+  bytes: number;
+  lines: number;
+  /** Read options in force, e.g. "interactive,query". */
+  flags: string;
+  /** Result facts worth a glance in the log: "shown" for a launch that showed
+   *  the app once, "blank" for a picture with nothing in it. */
+  marks: string;
+  error: string | null;
+}
+
+export function describeAxCall(c: AxCallInfo): string {
+  const where = c.app ? ` ${c.app}` : "";
+  const flags = c.flags ? ` [${c.flags}]` : "";
+  const waited = c.waitedMs !== null ? ` (waited ${c.waitedMs}ms)` : "";
+  const err = c.error ? ` ERROR ${c.error}` : "";
+  const marks = c.marks ? ` [${c.marks}]` : "";
+  return `call ${c.method}${where}${flags} ${c.ms}ms${waited} ${c.lines} lines ${c.bytes}B${marks}${err}`;
+}
+
 /** One long-running bridge process. Ids and diffs live in that process, so it
  *  is spawned once and kept. A request that gets no answer times out rather
  *  than hanging a turn; an exit rejects everything in flight. */
@@ -426,6 +777,8 @@ export class AxClient {
   /** How long refreshCrossSpace waits for its hello. A field, not a
    *  constructor argument, so a test can shorten it without a new ctor shape. */
   helloTimeoutMs = AX_HELLO_TIMEOUT_MS;
+  /** Called once per finished request with its timing and size. */
+  onCall: ((call: AxCallInfo) => void) | null = null;
 
   constructor(
     private readonly manifest: AxManifest,
@@ -491,14 +844,43 @@ export class AxClient {
   request(method: string, params: Record<string, unknown>, timeoutMs = this.timeoutMs): Promise<AxResult> {
     if (!this.alive || !this.proc?.stdin) return Promise.reject(new AxError("bridge_exited", "unbiased-ax is not running"));
     const id = this.nextId++;
+    const started = Date.now();
     return new Promise<AxResult>((resolve, reject) => {
+      const done = (r: AxResult | null, e: Error | null) => {
+        this.report(method, params, started, r, e);
+        if (e) reject(e);
+        else resolve(r ?? {});
+      };
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        reject(new AxError("timeout", `${method} did not answer within ${timeoutMs}ms`));
+        done(null, new AxError("timeout", `${method} did not answer within ${timeoutMs}ms`));
       }, timeoutMs);
-      this.pending.set(id, { resolve, reject, timer });
+      this.pending.set(id, { resolve: (r) => done(r, null), reject: (e) => done(null, e), timer });
       this.proc!.stdin!.write(JSON.stringify({ id, method, params }) + "\n");
     });
+  }
+
+  private report(method: string, params: Record<string, unknown>, started: number, r: AxResult | null, e: Error | null): void {
+    if (!this.onCall) return;
+    const text = typeof r?.diff === "string" ? r.diff : typeof r?.tree === "string" ? r.tree : null;
+    const flags: string[] = [];
+    for (const k of ["full", "web", "interactive"]) if (params[k] === true) flags.push(k);
+    if (typeof params.query === "string") flags.push("query");
+    try {
+      this.onCall({
+        method,
+        app: typeof params.app === "string" ? params.app : null,
+        ms: Date.now() - started,
+        waitedMs: typeof r?.waitedMs === "number" ? r.waitedMs : null,
+        bytes: r ? JSON.stringify(r).length : 0,
+        lines: text ? text.split("\n").length : 0,
+        flags: flags.join(","),
+        marks: (["shown", "blank"] as const).filter((k) => r?.[k] === true).join(","),
+        error: e ? e.message : null,
+      });
+    } catch {
+      // diagnostics must never break a request
+    }
   }
 
   private onLine(line: string): void {
@@ -546,6 +928,17 @@ export function describeAxAction(tool: string, rawArgs: unknown, lines?: Map<num
       return "List running apps";
     case "computer_app_state":
       return `Read the UI of ${app}`;
+    case "computer_app_screenshot":
+      return `Photograph ${app}'s window`;
+    case "computer_pointer": {
+      const path = Array.isArray((a as { path?: unknown }).path) ? ((a as { path: unknown[] }).path) : [];
+      const id = typeof a.id === "number" ? a.id : null;
+      const line = id !== null ? lines?.get(id) : null;
+      const inside = line ? ` inside #${id} — ${clip(line)}` : id !== null ? ` inside #${id}` : "";
+      // The card has to say this MOVES THE POINTER: it is the only desktop
+      // verb that touches the user's own cursor rather than the app's tree.
+      return `${a.hold === true ? "Drag" : "Click"} the pointer at ${path.length} point(s)${inside} in ${app}`;
+    }
     case "computer_raise":
       return `Bring ${app} to the front`;
     case "computer_launch":
@@ -554,6 +947,10 @@ export function describeAxAction(tool: string, rawArgs: unknown, lines?: Map<num
       const parsed = parseBatchSteps((a as { steps?: unknown }).steps);
       // A batch whose steps do not parse still has to produce a card, because
       // the card is shown before the call is made.
+      if ((a as { candidates?: unknown }).candidates !== undefined) {
+        const routes = parseCandidates((a as { candidates?: unknown }).candidates);
+        return "error" in routes ? `Try alternatives in ${app}` : describeCandidates(app, routes.candidates, lines);
+      }
       return "error" in parsed ? `Run steps in ${app}` : describeBatch(app, parsed.steps, lines);
     }
     case "computer_press":
@@ -589,9 +986,9 @@ export const APP_STATE_SPACE_SENTENCE =
 export const APP_STATE_SPACE_SENTENCE_CROSS =
   "Windows on another Space are in the tree and work like any other — never raise to read or act; a window line marked [other Space] is still fully usable. ";
 export const RAISE_DESCRIPTION =
-  "Bring an app to the front, switching Spaces if its windows are elsewhere. This TAKES OVER the user's screen, so use it in exactly one case: computer_app_state reported that every window of the app is on another Space, which means the app is not in the tree and cannot be read or acted on until it is raised. Never raise to read or press an app whose windows are already listed. This always requires explicit user approval.";
+  "Bring an app to the front, switching Spaces if its windows are elsewhere. This TAKES OVER the user's screen, so use it in exactly one case: computer_app_state reported that every window of the app is on another Space, which means the app is not in the tree and cannot be read or acted on until it is raised. Never raise to read or press an app whose windows are already listed. Never raise because presses are not landing: when Stage Manager has parked a window as a thumbnail, raising un-parks it only while the app is in front and it re-parks the moment focus moves on, so use the keyboard and the menu bar instead. This always requires explicit user approval.";
 export const RAISE_DESCRIPTION_CROSS =
-  "Bring an app to the front, switching Spaces if its windows are elsewhere. This TAKES OVER the user's screen. Reading and acting never need it — every window is in the tree wherever it is — so use it only when the user asked to SEE the app. This always requires explicit user approval.";
+  "Bring an app to the front, switching Spaces if its windows are elsewhere. This TAKES OVER the user's screen. Reading and acting never need it — every window is in the tree wherever it is — so use it only when the user asked to SEE the app. Not to look at it either: computer_app_screenshot photographs the window where it is, and what that picture leaves blank is content the app draws only on screen — report that to the user rather than raising. This always requires explicit user approval.";
 export const LAUNCH_FRONT_SENTENCE =
   "This brings the app to the front, which is what opening an app means.";
 export const LAUNCH_FRONT_SENTENCE_CROSS =

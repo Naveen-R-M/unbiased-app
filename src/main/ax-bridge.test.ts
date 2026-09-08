@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-import { AX_TOOL_NAMES, SCREENSHOT_TOOL_NAMES, routesToAx, parseBatchSteps, describeBatch, summarizeBatch, MAX_BATCH_STEPS, AxClient, AxError, appOfStep, axConsent, axNeedsFocus, screenshotToolsOffered, coordinateToolAllowed, withScreenshotGuidance, SCREENSHOT_FRAME_SENTENCE, axReadOptsFrom, axFilterSwitched, AX_DEFAULT_READ_OPTS, shouldRecoverRaise, describeAxAction, indexElementLines, readAxManifest, resolveAxDir, shouldOpenAccessibilitySettings, axNotTrustedText, RAISE_DESCRIPTION, APP_STATE_SPACE_SENTENCE, LAUNCH_FRONT_SENTENCE, withSpaceGuidance, otherSpaceNote, launchOutcome } from "./ax-bridge";
+import { AX_TOOL_NAMES, SCREENSHOT_TOOL_NAMES, routesToAx, parseBatchSteps, describeBatch, summarizeBatch, MAX_BATCH_STEPS, AxClient, AxError, appOfStep, axConsent, axNeedsFocus, screenshotToolsOffered, coordinateToolAllowed, withScreenshotGuidance, SCREENSHOT_FRAME_SENTENCE, axReadOptsFrom, axFilterSwitched, AX_DEFAULT_READ_OPTS, shouldRecoverRaise, describeAxAction, indexElementLines, readAxManifest, resolveAxDir, shouldOpenAccessibilitySettings, axNotTrustedText, RAISE_DESCRIPTION, APP_STATE_SPACE_SENTENCE, LAUNCH_FRONT_SENTENCE, withSpaceGuidance, otherSpaceNote, launchOutcome, renderActionResult, ACTION_NO_CHANGE_SENTENCE, TASK_DISCIPLINE_SENTENCE, SCREENSHOT_SPACE_SENTENCE, parseCandidates, describeCandidates, parkedNextCall, parkedReadNote, batchNudge, traceStep, MAX_TYPE_LENGTH, MAX_BATCH_STEPS, BATCH_NUDGE_AFTER, type RecentEdit, skillBody, skillPreamble, shouldSendSkill, prependSkill, MAX_SKILL_PREAMBLE, candidateWorked, summarizeCandidates, MAX_CANDIDATES, MAX_CANDIDATE_STEPS, type AxCallInfo } from "./ax-bridge";
 
 const scratch = () => mkdtempSync(join(tmpdir(), "ax-"));
 
@@ -549,7 +549,15 @@ test("every bridge call that rewrites the diff baseline carries the read's optio
   const src = readFileSync(join(__dirname, "index.ts"), "utf8");
   // find and tree are the read's own calls; they carry the freshly built opts
   // object, which IS the recorded view. Everything else must ask for it.
-  const carriedByOpts = new Set(["tree", "find"]);
+  //
+  // `opts` is allowed as the carrier anywhere, because every definition of it
+  // is checked below to BE the recorded view — spelled out here, a batch step
+  // that folds `settle: false` into an axActionOpts spread reads as a call
+  // with no options at all, and the guard fails on a call that is correct.
+  for (const [, def] of src.matchAll(/const opts(?::[^=]+)? = \{([\s\S]*?)\n *\};?/g)) {
+    assert.match(def, /axActionOpts|\.\.\.want/,
+      `this opts object is neither the read's own view (...want) nor the recorded one (axActionOpts), so the calls carrying it snapshot in a view of their own: ${def.trim().slice(0, 80)}`);
+  }
   for (const method of ["act", "setValue", "key", "scroll", "raise", "launch", "tree", "find"]) {
     // Any receiver, not just `ax.` — `ax!.request(...)` slipped through a
     // marker that spelled the variable out, which is how a call site added
@@ -565,10 +573,8 @@ test("every bridge call that rewrites the diff baseline carries the read's optio
     for (const hit of hits) {
       // Anchored on this hit, so each site resolves independently.
       const call = bridgeCallAt(src, (hit.index ?? 0) + hit[0].indexOf("("));
-      const carrier = carriedByOpts.has(method) ? /axActionOpts|\bopts\b/ : /axActionOpts/;
-      assert.match(call.replace(/\s+/g, " "), carrier,
-        `this ${method} call snapshots in a different view than the read did, so the next diff will be a lie` +
-        (carriedByOpts.has(method) ? " (carry ...axActionOpts(appName), or the read's own opts)" : " (carry ...axActionOpts(appName))"));
+      assert.match(call.replace(/\s+/g, " "), /axActionOpts|\bopts\b/,
+        `this ${method} call snapshots in a different view than the read did, so the next diff will be a lie (carry ...axActionOpts(appName), or an opts object built from it)`);
     }
   }
 });
@@ -808,4 +814,531 @@ test("a launch is readable only when a window line is in the tree, not when the 
   assert.equal(launchOutcome('1 application "Maps"\n2   menu bar\n3     menu bar item "Apple"'), "running",
     "the application and its menu bar alone prove only that it is running");
   assert.equal(launchOutcome('1 application "Maps"\n4   dialog "Open" {raise}'), "readable", "a dialog is a window too");
+});
+
+// An action that reports "(no changes)" is not a read that found nothing.
+// In the Maps run the model heard it as "nothing there" and pressed again.
+
+test("an action with no visible change says to read before repeating, instead of a bare (no changes)", () => {
+  const out = renderActionResult("(no changes)");
+  assert.ok(out.startsWith("Done."), out);
+  assert.ok(out.includes(ACTION_NO_CHANGE_SENTENCE), out);
+  assert.ok(!out.includes("(no changes)"), out);
+  assert.equal(renderActionResult(""), out);
+  const explained = renderActionResult("(no changes)", "Maps is behind a fullscreen Space.");
+  assert.ok(explained.startsWith("Done. Maps is behind a fullscreen Space. ") && explained.includes(ACTION_NO_CHANGE_SENTENCE), explained);
+  assert.equal(renderActionResult("+ 12 button \"Directions\" {press}"), "Done.\n+ 12 button \"Directions\" {press}");
+});
+
+test("a batch that ends with no visible change gets the same guidance", () => {
+  const out = summarizeBatch({ ran: ["press #3"], failed: null, remaining: 0, diff: "(no changes)" });
+  assert.ok(out.includes(ACTION_NO_CHANGE_SENTENCE), out);
+});
+
+test("the tools the model reads first carry the task-discipline sentence", () => {
+  const src = readFileSync(join(__dirname, "index.ts"), "utf8");
+  for (const name of ["computer_app_state", "computer_do"]) {
+    const start = src.indexOf(`name: "${name}"`);
+    assert.ok(start > 0, name);
+    const desc = src.slice(start, src.indexOf("inputSchema", start));
+    assert.ok(desc.includes("TASK_DISCIPLINE_SENTENCE"), `${name} should spell out scope`);
+  }
+  assert.ok(!src.includes("axText(`Done.\\n${diff}`"), "the press/act site must render through renderActionResult");
+  assert.ok(src.includes("renderActionResult(diff"), "the press/act site renders through renderActionResult");
+});
+
+test("every finished request reports its timing and size, errors included", async () => {
+  const m = fakeBridge();
+  assert.ok(m && !("error" in m));
+  const c = new AxClient(m);
+  const calls: AxCallInfo[] = [];
+  c.onCall = (x) => calls.push(x);
+  await c.start();
+  await c.request("echo", { app: "Maps", interactive: true, query: "Directions" });
+  await assert.rejects(c.request("boom", { app: "Maps" }));
+  c.stop();
+  const echo = calls.find((x) => x.method === "echo");
+  assert.ok(echo, JSON.stringify(calls));
+  assert.equal(echo.app, "Maps");
+  assert.equal(echo.flags, "interactive,query");
+  assert.equal(echo.marks, "", "a plain echo has nothing to mark");
+  assert.ok(echo.ms >= 0 && echo.bytes > 0 && echo.error === null);
+  const boom = calls.find((x) => x.method === "boom");
+  assert.ok(boom && boom.error && boom.error.includes("No running app"), JSON.stringify(boom));
+});
+
+// Run 3 of the Maps task: the model wanted to look, screenshotted a Space Maps
+// was not on, and raised Maps to see it — twice. The window picture is a tool
+// of its own now, and the display screenshot says so while Spaces are crossed.
+
+test("the window screenshot is an AX tool: routed, described, and read-gated like app_state", () => {
+  assert.ok(routesToAx("computer_app_screenshot"));
+  assert.equal(describeAxAction("computer_app_screenshot", { app: "Maps" }), "Photograph Maps's window");
+  assert.equal(axNeedsFocus("computer_app_screenshot", {}), false, "it never takes the screen");
+  assert.equal(axConsent({ tool: "computer_app_screenshot", mode: "ask", granted: false }), "ask", "window contents reach the model, so it is gated like a read");
+});
+
+test("while Spaces are crossed, computer_screenshot says it cannot see the other Space and names the tool that can", () => {
+  const shot = { name: "computer_screenshot", description: "Capture it. " + SCREENSHOT_FRAME_SENTENCE + " Approval required." };
+  assert.deepEqual(withScreenshotGuidance(shot, "all", false), shot);
+  const crossed = withScreenshotGuidance(shot, "all", true).description;
+  assert.ok(crossed.endsWith(SCREENSHOT_SPACE_SENTENCE), crossed);
+  assert.ok(crossed.includes("computer_app_screenshot"));
+  const both = withScreenshotGuidance(shot, "screenshot-only", true).description;
+  assert.ok(!both.includes(SCREENSHOT_FRAME_SENTENCE) && both.endsWith(SCREENSHOT_SPACE_SENTENCE), "both rewrites compose");
+  const other = { name: "computer_click", description: "Click " + SCREENSHOT_FRAME_SENTENCE };
+  assert.deepEqual(withScreenshotGuidance(other, "all", true), other, "only the screenshot tool speaks about Spaces");
+});
+
+test("while Spaces are crossed, raise says looking is not a reason either", () => {
+  const raise = { name: "computer_raise", description: RAISE_DESCRIPTION };
+  const crossed = withSpaceGuidance(raise, true).description;
+  assert.ok(crossed.includes("computer_app_screenshot") && crossed.includes("Not to look"), crossed);
+});
+
+test("a launch that showed the app and a blank picture are marked in the call line", async () => {
+  const { describeAxCall } = await import("./ax-bridge");
+  const base = { method: "launch", app: "Maps", ms: 3000, waitedMs: null, bytes: 900, lines: 20, flags: "", marks: "shown", error: null };
+  assert.ok(describeAxCall(base).includes("[shown]"));
+  assert.ok(describeAxCall({ ...base, method: "screenshot", marks: "blank" }).includes("[blank]"));
+  assert.ok(!describeAxCall({ ...base, marks: "" }).includes("["));
+});
+
+// Candidates: several plausible routes to one state, tried locally, so a wrong
+// guess costs a bridge call instead of a model turn.
+
+test("a candidate is a route: one step or a short list, and two routes minimum", () => {
+  const ok = parseCandidates([{ do: "press", id: 88 }, [{ do: "key", key: "down" }, { do: "key", key: "return" }]]);
+  assert.ok(!("error" in ok), JSON.stringify(ok));
+  assert.equal(ok.candidates.length, 2);
+  assert.equal(ok.candidates[0].length, 1);
+  assert.equal(ok.candidates[1].length, 2, "down then return is ONE route, not two");
+  const one = parseCandidates([{ do: "press", id: 1 }]);
+  assert.ok("error" in one && one.error.includes("at least two"), JSON.stringify(one));
+  const many = parseCandidates(Array.from({ length: MAX_CANDIDATES + 1 }, () => ({ do: "key", key: "return" })));
+  assert.ok("error" in many && many.error.includes("too many"), JSON.stringify(many));
+  const tooDeep = parseCandidates([{ do: "press", id: 1 }, Array.from({ length: MAX_CANDIDATE_STEPS + 1 }, () => ({ do: "key", key: "down" }))]);
+  assert.ok("error" in tooDeep && tooDeep.error.includes("candidate 2"), JSON.stringify(tooDeep));
+});
+
+test("a read can never be a candidate, and the refusal says which one", () => {
+  const bad = parseCandidates([{ do: "press", id: 1 }, [{ do: "key", key: "down" }, { do: "read" }]]);
+  assert.ok("error" in bad && bad.error.includes("candidate 2 step 2") && bad.error.includes("read"), JSON.stringify(bad));
+});
+
+test("a route counts as working only when the settled tree really moved", () => {
+  assert.equal(candidateWorked("+ 12 button \"Directions\""), true);
+  assert.equal(candidateWorked("(no changes)"), false);
+  assert.equal(candidateWorked("  (no changes)  "), false);
+  assert.equal(candidateWorked(""), false);
+});
+
+test("the summary names the winner, what each loser did, and does not overclaim success", () => {
+  const out = summarizeCandidates({
+    tried: [
+      { label: "1. press #23", outcome: "nothing" },
+      { label: "2. key then key", outcome: "worked" },
+    ],
+    winner: 1,
+    diff: "+ 99 heading \"AMC River East 21\"",
+    remaining: 1,
+  });
+  assert.ok(out.includes("Route 2 changed the app"), out);
+  assert.ok(out.includes("check it is the state you wanted"), "changing something is not the same as working");
+  assert.ok(out.includes("1. press #23 did nothing"), out);
+  assert.ok(out.includes("→ 2. key then key changed the app"), out);
+  assert.ok(out.includes("1 later route(s) were not tried"), out);
+  assert.ok(out.includes("AMC River East 21"), out);
+});
+
+test("when nothing worked the model is told that, with the do-not-repeat guidance", () => {
+  const out = summarizeCandidates({
+    tried: [
+      { label: "1. press #23", outcome: "nothing" },
+      { label: "2. act #24", outcome: "Element 24 does not offer \"focus\"" },
+    ],
+    winner: null,
+    diff: "",
+    remaining: 0,
+  });
+  assert.ok(out.startsWith("None of the 2 route(s) changed the app."), out);
+  assert.ok(out.includes("failed: Element 24 does not offer"), out);
+  assert.ok(out.includes(ACTION_NO_CHANGE_SENTENCE), out);
+});
+
+test("the approval card shows routes as alternatives, so one press is never approved as four", () => {
+  const routes = parseCandidates([{ do: "press", id: 88 }, [{ do: "key", key: "down" }, { do: "key", key: "return" }]]);
+  assert.ok(!("error" in routes));
+  const card = describeCandidates("Maps", routes.candidates, new Map([[88, 'button "AMC River East 21"']]));
+  assert.ok(card.startsWith("2 alternative route(s) in Maps, stopping at the first that changes anything:"), card);
+  assert.ok(card.includes("AMC River East 21"), "the card names what would be pressed");
+  assert.ok(/2\.\n/.test(card), `the two-step route is shown as two lines: ${card}`);
+});
+
+test("steps and candidates are different shapes and cannot be sent together", () => {
+  const src = readFileSync(join(__dirname, "index.ts"), "utf8");
+  assert.ok(src.includes("Pass steps for a sequence or candidates for alternatives, not both."));
+  assert.ok(src.includes("runCandidates(appName, routes.candidates, remember)"));
+  assert.ok(MAX_CANDIDATES < MAX_BATCH_STEPS, "the route cap is tighter than the sequence cap");
+});
+
+// Prose lost. Three texts told the model to use the keyboard on a parked
+// window and it raised twice anyway, so the reply now ends with the call.
+
+test("a click that died on a parked window ends with the calls to send next", () => {
+  const hint = "Stage Manager has parked Maps's window in the side strip as a thumbnail.";
+  const out = renderActionResult("(no changes)", hint, parkedNextCall("Maps"));
+  assert.ok(out.startsWith("Done. " + hint), out);
+  assert.ok(out.includes(ACTION_NO_CHANGE_SENTENCE), out);
+  // Both paths, each concrete: one for choosing out of a list, one for
+  // reaching a control that cannot be pressed at all.
+  assert.ok(out.includes('computer_do {"app":"Maps","steps":[{"do":"key","key":"down"},{"do":"key","key":"return"}]}'), out);
+  assert.ok(out.includes("whole intent") && out.includes('"directions to <place>"'), out);
+});
+
+test("down and return are one call, because down alone only moves the selection", () => {
+  const call = parkedNextCall("Maps");
+  const steps = /"steps":(\[.*\])/.exec(call);
+  assert.ok(steps, call);
+  const parsed = JSON.parse(steps[1]) as { do: string; key?: string }[];
+  assert.deepEqual(parsed, [{ do: "key", key: "down" }, { do: "key", key: "return" }]);
+  assert.ok(!call.includes("candidates"), "one measured route beats a set of guesses here");
+  assert.ok(call.includes("finished action"), "and the second path, for a control that cannot be pressed");
+});
+
+test("an app name with a quote in it cannot break the call it is embedded in", () => {
+  assert.ok(parkedNextCall('Bob\'s "App"').includes(JSON.stringify('Bob\'s "App"')));
+});
+
+test("nothing is appended when the action worked, or when it was itself a key", () => {
+  assert.equal(renderActionResult("+ 9 heading \"Card\"", "parked", parkedNextCall("Maps")), 'Done.\n+ 9 heading "Card"');
+  const src = readFileSync(join(__dirname, "index.ts"), "utf8");
+  assert.ok(src.includes('tool === "computer_press" || tool === "computer_act" || tool === "computer_set_value"'), "only the verbs that hit-test");
+  assert.ok(src.includes("hint && clicked ? parkedNextCall(appName) : null"));
+});
+
+// The parked state used to be discovered by pressing something and watching it
+// fail. One run then spent sixteen seconds shelling out to read the skill.
+
+test("a read of a parked window names the readable/interactable split and both working paths", () => {
+  const note = parkedReadNote([{ id: 1, parked: true }]);
+  assert.ok(note && note.startsWith("[parked] "), String(note));
+  // The distinction that matters: reads are exact, presses may not land.
+  assert.ok(note.includes("READABLE") && note.includes("INTERACTABLE"), note);
+  assert.ok(note.includes('[{"do":"key","key":"down"},{"do":"key","key":"return"}]'), note);
+  assert.ok(note.includes('"directions to <place>"'), "the intent query is the path for a control you cannot press");
+  assert.ok(note.includes("menu bar") || note.includes("Menu bar"), note);
+  assert.ok(note.includes("Do not raise") && note.includes("move or resize"), note);
+});
+
+test("nothing is said when no window is parked, whatever the shape of the input", () => {
+  assert.equal(parkedReadNote([{ id: 1, parked: false }]), null);
+  assert.equal(parkedReadNote([{ id: 1 }]), null);
+  assert.equal(parkedReadNote([]), null);
+  assert.equal(parkedReadNote(undefined), null);
+  assert.equal(parkedReadNote("nonsense"), null);
+  assert.equal(parkedReadNote([null, 3, "x"]), null);
+});
+
+test("one parked window among several is enough to say it", () => {
+  assert.ok(parkedReadNote([{ id: 1, parked: false }, { id: 2, parked: true }]));
+});
+
+test("the read result carries the note, next to the Space guidance", () => {
+  const src = readFileSync(join(__dirname, "index.ts"), "utf8");
+  const head = src.slice(src.indexOf("const head = ["), src.indexOf("].filter(Boolean).join"));
+  assert.ok(head.includes("parkedReadNote(w.windows)"), `the read head must carry it: ${head}`);
+  assert.ok(head.includes("otherSpaceNote"), "and still carry the Space note");
+});
+
+// The model does open the skill on its own — twice in the measured runs — but
+// both times mid-task, after it had already stalled, once costing 16 seconds.
+// So the first desktop call of a conversation hands it over.
+
+test("the frontmatter is stripped, because it addresses the loader and not the reader", () => {
+  const body = skillBody("---\nname: computer-use\ndescription: x\n---\n\n# Driving apps\n\nBody here.\n");
+  assert.equal(body, "# Driving apps\n\nBody here.");
+  assert.ok(!body.includes("description:"));
+});
+
+test("a file with no frontmatter is passed through, and an empty one sends nothing", () => {
+  assert.equal(skillBody("# Just a heading"), "# Just a heading");
+  assert.equal(skillPreamble("   \n  "), null);
+  assert.equal(skillPreamble("---\nname: x\n---\n"), null, "frontmatter alone is not content");
+});
+
+test("the preamble is framed so it cannot be read as tool output, and the result stays last", () => {
+  const preamble = skillPreamble("---\nname: computer-use\n---\n# Guide\nDo this.");
+  assert.ok(preamble && preamble.startsWith("=== How to drive desktop apps"), String(preamble));
+  assert.ok(preamble.includes("sent once per conversation"), preamble);
+  assert.ok(preamble.trimEnd().endsWith("=== end ==="), preamble);
+  const out = prependSkill({ contentItems: [{ type: "inputText", text: "the tree" }], success: true }, preamble);
+  assert.equal(out.contentItems.length, 2);
+  assert.equal((out.contentItems[0] as { text: string }).text, preamble);
+  assert.equal((out.contentItems[1] as { text: string }).text, "the tree", "the tool result is still the last thing read");
+  assert.equal(out.success, true);
+});
+
+test("a runaway skill file cannot flood a turn", () => {
+  const body = skillBody("x".repeat(MAX_SKILL_PREAMBLE + 5_000));
+  assert.ok(body.length <= MAX_SKILL_PREAMBLE + 20, String(body.length));
+  assert.ok(body.endsWith("(truncated)"));
+});
+
+test("it goes with a desktop tool, once, and never with anything else", () => {
+  assert.equal(shouldSendSkill("computer_app_state", false), true);
+  assert.equal(shouldSendSkill("computer_apps", false), true, "listing apps is often the first call");
+  assert.equal(shouldSendSkill("computer_screenshot", false), true, "the screenshot family counts too");
+  assert.equal(shouldSendSkill("computer_app_state", true), false, "once per conversation");
+  assert.equal(shouldSendSkill("schedule_create", false), false);
+  assert.equal(shouldSendSkill("memory_write", false), false);
+  assert.equal(shouldSendSkill("browser_navigate", false), false);
+});
+
+test("the real bundled skill survives the round trip", () => {
+  const md = readFileSync(join(__dirname, "..", "..", "resources", "skills", "computer-use", "SKILL.md"), "utf8");
+  const preamble = skillPreamble(md);
+  assert.ok(preamble, "the shipped skill must produce a preamble");
+  assert.ok(!preamble.includes("description: How to drive"), "frontmatter gone");
+  for (const needle of ["Stage Manager", "PARKED", "computer_app_screenshot", "menu bar"]) {
+    assert.ok(preamble.includes(needle) || preamble.toLowerCase().includes(needle.toLowerCase()), `lost ${needle}`);
+  }
+  assert.ok(preamble.length < MAX_SKILL_PREAMBLE, `the shipped skill is ${preamble.length} bytes and must not be truncated`);
+});
+
+test("the dispatch site sends it once, before the tool result", () => {
+  const src = readFileSync(join(__dirname, "index.ts"), "utf8");
+  assert.ok(src.includes("shouldSendSkill(tool, axSkillSent.has(skillRoot))"), "decided per conversation");
+  assert.ok(src.includes("axSkillSent.add(skillRoot)"), "and only once");
+  assert.ok(src.includes("prependSkill(response, preamble)"));
+  // An unreadable file must not break a turn.
+  assert.ok(src.includes("first-call preamble disabled"), "a missing skill file degrades quietly");
+});
+
+// Drawing. Two agents stalled on the same Figma task: the pen tool is behind
+// the letter `p` with no element, and the canvas has nothing to press.
+
+test("the pointer is an AX tool: routed, gated like an action, and never takes the screen by itself", () => {
+  assert.ok(routesToAx("computer_pointer"));
+  assert.equal(axNeedsFocus("computer_pointer", {}), false, "it does not raise; the bridge refuses when the window is not visible");
+  assert.equal(axConsent({ tool: "computer_pointer", mode: "ask", granted: false }), "ask");
+});
+
+test("the approval card says the pointer MOVES, names the anchor, and distinguishes a drag", () => {
+  const lines = new Map([[33, 'web area "Untitled – Figma"']]);
+  const click = describeAxAction("computer_pointer", { app: "Figma", id: 33, path: [{ x: 0.2, y: 0.2 }, { x: 0.8, y: 0.8 }] }, lines);
+  assert.equal(click, 'Click the pointer at 2 point(s) inside #33 — web area "Untitled – Figma" in Figma');
+  const drag = describeAxAction("computer_pointer", { app: "Figma", id: 33, path: [{ x: 0, y: 0 }], hold: true }, lines);
+  assert.ok(drag.startsWith("Drag the pointer at 1 point(s)"), drag);
+  const bare = describeAxAction("computer_pointer", { app: "Figma", id: 9, path: [] });
+  assert.equal(bare, "Click the pointer at 0 point(s) inside #9 in Figma");
+});
+
+test("a key is one letter, one digit or a named key — no enum to fence the pen out", () => {
+  const src = readFileSync(join(__dirname, "index.ts"), "utf8");
+  const start = src.indexOf('name: "computer_press_key"');
+  const schema = src.slice(start, src.indexOf("required:", start));
+  assert.ok(!schema.includes('enum: ["return"'), "the old enum would have refused p");
+  assert.ok(schema.includes("One letter (a-z)"), schema.slice(0, 400));
+  assert.ok(schema.includes("command"), "modifiers are part of the same call");
+});
+
+test("the pointer handler needs an anchor, defaults to its centre, and validates the click count", () => {
+  const src = readFileSync(join(__dirname, "index.ts"), "utf8");
+  const start = src.indexOf('case "computer_pointer"');
+  const body = src.slice(start, src.indexOf('case "computer_app_screenshot"', start));
+  // A path is now OPTIONAL: clicking a field to put a caret in it is the
+  // commonest use and should not require spelling out {"x":0.5,"y":0.5}.
+  assert.ok(!body.includes("path is required"), "an omitted path means the element's centre");
+  assert.ok(body.includes("clicks must be 1 to"), "a silly click count is refused before the bridge");
+  assert.ok(body.includes("id is required"));
+  assert.ok(body.includes("Landed at"), "the reply reports where the fractions landed");
+  assert.ok(body.includes('"pointer"'), "and it goes to the bridge's pointer verb");
+});
+
+// A Figma icon built from native shapes: 91 key presses and 63 value sets,
+// nearly all one per turn, at 15 seconds a turn. computer_do existed and was
+// barely used, so the app notices the run and hands back the literal call.
+
+test("a run of single edits on one app becomes the batch call that would have done them", () => {
+  const recent: RecentEdit[] = [
+    { tool: "computer_set_value", app: "Figma", id: 10, text: "500" },
+    { tool: "computer_set_value", app: "Figma", id: 11, text: "65" },
+    { tool: "computer_set_value", app: "Figma", id: 12, text: "280" },
+  ];
+  const out = batchNudge(recent);
+  assert.ok(out, "three in a row is worth saying");
+  assert.ok(out.includes("3 separate actions to Figma"), out);
+  assert.ok(out.includes('computer_do {"app":"Figma","steps":[{"do":"set_value","id":10,"text":"500"}'), out);
+  assert.ok(out.includes("not five"), out);
+});
+
+test("it stays quiet below the threshold, and starts the count again on a different app", () => {
+  assert.equal(batchNudge([]), null);
+  const two: RecentEdit[] = [
+    { tool: "computer_press", app: "Figma", id: 1 },
+    { tool: "computer_press", app: "Figma", id: 2 },
+  ];
+  assert.equal(batchNudge(two), null, `fewer than ${BATCH_NUDGE_AFTER} is not a pattern`);
+  const switched: RecentEdit[] = [
+    { tool: "computer_press", app: "Maps", id: 1 },
+    { tool: "computer_press", app: "Maps", id: 2 },
+    { tool: "computer_press", app: "Figma", id: 3 },
+  ];
+  assert.equal(batchNudge(switched), null, "only the trailing run on one app counts");
+});
+
+test("every batchable verb is rendered as its step, and an unbatchable one cancels the nudge", () => {
+  const mixed: RecentEdit[] = [
+    { tool: "computer_press", app: "Figma", id: 5 },
+    { tool: "computer_act", app: "Figma", id: 6, action: "show menu" },
+    { tool: "computer_press_key", app: "Figma", key: "return" },
+  ];
+  const out = batchNudge(mixed);
+  assert.ok(out, String(out));
+  assert.ok(out.includes('{"do":"press","id":5}') && out.includes('{"do":"act","id":6,"action":"show menu"}') && out.includes('{"do":"key","key":"return"}'), out);
+  const withRaise: RecentEdit[] = [...mixed, { tool: "computer_raise", app: "Figma" }];
+  assert.equal(batchNudge(withRaise), null, "raise is not batchable, so there is no single call to suggest");
+});
+
+test("the nudge is said once per conversation and a batch resets the count", () => {
+  const src = readFileSync(join(__dirname, "index.ts"), "utf8");
+  assert.ok(src.includes("axBatchNudged.has(root) ? null : batchNudge(axRecentEdits)"), "once per conversation");
+  assert.ok(src.includes("axRecentEdits = []; // the caller batched"), "batching clears the run");
+  assert.ok(src.includes("axRecentEdits.push({"), "single actions are recorded");
+});
+
+test("a batch skips the settle wait on every step but the last", () => {
+  const src = readFileSync(join(__dirname, "index.ts"), "utf8");
+  assert.ok(src.includes("runBatchStep(appName: string, st: BatchStep, settle = true)"));
+  assert.ok(src.includes("settle: false"), "the flag reaches the bridge");
+  assert.ok(src.includes("runBatchStep(appName, st, i === steps.length - 1)"), "only the last step settles");
+  // Candidates are judged BY their diffs, so they must keep the wait.
+  const runner = src.slice(src.indexOf("async function runCandidates"), src.indexOf("async function handleAxCall"));
+  assert.ok(runner.includes("runBatchStep(appName, st)") && !runner.includes("settle: false"), "candidate routes still settle");
+});
+
+// Codex's densest turn on the same Figma icon ran 17 primitive actions: four
+// inspector fields, each click + select-all + type + Return, then a colour
+// click. A ten-step cap split that across turns at ~15s each.
+
+test("a batch takes 30 steps, and says what to do with more", () => {
+  const step = { do: "press", id: 1 };
+  const at30 = parseBatchSteps(Array.from({ length: 30 }, () => step));
+  assert.ok(!("error" in at30), "30 fits a shape's whole geometry");
+  const at31 = parseBatchSteps(Array.from({ length: 31 }, () => step));
+  assert.ok("error" in at31 && at31.error.includes("max 30"), JSON.stringify(at31));
+});
+
+test("a batch key step carries a tool shortcut and its modifiers", () => {
+  // Both were unreachable in a batch before: the schema enum listed nine named
+  // keys, so "p" (Figma's pen) was invalid, and modifiers were dropped without
+  // a word — which made the select-all remedy for an appending field
+  // inexpressible as a batch at all.
+  const r = parseBatchSteps([
+    { do: "key", key: "p" },
+    { do: "key", key: "a", modifiers: ["command"], id: 88 },
+  ]);
+  assert.ok(!("error" in r), JSON.stringify(r));
+  assert.deepEqual(r.steps[0], { do: "key", key: "p", waitMs: 0 });
+  assert.deepEqual(r.steps[1], { do: "key", key: "a", id: 88, modifiers: ["command"], waitMs: 0 });
+});
+
+test("an unknown modifier is refused by name rather than dropped", () => {
+  const r = parseBatchSteps([{ do: "key", key: "a", modifiers: ["cmd"] }]);
+  assert.ok("error" in r && r.error.includes("cmd") && r.error.includes("command"), JSON.stringify(r));
+});
+
+test("the trace names the field and value, not just the verb", () => {
+  assert.equal(traceStep({ do: "set_value", id: 109, text: "180", waitMs: 0 }), 'set_value #109 = "180"');
+  assert.equal(traceStep({ do: "key", key: "a", modifiers: ["command"], id: 88, waitMs: 0 }), "key command+a in #88");
+  assert.equal(traceStep({ do: "act", id: 6, action: "show menu", waitMs: 0 }), 'act #6 "show menu"');
+  assert.equal(traceStep({ do: "press", id: 22, waitMs: 0 }), "press #22");
+  assert.equal(traceStep({ do: "read", waitMs: 0 }), "read");
+});
+
+test("a multi-step batch does not claim more than it watched", () => {
+  const ran = ["step 1 (set_value #88 = \"550\")", "step 2 (press #12)"];
+  const many = summarizeBatch({ ran, failed: null, remaining: 0, diff: "~ 12 button", unwatched: true });
+  assert.ok(many.includes("Every value written was read back"), many);
+  assert.ok(many.includes("presses were not watched individually"), many);
+  // A single step DID settle and its diff is its own, so the caveat would be
+  // false there.
+  const one = summarizeBatch({ ran: [ran[0]], failed: null, remaining: 0, diff: "~ 88", unwatched: true });
+  assert.ok(!one.includes("not watched"), one);
+});
+
+test("a stopped batch still reports which steps ran and which did not", () => {
+  const out = summarizeBatch({
+    ran: ["step 1 (set_value #88 = \"550\")"],
+    failed: { step: "step 2 (set_value #109 = \"180\")", message: 'setValue did not land: asked for "180", the field now reads "120180"' },
+    remaining: 3,
+    diff: "~ 88 stepper",
+  });
+  assert.ok(out.includes("Stopped at step 2 (set_value #109"), out);
+  assert.ok(out.includes("120180"), out);
+  assert.ok(out.includes("The remaining 3 step(s) did NOT run."), out);
+});
+
+// Setting a value in a web app's inspector takes four primitives — click the
+// field, select all, type, commit — and until `type` and `pointer` were batch
+// verbs it could not be written as one call. Measured on Figma: set_value
+// lands on a "text field" and is silently ignored on a "stepper".
+
+test("the four-step field recipe parses as a single batch", () => {
+  const r = parseBatchSteps([
+    { do: "pointer", id: 83 },
+    { do: "key", key: "a", modifiers: ["command"] },
+    { do: "type", text: "-19.6875" },
+    { do: "key", key: "return" },
+  ]);
+  assert.ok(!("error" in r), JSON.stringify(r));
+  assert.deepEqual(r.steps[0], { do: "pointer", id: 83, waitMs: 0 });
+  assert.deepEqual(r.steps[2], { do: "type", text: "-19.6875", waitMs: 0 });
+});
+
+test("a pointer step needs an element, and takes a double click", () => {
+  assert.ok("error" in parseBatchSteps([{ do: "pointer" }]), "no id, no target");
+  const two = parseBatchSteps([{ do: "pointer", id: 5, clicks: 2 }]);
+  assert.ok(!("error" in two) && two.steps[0].clicks === 2, JSON.stringify(two));
+  const silly = parseBatchSteps([{ do: "pointer", id: 5, clicks: 99 }]);
+  assert.ok("error" in silly && silly.error.includes("double click"), JSON.stringify(silly));
+});
+
+test("a type step needs text, and refuses a document", () => {
+  assert.ok("error" in parseBatchSteps([{ do: "type" }]));
+  const long = parseBatchSteps([{ do: "type", text: "x".repeat(MAX_TYPE_LENGTH + 1) }]);
+  assert.ok("error" in long && long.error.includes("not a document"), JSON.stringify(long));
+});
+
+test("four fields plus a colour fit one call, which is the point", () => {
+  // Codex's densest turn on the same icon: 4 fields x (click, select all,
+  // type, commit) + 1 colour click = 17 primitives. That has to fit.
+  const steps = [];
+  for (const [id, val] of [[83, "460"], [84, "-19.6875"], [101, "360"], [104, "360"]]) {
+    steps.push({ do: "pointer", id }, { do: "key", key: "a", modifiers: ["command"] },
+               { do: "type", text: val }, { do: "key", key: "return" });
+  }
+  steps.push({ do: "press", id: 126 });
+  assert.equal(steps.length, 17);
+  const r = parseBatchSteps(steps);
+  assert.ok(!("error" in r), JSON.stringify(r));
+  assert.ok(steps.length <= MAX_BATCH_STEPS, `${steps.length} steps must fit the cap of ${MAX_BATCH_STEPS}`);
+});
+
+test("the trace names the typed string and the click", () => {
+  assert.equal(traceStep({ do: "type", text: "460", id: 83, waitMs: 0 }), 'type "460" in #83');
+  assert.equal(traceStep({ do: "pointer", id: 83, clicks: 2, waitMs: 0 }), "click x2 #83");
+  assert.equal(traceStep({ do: "pointer", id: 83, waitMs: 0 }), "click #83");
+});
+
+test("computer_do tells the model which field kind takes which route", () => {
+  const src = readFileSync(join(__dirname, "index.ts"), "utf8");
+  const start = src.indexOf('name: "computer_do"');
+  const decl = src.slice(start, start + 6000);
+  assert.ok(decl.includes("text field") && decl.includes("stepper"), "name both kinds");
+  assert.ok(decl.includes("100100"), "and what going wrong looks like");
+  // The description is a TS string literal, so its quotes are escaped in source.
+  assert.ok(decl.includes(String.raw`{\"do\":\"type\",\"text\":\"460\"}`), "hand over the literal recipe");
+  assert.ok(decl.includes("clicks:2"), "and the double-click fallback");
 });

@@ -36,6 +36,23 @@ import { EngineClient, engineVersionFromUserAgent, type EngineStatus } from "./e
 import { pollDeviceToken, requestDeviceAuthorization } from "./device-auth";
 import { RendererCrashRecovery } from "./crash-recovery";
 import {
+  type BatchStep,
+  type AxResult,
+  parseCandidates,
+  parkedNextCall,
+  parkedReadNote,
+  batchNudge,
+  BATCH_NUDGE_AFTER,
+  type RecentEdit,
+  shouldSendSkill,
+  skillPreamble,
+  prependSkill,
+  MAX_CANDIDATES,
+  candidateWorked,
+  summarizeCandidates,
+  renderActionResult,
+  TASK_DISCIPLINE_SENTENCE,
+  describeAxCall,
   AxClient,
   AxError,
   appOfStep,
@@ -59,6 +76,8 @@ import {
   routesToAx,
   parseBatchSteps,
   summarizeBatch,
+  traceStep,
+  MAX_CLICKS,
   MAX_BATCH_STEPS,
   APP_STATE_SPACE_SENTENCE,
   RAISE_DESCRIPTION,
@@ -1280,7 +1299,7 @@ const AX_TOOLS = [
       "THIS IS THE TOOL FOR APPS THE USER ALREADY HAS OPEN — their running browser and its existing tabs included, so a site they are already signed into (Slack, Gmail, a dashboard) is read and operated here, in their own window. The browser_* tools open a separate browser instead and cannot see any of it. " +
       "Act on those ids: the controls are named, so press them rather than guessing keyboard shortcuts. " +
       "Reach for this BEFORE computer_screenshot: it answers what is on screen, which tab is selected, and where a control is, as text. "
-      + "It works on a BACKGROUND app on any Space and never takes over the user's screen. " +
+      + "It works on a BACKGROUND app on any Space and never takes over the user's screen. " + TASK_DISCIPLINE_SENTENCE +
       "Ids are stable per app until an element disappears. After the first read of an app the result is a DIFF (~ changed, + added, removed by id) unless full=true. " +
       APP_STATE_SPACE_SENTENCE + "Pass query to search for one control by title instead of reading everything. " +
       "Web page content inside a browser needs web=true. Use computer_screenshot when you need to SEE something the tree cannot express — whether a video is actually playing, a canvas, a rendered chart — and one confirming screenshot at the end of a visual task is worth taking.",
@@ -1345,13 +1364,23 @@ const AX_TOOLS = [
     type: "function",
     name: "computer_press_key",
     description:
-      "Send one real key event. Use it for what pressing a control cannot express: committing a field with return, dismissing with escape, moving with tab or the arrows. Pass id to aim the key at an element, which is focused first — WITHOUT id it goes wherever keyboard focus already happens to be, which may be another field entirely. Reaches a background app without taking the user's screen." +
+      "Send one real key event. Use it for what pressing a control cannot express: committing a field with return, dismissing with escape, moving with tab or the arrows, and SELECTING A TOOL by its shortcut. " +
+      "A single letter or digit is a key, which is often the only way in: a design app puts its tools behind one-character shortcuts and exposes no element for them at all, so Figma's pen is \"p\" and nothing else reaches it. modifiers holds command, shift, option or control around the keystroke. " +
+      "Pass id to aim the key at an element, which is focused first — WITHOUT id it goes wherever keyboard focus already happens to be, which may be another field entirely. Reaches a background app on any Space without taking the user's screen, because a key event does not depend on where the window is. " +
       "It waits for the app to react and returns what changed — committing a search with return comes back with the results in it, so do not read again straight afterwards.",
     inputSchema: {
       type: "object",
       properties: {
         app: { type: "string" },
-        key: { type: "string", enum: ["return", "tab", "escape", "space", "delete", "up", "down", "left", "right"] },
+        key: {
+          type: "string",
+          description: "One letter (a-z), one digit, shortcut punctuation such as ] and [ for bring-to-front and send-to-back, or a named key: return, tab, escape, space, delete, up, down, left, right.",
+        },
+        modifiers: {
+          type: "array",
+          description: "Held around the keystroke: command, shift, option, control.",
+          items: { type: "string", enum: ["command", "shift", "option", "control"] },
+        },
         id: { type: "integer", description: "Focus this element first, so the keystroke lands there." },
       },
       required: ["app", "key"],
@@ -1379,12 +1408,20 @@ const AX_TOOLS = [
     description:
       "Run several steps on ONE app in a single call, in order, and get back what changed. Use this whenever you already know the next few moves — filling a field and committing it, pressing a tab and reading the result, scrolling and reading. It saves a whole round trip per step, which is the main cost of operating an app. " +
       "Each step is {do, ...}: do=\"press\" with id; do=\"set_value\" with id and text; do=\"key\" with key (and optional id to aim it); do=\"scroll\" with id and direction; do=\"act\" with id and action; do=\"read\" to re-read the app. Add wait_ms to a step to pause after it, for content that loads (a tab that shows \"Loading…\"). " +
-      `Up to ${MAX_BATCH_STEPS} steps. It STOPS at the first step that fails and tells you which one — the rest do not run, so do not assume they did. ` +
-      "Opening or raising an app is not batchable: call computer_launch or computer_raise on its own. Do NOT batch steps whose ids you have not read yet, or steps that depend on what an earlier step reveals — read first, then batch what you can see.",
+      `Up to ${MAX_BATCH_STEPS} steps — use them: one shape's position, size, colour and commit is ONE call, not five. It STOPS at the first step that fails and tells you which one — the rest do not run, so do not assume they did. Every set_value is read back, so a field that kept its old text and appended to it stops the run there instead of corrupting everything computed after it. ` +
+      "SETTING A VALUE IN A WEB APP'S PANEL (Figma, and anything Chromium): set_value works on an element the tree calls a \"text field\" and is SILENTLY IGNORED on a \"stepper\" — the write appears in the box, the value never changes, and it commits later when focus leaves, which is how a 67 became 100100. For a stepper use the four-step recipe in ONE call: {\"do\":\"pointer\",\"id\":N} then {\"do\":\"key\",\"key\":\"a\",\"modifiers\":[\"command\"]} then {\"do\":\"type\",\"text\":\"460\"} then {\"do\":\"key\",\"key\":\"return\"}. Add clicks:2 to the pointer step if one click does not open the field. Read the value back afterwards: some fields reject what you typed and fall back to 0. " +
+      "Opening or raising an app is not batchable: call computer_launch or computer_raise on its own. Do NOT batch steps whose ids you have not read yet, or steps that depend on what an earlier step reveals — read first, then batch what you can see. " +
+      `Pass candidates instead of steps when you can see several plausible ways to reach ONE state and cannot tell which the app will honour: press the result row, or send down then return, or type the whole intent into the search field. Each candidate is a route — a step or a short list of steps — they are tried in order, and it stops at the first that changes the app, telling you what each one did. That is a model turn saved per wrong guess. Read the diff and confirm the state is the one you wanted; "it changed something" is not "it worked". Actions only, never for anything you would not want to happen twice. ` +
+      TASK_DISCIPLINE_SENTENCE.trim(),
     inputSchema: {
       type: "object",
       properties: {
         app: { type: "string" },
+        candidates: {
+          type: "array",
+          description: `Instead of steps: alternative routes to ONE state, tried in order, stopping at the first that changes the app. Each entry is a step or a short list of steps, e.g. [{"do":"press","id":88}, [{"do":"key","key":"down"},{"do":"key","key":"return"}]]. Two to ${MAX_CANDIDATES} routes.`,
+          items: { type: "array", items: { type: "object" } },
+        },
         steps: {
           type: "array",
           description: "The steps to run, in order.",
@@ -1393,8 +1430,19 @@ const AX_TOOLS = [
             properties: {
               do: { type: "string", enum: ["press", "set_value", "key", "scroll", "act", "read"] },
               id: { type: "integer", description: "Element id from computer_app_state." },
-              text: { type: "string", description: "With do=set_value." },
-              key: { type: "string", enum: ["return", "tab", "escape", "space", "delete", "up", "down", "left", "right"], description: "With do=key." },
+              text: { type: "string", description: "With do=set_value, or with do=type: the whole string to type as real keystrokes." },
+              clicks: { type: "integer", description: "With do=pointer: 2 for a double click, which some fields need before they accept typing." },
+              // The same key surface as computer_press_key. It used to be an
+              // enum of nine named keys here, so a tool shortcut ("p" for
+              // Figma's pen) and a select-all could not appear in a batch at
+              // all — measured: one Figma task sent 91 key presses one per
+              // turn, every one of which was legal only as a single call.
+              key: { type: "string", description: "With do=key: one letter (a-z), one digit, shortcut punctuation, or a named key — return, tab, escape, space, delete, up, down, left, right." },
+              modifiers: {
+                type: "array",
+                description: "With do=key: held around the keystroke — command, shift, option, control.",
+                items: { type: "string", enum: ["command", "shift", "option", "control"] },
+              },
               direction: { type: "string", enum: ["down", "up", "left", "right"], description: "With do=scroll." },
               amount: { type: "integer", description: "With do=scroll: lines (default 5)." },
               action: { type: "string", description: "With do=act: one of the actions the element listed in braces." },
@@ -1405,6 +1453,55 @@ const AX_TOOLS = [
         },
       },
       required: ["app", "steps"],
+    },
+  },
+  {
+    type: "function",
+    name: "computer_pointer",
+    description:
+      "Click or drag INSIDE one element, for surfaces that have no controls to press: a design canvas, a drawing area, a map you must place a point on. This is how you draw. " +
+      'Points are FRACTIONS of the anchor element\'s box, never screen pixels: {"x":0,"y":0} is its top-left, {"x":0.5,"y":0.5} its centre, {"x":1,"y":1} its bottom-right. Pass the id of the element you are aiming inside — the canvas or web area, not the window — and the reply tells you the screen points your fractions landed on. ' +
+      "Several points are separate clicks, which is how a pen tool takes a path; add hold=true to make them one press-drag-release instead. modifiers holds shift, option, command or control throughout. " +
+      "This is the ONE verb that needs the window actually visible on this Space, because it aims at real screen coordinates and the app hit-tests them: it is refused when the window is parked or elsewhere, since the click would land on whatever is there instead. So raise the app first for this kind of work and tell the user why. " +
+      "It moves the real pointer. Do not use it to press something that IS in the tree — press that by id.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        app: { type: "string" },
+        id: { type: "integer", description: "The element to aim inside, from computer_app_state. Its box is the coordinate space." },
+        path: {
+          type: "array",
+          description: 'Points in order, each a fraction of the anchor: [{"x":0.25,"y":0.5},{"x":0.75,"y":0.5}].',
+          items: {
+            type: "object",
+            properties: { x: { type: "number" }, y: { type: "number" } },
+            required: ["x", "y"],
+          },
+        },
+        clicks: {
+          type: "integer",
+          description: "2 for a double click at each point — a different event from two clicks, and sometimes the only one a control honours (a design app's number fields).",
+        },
+        hold: { type: "boolean", description: "True: one drag through every point. False (default): a click at each." },
+        modifiers: {
+          type: "array",
+          description: "Held down throughout: command, shift, option, control.",
+          items: { type: "string", enum: ["command", "shift", "option", "control"] },
+        },
+      },
+      required: ["app", "id", "path"],
+    },
+  },
+  {
+    type: "function",
+    name: "computer_app_screenshot",
+    description:
+      "Photograph ONE app's window as an image, wherever the window is — another Space included — without raising it or touching the user's screen. Use it when the tree cannot express what you need to see: a rendered chart, whether a video is playing, how things are laid out. " +
+      "In a window on another Space, content the app only draws while visible (map tiles, video frames, some web views) may be blank; its controls and text are not. Never raise an app just to look at it: use this.",
+    inputSchema: {
+      type: "object",
+      properties: { app: { type: "string" }, window: { type: "integer", description: "Window id from computer_app_state. Default: the focused window." } },
+      required: ["app"],
     },
   },
   {
@@ -1631,7 +1728,7 @@ function threadDynamicTools(): Record<string, unknown>[] | undefined {
     ...(ax?.alive ? AX_TOOLS.map((t) => withSpaceGuidance(t, ax!.crossSpace)) : []),
     ...COMPUTER_USE_TOOLS
       .filter((t) => coordinateToolAllowed(t.name, screenshots))
-      .map((t) => withScreenshotGuidance(t, screenshots)),
+      .map((t) => withScreenshotGuidance(t, screenshots, ax?.crossSpace === true)),
     ...SCHEDULE_TOOLS,
     ...MEMORY_TOOLS,
     ...(agentBrowserTools() ?? []),
@@ -2231,6 +2328,7 @@ async function startAxBridge(): Promise<void> {
     return;
   }
   const client = new AxClient(manifest);
+  client.onCall = (c) => axLog(describeAxCall(c));
   try {
     const hello = await client.start();
     ax = client;
@@ -2244,6 +2342,100 @@ async function startAxBridge(): Promise<void> {
 function axText(text: string, success: boolean): DynamicToolResponse {
   return { contentItems: [{ type: "inputText", text }], success };
 }
+
+/** One batch step, as a bridge call. Shared by both batch shapes so a verb can
+ *  never mean two things depending on which one ran it. */
+/** One batch step, as a bridge call. Shared by both batch shapes so a verb can
+ *  never mean two things depending on which one ran it.
+ *
+ *  `settle` false on every step but the last: a batch reports its NET effect
+ *  at the end, so waiting for each step's reaction buys a diff nobody reads.
+ *  Measured on a Figma icon built out of inspector fields — 372 actions and
+ *  253 seconds of settle waiting, a fifth of the run. */
+async function runBatchStep(appName: string, st: BatchStep, settle = true): Promise<AxResult> {
+  const opts = { ...axActionOpts(appName), ...(settle ? {} : { settle: false }) };
+  switch (st.do) {
+    case "read":
+      return await ax!.request("tree", { app: appName, ...opts });
+    case "press":
+      return await ax!.request("act", { app: appName, id: st.id, action: "press", ...opts });
+    case "act":
+      return await ax!.request("act", { app: appName, id: st.id, action: st.action, ...opts });
+    case "set_value":
+      return await ax!.request("setValue", { app: appName, id: st.id, value: st.text, ...opts });
+    case "type":
+      return await ax!.request("type", { app: appName, text: st.text, ...(st.id !== undefined ? { id: st.id } : {}), ...opts });
+    case "pointer":
+      // No path: the bridge aims at the element's centre, which is what
+      // clicking a field means.
+      return await ax!.request("pointer", { app: appName, id: st.id, ...(st.clicks ? { clicks: st.clicks } : {}), ...opts });
+    case "key":
+      return await ax!.request("key", { app: appName, key: st.key, ...(st.id !== undefined ? { id: st.id } : {}), ...(st.modifiers?.length ? { modifiers: st.modifiers } : {}), ...opts });
+    case "scroll": {
+      const amount = typeof st.amount === "number" && st.amount > 0 ? Math.min(st.amount, 40) : 5;
+      const d = SCROLL_DELTAS[st.direction];
+      if (!d) throw new Error(`unknown direction "${st.direction}"`);
+      return await ax!.request("scroll", { app: appName, id: st.id, dx: d.dx * amount, dy: d.dy * amount, ...opts });
+    }
+  }
+}
+
+/** Try each route in order and keep the first that changes the app.
+ *
+ *  This is the whole of "speculative execution" that survives contact with a
+ *  real desktop. There is no reset between routes and none is needed: the
+ *  losers are the routes that did nothing, which is precisely why they lost. A
+ *  route that DOES something ends the run, so no side effect is ever followed
+ *  by another attempt.
+ *
+ *  A route is judged as a whole, after all of its steps: down-then-return is
+ *  one route, and stopping at the selection that "down" produced would have
+ *  called a half-finished move a success. Its diffs are joined, because each
+ *  step's diff is measured against the one before it.
+ *
+ *  Approval is unchanged. The card lists every route before any of them runs,
+ *  so this cannot be a way to slip an extra press past the user. */
+async function runCandidates(appName: string, routes: BatchStep[][], remember: (text: string) => void): Promise<DynamicToolResponse> {
+  axLog(`do ${appName} ${routes.length} route(s): ${routes.map((r) => r.map((x) => x.do).join("+")).join(" | ")}`);
+  const tried: { label: string; outcome: "worked" | "nothing" | string }[] = [];
+  let winner: number | null = null;
+  let diff = "";
+  for (const [i, steps] of routes.entries()) {
+    const label = `${i + 1}. ${steps.map((st) => `${st.do}${"id" in st && typeof st.id === "number" ? ` #${st.id}` : ""}`).join(" then ")}`;
+    const diffs: string[] = [];
+    let failure: string | null = null;
+    for (const st of steps) {
+      try {
+        const r = await runBatchStep(appName, st);
+        const stepDiff = String(r.diff ?? "");
+        if (candidateWorked(stepDiff)) diffs.push(stepDiff);
+      } catch (err) {
+        // A step that cannot even be attempted ends this route, not the call:
+        // that is the point of having sent alternatives.
+        failure = err instanceof AxError ? err.message : String(err);
+        break;
+      }
+      if (st.waitMs > 0) await new Promise((r) => setTimeout(r, st.waitMs));
+    }
+    if (failure !== null) {
+      tried.push({ label, outcome: failure });
+      continue;
+    }
+    if (diffs.length > 0) {
+      tried.push({ label, outcome: "worked" });
+      winner = i;
+      diff = diffs.join("\n");
+      break;
+    }
+    tried.push({ label, outcome: "nothing" });
+  }
+  if (diff) remember(diff);
+  return axText(
+    summarizeCandidates({ tried, winner, diff, remaining: routes.length - tried.length }),
+    winner !== null,
+  );
+}
+
 
 async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | null): Promise<DynamicToolResponse> {
   if (!ax?.alive) await startAxBridge(); // it may have died; one attempt to bring it back
@@ -2324,6 +2516,7 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         const head = [
           windowsText ? `windows:\n${windowsText}` : (ax.crossSpace ? "windows: none" : "windows: none on this Space"),
           typeof w.hint === "string" ? w.hint : "",
+          parkedReadNote(w.windows),
           otherSpaceNote(ax.crossSpace, windowsText),
         ].filter(Boolean).join("\n");
         if (!windowsText && offscreen > 0) return axText(head, true);
@@ -2374,9 +2567,16 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         );
       }
       case "computer_do": {
+        if (a.candidates !== undefined) {
+          if (a.steps !== undefined) return axText("Pass steps for a sequence or candidates for alternatives, not both.", false);
+          const routes = parseCandidates(a.candidates);
+          if ("error" in routes) return axText(routes.error, false);
+          return await runCandidates(appName, routes.candidates, remember);
+        }
         const parsed = parseBatchSteps(a.steps);
         if ("error" in parsed) return axText(parsed.error, false);
         const steps = parsed.steps;
+        axRecentEdits = []; // the caller batched; nothing to nudge about
         axLog(`do ${appName} ${steps.length} step(s): ${steps.map((x) => x.do).join(",")}`);
         const ran: string[] = [];
         let failed: { step: string; message: string } | null = null;
@@ -2384,32 +2584,9 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         // a local pipe — and collapsing them into ONE model round trip is the
         // entire point of this tool.
         for (const [i, st] of steps.entries()) {
-          const label = `step ${i + 1} (${st.do})`;
+          const label = `step ${i + 1} (${traceStep(st)})`;
           try {
-            switch (st.do) {
-              case "read":
-                await ax.request("tree", { app: appName, ...axActionOpts(appName) });
-                break;
-              case "press":
-                await ax.request("act", { app: appName, id: st.id, action: "press", ...axActionOpts(appName) });
-                break;
-              case "act":
-                await ax.request("act", { app: appName, id: st.id, action: st.action, ...axActionOpts(appName) });
-                break;
-              case "set_value":
-                await ax.request("setValue", { app: appName, id: st.id, value: st.text, ...axActionOpts(appName) });
-                break;
-              case "key":
-                await ax.request("key", { app: appName, key: st.key, ...(st.id !== undefined ? { id: st.id } : {}), ...axActionOpts(appName) });
-                break;
-              case "scroll": {
-                const amount = typeof st.amount === "number" && st.amount > 0 ? Math.min(st.amount, 40) : 5;
-                const d = SCROLL_DELTAS[st.direction];
-                if (!d) throw new Error(`unknown direction "${st.direction}"`);
-                await ax.request("scroll", { app: appName, id: st.id, dx: d.dx * amount, dy: d.dy * amount, ...axActionOpts(appName) });
-                break;
-              }
-            }
+            await runBatchStep(appName, st, i === steps.length - 1);
             ran.push(label);
             if (st.waitMs > 0) await new Promise((r) => setTimeout(r, st.waitMs));
           } catch (err) {
@@ -2430,7 +2607,10 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
           // to show. The step log above still says what ran.
         }
         return axText(
-          summarizeBatch({ ran, failed, remaining: steps.length - ran.length - (failed ? 1 : 0), diff }),
+          summarizeBatch({
+            ran, failed, remaining: steps.length - ran.length - (failed ? 1 : 0), diff,
+            unwatched: steps.length > 1,
+          }),
           failed === null,
         );
       }
@@ -2449,6 +2629,48 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         remember(diff);
         return axText(`Scrolled ${dir}.\n${diff || "(nothing changed — the container may not scroll, or is already at the end)"}`, true);
       }
+      case "computer_pointer": {
+        // An omitted path is the element's centre: clicking a field to put a
+        // caret in it is the commonest use, and it should not need x and y.
+        const path = Array.isArray(a.path) && a.path.length > 0 ? a.path : null;
+        if (typeof a.id !== "number") return axText("id is required: the element whose box the fractions are measured in.", false);
+        const hold = a.hold === true;
+        const clicks = typeof a.clicks === "number" ? Math.round(a.clicks) : 1;
+        if (clicks < 1 || clicks > MAX_CLICKS) return axText(`clicks must be 1 to ${MAX_CLICKS}; 2 is a double click.`, false);
+        const mods = Array.isArray(a.modifiers) ? a.modifiers.filter((m) => typeof m === "string") : [];
+        axLog(`pointer ${appName} #${String(a.id)} ${path ? `${path.length} point(s)` : "centre"}${clicks > 1 ? ` x${clicks}` : ""}${hold ? " held" : ""}${mods.length ? ` +${mods.join("+")}` : ""}`);
+        const r = await ax.request("pointer", {
+          app: appName,
+          id: a.id,
+          ...(path ? { path } : {}),
+          ...(clicks > 1 ? { clicks } : {}),
+          ...(hold ? { hold: true } : {}),
+          ...(mods.length ? { modifiers: mods } : {}),
+          ...axActionOpts(appName),
+        }, 60_000);
+        const diff = String(r.diff ?? "");
+        remember(diff);
+        // Where the fractions landed, so a caller can see its own geometry and
+        // correct it without guessing at a display scale.
+        const at = Array.isArray(r.at) ? (r.at as { x: number; y: number }[]) : [];
+        const where = at.length ? `\nLanded at ${at.map((q) => `(${q.x},${q.y})`).join(" ")}.` : "";
+        return axText(`${hold ? "Dragged" : "Clicked"} ${path ? `${path.length} point(s)` : "the centre"} in ${appName}.${where}\n${diff || "(nothing in the tree changed — a canvas often shows its result only as a new object, so read the app)"}`, true);
+      }
+      case "computer_app_screenshot": {
+        const r = await ax.request("screenshot", { app: appName, ...(typeof a.window === "number" ? { window: a.window } : {}) }, 15_000);
+        const image = String(r.image ?? r.png ?? "");
+        if (!image) return axText("The bridge returned no image.", false);
+        const mime = typeof r.mime === "string" ? r.mime : "image/png";
+        const where = r.onSpace === false ? " (on another Space)" : "";
+        const note = typeof r.note === "string" ? ` ${r.note}` : "";
+        return {
+          contentItems: [
+            { type: "inputText", text: `Window ${String(r.window)} of ${appName}${where}, ${String(r.width)}x${String(r.height)}.${note}` },
+            { type: "inputImage", imageUrl: `data:${mime};base64,${image}` },
+          ],
+          success: true,
+        };
+      }
       case "computer_press":
       case "computer_set_value":
       case "computer_press_key":
@@ -2461,9 +2683,16 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         const legacyValue = tool === "computer_act" && typeof a.value === "string";
         if (tool === "computer_press_key" || legacyKey) {
           if (typeof a.key !== "string") return axText("key is required.", false);
-          axLog(`key ${appName} ${a.key}${typeof a.id === "number" ? ` -> #${a.id}` : ""}`);
+          const mods = Array.isArray(a.modifiers) ? a.modifiers.filter((m) => typeof m === "string") : [];
+          axLog(`key ${appName} ${mods.length ? `${mods.join("+")}+` : ""}${a.key}${typeof a.id === "number" ? ` -> #${a.id}` : ""}`);
           // Nothing raises: a key posted to the pid reaches a background app.
-          r = await ax.request("key", { app: appName, key: a.key, ...(typeof a.id === "number" ? { id: a.id } : {}), ...axActionOpts(appName) });
+          r = await ax.request("key", {
+            app: appName,
+            key: a.key,
+            ...(mods.length ? { modifiers: mods } : {}),
+            ...(typeof a.id === "number" ? { id: a.id } : {}),
+            ...axActionOpts(appName),
+          });
         } else if (tool === "computer_set_value" || legacyValue) {
           const text = typeof a.text === "string" ? a.text : typeof a.value === "string" ? a.value : null;
           if (text === null) return axText("text is required.", false);
@@ -2477,7 +2706,29 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         }
         const diff = String(r.diff ?? "");
         remember(diff);
-        return axText(`Done.\n${diff}`, true);
+        axRecentEdits.push({
+          tool,
+          app: appName,
+          ...(typeof a.id === "number" ? { id: a.id } : {}),
+          ...(typeof a.text === "string" ? { text: a.text } : {}),
+          ...(typeof a.key === "string" ? { key: a.key } : {}),
+          ...(typeof a.action === "string" ? { action: a.action } : {}),
+        });
+        if (axRecentEdits.length > BATCH_NUDGE_AFTER * 2) axRecentEdits = axRecentEdits.slice(-BATCH_NUDGE_AFTER * 2);
+        const nudge = axBatchNudged.has(root) ? null : batchNudge(axRecentEdits);
+        if (nudge) {
+          axBatchNudged.add(root);
+          axLog(`nudged ${appName} toward computer_do after ${axRecentEdits.length} single actions`);
+        }
+        const hint = typeof r.hint === "string" ? r.hint : null;
+        // Only for the verbs that go through hit-testing. Telling a caller that
+        // just sent a key to send a key is noise, and it is the click that
+        // dies on a parked window.
+        const clicked = tool === "computer_press" || tool === "computer_act" || tool === "computer_set_value";
+        return axText(
+          [renderActionResult(diff, hint, hint && clicked ? parkedNextCall(appName) : null), nudge].filter(Boolean).join("\n"),
+          true,
+        );
       }
       default:
         return axText(`Unknown tool ${tool}`, false);
@@ -3865,6 +4116,32 @@ function bundledSkillsDir(): string {
     ? join(process.resourcesPath, "skills")
     : join(app.getAppPath(), "resources", "skills");
 }
+/** The computer-use skill's text, read once from the bundled directory the
+ *  engine is also given. Cached: a conversation asks for it at most once, but
+ *  a long session has many conversations. */
+let computerUseSkillCache: string | null | undefined;
+function computerUseSkillText(): string | null {
+  if (computerUseSkillCache !== undefined) return computerUseSkillCache;
+  try {
+    computerUseSkillCache = readFileSync(join(bundledSkillsDir(), "computer-use", "SKILL.md"), "utf8");
+  } catch (err) {
+    // Not fatal: the tools still carry their own descriptions, and the skill
+    // is still listed for the model to open itself.
+    console.warn("[skills] computer-use skill unreadable, first-call preamble disabled:", String(err));
+    computerUseSkillCache = null;
+  }
+  return computerUseSkillCache;
+}
+
+/** Conversations that have already been handed the skill. */
+const axSkillSent = new Set<string>();
+
+/** The trailing run of single-action desktop calls, and the conversations that
+ *  have already been shown the batch nudge. See batchNudge: said once, because
+ *  a reminder on every action would be noise. */
+let axRecentEdits: RecentEdit[] = [];
+const axBatchNudged = new Set<string>();
+
 function globalSkillsDir(): string {
   return join(app.getPath("home"), ".unbiased", "skills");
 }
@@ -5557,11 +5834,25 @@ function wireNotifications(): void {
             : tool.startsWith("computer_")
               ? handleComputerUseCall(tool, args, approvalThread)
               : handleAgentBrowserCall(tool, args, approvalThread);
+        // The first desktop call of a conversation carries the computer-use
+        // skill. See skillPreamble: the model does open it on its own, but
+        // reactively, mid-task, after it has already stalled.
+        const skillRoot = rootThreadOf(approvalThread);
+        const sendSkill = shouldSendSkill(tool, axSkillSent.has(skillRoot));
         void call
           .catch((err) => ({
             contentItems: [{ type: "inputText" as const, text: `tool crashed: ${String(err)}` }],
             success: false,
           }))
+          .then((response) => {
+            if (!sendSkill) return response;
+            const text = computerUseSkillText();
+            const preamble = text ? skillPreamble(text) : null;
+            if (!preamble) return response;
+            axSkillSent.add(skillRoot);
+            axLog(`sent the computer-use skill with the first desktop call (${tool})`);
+            return prependSkill(response, preamble);
+          })
           .then((response) => engine.respond(msg.id, response));
         return;
       }
