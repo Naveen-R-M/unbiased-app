@@ -42,6 +42,9 @@ import {
   parkedNextCall,
   parkedReadNote,
   batchNudge,
+  touchedFieldIds,
+  renderFieldValues,
+  type FieldValue,
   BATCH_NUDGE_AFTER,
   type RecentEdit,
   shouldSendSkill,
@@ -1407,7 +1410,7 @@ const AX_TOOLS = [
     description:
       "Run several steps on ONE app in a single call, in order, and get back what changed. Use this whenever you already know the next few moves — filling a field and committing it, pressing a tab and reading the result, scrolling and reading. It saves a whole round trip per step, which is the main cost of operating an app. " +
       "Each step is {do, ...}: do=\"press\" with id; do=\"set_value\" with id and text; do=\"key\" with key (and optional id to aim it); do=\"scroll\" with id and direction; do=\"act\" with id and action; do=\"read\" to re-read the app. Add wait_ms to a step to pause after it, for content that loads (a tab that shows \"Loading…\"). " +
-      `Up to ${MAX_BATCH_STEPS} steps — use them: one shape's position, size, colour and commit is ONE call, not five. It STOPS at the first step that fails and tells you which one — the rest do not run, so do not assume they did. Every set_value is read back, so a field that kept its old text and appended to it stops the run there instead of corrupting everything computed after it. ` +
+      `Up to ${MAX_BATCH_STEPS} steps — use them: one shape's position, size, colour and commit is ONE call, not five. It STOPS at the first step that fails and tells you which one — the rest do not run, so do not assume they did. After the batch, every field it touched is read back and listed under \"Fields now:\", so you do not need to read the app to check a value you just wrote. ` +
       "SETTING A VALUE IN A WEB APP'S PANEL (Figma, and anything Chromium): set_value works on an element the tree calls a \"text field\" and is SILENTLY IGNORED on a \"stepper\" — the write appears in the box, the value never changes, and it commits later when focus leaves, which is how a 67 became 100100. For a stepper use the four-step recipe in ONE call: {\"do\":\"pointer\",\"id\":N} then {\"do\":\"key\",\"key\":\"a\",\"modifiers\":[\"command\"]} then {\"do\":\"type\",\"text\":\"460\"} then {\"do\":\"key\",\"key\":\"return\"}. Add clicks:2 to the pointer step if one click does not open the field. Read the value back afterwards: some fields reject what you typed and fall back to 0. " +
       "Opening or raising an app is not batchable: call computer_launch or computer_raise on its own. Do NOT batch steps whose ids you have not read yet, or steps that depend on what an earlier step reveals — read first, then batch what you can see. " +
       `Pass candidates instead of steps when you can see several plausible ways to reach ONE state and cannot tell which the app will honour: press the result row, or send down then return, or type the whole intent into the search field. Each candidate is a route — a step or a short list of steps — they are tried in order, and it stops at the first that changes the app, telling you what each one did. That is a model turn saved per wrong guess. Read the diff and confirm the state is the one you wanted; "it changed something" is not "it worked". Actions only, never for anything you would not want to happen twice. ` +
@@ -2605,10 +2608,25 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
           // A batch that closed the window it was working in has no tree left
           // to show. The step log above still says what ran.
         }
+        // Read back every field the batch touched, so nobody has to read the
+        // app to check a value it just wrote. One bridge call, one attribute
+        // read per id; an older bridge without `values` costs nothing but the
+        // caveat.
+        let fields: string | undefined;
+        const touched = touchedFieldIds(steps);
+        if (touched.length) {
+          try {
+            const r = await ax.request("values", { app: appName, ids: touched }, 3_000);
+            const values = Array.isArray(r.values) ? (r.values as FieldValue[]) : [];
+            if (values.length) fields = renderFieldValues(values);
+          } catch {
+            // the diff still stands
+          }
+        }
         return axText(
           summarizeBatch({
             ran, failed, remaining: steps.length - ran.length - (failed ? 1 : 0), diff,
-            unwatched: steps.length > 1,
+            unwatched: steps.length > 1, fields,
           }),
           failed === null,
         );

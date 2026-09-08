@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-import { AX_TOOL_NAMES, SCREENSHOT_TOOL_NAMES, routesToAx, parseBatchSteps, describeBatch, summarizeBatch, MAX_BATCH_STEPS, AxClient, AxError, appOfStep, axConsent, axNeedsFocus, screenshotToolsOffered, coordinateToolAllowed, withScreenshotGuidance, SCREENSHOT_FRAME_SENTENCE, axReadOptsFrom, AX_DEFAULT_READ_OPTS, shouldRecoverRaise, describeAxAction, indexElementLines, readAxManifest, resolveAxDir, shouldOpenAccessibilitySettings, axNotTrustedText, RAISE_DESCRIPTION, APP_STATE_SPACE_SENTENCE, LAUNCH_FRONT_SENTENCE, withSpaceGuidance, otherSpaceNote, launchOutcome, renderActionResult, ACTION_NO_CHANGE_SENTENCE, TASK_DISCIPLINE_SENTENCE, SCREENSHOT_SPACE_SENTENCE, parseCandidates, describeCandidates, parkedNextCall, parkedReadNote, batchNudge, traceStep, MAX_TYPE_LENGTH, type BatchStep, BATCH_NUDGE_AFTER, type RecentEdit, skillBody, skillPreamble, shouldSendSkill, prependSkill, MAX_SKILL_PREAMBLE, candidateWorked, summarizeCandidates, MAX_CANDIDATES, MAX_CANDIDATE_STEPS, type AxCallInfo } from "./ax-bridge";
+import { AX_TOOL_NAMES, SCREENSHOT_TOOL_NAMES, routesToAx, parseBatchSteps, describeBatch, summarizeBatch, MAX_BATCH_STEPS, AxClient, AxError, appOfStep, axConsent, axNeedsFocus, screenshotToolsOffered, coordinateToolAllowed, withScreenshotGuidance, SCREENSHOT_FRAME_SENTENCE, axReadOptsFrom, AX_DEFAULT_READ_OPTS, shouldRecoverRaise, describeAxAction, indexElementLines, readAxManifest, resolveAxDir, shouldOpenAccessibilitySettings, axNotTrustedText, RAISE_DESCRIPTION, APP_STATE_SPACE_SENTENCE, LAUNCH_FRONT_SENTENCE, withSpaceGuidance, otherSpaceNote, launchOutcome, renderActionResult, ACTION_NO_CHANGE_SENTENCE, TASK_DISCIPLINE_SENTENCE, SCREENSHOT_SPACE_SENTENCE, parseCandidates, describeCandidates, parkedNextCall, parkedReadNote, batchNudge, traceStep, MAX_TYPE_LENGTH, type BatchStep, BATCH_NUDGE_AFTER, type RecentEdit, skillBody, skillPreamble, shouldSendSkill, prependSkill, MAX_SKILL_PREAMBLE, candidateWorked, summarizeCandidates, MAX_CANDIDATES, MAX_CANDIDATE_STEPS, type AxCallInfo, touchedFieldIds, renderFieldValues, MAX_FIELDS_READ_BACK, type FieldValue } from "./ax-bridge";
 
 const scratch = () => mkdtempSync(join(tmpdir(), "ax-"));
 
@@ -1247,17 +1247,41 @@ test("the trace names the field and value, not just the verb", () => {
   assert.equal(traceStep({ do: "read", waitMs: 0 }), "read");
 });
 
-test("a multi-step batch does not claim more than it watched", () => {
-  const ran = ["step 1 (set_value #88 = \"550\")", "step 2 (press #12)"];
-  const many = summarizeBatch({ ran, failed: null, remaining: 0, diff: "~ 12 button", unwatched: true });
-  assert.ok(many.includes("Every value written was read back"), many);
-  assert.ok(many.includes("presses were not watched individually"), many);
-  // A single step DID settle and its diff is its own, so the caveat would be
-  // false there.
-  const one = summarizeBatch({ ran: [ran[0]], failed: null, remaining: 0, diff: "~ 88", unwatched: true });
-  assert.ok(!one.includes("not watched"), one);
+// Measured 2026-09-08: the four-step stepper recipe (pointer, ⌘a, type, return)
+// bypassed setValue's read-back, so after every batch the model read the app
+// again to check the fields — 32 finds in one run, a model turn each. The
+// batch now reads back every field it touched and prints them.
+test("a batch names the fields it touched so they can be read back", () => {
+  const steps: BatchStep[] = [
+    { do: "pointer", id: 88, clicks: 2, waitMs: 0 }, { do: "key", key: "a", modifiers: ["command"], waitMs: 0 },
+    { do: "type", text: "460", waitMs: 0 }, { do: "key", key: "return", waitMs: 0 },
+    { do: "set_value", id: 101, text: "360", waitMs: 0 }, { do: "type", text: "x", id: 88, waitMs: 0 },
+    { do: "press", id: 5, waitMs: 0 }, { do: "read", waitMs: 0 },
+  ];
+  assert.deepEqual(touchedFieldIds(steps), [88, 101], "pointer, set_value and type-with-id are field edits; press and read are not; ids are unique in first-seen order");
+  const many = Array.from({ length: 20 }, (_, i) => ({ do: "set_value", id: i, text: "1", waitMs: 0 }) as BatchStep);
+  assert.equal(touchedFieldIds(many).length, MAX_FIELDS_READ_BACK, "capped");
 });
 
+test("field values render one line per id, with what the bridge knows about it", () => {
+  const values: FieldValue[] = [
+    { id: 88, role: "incrementor", title: "X-position", value: "460" },
+    { id: 101, role: "text field", title: "Width", value: "360" },
+    { id: 7, role: null, title: null, value: null },
+  ];
+  assert.equal(renderFieldValues(values), 'Fields now:\n#88 incrementor "X-position" = 460\n#101 text field "Width" = 360\n#7 = (no value)');
+});
+
+test("a multi-step batch reports the fields it read back instead of a caveat about presses", () => {
+  const ran = ["step 1 (set_value #88 = \"550\")", "step 2 (press #12)"];
+  const out = summarizeBatch({ ran, failed: null, remaining: 0, diff: "~ 12 button", unwatched: true, fields: 'Fields now:\n#88 text field "Width" = 550' });
+  assert.ok(out.includes("Only the closing diff was watched"), out);
+  assert.ok(!out.includes("not watched individually") && !out.includes("Every value written was read back"), out);
+  assert.ok(out.endsWith('\nFields now:\n#88 text field "Width" = 550'), out);
+  // A single step DID settle and its diff is its own, so no caveat.
+  const one = summarizeBatch({ ran: [ran[0]], failed: null, remaining: 0, diff: "~ 88", unwatched: true });
+  assert.ok(!one.includes("closing diff"), one);
+});
 test("a stopped batch still reports which steps ran and which did not", () => {
   const out = summarizeBatch({
     ran: ["step 1 (set_value #88 = \"550\")"],

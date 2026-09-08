@@ -393,11 +393,42 @@ export function traceStep(st: BatchStep): string {
   }
 }
 
+/** The ids a batch wrote into: set_value, type aimed at an id, and pointer
+ *  (the click that starts the four-step stepper recipe). Presses are not field
+ *  edits. Unique, first-seen order, capped — thirty edits read back the first
+ *  dozen, which is every field on one Figma shape.
+ *
+ *  Measured 2026-09-08: that recipe bypassed setValue's read-back, so after
+ *  every batch the model read the app again to check the fields — 32 finds in
+ *  one run, a model turn each. The batch now hands the values over itself. */
+export const MAX_FIELDS_READ_BACK = 12;
+export function touchedFieldIds(steps: BatchStep[]): number[] {
+  const ids: number[] = [];
+  for (const st of steps) {
+    const id = st.do === "set_value" || st.do === "pointer" || st.do === "type" ? st.id : undefined;
+    if (typeof id === "number" && !ids.includes(id)) ids.push(id);
+    if (ids.length >= MAX_FIELDS_READ_BACK) break;
+  }
+  return ids;
+}
+
+/** One entry of the bridge's `values` reply. */
+export type FieldValue = { id: number; role: string | null; title: string | null; value: string | null };
+export function renderFieldValues(values: FieldValue[]): string {
+  const lines = values.map((v) => {
+    const what = [v.role, v.title ? JSON.stringify(v.title) : null].filter(Boolean).join(" ");
+    return `#${v.id}${what ? ` ${what}` : ""} = ${v.value ?? "(no value)"}`;
+  });
+  return `Fields now:\n${lines.join("\n")}`;
+}
+
 export function summarizeBatch(opts: {
   ran: string[];
   failed: { step: string; message: string } | null;
   remaining: number;
   diff: string;
+  /** renderFieldValues() of every field the batch touched, read back after it. */
+  fields?: string;
   /** True when mid-sequence steps skipped their settle wait, so the only
    *  evidence about them is the closing diff. Said out loud rather than
    *  implied: a press that quietly did nothing at step 4 is invisible here,
@@ -414,11 +445,13 @@ export function summarizeBatch(opts: {
     : [
         `Done: ${opts.ran.join("; ")}.`,
         opts.unwatched && opts.ran.length > 1
-          ? "Every value written was read back; the presses were not watched individually, so check the diff below for what they did."
+          ? opts.fields
+            ? "Only the closing diff was watched; the field values below were read back afterwards."
+            : "Only the closing diff was watched."
           : "",
       ].filter(Boolean).join(" ");
-  if (opts.diff.trim() === "(no changes)") return `${head}\n${ACTION_NO_CHANGE_SENTENCE}`;
-  return opts.diff ? `${head}\n${opts.diff}` : `${head}\n(nothing in the tree changed)`;
+  const body = opts.diff.trim() === "(no changes)" ? ACTION_NO_CHANGE_SENTENCE : opts.diff || "(nothing in the tree changed)";
+  return [head, body, opts.fields].filter(Boolean).join("\n");
 }
 
 /** The desktop tools the accessibility bridge owns. This list lives next to
