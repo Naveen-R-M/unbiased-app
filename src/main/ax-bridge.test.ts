@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-import { AX_TOOL_NAMES, SCREENSHOT_TOOL_NAMES, routesToAx, parseBatchSteps, describeBatch, summarizeBatch, MAX_BATCH_STEPS, AxClient, AxError, appOfStep, axConsent, axNeedsFocus, screenshotToolsOffered, coordinateToolAllowed, withScreenshotGuidance, SCREENSHOT_FRAME_SENTENCE, axReadOptsFrom, axFilterSwitched, AX_DEFAULT_READ_OPTS, shouldRecoverRaise, describeAxAction, indexElementLines, readAxManifest, resolveAxDir, shouldOpenAccessibilitySettings, axNotTrustedText, RAISE_DESCRIPTION, APP_STATE_SPACE_SENTENCE, LAUNCH_FRONT_SENTENCE, withSpaceGuidance, otherSpaceNote, launchOutcome, renderActionResult, ACTION_NO_CHANGE_SENTENCE, TASK_DISCIPLINE_SENTENCE, SCREENSHOT_SPACE_SENTENCE, parseCandidates, describeCandidates, parkedNextCall, parkedReadNote, batchNudge, traceStep, MAX_TYPE_LENGTH, type BatchStep, BATCH_NUDGE_AFTER, type RecentEdit, skillBody, skillPreamble, shouldSendSkill, prependSkill, MAX_SKILL_PREAMBLE, candidateWorked, summarizeCandidates, MAX_CANDIDATES, MAX_CANDIDATE_STEPS, type AxCallInfo } from "./ax-bridge";
+import { AX_TOOL_NAMES, SCREENSHOT_TOOL_NAMES, routesToAx, parseBatchSteps, describeBatch, summarizeBatch, MAX_BATCH_STEPS, AxClient, AxError, appOfStep, axConsent, axNeedsFocus, screenshotToolsOffered, coordinateToolAllowed, withScreenshotGuidance, SCREENSHOT_FRAME_SENTENCE, axReadOptsFrom, AX_DEFAULT_READ_OPTS, shouldRecoverRaise, describeAxAction, indexElementLines, readAxManifest, resolveAxDir, shouldOpenAccessibilitySettings, axNotTrustedText, RAISE_DESCRIPTION, APP_STATE_SPACE_SENTENCE, LAUNCH_FRONT_SENTENCE, withSpaceGuidance, otherSpaceNote, launchOutcome, renderActionResult, ACTION_NO_CHANGE_SENTENCE, TASK_DISCIPLINE_SENTENCE, SCREENSHOT_SPACE_SENTENCE, parseCandidates, describeCandidates, parkedNextCall, parkedReadNote, batchNudge, traceStep, MAX_TYPE_LENGTH, type BatchStep, BATCH_NUDGE_AFTER, type RecentEdit, skillBody, skillPreamble, shouldSendSkill, prependSkill, MAX_SKILL_PREAMBLE, candidateWorked, summarizeCandidates, MAX_CANDIDATES, MAX_CANDIDATE_STEPS, type AxCallInfo } from "./ax-bridge";
 
 const scratch = () => mkdtempSync(join(tmpdir(), "ax-"));
 
@@ -491,23 +491,15 @@ test("an action snapshots the way the app last read, or the diff is a lie", () =
     "it is handed out by reference to every action on an unread app; one mutation would rewrite the default for all of them");
 });
 
-test("a read that CHANGES the filter has no honest diff, so it asks for the whole tree", () => {
-  // The lie the rest of this commit kills, reached with two reads instead of
-  // an action: read interactive:true (46 nodes), read interactive:false (119
-  // nodes, brand-new ids), read true again — "- removed:" the 73 that were
-  // never gone. Fix C's description actively invites that middle read.
-  const on = { interactive: true, web: false };
-  assert.equal(axFilterSwitched(on, { interactive: false, web: false }), true);
-  assert.equal(axFilterSwitched(on, { interactive: true, web: true }), true);
-  assert.equal(axFilterSwitched({ interactive: true, web: false, depth: 5 }, on), true, "depth is a filter too");
-  assert.equal(axFilterSwitched(on, { interactive: true, web: false, depth: 5 }), true);
-  assert.equal(axFilterSwitched(on, on), false, "the same view twice is exactly when a diff is honest");
-  assert.equal(axFilterSwitched({ interactive: true, web: false, depth: 5 }, { interactive: true, web: false, depth: 5 }), false);
-  // An app nothing has read yet is not "no baseline": a launch or a raise may
-  // have written one, and it wrote it in the defaults.
-  assert.equal(axFilterSwitched(undefined, { interactive: false, web: false }), true,
-    "the first read after a launch, asking for static text, is a changed filter — the launch tree was interactive-only");
-  assert.equal(axFilterSwitched(undefined, { interactive: true, web: false }), false);
+// Measured 2026-09-08 on the Figma logo run: 28 web/interactive flips between
+// consecutive reads, and every one became a forced full tree (~9KB) because the
+// bridge held one baseline per app. It now holds one per filter, so a flip is a
+// diff against that filter's own last read and only a never-used filter is a
+// full tree. The app has nothing left to decide here.
+test("a read that changes the filter is a diff, not a forced full tree (the bridge keeps one baseline per filter)", () => {
+  const src = readFileSync(join(__dirname, "index.ts"), "utf8");
+  assert.ok(!src.includes("axFilterSwitched"), "the app no longer decides this; the bridge diffs against the filter's own baseline");
+  assert.ok(src.includes("full: a.full === true,"), "full is the model's explicit ask and nothing else");
 });
 
 /** The text of one call: from `ax.request(` forward to its matching `)`, with
@@ -579,7 +571,7 @@ test("every bridge call that rewrites the diff baseline carries the read's optio
   }
 });
 
-test("a read records its filter before anything snapshots, and takes a whole tree when it changed", () => {
+test("a read records its filter before anything snapshots", () => {
   const src = readFileSync(join(__dirname, "index.ts"), "utf8");
   const start = src.indexOf('case "computer_app_state": {');
   assert.ok(start > 0, "expected the computer_app_state case in index.ts");
@@ -589,8 +581,6 @@ test("a read records its filter before anything snapshots, and takes a whole tre
   assert.ok(recorded > 0 && firstCall > 0, "expected the read to record its filter and to call the bridge");
   assert.ok(recorded < firstCall,
     "record the filter BEFORE the auto-recovery raise: that raise snapshots and rewrites the baseline, and would write it in the previous read's view");
-  assert.match(block, /full:\s*a\.full === true \|\| switched/,
-    "a read that changed the filter has no honest diff — it has to ask for the whole tree");
 });
 
 test("a withheld verb is refused when it is called anyway, not merely left off the menu", () => {

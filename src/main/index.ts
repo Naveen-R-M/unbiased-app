@@ -61,7 +61,6 @@ import {
   coordinateToolAllowed,
   withScreenshotGuidance,
   axReadOptsFrom,
-  axFilterSwitched,
   AX_DEFAULT_READ_OPTS,
   type AxReadOpts,
   shouldRecoverRaise,
@@ -2495,7 +2494,6 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         // lines later is diffed against — in the PREVIOUS read's view, unless
         // this runs first.
         const want = axReadOptsFrom(a);
-        const switched = axFilterSwitched(axReadOpts.get(appName), want);
         axReadOpts.set(appName, want);
         let w = await ax.request("windows", { app: appName }, 3_000);
         // An app this conversation already raised can drift back off-Space
@@ -2526,10 +2524,11 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
           // view every action after it uses are one object, not two that can
           // drift.
           ...want,
-          // a changed filter has no honest diff — the bridge would report every
-          // element the old filter hid as added, and every one the new filter
-          // hides as removed
-          full: a.full === true || switched,
+          // The bridge holds one baseline per filter, so a changed filter is a
+          // diff against that filter's own last read — full is only ever the
+          // model's explicit ask. (Before that, 28 flips in one Figma run each
+          // forced a whole tree and drove two compactions.)
+          full: a.full === true,
         };
         if (typeof a.query === "string" && a.query.trim()) {
           const r = await ax.request("find", { ...opts, title: a.query.trim(), ...(typeof a.role === "string" ? { role: a.role } : {}) });

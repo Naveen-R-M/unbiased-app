@@ -129,19 +129,6 @@ export function axReadOptsFrom(args: { interactive?: unknown; web?: unknown; dep
   };
 }
 
-/** Whether this read asks for a DIFFERENT view than the last one, which means
- *  there is no honest diff to show: the bridge would report every element the
- *  old filter hid as added, and every one the new filter hides as removed —
- *  the same +73/-73 lie, reached with two reads instead of an action. The
- *  caller answers by asking for the whole tree instead.
- *
- *  An app nothing has read yet counts as the defaults rather than as "no
- *  baseline": a launch or a raise may already have written one, and it wrote
- *  it in exactly those defaults (see axActionOpts). */
-export function axFilterSwitched(prev: AxReadOpts | undefined, want: AxReadOpts): boolean {
-  const from = prev ?? AX_DEFAULT_READ_OPTS;
-  return from.interactive !== want.interactive || from.web !== want.web || from.depth !== want.depth;
-}
 
 /** The app a computer step acted on, so the transcript can show that app's own
  *  icon instead of a generic terminal glyph. */
