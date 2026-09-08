@@ -831,6 +831,18 @@ test("tool text states facts and options, never scolds or cites past runs", () =
   }
 });
 
+// The checkpoint's wiring lives in index.ts, which has no unit harness; this
+// pins the six places it must touch, the way the routing and skill tests do.
+test("the checkpoint is wired: declared, routed, gated before actions, written at the threshold, replayed after compaction, fed facts", () => {
+  const src = readFileSync(join(__dirname, "index.ts"), "utf8");
+  assert.ok(src.includes("...CHECKPOINT_TOOLS,"), "declared to every thread");
+  assert.ok(src.includes('tool.startsWith("checkpoint_")') && src.includes("handleCheckpointToolCall("), "routed by prefix");
+  assert.ok(src.includes("isGatedTool(tool) && checkpointDue("), "the first action past the threshold is held once");
+  assert.ok(src.includes("ctxPercent.set("), "the app tracks context occupancy per root thread");
+  assert.ok(src.includes("checkpointReplayDue.add(") && src.includes("checkpointPreamble("), "the file comes back on the first tool result after a compaction");
+  assert.ok(src.includes("recordFact("), "measured facts are recorded by the app");
+});
+
 test("a batch that ends with no visible change gets the same guidance", () => {
   const out = summarizeBatch({ ran: ["press #3"], failed: null, remaining: 0, diff: "(no changes)" });
   assert.ok(out.includes(ACTION_NO_CHANGE_SENTENCE), out);

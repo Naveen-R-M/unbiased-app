@@ -88,6 +88,10 @@ import {
   otherSpaceNote,
   launchOutcome,
 } from "./ax-bridge";
+import {
+  CHECKPOINT_TOOLS, checkpointPath, validateCheckpointNotes, renderCheckpoint, pushFact, checkpointDue,
+  checkpointGateText, checkpointPreamble, isGatedTool, type LedgerEntry,
+} from "./checkpoint";
 import { isProductionBuild } from "./runtime-mode";
 import {
   dueAt,
@@ -1733,6 +1737,7 @@ function threadDynamicTools(): Record<string, unknown>[] | undefined {
       .map((t) => withScreenshotGuidance(t, screenshots, ax?.crossSpace === true)),
     ...SCHEDULE_TOOLS,
     ...MEMORY_TOOLS,
+    ...CHECKPOINT_TOOLS,
     ...(agentBrowserTools() ?? []),
   ];
   return tools.length ? (tools as Record<string, unknown>[]) : undefined;
@@ -2455,6 +2460,16 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
   // a card there ignores what the user set. Mode first, then the grant.
   const root = rootThreadOf(threadId);
   const mode = liveAccessMode(root);
+  // Past the context threshold, the first ACTION is held once and the model is
+  // handed the literal save call — before the approval card, so the user is not
+  // asked to approve something that will not run. Reads pass: they are how the
+  // model finds out where it is.
+  const cycle = checkpointCycle(root);
+  if (isGatedTool(tool) && checkpointDue({ percent: ctxPercent.get(root) ?? null, savedThisCycle: cycle.savedThisCycle, gateUsed: cycle.gateUsed })) {
+    cycle.gateUsed = true;
+    axLog(`checkpoint: held ${tool} at ${String(ctxPercent.get(root))}% until notes are saved`);
+    return axText(checkpointGateText(ctxPercent.get(root) ?? 0, checkpointFile(root)), false);
+  }
   if (axConsent({ tool, mode, granted: axGrants.has(root) }) === "ask") {
     const decision = await requestLocalApproval(
       threadId,
@@ -2486,6 +2501,7 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
       case "computer_raise": {
         axLog(`raise ${appName} (the model asked)`);
         axRaised.set(root, appName);
+        recordFact(threadId, `${appName} raised (the model asked)`);
         const r = await ax.request("raise", { app: appName, ...axActionOpts(appName) });
         const diff = String(r.diff ?? "");
         remember(diff);
@@ -2560,6 +2576,7 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         // The bridge answers ok at its deadline as long as the app is RUNNING;
         // only a window line proves the tree is readable. With cross-Space on
         // there is never a hint to say otherwise, so the sentence has to.
+        recordFact(threadId, `${appName} launched: ${launchOutcome(tree)}`);
         if (launchOutcome(tree) === "running") {
           return axText(`${appName} is running but no window is readable yet — read it again in a moment.${hint}\n${tree}`, true);
         }
@@ -2619,6 +2636,7 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
             const r = await ax.request("values", { app: appName, ids: touched }, 3_000);
             const values = Array.isArray(r.values) ? (r.values as FieldValue[]) : [];
             if (values.length) fields = renderFieldValues(values);
+            for (const v of values) recordFact(threadId, `${appName} #${v.id}${v.title ? ` ${JSON.stringify(v.title)}` : ""} = ${v.value ?? "(no value)"}`);
           } catch {
             // the diff still stands
           }
@@ -2670,6 +2688,7 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         // Where the fractions landed, so a caller can see its own geometry and
         // correct it without guessing at a display scale.
         const at = Array.isArray(r.at) ? (r.at as { x: number; y: number }[]) : [];
+        if (at.length) recordFact(threadId, `${appName} pointer #${String(a.id)} ${hold ? "drag" : "click"} landed ${at.map((q) => `(${q.x},${q.y})`).join(" ")}`);
         const where = at.length ? `\nLanded at ${at.map((q) => `(${q.x},${q.y})`).join(" ")}.` : "";
         return axText(`${hold ? "Dragged" : "Clicked"} ${path ? `${path.length} point(s)` : "the centre"} in ${appName}.${where}\n${diff || "(nothing in the tree changed — a canvas often shows its result only as a new object, so read the app)"}`, true);
       }
@@ -2715,6 +2734,7 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
           if (text === null) return axText("text is required.", false);
           axLog(`type ${appName} #${String(a.id)} <set>`);
           r = await ax.request("setValue", { app: appName, id: a.id, value: text, ...axActionOpts(appName) });
+          recordFact(threadId, `${appName} set #${String(a.id)} = ${JSON.stringify(text)}`);
         } else {
           const action = tool === "computer_press" ? "press" : String(a.action ?? "");
           if (!action) return axText("action is required. Use one of the actions the element listed in braces.", false);
@@ -4153,6 +4173,45 @@ function computerUseSkillText(): string | null {
 /** Conversations that have already been handed the skill. */
 const axSkillSent = new Set<string>();
 
+// ── Working-memory checkpoint (see checkpoint.ts) ─────────────────────────
+// Context occupancy per thread and per root, from thread/tokenUsage/updated.
+const ctxPercent = new Map<string, number>();
+type CheckpointCycle = { savedThisCycle: boolean; gateUsed: boolean; thresholdWritten: boolean; compactions: number; notes: string | null };
+const checkpointCycles = new Map<string, CheckpointCycle>();
+const checkpointLedger = new Map<string, LedgerEntry[]>();
+// Roots whose next tool result must carry the checkpoint back: a compaction
+// happened and the model's verbatim history is gone.
+const checkpointReplayDue = new Set<string>();
+function checkpointCycle(root: string): CheckpointCycle {
+  let c = checkpointCycles.get(root);
+  if (!c) {
+    c = { savedThisCycle: false, gateUsed: false, thresholdWritten: false, compactions: 0, notes: null };
+    checkpointCycles.set(root, c);
+  }
+  return c;
+}
+function checkpointFile(root: string): string {
+  return checkpointPath(threadCwds.get(root) ?? defaultChatDir(), root);
+}
+function writeCheckpoint(root: string): string {
+  const c = checkpointCycle(root);
+  const file = checkpointFile(root);
+  mkdirSync(dirname(file), { recursive: true });
+  writeFileSync(file, renderCheckpoint({
+    root, notes: c.notes, facts: checkpointLedger.get(root) ?? [],
+    savedAt: new Date().toISOString(), percent: ctxPercent.get(root) ?? 0, compactions: c.compactions,
+  }));
+  return file;
+}
+/** A measured fact the app itself observed — a value read back, where a click
+ *  landed, what launched. Never a tree and never a picture. */
+function recordFact(threadId: string | null, text: string): void {
+  const root = rootThreadOf(threadId);
+  const ledger = checkpointLedger.get(root) ?? [];
+  pushFact(ledger, text);
+  checkpointLedger.set(root, ledger);
+}
+
 /** The trailing run of single-action desktop calls, and the conversations that
  *  have already been shown the batch nudge. See batchNudge: said once, because
  *  a reminder on every action would be noise. */
@@ -5530,7 +5589,19 @@ function wireNotifications(): void {
           }
         } else if (item?.type === "contextCompaction") {
           // Mark where the model's verbatim history got summarized.
-          if (phase === "completed") send("chat:compaction", { paneId });
+          if (phase === "completed") {
+            send("chat:compaction", { paneId });
+            if (threadId) {
+              const root = rootThreadOf(threadId);
+              const c = checkpointCycle(root);
+              c.compactions += 1;
+              c.savedThisCycle = false;
+              c.gateUsed = false;
+              c.thresholdWritten = false;
+              checkpointReplayDue.add(root);
+              axLog(`checkpoint: compaction ${c.compactions} on ${root}; replay armed`);
+            }
+          }
         } else if (item?.type === "fileChange") {
           // File changes render as command-style cards so the approval
           // buttons have a card to land on.
@@ -5580,6 +5651,23 @@ function wireNotifications(): void {
           // best-effort
         }
         if (paneId) send("chat:token-usage", { paneId, ...usage });
+        if (usage.percent !== null) {
+          const root = rootThreadOf(String(params.threadId));
+          ctxPercent.set(String(params.threadId), usage.percent);
+          ctxPercent.set(root, usage.percent);
+          // Past the threshold, write what the app knows right away; the model's
+          // own notes arrive when the gate hands it the call.
+          const c = checkpointCycle(root);
+          if (!c.thresholdWritten && checkpointDue({ percent: usage.percent, savedThisCycle: c.savedThisCycle, gateUsed: c.gateUsed })) {
+            c.thresholdWritten = true;
+            try {
+              writeCheckpoint(root);
+              axLog(`checkpoint: wrote app facts at ${usage.percent}% for ${root}`);
+            } catch {
+              // best-effort; the gate still fires
+            }
+          }
+        }
         break;
       }
       case "turn/completed": {
@@ -5844,6 +5932,8 @@ function wireNotifications(): void {
         // the browser owns every dynamic tool.
         const call = tool.startsWith("schedule_")
           ? handleScheduleToolCall(tool, args, approvalThread)
+          : tool.startsWith("checkpoint_")
+            ? handleCheckpointToolCall(tool, args, approvalThread)
           : tool.startsWith("memory_")
             ? handleMemoryToolCall(tool, args, approvalThread)
             : routesToAx(tool)
@@ -5861,6 +5951,22 @@ function wireNotifications(): void {
             contentItems: [{ type: "inputText" as const, text: `tool crashed: ${String(err)}` }],
             success: false,
           }))
+          .then((response) => {
+            // The first tool result after a compaction carries the checkpoint
+            // back: the summary kept the plan and dropped the numbers.
+            const root = rootThreadOf(approvalThread);
+            if (!checkpointReplayDue.has(root)) return response;
+            checkpointReplayDue.delete(root);
+            try {
+              const file = checkpointFile(root);
+              if (!existsSync(file)) return response;
+              const md = readFileSync(file, "utf8");
+              axLog(`checkpoint: replayed ${md.length} chars after compaction (${tool})`);
+              return prependSkill(response, checkpointPreamble(md));
+            } catch {
+              return response;
+            }
+          })
           .then((response) => {
             if (!sendSkill) return response;
             const text = computerUseSkillText();
@@ -6142,6 +6248,31 @@ async function handleScheduleToolCall(
 }
 
 // ── Memory tools (model-initiated) ──────────────────────────────────────
+/** checkpoint_save: the model's half of the working memory. Validated (no
+ *  trees, no images, bounded), then written together with the app's ledger.
+ *  Allowed in plan mode: it is the agent's own notes about the conversation,
+ *  and losing them at a compaction is worse than a file under ./memories. */
+async function handleCheckpointToolCall(tool: string, rawArgs: unknown, threadId: string | null): Promise<DynamicToolResponse> {
+  const text = (t: string, ok: boolean): DynamicToolResponse => ({ contentItems: [{ type: "inputText", text: t }], success: ok });
+  if (tool !== "checkpoint_save") return text(`Unknown tool ${tool}`, false);
+  const notes = (rawArgs as { notes?: unknown } | null)?.notes;
+  if (typeof notes !== "string") return text("notes is required: the decisions and measured facts to keep.", false);
+  const v = validateCheckpointNotes(notes);
+  if (!v.ok) return text(v.error, false);
+  const root = rootThreadOf(threadId);
+  const c = checkpointCycle(root);
+  c.notes = notes.trim();
+  c.savedThisCycle = true;
+  try {
+    const file = writeCheckpoint(root);
+    const facts = checkpointLedger.get(root)?.length ?? 0;
+    axLog(`checkpoint: saved ${c.notes.length} chars of notes + ${facts} facts to ${file}`);
+    return text(`Saved working memory to ${file} (${c.notes.length} characters of notes, ${facts} recorded facts). It is handed back to you automatically after the next summary.`, true);
+  } catch (err) {
+    return text(`Could not write the checkpoint: ${String(err)}`, false);
+  }
+}
+
 async function handleMemoryToolCall(
   tool: string,
   rawArgs: unknown,
