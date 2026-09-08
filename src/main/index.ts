@@ -42,6 +42,8 @@ import {
   parkedNextCall,
   parkedReadNote,
   batchNudge,
+  isSingleEdit,
+  stepsForNudge,
   touchedFieldIds,
   renderFieldValues,
   type FieldValue,
@@ -2618,7 +2620,11 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         const parsed = parseBatchSteps(a.steps);
         if ("error" in parsed) return axText(parsed.error, false);
         const steps = parsed.steps;
-        axRecentEdits = []; // the caller batched; nothing to nudge about
+        // A batch that edited one thing is one edit, whatever it took to land it;
+        // only a batch that edited several things is the behaviour the nudge asks for.
+        const batchNudgeText = isSingleEdit(steps)
+          ? recordEditAndNudge(root, appName, { tool: "computer_do", app: appName, steps: stepsForNudge(steps) })
+          : (axRecentEdits = [], null);
         axLog(`do ${appName} ${steps.length} step(s): ${steps.map((x) => x.do).join(",")}`);
         const ran: string[] = [];
         const pictures: AxResult[] = [];
@@ -2679,6 +2685,7 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
           }),
           inspector,
           ...captions,
+          batchNudgeText,
         ].filter(Boolean).join("\n");
         return {
           contentItems: [
@@ -2735,7 +2742,12 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         if (at.length) recordFact(threadId, `${appName} pointer #${String(a.id)} ${hold ? "drag" : "click"} landed ${at.map((q) => `(${q.x},${q.y})`).join(" ")}`);
         const where = at.length ? `\nLanded at ${at.map((q) => `(${q.x},${q.y})`).join(" ")}.` : "";
         const inspector = await inspectorBlock(appName); // a click changes the selection; the inspector follows
-        return axText([`${hold ? "Dragged" : "Clicked"} ${path ? `${path.length} point(s)` : "the centre"} in ${appName}.${where}\n${diff || "(nothing in the tree changed — a canvas often shows its result only as a new object, so read the app)"}`, inspector].filter(Boolean).join("\n"), true);
+        // A plain click is one edit; a drawn stroke has no batch step and only
+        // interrupts a run (asStep says so by returning null for a path).
+        const pointerNudge = recordEditAndNudge(root, appName, {
+          tool: "computer_pointer", app: appName, id: a.id as number, ...(typeof a.clicks === "number" ? { clicks: a.clicks } : {}), ...(path ? { path: true } : {}),
+        });
+        return axText([`${hold ? "Dragged" : "Clicked"} ${path ? `${path.length} point(s)` : "the centre"} in ${appName}.${where}\n${diff || "(nothing in the tree changed — a canvas often shows its result only as a new object, so read the app)"}`, inspector, pointerNudge].filter(Boolean).join("\n"), true);
       }
       case "computer_app_screenshot": {
         const r = await ax.request("screenshot", { app: appName, ...(typeof a.window === "number" ? { window: a.window } : {}) }, 15_000);
@@ -2788,7 +2800,7 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         }
         const diff = String(r.diff ?? "");
         remember(diff);
-        axRecentEdits.push({
+        const nudge = recordEditAndNudge(root, appName, {
           tool,
           app: appName,
           ...(typeof a.id === "number" ? { id: a.id } : {}),
@@ -2796,12 +2808,6 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
           ...(typeof a.key === "string" ? { key: a.key } : {}),
           ...(typeof a.action === "string" ? { action: a.action } : {}),
         });
-        if (axRecentEdits.length > BATCH_NUDGE_AFTER * 2) axRecentEdits = axRecentEdits.slice(-BATCH_NUDGE_AFTER * 2);
-        const nudge = axBatchNudged.has(root) ? null : batchNudge(axRecentEdits);
-        if (nudge) {
-          axBatchNudged.add(root);
-          axLog(`nudged ${appName} toward computer_do after ${axRecentEdits.length} single actions`);
-        }
         const hint = typeof r.hint === "string" ? r.hint : null;
         // Only for the verbs that go through hit-testing. Telling a caller that
         // just sent a key to send a key is noise, and it is the click that
@@ -4265,6 +4271,18 @@ function recordFact(threadId: string | null, text: string): void {
  *  a reminder on every action would be noise. */
 let axRecentEdits: RecentEdit[] = [];
 const axBatchNudged = new Set<string>();
+/** Record one logical edit and, once per compaction cycle, hand back the batch
+ *  call that would have carried the recent run of them. */
+function recordEditAndNudge(root: string, appName: string, edit: RecentEdit): string | null {
+  axRecentEdits.push(edit);
+  if (axRecentEdits.length > BATCH_NUDGE_AFTER * 2) axRecentEdits = axRecentEdits.slice(-BATCH_NUDGE_AFTER * 2);
+  const nudge = axBatchNudged.has(root) ? null : batchNudge(axRecentEdits);
+  if (nudge) {
+    axBatchNudged.add(root);
+    axLog(`nudged ${appName} toward computer_do after ${axRecentEdits.length} single edits`);
+  }
+  return nudge;
+}
 
 function globalSkillsDir(): string {
   return join(app.getPath("home"), ".unbiased", "skills");
@@ -5650,7 +5668,9 @@ function wireNotifications(): void {
               // The summary ate the skill too: last run the model re-read it
               // through the shell, 8KB and a turn. Send it again with the next call.
               axSkillSent.delete(root);
-              axLog(`checkpoint: compaction ${c.compactions} on ${root}; replay armed, skill re-armed`);
+              // The nudge it heard is in the summary too, if at all. Say it again.
+              axBatchNudged.delete(root);
+              axLog(`checkpoint: compaction ${c.compactions} on ${root}; replay armed, skill and nudge re-armed`);
             }
           }
         } else if (item?.type === "fileChange") {

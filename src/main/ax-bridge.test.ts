@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-import { AX_TOOL_NAMES, SCREENSHOT_TOOL_NAMES, routesToAx, parseBatchSteps, describeBatch, summarizeBatch, MAX_BATCH_STEPS, AxClient, AxError, appOfStep, axConsent, axNeedsFocus, screenshotToolsOffered, coordinateToolAllowed, withScreenshotGuidance, SCREENSHOT_FRAME_SENTENCE, axReadOptsFrom, AX_DEFAULT_READ_OPTS, shouldRecoverRaise, describeAxAction, indexElementLines, readAxManifest, resolveAxDir, shouldOpenAccessibilitySettings, axNotTrustedText, RAISE_DESCRIPTION, APP_STATE_SPACE_SENTENCE, LAUNCH_FRONT_SENTENCE, withSpaceGuidance, otherSpaceNote, launchOutcome, renderActionResult, ACTION_NO_CHANGE_SENTENCE, TASK_DISCIPLINE_SENTENCE, SCREENSHOT_SPACE_SENTENCE, parseCandidates, describeCandidates, parkedNextCall, parkedReadNote, batchNudge, traceStep, MAX_TYPE_LENGTH, type BatchStep, BATCH_NUDGE_AFTER, type RecentEdit, skillBody, skillPreamble, shouldSendSkill, prependSkill, MAX_SKILL_PREAMBLE, candidateWorked, summarizeCandidates, MAX_CANDIDATES, MAX_CANDIDATE_STEPS, type AxCallInfo, touchedFieldIds, renderFieldValues, MAX_FIELDS_READ_BACK, type FieldValue, renderInspector, MAX_INSPECTOR_FIELDS, BATCH_VERBS, type InspectorField } from "./ax-bridge";
+import { AX_TOOL_NAMES, SCREENSHOT_TOOL_NAMES, routesToAx, parseBatchSteps, describeBatch, summarizeBatch, MAX_BATCH_STEPS, AxClient, AxError, appOfStep, axConsent, axNeedsFocus, screenshotToolsOffered, coordinateToolAllowed, withScreenshotGuidance, SCREENSHOT_FRAME_SENTENCE, axReadOptsFrom, AX_DEFAULT_READ_OPTS, shouldRecoverRaise, describeAxAction, indexElementLines, readAxManifest, resolveAxDir, shouldOpenAccessibilitySettings, axNotTrustedText, RAISE_DESCRIPTION, APP_STATE_SPACE_SENTENCE, LAUNCH_FRONT_SENTENCE, withSpaceGuidance, otherSpaceNote, launchOutcome, renderActionResult, ACTION_NO_CHANGE_SENTENCE, TASK_DISCIPLINE_SENTENCE, SCREENSHOT_SPACE_SENTENCE, parseCandidates, describeCandidates, parkedNextCall, parkedReadNote, batchNudge, isSingleEdit, stepsForNudge, traceStep, MAX_TYPE_LENGTH, type BatchStep, BATCH_NUDGE_AFTER, type RecentEdit, skillBody, skillPreamble, shouldSendSkill, prependSkill, MAX_SKILL_PREAMBLE, candidateWorked, summarizeCandidates, MAX_CANDIDATES, MAX_CANDIDATE_STEPS, type AxCallInfo, touchedFieldIds, renderFieldValues, MAX_FIELDS_READ_BACK, type FieldValue, renderInspector, MAX_INSPECTOR_FIELDS, BATCH_VERBS, type InspectorField } from "./ax-bridge";
 
 const scratch = () => mkdtempSync(join(tmpdir(), "ax-"));
 
@@ -1181,7 +1181,7 @@ test("a run of single edits on one app becomes the batch call that would have do
   ];
   const out = batchNudge(recent);
   assert.ok(out, "three in a row is worth saying");
-  assert.ok(out.includes("3 separate actions to Figma"), out);
+  assert.ok(out.includes("3 separate calls to Figma"), out);
   assert.ok(out.includes('computer_do {"app":"Figma","steps":[{"do":"set_value","id":10,"text":"500"}'), out);
   assert.ok(out.includes("not five"), out);
 });
@@ -1214,11 +1214,59 @@ test("every batchable verb is rendered as its step, and an unbatchable one cance
   assert.equal(batchNudge(withRaise), null, "raise is not batchable, so there is no single call to suggest");
 });
 
-test("the nudge is said once per conversation and a batch resets the count", () => {
+// Run 6, 2026-09-08: 122 turns, 84 of them one call each; 30 were single
+// computer_pointer calls and 46 of 53 computer_do batches edited ONE field —
+// the four-keystroke recipe wrapped in a batch. The nudge saw none of it: it did
+// not know pointer, it counted a one-field batch as batching, and it had said
+// its one sentence before the first compaction erased it. It now counts logical
+// edits, whatever call carried them, and is re-armed when a compaction has
+// taken the earlier one away.
+test("a single pointer click counts as one edit; a drawn path does not, because it has no batch step", () => {
+  const clicks: RecentEdit[] = [
+    { tool: "computer_pointer", app: "Figma", id: 88, clicks: 2 },
+    { tool: "computer_pointer", app: "Figma", id: 89, clicks: 2 },
+    { tool: "computer_pointer", app: "Figma", id: 90 },
+  ];
+  const out = batchNudge(clicks);
+  assert.ok(out && out.includes('{"do":"pointer","id":88,"clicks":2}') && out.includes('{"do":"pointer","id":90}'), String(out));
+  const drawn: RecentEdit[] = [...clicks.slice(0, 2), { tool: "computer_pointer", app: "Figma", id: 14, path: true }];
+  assert.equal(batchNudge(drawn), null, "a stroke with a path cannot be written as a batch step");
+});
+
+test("a batch that edits one field is one edit, and its steps are spliced into the suggested call", () => {
+  const oneField: BatchStep[] = [
+    { do: "pointer", id: 88, clicks: 2, waitMs: 0 }, { do: "key", key: "a", modifiers: ["command"], waitMs: 0 },
+    { do: "type", text: "460", waitMs: 0 }, { do: "key", key: "return", waitMs: 0 }, { do: "read", waitMs: 0 },
+  ];
+  assert.equal(isSingleEdit(oneField), true, "four keystrokes into one field is one edit");
+  assert.equal(isSingleEdit([{ do: "set_value", id: 10, text: "1", waitMs: 0 }, { do: "set_value", id: 11, text: "2", waitMs: 0 }]), false, "two fields is batching");
+  assert.equal(isSingleEdit([{ do: "key", key: "return", waitMs: 0 }]), false, "nothing edited: nothing to combine");
+  assert.equal(isSingleEdit([{ do: "screenshot", waitMs: 0 }, { do: "read", waitMs: 0 }]), false);
+  assert.deepEqual(stepsForNudge(oneField), [
+    { do: "pointer", id: 88, clicks: 2 }, { do: "key", key: "a", modifiers: ["command"] }, { do: "type", text: "460" }, { do: "key", key: "return" }, { do: "read" },
+  ], "waitMs is dropped when zero and the wire name is used otherwise");
+  assert.deepEqual(stepsForNudge([{ do: "press", id: 3, waitMs: 500 }]), [{ do: "press", id: 3, wait_ms: 500 }]);
+  const recent: RecentEdit[] = [
+    { tool: "computer_pointer", app: "Figma", id: 87, clicks: 2 },
+    { tool: "computer_do", app: "Figma", steps: stepsForNudge(oneField) },
+    { tool: "computer_set_value", app: "Figma", id: 91, text: "512" },
+  ];
+  const out = batchNudge(recent);
+  assert.ok(out && out.includes("3 separate calls to Figma"), String(out));
+  assert.ok(out && out.includes('{"do":"pointer","id":87,"clicks":2},{"do":"pointer","id":88,"clicks":2},{"do":"key","key":"a","modifiers":["command"]}'), "the batch's own steps appear inline, in order: " + String(out));
+  assert.ok(out && out.includes('{"do":"set_value","id":91,"text":"512"}'), String(out));
+});
+
+test("the nudge is said once per compaction cycle; a real batch resets the count, a one-edit batch does not", () => {
   const src = readFileSync(join(__dirname, "index.ts"), "utf8");
-  assert.ok(src.includes("axBatchNudged.has(root) ? null : batchNudge(axRecentEdits)"), "once per conversation");
-  assert.ok(src.includes("axRecentEdits = []; // the caller batched"), "batching clears the run");
-  assert.ok(src.includes("axRecentEdits.push({"), "single actions are recorded");
+  assert.ok(src.includes("axBatchNudged.has(root) ? null : batchNudge(axRecentEdits)"), "gated on the armed set");
+  const compaction = src.slice(src.indexOf('item?.type === "contextCompaction"'), src.indexOf('item?.type === "fileChange"'));
+  assert.ok(compaction.includes("axBatchNudged.delete(root)"), "a compaction erased the earlier nudge, so it is said again");
+  const batch = src.slice(src.indexOf('case "computer_do": {'), src.indexOf('case "computer_scroll_view": {'));
+  assert.ok(batch.includes("isSingleEdit(steps)") && batch.includes("stepsForNudge(steps)"), "a one-edit batch is recorded as one edit");
+  assert.ok(!src.includes("axRecentEdits = []; // the caller batched"), "the unconditional reset is gone");
+  const pointer = src.slice(src.indexOf('case "computer_pointer": {'), src.indexOf('case "computer_app_screenshot": {'));
+  assert.ok(pointer.includes('tool: "computer_pointer"') && pointer.includes("recordEditAndNudge("), "a single click is recorded as one edit through the shared helper");
 });
 
 test("a batch skips the settle wait on every step but the last", () => {

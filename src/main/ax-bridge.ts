@@ -706,6 +706,15 @@ export interface RecentEdit {
   text?: string;
   key?: string;
   action?: string;
+  /** A single pointer click: how many clicks; `path` true means a drawn stroke,
+   *  which has no batch step and so cannot be part of a suggested call. */
+  clicks?: number;
+  path?: boolean;
+  /** A computer_do that edited ONE thing: its steps, already in wire form, so
+   *  the suggested call can splice them in. Run 6, 2026-09-08: 46 of 53 batches
+   *  were the four-keystroke recipe on a single field — one edit per turn wearing
+   *  a batch's clothes. */
+  steps?: Record<string, unknown>[];
 }
 
 export const BATCH_NUDGE_AFTER = 3;
@@ -716,6 +725,7 @@ function asStep(e: RecentEdit): Record<string, unknown> | null {
     case "computer_act": return e.id === undefined || !e.action ? null : { do: "act", id: e.id, action: e.action };
     case "computer_set_value": return e.id === undefined || e.text === undefined ? null : { do: "set_value", id: e.id, text: e.text };
     case "computer_press_key": return !e.key ? null : { do: "key", key: e.key, ...(e.id !== undefined ? { id: e.id } : {}) };
+    case "computer_pointer": return e.id === undefined || e.path ? null : { do: "pointer", id: e.id, ...(e.clicks && e.clicks > 1 ? { clicks: e.clicks } : {}) };
     default: return null;
   }
 }
@@ -728,13 +738,31 @@ export function batchNudge(recent: RecentEdit[]): string | null {
   const run: RecentEdit[] = [];
   for (let i = recent.length - 1; i >= 0 && recent[i].app === app; i -= 1) run.unshift(recent[i]);
   if (run.length < BATCH_NUDGE_AFTER) return null;
-  const steps = run.map(asStep);
+  const steps = run.flatMap((e) => (e.steps ? e.steps : [asStep(e)]));
   if (steps.some((st) => st === null)) return null;
   return (
-    `You have sent ${run.length} separate actions to ${app} in a row, and each one costs a whole turn. ` +
+    `You have sent ${run.length} separate calls to ${app} in a row, each editing one thing, and each costs a whole turn. ` +
     `They fit in one call: computer_do {"app":${JSON.stringify(app)},"steps":${JSON.stringify(steps)}}. ` +
     "Batch the moves you already know — setting one object's position, size and colour is one call, not five."
   );
+}
+
+/** Whether a batch edited a single thing — one field, one control — however
+ *  many keystrokes it took. Steps without an id (keys, reads, pictures) are the
+ *  means, not the edit. Zero ids is nothing to combine. */
+export function isSingleEdit(steps: BatchStep[]): boolean {
+  const ids = new Set<number>();
+  for (const st of steps) if ("id" in st && typeof st.id === "number") ids.add(st.id);
+  return ids.size === 1;
+}
+
+/** Batch steps as the wire shape the model would send: `wait_ms` only when
+ *  set, internal field names dropped. For splicing into a suggested call. */
+export function stepsForNudge(steps: BatchStep[]): Record<string, unknown>[] {
+  return steps.map((st) => {
+    const { waitMs, ...rest } = st as BatchStep & { waitMs: number };
+    return waitMs > 0 ? { ...rest, wait_ms: waitMs } : { ...rest };
+  });
 }
 
 export function renderActionResult(diff: string, hint?: string | null, nextCall?: string | null): string {
