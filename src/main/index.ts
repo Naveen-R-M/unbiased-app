@@ -4002,6 +4002,43 @@ function mcpOverrideFor(threadId: string | null): Record<string, unknown> {
   return mcpConfigOverride(configured, new Set(enabledMcpFor(threadId)));
 }
 
+// Re-declare everything a thread/start would. Tools are declared per
+// session, not stored with the thread, so a resumed conversation had
+// NO dynamic tools at all — reopening a chat silently cost it the
+// agent browser and the scheduling tool, and the model discovered
+// that mid-task ("there are no browser_connect tools available").
+//
+// Same omission as the side-chat fork, in the path I did not check
+// when fixing that one. ThreadResumeParams accepts
+// developerInstructions; dynamicTools and experimentalRawEvents are
+// experimentalApi fields absent from the schema, and the engine
+// ignores unknown params, so this cannot break a resume. Whether it
+// HONOURS them on resume is unverified — experimentalRawEvents is
+// known to be ignored here (measured for the sub-agent nicknames),
+// so dynamicTools may be too. If it is, a reopened conversation
+// needs a fresh thread to regain tools, not this.
+/** Everything a thread/resume must re-declare, plus the conversation's MCP
+ *  set. One function so the reopen path and the MCP-switch path can never
+ *  disagree — a resume that forgot the override would silently hand the
+ *  thread the engine's whole default server set back. */
+function resumeParamsFor(id: string): Record<string, unknown> {
+  return {
+    threadId: id,
+    ...threadPolicy(),
+    dynamicTools: threadDynamicTools(),
+    // The thread's cwd is only known once the resume RETURNS, so the
+    // memory index rides along when this app session has seen the
+    // thread before, and is omitted on a cold reopen — no section
+    // beats injecting some other project's memory (mainCwd still
+    // points at the conversation being left).
+    developerInstructions: threadCwds.has(id)
+      ? developerInstructionsFor(threadCwds.get(id) ?? null)
+      : APP_DEVELOPER_INSTRUCTIONS,
+    experimentalRawEvents: true,
+    config: mcpOverrideFor(id),
+  };
+}
+
 // A project is a display name + one or more source folders (chats whose cwd
 // falls in ANY of them group under it), a primary folder (the cwd new chats
 // start in), and an icon/color identity. Legacy projects.json was a bare
@@ -6650,6 +6687,10 @@ async function runScheduledTask(
       // thread, so it stays right for runs from previous app versions and
       // needs no pruning.
       threadSource: SCHEDULED_THREAD_SOURCE,
+      // A scheduled run has no one to switch a server on for it, and run 9
+      // measured what the default set costs: ~35k tokens of schemas before
+      // the first word. A run that needs a server is a later feature.
+      config: mcpConfigOverride(readMcpConfig().servers.map((sv) => sv.name), new Set()),
     })) as { thread: { id: string } };
     threadId = started.thread.id;
     threadCwds.set(threadId, cwd); // memory_save from this run targets ITS project
@@ -7148,6 +7189,8 @@ app.whenReady().then(async () => {
           dynamicTools: threadDynamicTools(),
           developerInstructions: developerInstructionsFor(mainCwd),
           experimentalRawEvents: true,
+          // A side chat sees what its conversation sees.
+          config: mcpOverrideFor(panes.main.threadId),
         })) as { thread: { id: string } };
       } else if (paneId.startsWith("side")) {
         // No parent conversation yet: a plain scratch thread.
@@ -7157,6 +7200,7 @@ app.whenReady().then(async () => {
           experimentalRawEvents: true,
           dynamicTools: threadDynamicTools(),
           developerInstructions: developerInstructionsFor(mainCwd),
+          config: mcpOverrideFor(null),
         })) as { thread: { id: string } };
       } else {
         // Explicit default when no project is chosen — left implicit, the
@@ -7184,10 +7228,18 @@ app.whenReady().then(async () => {
           // Raw response items feed the sub-agent viewer (task text + spawn
           // instructions). Sub-threads inherit this from their parent.
           experimentalRawEvents: true,
+          config: mcpOverrideFor(null),
         })) as { thread: { id: string }; cwd?: string };
         mainCwd = (started as { cwd?: string }).cwd ?? cwd;
       }
       pane.threadId = started.thread.id;
+      // The choice made in the composer before the first message belongs to
+      // the thread that message created.
+      if (paneId === "main" && pendingNewThreadMcp) {
+        if (pendingNewThreadMcp.length) threadMcp.set(started.thread.id, new Set(pendingNewThreadMcp));
+        pendingNewThreadMcp = null;
+        saveThreadMcp();
+      }
       // Side/fork threads inherit the main conversation's cwd; the main
       // branch just set mainCwd above. Recorded so a memory_save from any of
       // them resolves to the right project's store.
@@ -7478,6 +7530,7 @@ app.whenReady().then(async () => {
           sandbox: "read-only",
           cwd: defaultChatDir(),
           threadSource: "unbiased_prompt_tuner",
+          config: mcpConfigOverride(readMcpConfig().servers.map((sv) => sv.name), new Set()),
         })) as { thread: { id: string } };
         threadId = started.thread.id;
 
@@ -9760,35 +9813,7 @@ app.whenReady().then(async () => {
           thread: WireThread;
           cwd?: string;
         })
-      : ((await engine.request("thread/resume", {
-          threadId: id,
-          ...threadPolicy(),
-          // Re-declare everything a thread/start would. Tools are declared per
-          // session, not stored with the thread, so a resumed conversation had
-          // NO dynamic tools at all — reopening a chat silently cost it the
-          // agent browser and the scheduling tool, and the model discovered
-          // that mid-task ("there are no browser_connect tools available").
-          //
-          // Same omission as the side-chat fork, in the path I did not check
-          // when fixing that one. ThreadResumeParams accepts
-          // developerInstructions; dynamicTools and experimentalRawEvents are
-          // experimentalApi fields absent from the schema, and the engine
-          // ignores unknown params, so this cannot break a resume. Whether it
-          // HONOURS them on resume is unverified — experimentalRawEvents is
-          // known to be ignored here (measured for the sub-agent nicknames),
-          // so dynamicTools may be too. If it is, a reopened conversation
-          // needs a fresh thread to regain tools, not this.
-          dynamicTools: threadDynamicTools(),
-          // The thread's cwd is only known once the resume RETURNS, so the
-          // memory index rides along when this app session has seen the
-          // thread before, and is omitted on a cold reopen — no section
-          // beats injecting some other project's memory (mainCwd still
-          // points at the conversation being left).
-          developerInstructions: threadCwds.has(id)
-            ? developerInstructionsFor(threadCwds.get(id) ?? null)
-            : APP_DEVELOPER_INSTRUCTIONS,
-          experimentalRawEvents: true,
-        })) as {
+      : ((await engine.request("thread/resume", resumeParamsFor(id))) as {
           thread: WireThread;
           cwd?: string;
         });
