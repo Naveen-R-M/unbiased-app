@@ -155,11 +155,51 @@ is a normal answer, not an error.
 | `…/sessions/**/rollout-*.jsonl` | append-only log of every conversation, by thread id |
 | `<userData>/transcripts/` | the app's own rendered-transcript cache |
 | `<userData>/worktrees.json` | git worktrees created per conversation |
+| `<userData>/thread-mcp.json` | which MCP servers each conversation has turned on |
 | `<userData>/window-state.json` | window size and position |
 
 Rollouts only ever grow — compaction shortens what's *sent to the model*,
 not what's on disk. Settings → Resources shows the real footprint per
 conversation.
+
+## MCP servers are per conversation
+
+Every MCP server the engine connects to puts its whole tool schema in front
+of the model on every request. Measured 2026-09-09 on a drawing task: the
+first request was 56,495 tokens before the model said a word, and about 35k
+of that was four servers the task never used — Figma remote 41 tools,
+Honeycomb 23, PostHog 1, Figma desktop 10. The window is 124,518 and
+compaction arms at 96,000, so most of the working room was gone at hello.
+
+So a server is off in every conversation until it is switched on for that
+one. The app keeps the set per ROOT thread in `thread-mcp.json` and passes
+`config: { mcp_servers: { <name>: { enabled: false } } }` for every server
+not in it — on `thread/start`, `thread/resume` and `thread/fork` alike, all
+three of which accept the override. Side chats and sub-agents key off the
+root, so they see what their conversation sees. Scheduled and authoring
+threads get everything off.
+
+Two engine facts shape how a switch mid-conversation works, both measured
+against the pinned 0.147 binary:
+
+- `thread/resume` on a thread the engine has already LOADED hands back the
+  loaded session and ignores `config`. Only an unloaded thread reads it.
+- `thread/unsubscribe` followed by `thread/resume` re-creates the session
+  with the new set in about two seconds — same thread id, history intact,
+  and only the newly enabled server reports `starting` → `ready`.
+
+Hence the apply path: unsubscribe, then resume with the new override. It
+cannot run mid-turn (the resume would kill the turn), so a switch thrown
+while a turn is running is queued and flushed on `turn/completed`. A thread
+that has never completed a turn has no rollout to resume — the set is saved
+and applies the next time it loads.
+
+The composer chip only says "MCP on" or "MCP off" and opens the panel; the
+per-server switches live in the MCP panel under `+`, beside the list they
+belong to. Adding, removing or signing into a server still edits the
+engine's own config and still needs the engine restart that panel offers —
+that is a different layer from choosing among servers the engine already
+knows.
 
 ## Signing in
 
