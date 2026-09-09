@@ -179,6 +179,15 @@ three of which accept the override. Side chats and sub-agents key off the
 root, so they see what their conversation sees. Scheduled and authoring
 threads get everything off.
 
+One server cannot be switched this way: a connector carrying an OAuth client
+secret (the Google ones) is written into the engine's config as a managed
+plugin, not as an `[mcp_servers.*]` table. Naming it in the override invents
+a server with no transport and every turn dies with `failed to load
+configuration: invalid transport` — measured 2026-09-09, by doing exactly
+that. `overridableServerNames` mirrors the wrapper's own rule
+(`renderMCPServers`/`managedPluginServers` in `internal/engine/mcp.go`), and
+the panel offers a switch only for the servers it returns.
+
 Two engine facts shape how a switch mid-conversation works, both measured
 against the pinned 0.147 binary:
 

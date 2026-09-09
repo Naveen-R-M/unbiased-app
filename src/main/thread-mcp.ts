@@ -25,6 +25,21 @@ export function mcpConfigOverride(
   return { mcp_servers };
 }
 
+/** The servers the engine actually holds as `[mcp_servers.*]` tables, which
+ *  are the only ones a thread override can switch off.
+ *
+ *  Mirrors renderMCPServers/managedPluginServers in the engine wrapper
+ *  (internal/engine/mcp.go): a server carrying an OAuth client SECRET is
+ *  written as a managed plugin instead, and one switched off globally is not
+ *  written at all. Measured 2026-09-09 by getting this wrong — an override
+ *  naming google-drive invented `[mcp_servers.google-drive]` with no command
+ *  and no url, and every turn died with "failed to load configuration:
+ *  invalid transport". A client ID alone is not enough; only a secret routes
+ *  a server down the plugin path. */
+export function overridableServerNames(servers: readonly { name: string; enabled?: boolean; oauthClientSecret?: string }[]): string[] {
+  return servers.filter((s) => s.enabled !== false && !s.oauthClientSecret).map((s) => s.name);
+}
+
 export function serializeThreadMcp(m: ReadonlyMap<string, ReadonlySet<string>>): string {
   const out: Record<string, string[]> = {};
   for (const [root, names] of m) if (names.size) out[root] = [...names].sort();

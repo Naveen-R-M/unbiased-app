@@ -35,7 +35,7 @@ import { get as httpGet } from "node:http";
 import { EngineClient, engineVersionFromUserAgent, type EngineStatus } from "./engine";
 import { pollDeviceToken, requestDeviceAuthorization } from "./device-auth";
 import { RendererCrashRecovery } from "./crash-recovery";
-import { mcpApplyDecision, mcpConfigOverride, parseThreadMcp, serializeThreadMcp, THREAD_MCP_FILE } from "./thread-mcp";
+import { mcpApplyDecision, mcpConfigOverride, overridableServerNames, parseThreadMcp, serializeThreadMcp, THREAD_MCP_FILE } from "./thread-mcp";
 import {
   type BatchStep,
   type AxResult,
@@ -4009,11 +4009,9 @@ async function applyThreadMcp(threadId: string): Promise<void> {
 
 /** The `config` override for a thread: every server in mcp-servers.json the
  *  conversation has not enabled is off. */
+/** Every server the engine has that this conversation has not enabled. */
 function mcpOverrideFor(threadId: string | null): Record<string, unknown> {
-  const configured = readMcpConfig()
-    .servers.filter((s) => s.enabled !== false)
-    .map((s) => s.name);
-  return mcpConfigOverride(configured, new Set(enabledMcpFor(threadId)));
+  return mcpConfigOverride(overridableServerNames(readMcpConfig().servers), new Set(enabledMcpFor(threadId)));
 }
 
 // Re-declare everything a thread/start would. Tools are declared per
@@ -6710,7 +6708,7 @@ async function runScheduledTask(
       // A scheduled run has no one to switch a server on for it, and run 9
       // measured what the default set costs: ~35k tokens of schemas before
       // the first word. A run that needs a server is a later feature.
-      config: mcpConfigOverride(readMcpConfig().servers.map((sv) => sv.name), new Set()),
+      config: mcpConfigOverride(overridableServerNames(readMcpConfig().servers), new Set()),
     })) as { thread: { id: string } };
     threadId = started.thread.id;
     threadCwds.set(threadId, cwd); // memory_save from this run targets ITS project
@@ -7550,7 +7548,7 @@ app.whenReady().then(async () => {
           sandbox: "read-only",
           cwd: defaultChatDir(),
           threadSource: "unbiased_prompt_tuner",
-          config: mcpConfigOverride(readMcpConfig().servers.map((sv) => sv.name), new Set()),
+          config: mcpConfigOverride(overridableServerNames(readMcpConfig().servers), new Set()),
         })) as { thread: { id: string } };
         threadId = started.thread.id;
 
@@ -8043,7 +8041,9 @@ app.whenReady().then(async () => {
   ipcMain.handle("mcp:thread-get", (_e, threadId: string | null) => {
     const cfg = readMcpConfig();
     return {
-      configured: cfg.servers.filter((sv) => sv.enabled !== false).map((sv) => sv.name),
+      // Only servers that can actually be switched: a secret-bearing one is a
+      // managed plugin, so the panel must not offer it a switch.
+      configured: overridableServerNames(cfg.servers),
       enabled: enabledMcpFor(threadId),
       pending: threadId ? mcpApplyPending.has(threadId) : false,
       running: threadId ? runningTurns.has(threadId) : false,
