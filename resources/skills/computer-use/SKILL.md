@@ -173,14 +173,17 @@ of that element's box, so `{"x":0.5,"y":0.5}` is its centre and you never touch
 a screen pixel or a display scale. Give it the id of the canvas or web area,
 not the window. Several points are separate clicks, which is exactly how a pen
 tool takes a path; `hold=true` makes them one press-drag-release. The reply
-tells you the screen points your fractions landed on, so you can correct your
-geometry from fact rather than guesswork.
+tells you the screen points your fractions landed on.
 
-**Pointer input is the one thing that needs the window really visible.** It
-aims at real screen coordinates and the app hit-tests them, so it is refused
-when the window is parked or on another Space — a click there would land on
-whatever IS at that spot. So this kind of work is foreground work: raise the
-app, say to the user that drawing needs the screen, and do it.
+**Pointer input needs the window really visible.** It aims at screen
+coordinates the app hit-tests, so it is refused when the window is parked or
+on another Space. Raise the app, tell the user drawing needs the screen, do it.
+
+**Clear the surface before the first point.** Apps float toolbars and popups
+over a drawing surface, often only once drawing begins, and a click on one of
+them ends the path or switches the tool. Fit the target to the view, hide the
+app's panels and toolbars or go full screen, then draw the whole shape in ONE
+call: an app may not join a path continued in a second call.
 
 **If you are asked to draw, draw.** Pasting an SVG or importing a file is not
 drawing, and substituting one for the other is answering a different request.
@@ -251,10 +254,9 @@ saved; the reply carries the exact call. Save, then send the action again.
 **Measure once.** What you work out before acting — sizes and colours read
 from a source file, a scale, an offset — cannot be read off the app later.
 Save it with `checkpoint_save` before the first action and work from what you
-wrote. Across three runs of one task the same file was analysed five, four
-and three times; one analysis printed 8k tokens and cost a summary, and two
-of those runs still had the numbers in front of them. Measure again only if
-the checkpoint is missing or something on screen proves a number wrong.
+wrote. Measured: one task re-analysed its source file five times, and one of
+those analyses cost a summary. Measure again only if the checkpoint is missing
+or something on screen proves a number wrong.
 
 What a good note looks like — small, exact, and about the work rather than the
 screen:
