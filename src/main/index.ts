@@ -3754,9 +3754,17 @@ const COMPUTER_DIRECTIVE =
   // computer_app_state returns for free — then it reported route figures it
   // had never read, because it never actually operated the app.
   "Do NOT drive the desktop with the shell for this turn. No `open`, no `osascript`, no AppleScript or JXA, no URL " +
-  "schemes, and never write a program to inspect the UI: the computer_* tools ARE that capability, and a shell detour " +
-  "loses the element ids that make the next step possible. Operate the app the way a person would — type into its " +
-  "search field, press its results, press its tabs — rather than constructing a URL that guesses at what the user meant. " +
+  "schemes, no `pbcopy` to smuggle in content the app was supposed to make, and never write a program to inspect the " +
+  "UI: the computer_* tools ARE that capability, and a shell detour loses the element ids that make the next step " +
+  "possible. Operate the app the way a person would — type into its search field, press its results, press its tabs — " +
+  "rather than constructing a URL that guesses at what the user meant. " +
+  // Measured 2026-09-09: three pen-tool passes fragmented (a bridge defect,
+  // since fixed), and on the fourth attempt the model wrote an SVG from the
+  // shell, put it on the clipboard, and pasted it — the one thing the user
+  // had said not to do. Repeated failure is a reason to report, not a
+  // licence to switch routes.
+  "A route the task ruled out is not a fallback. If the app's own tools cannot do what was asked the way it was " +
+  "asked, after a real attempt, stop and say exactly what failed — do not quietly switch to the route that was forbidden. " +
   "Report only what you actually read. Every number, name, distance, time or price in your answer must appear in a tool " +
   "result from this turn; if the app never showed it, say what you could not get instead of filling the gap. " +
   // The input-side twin of the sentence above, and measured the same way.
