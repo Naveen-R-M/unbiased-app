@@ -548,6 +548,16 @@ declare global {
       mcpSave: (servers: McpServerConfig[]) => Promise<{ ok: boolean; error?: string }>;
       mcpApply: () => Promise<{ ok: boolean; busy?: boolean }>;
       onMcpStatus: (cb: (p: McpStatusEvent) => void) => () => void;
+      mcpThreadGet: (
+        threadId: string | null,
+      ) => Promise<{ configured: string[]; enabled: string[]; pending: boolean; running: boolean }>;
+      mcpThreadSet: (
+        threadId: string | null,
+        enabled: string[],
+      ) => Promise<{ status: "applied" | "queued" | "pending-new-thread" | "saved"; error?: string }>;
+      onMcpThreadApplied: (
+        cb: (p: { threadId: string; enabled: string[]; error?: string }) => void,
+      ) => () => void;
       skillsList: (cwd?: string | null) => Promise<{
         skills: SkillEntry[];
         cwd: string | null;
