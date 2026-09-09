@@ -35,6 +35,7 @@ import { get as httpGet } from "node:http";
 import { EngineClient, engineVersionFromUserAgent, type EngineStatus } from "./engine";
 import { pollDeviceToken, requestDeviceAuthorization } from "./device-auth";
 import { RendererCrashRecovery } from "./crash-recovery";
+import { mcpConfigOverride, parseThreadMcp, serializeThreadMcp, THREAD_MCP_FILE } from "./thread-mcp";
 import {
   type BatchStep,
   type AxResult,
@@ -3893,6 +3894,59 @@ function projectsFile(): string {
   return join(app.getPath("userData"), "projects.json");
 }
 
+// Two different truths, deliberately reported separately: `connected` is
+// what the running engine actually has (authoritative, but empty while the
+// engine is down or before a restart), and `configured` is what the user
+// has asked for. A server present in the second and absent from the first
+// is exactly the "restart to apply" case the panel needs to show.
+function mcpConfigPath(): string {
+  return join(app.getPath("home"), ".unbiased", "mcp-servers.json");
+}
+type UserMcpServer = {
+  name: string;
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  url?: string;
+  bearerTokenEnvVar?: string;
+  /** Absent means on. Off keeps the entry — and its OAuth registration —
+   *  while leaving it out of the engine's config. */
+  enabled?: boolean;
+  /** An OAuth client WE registered with the provider, so its consent screen
+   *  shows Unbiased rather than codex's dynamically-registered "Codex". */
+  oauthClientId?: string;
+  /** Providers whose token exchange needs a secret (Google). Its presence
+   *  routes the server through the engine's managed-plugin path. */
+  oauthClientSecret?: string;
+  scopes?: string[];
+  startupTimeoutSec?: number;
+  toolTimeoutSec?: number;
+  enabledTools?: string[];
+};
+// Absent and unreadable are NOT the same answer. Returning [] for both let a
+// save overwrite a file we had failed to parse — a malformed file read as
+// "no servers", and the next Save wrote only the newly added one, silently
+// destroying the rest. The engine fails loudly on this file for exactly this
+// reason; so must we.
+function readMcpConfig(): { servers: UserMcpServer[]; error: string | null } {
+  let text: string;
+  try {
+    text = readFileSync(mcpConfigPath(), "utf8");
+  } catch (err) {
+    const missing = (err as NodeJS.ErrnoException)?.code === "ENOENT";
+    return { servers: [], error: missing ? null : `Could not read ${mcpConfigPath()}: ${String(err)}` };
+  }
+  try {
+    const raw = JSON.parse(text) as { servers?: unknown };
+    if (raw.servers !== undefined && !Array.isArray(raw.servers)) {
+      return { servers: [], error: `${mcpConfigPath()} has a "servers" value that is not a list.` };
+    }
+    return { servers: (raw.servers as UserMcpServer[]) ?? [], error: null };
+  } catch {
+    return { servers: [], error: `${mcpConfigPath()} is not valid JSON. Fix or delete it — saving now would discard whatever it holds.` };
+  }
+}
+
 // App-side thread → project assignment. The engine pins a thread's cwd at
 // creation, so "moving" a Recents chat into a project is a GROUPING override
 // the app owns, not an engine mutation.
@@ -3907,6 +3961,45 @@ function loadThreadProjects(): Record<string, string> {
   } catch {
     return {};
   }
+}
+
+// ── Per-conversation MCP servers ──────────────────────────────────────────
+// See src/main/thread-mcp.ts for the measurement. Keyed by ROOT thread so a
+// side chat or sub-agent sees what its conversation sees.
+function threadMcpFile(): string {
+  return join(app.getPath("userData"), THREAD_MCP_FILE);
+}
+
+const threadMcp: Map<string, Set<string>> = (() => {
+  try {
+    return parseThreadMcp(readFileSync(threadMcpFile(), "utf8"));
+  } catch {
+    return new Map();
+  }
+})();
+
+/** What the user chose for the conversation they have not sent a message in
+ *  yet: consumed by the next main-pane thread/start. */
+let pendingNewThreadMcp: string[] | null = null;
+
+function saveThreadMcp(): void {
+  const tmp = `${threadMcpFile()}.tmp`;
+  writeFileSync(tmp, serializeThreadMcp(threadMcp), { mode: 0o600 });
+  renameSync(tmp, threadMcpFile());
+}
+
+function enabledMcpFor(threadId: string | null): string[] {
+  if (!threadId) return pendingNewThreadMcp ?? [];
+  return [...(threadMcp.get(rootThreadOf(threadId)) ?? [])].sort();
+}
+
+/** The `config` override for a thread: every server in mcp-servers.json the
+ *  conversation has not enabled is off. */
+function mcpOverrideFor(threadId: string | null): Record<string, unknown> {
+  const configured = readMcpConfig()
+    .servers.filter((s) => s.enabled !== false)
+    .map((s) => s.name);
+  return mcpConfigOverride(configured, new Set(enabledMcpFor(threadId)));
 }
 
 // A project is a display name + one or more source folders (chats whose cwd
@@ -7747,58 +7840,6 @@ app.whenReady().then(async () => {
   // transcript looks identical to a live one, so the renderer has to ask —
   // otherwise a request whose turn died with the app still shows Allow/Deny.
   // ---- MCP servers -------------------------------------------------------
-  // Two different truths, deliberately reported separately: `connected` is
-  // what the running engine actually has (authoritative, but empty while the
-  // engine is down or before a restart), and `configured` is what the user
-  // has asked for. A server present in the second and absent from the first
-  // is exactly the "restart to apply" case the panel needs to show.
-  function mcpConfigPath(): string {
-    return join(app.getPath("home"), ".unbiased", "mcp-servers.json");
-  }
-  type UserMcpServer = {
-    name: string;
-    command?: string;
-    args?: string[];
-    env?: Record<string, string>;
-    url?: string;
-    bearerTokenEnvVar?: string;
-    /** Absent means on. Off keeps the entry — and its OAuth registration —
-     *  while leaving it out of the engine's config. */
-    enabled?: boolean;
-    /** An OAuth client WE registered with the provider, so its consent screen
-     *  shows Unbiased rather than codex's dynamically-registered "Codex". */
-    oauthClientId?: string;
-    /** Providers whose token exchange needs a secret (Google). Its presence
-     *  routes the server through the engine's managed-plugin path. */
-    oauthClientSecret?: string;
-    scopes?: string[];
-    startupTimeoutSec?: number;
-    toolTimeoutSec?: number;
-    enabledTools?: string[];
-  };
-  // Absent and unreadable are NOT the same answer. Returning [] for both let a
-  // save overwrite a file we had failed to parse — a malformed file read as
-  // "no servers", and the next Save wrote only the newly added one, silently
-  // destroying the rest. The engine fails loudly on this file for exactly this
-  // reason; so must we.
-  function readMcpConfig(): { servers: UserMcpServer[]; error: string | null } {
-    let text: string;
-    try {
-      text = readFileSync(mcpConfigPath(), "utf8");
-    } catch (err) {
-      const missing = (err as NodeJS.ErrnoException)?.code === "ENOENT";
-      return { servers: [], error: missing ? null : `Could not read ${mcpConfigPath()}: ${String(err)}` };
-    }
-    try {
-      const raw = JSON.parse(text) as { servers?: unknown };
-      if (raw.servers !== undefined && !Array.isArray(raw.servers)) {
-        return { servers: [], error: `${mcpConfigPath()} has a "servers" value that is not a list.` };
-      }
-      return { servers: (raw.servers as UserMcpServer[]) ?? [], error: null };
-    } catch {
-      return { servers: [], error: `${mcpConfigPath()} is not valid JSON. Fix or delete it — saving now would discard whatever it holds.` };
-    }
-  }
   // Mirrors internal/engine/mcp.go. Kept in sync by hand and deliberately
   // NOT authoritative: the engine revalidates before writing config.toml.
   // This copy exists only so the form can refuse a bad server immediately
