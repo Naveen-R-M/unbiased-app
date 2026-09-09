@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mcpConfigOverride, parseThreadMcp, serializeThreadMcp, mcpChipLabel, THREAD_MCP_FILE } from "./thread-mcp";
+import { mcpApplyDecision, mcpConfigOverride, parseThreadMcp, serializeThreadMcp, mcpChipLabel, THREAD_MCP_FILE } from "./thread-mcp";
 
 // Measured 2026-09-09: the Figma run started at 56,495 tokens, ~35k of them
 // MCP tool schemas from four connected servers the task never used. The
@@ -36,4 +36,10 @@ test("the chip says off, the one name, or a count", () => {
   assert.equal(mcpChipLabel([]), "MCP off");
   assert.equal(mcpChipLabel(["figma_mcp"]), "MCP: figma_mcp");
   assert.equal(mcpChipLabel(["a", "b", "c"]), "MCP: 3 on");
+});
+
+test("a switch applies now on an idle thread, queues while a turn runs, and is only a note for a thread that has not started", () => {
+  assert.equal(mcpApplyDecision({ threadId: null, running: false }), "pending-new-thread");
+  assert.equal(mcpApplyDecision({ threadId: "t", running: false }), "apply");
+  assert.equal(mcpApplyDecision({ threadId: "t", running: true }), "queue");
 });

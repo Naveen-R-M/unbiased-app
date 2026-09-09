@@ -53,3 +53,14 @@ export function mcpChipLabel(enabled: readonly string[]): string {
   if (enabled.length === 1) return `MCP: ${enabled[0]}`;
   return `MCP: ${enabled.length} on`;
 }
+
+/** Measured 2026-09-09: thread/resume on a LOADED thread hands back the
+ *  loaded session and ignores config; thread/unsubscribe then thread/resume
+ *  re-creates it with the new set in ~2 s, same id, history intact. A resume
+ *  mid-turn would kill the turn, so a running thread waits for turn/completed. */
+export type McpApplyDecision = "apply" | "queue" | "pending-new-thread";
+
+export function mcpApplyDecision(s: { threadId: string | null; running: boolean }): McpApplyDecision {
+  if (!s.threadId) return "pending-new-thread";
+  return s.running ? "queue" : "apply";
+}

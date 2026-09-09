@@ -35,7 +35,7 @@ import { get as httpGet } from "node:http";
 import { EngineClient, engineVersionFromUserAgent, type EngineStatus } from "./engine";
 import { pollDeviceToken, requestDeviceAuthorization } from "./device-auth";
 import { RendererCrashRecovery } from "./crash-recovery";
-import { mcpConfigOverride, parseThreadMcp, serializeThreadMcp, THREAD_MCP_FILE } from "./thread-mcp";
+import { mcpApplyDecision, mcpConfigOverride, parseThreadMcp, serializeThreadMcp, THREAD_MCP_FILE } from "./thread-mcp";
 import {
   type BatchStep,
   type AxResult,
@@ -3993,6 +3993,20 @@ function enabledMcpFor(threadId: string | null): string[] {
   return [...(threadMcp.get(rootThreadOf(threadId)) ?? [])].sort();
 }
 
+/** Threads whose MCP set changed while a turn was running; applied at turn end. */
+const mcpApplyPending = new Set<string>();
+
+/** Swap a live thread's MCP servers. The engine gives back the loaded session
+ *  on a plain resume and never re-reads config, so the thread has to be
+ *  dropped first; unsubscribe + resume re-creates it with the new set in ~2 s,
+ *  same id, history intact (measured 2026-09-09). Never call this while a turn
+ *  is running — the resume would kill it. */
+async function applyThreadMcp(threadId: string): Promise<void> {
+  await engine.request("thread/unsubscribe", { threadId });
+  await engine.request("thread/resume", resumeParamsFor(threadId));
+  send("mcp:thread-applied", { threadId, enabled: enabledMcpFor(threadId) });
+}
+
 /** The `config` override for a thread: every server in mcp-servers.json the
  *  conversation has not enabled is off. */
 function mcpOverrideFor(threadId: string | null): Record<string, unknown> {
@@ -5894,6 +5908,12 @@ function wireNotifications(): void {
           // Idle again: nothing of the user's is competing for the gateway.
           if (runningTurns.size <= 1) learning?.setIdle(true);
           runningTurns.delete(threadId);
+          if (mcpApplyPending.delete(threadId)) {
+            // Queued while the turn ran; the thread is idle now.
+            void applyThreadMcp(threadId).catch((err) =>
+              send("mcp:thread-applied", { threadId, enabled: enabledMcpFor(threadId), error: String(err) }),
+            );
+          }
           bgStream.delete(threadId);
           // A turn can't end while the engine still waits on an approval —
           // it dropped the request (interrupt/failure). Retire the card so
@@ -8019,6 +8039,47 @@ app.whenReady().then(async () => {
     iconTrimCache.set(src, out);
     return out;
   }
+
+  ipcMain.handle("mcp:thread-get", (_e, threadId: string | null) => {
+    const cfg = readMcpConfig();
+    return {
+      configured: cfg.servers.filter((sv) => sv.enabled !== false).map((sv) => sv.name),
+      enabled: enabledMcpFor(threadId),
+      pending: threadId ? mcpApplyPending.has(threadId) : false,
+      running: threadId ? runningTurns.has(threadId) : false,
+    };
+  });
+
+  ipcMain.handle("mcp:thread-set", async (_e, payload: { threadId: string | null; enabled: string[] }) => {
+    const names = [...new Set(payload.enabled.filter((nm) => typeof nm === "string"))];
+    const decision = mcpApplyDecision({
+      threadId: payload.threadId,
+      running: payload.threadId ? runningTurns.has(payload.threadId) : false,
+    });
+    // No thread yet: the composer's choice is held and consumed by the
+    // thread/start the first message makes.
+    if (decision === "pending-new-thread") {
+      pendingNewThreadMcp = names;
+      return { status: "pending-new-thread" as const };
+    }
+    const threadId = payload.threadId as string;
+    const root = rootThreadOf(threadId);
+    if (names.length) threadMcp.set(root, new Set(names));
+    else threadMcp.delete(root);
+    saveThreadMcp();
+    if (decision === "queue") {
+      mcpApplyPending.add(threadId);
+      return { status: "queued" as const };
+    }
+    try {
+      await applyThreadMcp(threadId);
+      return { status: "applied" as const };
+    } catch (err) {
+      // "no rollout found": a thread that has not completed a turn cannot be
+      // resumed. The set is saved; it applies on the next load.
+      return { status: "saved" as const, error: String(err) };
+    }
+  });
 
   ipcMain.handle("mcp:list", async () => {
     const cfg = readMcpConfig();
@@ -10639,6 +10700,9 @@ app.whenReady().then(async () => {
     }
     runningTurns.delete(id);
     settleLocalApprovals(id);
+    threadMcp.delete(id);
+    mcpApplyPending.delete(id);
+    saveThreadMcp();
     browserNetGrants.delete(id);
     browserConnectGrants.delete(id);
     threadAccessModes.delete(id);
