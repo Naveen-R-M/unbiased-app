@@ -162,6 +162,38 @@ Rollouts only ever grow — compaction shortens what's *sent to the model*,
 not what's on disk. Settings → Resources shows the real footprint per
 conversation.
 
+## An attached image the app cannot decode is converted, not degraded
+
+Attachments reach the engine two ways: an image goes as a `localImage` item
+(the model sees pixels), anything else goes as a `mention` (the engine reads
+the path as text). Which one it is was decided by asking Electron's
+`nativeImage` to decode the file — and Electron cannot decode WebP, nor HEIC
+or AVIF on every build.
+
+Measured 2026-09-09: a WebP logo was attached with "draw this icon as is".
+The extension said image, the decode said empty, the record fell through to
+`kind: "file"`, and the engine dropped the binary mention without a word. The
+model's context held **zero** images (verified in the rollout: no
+`input_image` item, and the string "webp" appears nowhere in the session). It
+inferred the subject from the target frame's NAME, drew the mark from memory,
+and reported success. Every other failure in this series was slow; this one
+was wrong.
+
+So a file whose extension promises pixels but which fails to decode is
+converted to PNG with `sips -s format png` and the converted copy is attached
+instead — verified on that exact file: empty before, 1280x1280 after. The
+destination is derived from the source path, so a re-attach reuses it; the
+card still shows the original filename; and if there is no `sips` or the
+format is genuinely unreadable it falls back to a file mention as before,
+with a line in the diagnostic log either way. SVG is excluded on purpose: it
+is a vector and `sips` cannot rasterise it, so trying would only cost a failed
+subprocess on every attach.
+
+The model side is covered too, because no tool can detect this: the per-turn
+computer directive now says to work only from what is actually in front of it,
+and to say an image did not arrive rather than reconstruct it from memory or
+from a file or frame name.
+
 ## MCP servers are per conversation
 
 Every MCP server the engine connects to puts its whole tool schema in front

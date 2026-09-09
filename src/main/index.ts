@@ -97,6 +97,7 @@ import {
   CHECKPOINT_TOOLS, checkpointPath, validateCheckpointNotes, renderCheckpoint, pushFact, checkpointDue,
   checkpointGateText, checkpointPreamble, isGatedTool, pathsInCommand, remeasureNudge, type LedgerEntry,
 } from "./checkpoint";
+import { looksLikeImage, convertedImagePath, sipsArgs } from "./attachments";
 import { isProductionBuild } from "./runtime-mode";
 import {
   dueAt,
@@ -3758,6 +3759,16 @@ const COMPUTER_DIRECTIVE =
   "search field, press its results, press its tabs — rather than constructing a URL that guesses at what the user meant. " +
   "Report only what you actually read. Every number, name, distance, time or price in your answer must appear in a tool " +
   "result from this turn; if the app never showed it, say what you could not get instead of filling the gap. " +
+  // The input-side twin of the sentence above, and measured the same way.
+  // 2026-09-09: an attached WebP logo could not be decoded, so it reached the
+  // model as nothing at all. The model inferred the subject from the target
+  // frame's NAME, drew the mark from memory, and reported success — the one
+  // failure in this whole series that produced a wrong result rather than a
+  // slow one. Nothing in the tools could have caught it; only the model knows
+  // its own context is missing the thing the task is about.
+  "Work only from what is actually in front of you. If the task refers to an image, file or document that is not in " +
+  "this conversation, say that it did not arrive and stop — never reconstruct it from memory of what it probably " +
+  "looks like, and never infer it from a file or frame name. " +
   "Every desktop action still requires explicit user approval.";
 
 // Work-in mode for NEW project chats: the live checkout, or an isolated
@@ -10104,6 +10115,27 @@ app.whenReady().then(async () => {
     }
   });
 
+  /** A PNG copy of an image this app cannot decode, or null. See
+   *  attachments.ts for what this cost when it was missing. Cheap and cached:
+   *  the destination is derived from the source path, so a re-attach of the
+   *  same file skips the subprocess. */
+  function pngCopyOf(source: string): string | null {
+    const dir = join(app.getPath("temp"), "unbiased-converted");
+    const out = convertedImagePath(source, dir);
+    try {
+      if (existsSync(out) && statSync(out).size > 0) return out;
+      mkdirSync(dir, { recursive: true });
+      // Absolute path: this must be macOS's sips, not something earlier on a
+      // PATH the app inherited.
+      execFileSync("/usr/bin/sips", sipsArgs(source, out), { stdio: "ignore", timeout: 15_000 });
+      return statSync(out).size > 0 ? out : null;
+    } catch {
+      // No sips, an unsupported format, or a corrupt file: the caller falls
+      // back to attaching it as a plain file, which is what happened before.
+      return null;
+    }
+  }
+
   /** One attachment record from a path — folder, image (thumbnailed, sent as
    *  localImage so the model sees pixels rather than binary in context), or a
    *  plain file. Shared by the picker and by drag-and-drop. */
@@ -10114,9 +10146,24 @@ app.whenReady().then(async () => {
     } catch {
       // fall through to the generic file card
     }
-    if (/\.(png|jpe?g|gif|webp|bmp)$/i.test(path)) {
+    if (looksLikeImage(path)) {
       const img = nativeImage.createFromPath(path);
       if (!img.isEmpty()) return { path, name, kind: "image", thumb: thumbDataUrl(img) };
+      // The extension promised pixels and the decoder disagreed. Convert
+      // rather than degrade to a file mention: measured 2026-09-09, that
+      // silent degradation put NO image in the model's context and it drew a
+      // logo from memory instead of saying the source had not arrived.
+      // `name` stays the original so the card reads as the file the user
+      // picked; only the path the engine reads is the converted copy.
+      const png = pngCopyOf(path);
+      if (png) {
+        const converted = nativeImage.createFromPath(png);
+        if (!converted.isEmpty()) {
+          axLog(`attachment: converted ${name} to PNG for the model (this app cannot decode it directly)`);
+          return { path: png, name, kind: "image", thumb: thumbDataUrl(converted) };
+        }
+      }
+      axLog(`attachment: ${name} looks like an image but could not be decoded or converted; attaching as a file`);
     }
     return { path, name, kind: "file" };
   }
