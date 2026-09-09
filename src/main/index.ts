@@ -35,6 +35,7 @@ import { get as httpGet } from "node:http";
 import { EngineClient, engineVersionFromUserAgent, type EngineStatus } from "./engine";
 import { pollDeviceToken, requestDeviceAuthorization } from "./device-auth";
 import { RendererCrashRecovery } from "./crash-recovery";
+import { mcpApplyDecision, mcpConfigOverride, parseThreadMcp, serializeThreadMcp, THREAD_MCP_FILE } from "./thread-mcp";
 import {
   type BatchStep,
   type AxResult,
@@ -42,6 +43,13 @@ import {
   parkedNextCall,
   parkedReadNote,
   batchNudge,
+  isSingleEdit,
+  stepsForNudge,
+  touchedFieldIds,
+  renderFieldValues,
+  type FieldValue,
+  renderInspector,
+  type InspectorField,
   BATCH_NUDGE_AFTER,
   type RecentEdit,
   shouldSendSkill,
@@ -61,7 +69,6 @@ import {
   coordinateToolAllowed,
   withScreenshotGuidance,
   axReadOptsFrom,
-  axFilterSwitched,
   AX_DEFAULT_READ_OPTS,
   type AxReadOpts,
   shouldRecoverRaise,
@@ -86,6 +93,10 @@ import {
   otherSpaceNote,
   launchOutcome,
 } from "./ax-bridge";
+import {
+  CHECKPOINT_TOOLS, checkpointPath, validateCheckpointNotes, renderCheckpoint, pushFact, checkpointDue,
+  checkpointGateText, checkpointPreamble, isGatedTool, type LedgerEntry,
+} from "./checkpoint";
 import { isProductionBuild } from "./runtime-mode";
 import {
   dueAt,
@@ -1365,7 +1376,8 @@ const AX_TOOLS = [
     name: "computer_press_key",
     description:
       "Send one real key event. Use it for what pressing a control cannot express: committing a field with return, dismissing with escape, moving with tab or the arrows, and SELECTING A TOOL by its shortcut. " +
-      "A single letter or digit is a key, which is often the only way in: a design app puts its tools behind one-character shortcuts and exposes no element for them at all, so Figma's pen is \"p\" and nothing else reaches it. modifiers holds command, shift, option or control around the keystroke. " +
+      "A single letter or digit is a key, which is often the only way in: a design app puts its tools behind one-character shortcuts and exposes no element for them at all, a pen or shape tool is one letter and nothing else reaches it. modifiers holds command, shift, option or control around the keystroke. " +
+      "A bare digit is text: with keyboard focus off a field it is refused, because it would reach the app as a shortcut — enter numbers with type or set_value on the field. A delete with focus off a field removes objects and is watched even inside computer_do, with what it removed named. " +
       "Pass id to aim the key at an element, which is focused first — WITHOUT id it goes wherever keyboard focus already happens to be, which may be another field entirely. Reaches a background app on any Space without taking the user's screen, because a key event does not depend on where the window is. " +
       "It waits for the app to react and returns what changed — committing a search with return comes back with the results in it, so do not read again straight afterwards.",
     inputSchema: {
@@ -1407,9 +1419,9 @@ const AX_TOOLS = [
     name: "computer_do",
     description:
       "Run several steps on ONE app in a single call, in order, and get back what changed. Use this whenever you already know the next few moves — filling a field and committing it, pressing a tab and reading the result, scrolling and reading. It saves a whole round trip per step, which is the main cost of operating an app. " +
-      "Each step is {do, ...}: do=\"press\" with id; do=\"set_value\" with id and text; do=\"key\" with key (and optional id to aim it); do=\"scroll\" with id and direction; do=\"act\" with id and action; do=\"read\" to re-read the app. Add wait_ms to a step to pause after it, for content that loads (a tab that shows \"Loading…\"). " +
-      `Up to ${MAX_BATCH_STEPS} steps — use them: one shape's position, size, colour and commit is ONE call, not five. It STOPS at the first step that fails and tells you which one — the rest do not run, so do not assume they did. Every set_value is read back, so a field that kept its old text and appended to it stops the run there instead of corrupting everything computed after it. ` +
-      "SETTING A VALUE IN A WEB APP'S PANEL (Figma, and anything Chromium): set_value works on an element the tree calls a \"text field\" and is SILENTLY IGNORED on a \"stepper\" — the write appears in the box, the value never changes, and it commits later when focus leaves, which is how a 67 became 100100. For a stepper use the four-step recipe in ONE call: {\"do\":\"pointer\",\"id\":N} then {\"do\":\"key\",\"key\":\"a\",\"modifiers\":[\"command\"]} then {\"do\":\"type\",\"text\":\"460\"} then {\"do\":\"key\",\"key\":\"return\"}. Add clicks:2 to the pointer step if one click does not open the field. Read the value back afterwards: some fields reject what you typed and fall back to 0. " +
+      "Each step is {do, ...}: do=\"press\" with id; do=\"set_value\" with id and text; do=\"key\" with key (and optional id to aim it); do=\"scroll\" with id and direction; do=\"act\" with id and action; do=\"read\" to re-read the app; do=\"screenshot\" to photograph the window at that point — the picture comes back with the result, so a look costs no extra turn. Add wait_ms to a step to pause after it, for content that loads (a tab that shows \"Loading…\"). " +
+      `Up to ${MAX_BATCH_STEPS} steps — use them: one shape's position, size, colour and commit is ONE call, not five. It STOPS at the first step that fails and tells you which one — the rest do not run, so do not assume they did. After the batch, every field it touched is read back and listed under \"Fields now:\", so you do not need to read the app to check a value you just wrote. The result also ends with the inspector — every settable control with its id and current value the first time, then only what changed — so the next step can be aimed without reading the app. ` +
+      "SETTING A VALUE IN A WEB APP'S PANEL (any Chromium-based app, which is most design and productivity tools): set_value works on an element the tree calls a \"text field\" and is SILENTLY IGNORED on a \"stepper\" — the write appears in the box, the value never changes, and it commits later when focus leaves, which is how a 67 became 100100. For a stepper use the four-step recipe in ONE call: {\"do\":\"pointer\",\"id\":N} then {\"do\":\"key\",\"key\":\"a\",\"modifiers\":[\"command\"]} then {\"do\":\"type\",\"text\":\"460\"} then {\"do\":\"key\",\"key\":\"return\"}. Add clicks:2 to the pointer step if one click does not open the field. Read the value back afterwards: some fields reject what you typed and fall back to 0. " +
       "Opening or raising an app is not batchable: call computer_launch or computer_raise on its own. Do NOT batch steps whose ids you have not read yet, or steps that depend on what an earlier step reveals — read first, then batch what you can see. " +
       `Pass candidates instead of steps when you can see several plausible ways to reach ONE state and cannot tell which the app will honour: press the result row, or send down then return, or type the whole intent into the search field. Each candidate is a route — a step or a short list of steps — they are tried in order, and it stops at the first that changes the app, telling you what each one did. That is a model turn saved per wrong guess. Read the diff and confirm the state is the one you wanted; "it changed something" is not "it worked". Actions only, never for anything you would not want to happen twice. ` +
       TASK_DISCIPLINE_SENTENCE.trim(),
@@ -1428,7 +1440,7 @@ const AX_TOOLS = [
           items: {
             type: "object",
             properties: {
-              do: { type: "string", enum: ["press", "set_value", "key", "scroll", "act", "read"] },
+              do: { type: "string", enum: ["press", "set_value", "key", "scroll", "act", "read", "screenshot"] },
               id: { type: "integer", description: "Element id from computer_app_state." },
               text: { type: "string", description: "With do=set_value, or with do=type: the whole string to type as real keystrokes." },
               clicks: { type: "integer", description: "With do=pointer: 2 for a double click, which some fields need before they accept typing." },
@@ -1446,6 +1458,7 @@ const AX_TOOLS = [
               direction: { type: "string", enum: ["down", "up", "left", "right"], description: "With do=scroll." },
               amount: { type: "integer", description: "With do=scroll: lines (default 5)." },
               action: { type: "string", description: "With do=act: one of the actions the element listed in braces." },
+              window: { type: "integer", description: "With do=screenshot: window id from computer_app_state (default: the focused window)." },
               wait_ms: { type: "integer", description: "Pause this many ms after the step, for content that loads." },
             },
             required: ["do"],
@@ -1731,6 +1744,7 @@ function threadDynamicTools(): Record<string, unknown>[] | undefined {
       .map((t) => withScreenshotGuidance(t, screenshots, ax?.crossSpace === true)),
     ...SCHEDULE_TOOLS,
     ...MEMORY_TOOLS,
+    ...CHECKPOINT_TOOLS,
     ...(agentBrowserTools() ?? []),
   ];
   return tools.length ? (tools as Record<string, unknown>[]) : undefined;
@@ -2257,6 +2271,24 @@ async function reassertRaise(root: string): Promise<void> {
 /** id -> element line per app, accumulated from every tree and diff the model
  *  saw, so an approval can say WHICH element is about to be pressed. */
 const axLines = new Map<string, Map<number, string>>();
+
+/** The settable controls in the app's latest snapshot, as ids the model can aim
+ *  at next. Sent after every action that can change the selection and after
+ *  every batch. Identical to the last block sent for this app collapses to one
+ *  line, so an unchanged inspector costs almost nothing. Second Figma run,
+ *  2026-09-08: 34 of 90 turns were finds for exactly these ids. */
+const axLastInspector = new Map<string, InspectorField[]>();
+async function inspectorBlock(appName: string): Promise<string | null> {
+  try {
+    const r = await ax!.request("fields", { app: appName }, 3_000);
+    const fields = Array.isArray(r.fields) ? (r.fields as InspectorField[]) : [];
+    const text = renderInspector(fields, r.truncated === true, axLastInspector.get(appName));
+    if (fields.length) axLastInspector.set(appName, fields);
+    return text;
+  } catch {
+    return null; // an older bridge has no `fields`
+  }
+}
 /** app name -> its icon as a data URL, fetched once per app. The transcript
  *  shows it beside each step, so "press #643 in Brave" carries Brave's icon
  *  rather than a terminal glyph. */
@@ -2371,6 +2403,8 @@ async function runBatchStep(appName: string, st: BatchStep, settle = true): Prom
       return await ax!.request("pointer", { app: appName, id: st.id, ...(st.clicks ? { clicks: st.clicks } : {}), ...opts });
     case "key":
       return await ax!.request("key", { app: appName, key: st.key, ...(st.id !== undefined ? { id: st.id } : {}), ...(st.modifiers?.length ? { modifiers: st.modifiers } : {}), ...opts });
+    case "screenshot":
+      return await ax!.request("screenshot", { app: appName, ...(st.window !== undefined ? { window: st.window } : {}) }, 15_000);
     case "scroll": {
       const amount = typeof st.amount === "number" && st.amount > 0 ? Math.min(st.amount, 40) : 5;
       const d = SCROLL_DELTAS[st.direction];
@@ -2453,6 +2487,16 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
   // a card there ignores what the user set. Mode first, then the grant.
   const root = rootThreadOf(threadId);
   const mode = liveAccessMode(root);
+  // Past the context threshold, the first ACTION is held once and the model is
+  // handed the literal save call — before the approval card, so the user is not
+  // asked to approve something that will not run. Reads pass: they are how the
+  // model finds out where it is.
+  const cycle = checkpointCycle(root);
+  if (isGatedTool(tool) && checkpointDue({ percent: ctxPercent.get(root) ?? null, savedThisCycle: cycle.savedThisCycle, gateUsed: cycle.gateUsed })) {
+    cycle.gateUsed = true;
+    axLog(`checkpoint: held ${tool} at ${String(ctxPercent.get(root))}% until notes are saved`);
+    return axText(checkpointGateText(ctxPercent.get(root) ?? 0, checkpointFile(root)), false);
+  }
   if (axConsent({ tool, mode, granted: axGrants.has(root) }) === "ask") {
     const decision = await requestLocalApproval(
       threadId,
@@ -2484,6 +2528,7 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
       case "computer_raise": {
         axLog(`raise ${appName} (the model asked)`);
         axRaised.set(root, appName);
+        recordFact(threadId, `${appName} raised (the model asked)`);
         const r = await ax.request("raise", { app: appName, ...axActionOpts(appName) });
         const diff = String(r.diff ?? "");
         remember(diff);
@@ -2495,7 +2540,6 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         // lines later is diffed against — in the PREVIOUS read's view, unless
         // this runs first.
         const want = axReadOptsFrom(a);
-        const switched = axFilterSwitched(axReadOpts.get(appName), want);
         axReadOpts.set(appName, want);
         let w = await ax.request("windows", { app: appName }, 3_000);
         // An app this conversation already raised can drift back off-Space
@@ -2526,10 +2570,11 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
           // view every action after it uses are one object, not two that can
           // drift.
           ...want,
-          // a changed filter has no honest diff — the bridge would report every
-          // element the old filter hid as added, and every one the new filter
-          // hides as removed
-          full: a.full === true || switched,
+          // The bridge holds one baseline per filter, so a changed filter is a
+          // diff against that filter's own last read — full is only ever the
+          // model's explicit ask. (Before that, 28 flips in one Figma run each
+          // forced a whole tree and drove two compactions.)
+          full: a.full === true,
         };
         if (typeof a.query === "string" && a.query.trim()) {
           const r = await ax.request("find", { ...opts, title: a.query.trim(), ...(typeof a.role === "string" ? { role: a.role } : {}) });
@@ -2558,6 +2603,7 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         // The bridge answers ok at its deadline as long as the app is RUNNING;
         // only a window line proves the tree is readable. With cross-Space on
         // there is never a hint to say otherwise, so the sentence has to.
+        recordFact(threadId, `${appName} launched: ${launchOutcome(tree)}`);
         if (launchOutcome(tree) === "running") {
           return axText(`${appName} is running but no window is readable yet — read it again in a moment.${hint}\n${tree}`, true);
         }
@@ -2576,9 +2622,15 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         const parsed = parseBatchSteps(a.steps);
         if ("error" in parsed) return axText(parsed.error, false);
         const steps = parsed.steps;
-        axRecentEdits = []; // the caller batched; nothing to nudge about
+        // A batch that edited one thing is one edit, whatever it took to land it;
+        // only a batch that edited several things is the behaviour the nudge asks for.
+        const batchNudgeText = isSingleEdit(steps)
+          ? recordEditAndNudge(root, appName, { tool: "computer_do", app: appName, steps: stepsForNudge(steps) })
+          : (axRecentEdits = [], null);
         axLog(`do ${appName} ${steps.length} step(s): ${steps.map((x) => x.do).join(",")}`);
         const ran: string[] = [];
+        const pictures: AxResult[] = [];
+        const watched: { step: string; diff: string }[] = [];
         let failed: { step: string; message: string } | null = null;
         // One bridge call per step. That is the cheap round trip — 3-70ms over
         // a local pipe — and collapsing them into ONE model round trip is the
@@ -2586,7 +2638,12 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         for (const [i, st] of steps.entries()) {
           const label = `step ${i + 1} (${traceStep(st)})`;
           try {
-            await runBatchStep(appName, st, i === steps.length - 1);
+            const stepResult = await runBatchStep(appName, st, i === steps.length - 1);
+            if (st.do === "screenshot") pictures.push(stepResult);
+            // The bridge watches a delete outside a text field even mid-sequence
+            // and hands back that step's own diff: show it, or a frame removed
+            // at step 4 is one id range in the closing diff.
+            if (typeof stepResult.watched === "string" && typeof stepResult.diff === "string") watched.push({ step: label, diff: stepResult.diff });
             ran.push(label);
             if (st.waitMs > 0) await new Promise((r) => setTimeout(r, st.waitMs));
           } catch (err) {
@@ -2606,13 +2663,49 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
           // A batch that closed the window it was working in has no tree left
           // to show. The step log above still says what ran.
         }
-        return axText(
+        // Read back every field the batch touched, so nobody has to read the
+        // app to check a value it just wrote. One bridge call, one attribute
+        // read per id; an older bridge without `values` costs nothing but the
+        // caveat.
+        let fields: string | undefined;
+        const touched = touchedFieldIds(steps);
+        if (touched.length) {
+          try {
+            const r = await ax.request("values", { app: appName, ids: touched }, 3_000);
+            const values = Array.isArray(r.values) ? (r.values as FieldValue[]) : [];
+            if (values.length) fields = renderFieldValues(values);
+            for (const v of values) recordFact(threadId, `${appName} #${v.id}${v.title ? ` ${JSON.stringify(v.title)}` : ""} = ${v.value ?? "(no value)"}`);
+          } catch {
+            // the diff still stands
+          }
+        }
+        const inspector = await inspectorBlock(appName);
+        const captions = pictures.map((r, i) => {
+          const where = r.onSpace === false ? ", on another Space" : "";
+          const note = typeof r.note === "string" ? ` ${r.note}` : "";
+          return `Picture ${i + 1}: window ${String(r.window)} of ${appName}, ${String(r.width)}x${String(r.height)}${where}.${note}`;
+        });
+        const text = [
           summarizeBatch({
             ran, failed, remaining: steps.length - ran.length - (failed ? 1 : 0), diff,
-            unwatched: steps.length > 1,
+            unwatched: steps.length > 1, fields, watched,
           }),
-          failed === null,
-        );
+          inspector,
+          ...captions,
+          batchNudgeText,
+        ].filter(Boolean).join("\n");
+        return {
+          contentItems: [
+            { type: "inputText", text },
+            ...pictures.flatMap((r) => {
+              const image = String(r.image ?? "");
+              if (!image) return [];
+              const mime = typeof r.mime === "string" ? r.mime : "image/png";
+              return [{ type: "inputImage" as const, imageUrl: `data:${mime};base64,${image}` }];
+            }),
+          ],
+          success: failed === null,
+        };
       }
       case "computer_scroll_view": {
         const amount = typeof a.amount === "number" && a.amount > 0 ? Math.min(a.amount, 40) : 5;
@@ -2653,8 +2746,15 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         // Where the fractions landed, so a caller can see its own geometry and
         // correct it without guessing at a display scale.
         const at = Array.isArray(r.at) ? (r.at as { x: number; y: number }[]) : [];
+        if (at.length) recordFact(threadId, `${appName} pointer #${String(a.id)} ${hold ? "drag" : "click"} landed ${at.map((q) => `(${q.x},${q.y})`).join(" ")}`);
         const where = at.length ? `\nLanded at ${at.map((q) => `(${q.x},${q.y})`).join(" ")}.` : "";
-        return axText(`${hold ? "Dragged" : "Clicked"} ${path ? `${path.length} point(s)` : "the centre"} in ${appName}.${where}\n${diff || "(nothing in the tree changed — a canvas often shows its result only as a new object, so read the app)"}`, true);
+        const inspector = await inspectorBlock(appName); // a click changes the selection; the inspector follows
+        // A plain click is one edit; a drawn stroke has no batch step and only
+        // interrupts a run (asStep says so by returning null for a path).
+        const pointerNudge = recordEditAndNudge(root, appName, {
+          tool: "computer_pointer", app: appName, id: a.id as number, ...(typeof a.clicks === "number" ? { clicks: a.clicks } : {}), ...(path ? { path: true } : {}),
+        });
+        return axText([`${hold ? "Dragged" : "Clicked"} ${path ? `${path.length} point(s)` : "the centre"} in ${appName}.${where}\n${diff || "(nothing in the tree changed — a canvas often shows its result only as a new object, so read the app)"}`, inspector, pointerNudge].filter(Boolean).join("\n"), true);
       }
       case "computer_app_screenshot": {
         const r = await ax.request("screenshot", { app: appName, ...(typeof a.window === "number" ? { window: a.window } : {}) }, 15_000);
@@ -2698,6 +2798,7 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
           if (text === null) return axText("text is required.", false);
           axLog(`type ${appName} #${String(a.id)} <set>`);
           r = await ax.request("setValue", { app: appName, id: a.id, value: text, ...axActionOpts(appName) });
+          recordFact(threadId, `${appName} set #${String(a.id)} = ${JSON.stringify(text)}`);
         } else {
           const action = tool === "computer_press" ? "press" : String(a.action ?? "");
           if (!action) return axText("action is required. Use one of the actions the element listed in braces.", false);
@@ -2706,7 +2807,7 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         }
         const diff = String(r.diff ?? "");
         remember(diff);
-        axRecentEdits.push({
+        const nudge = recordEditAndNudge(root, appName, {
           tool,
           app: appName,
           ...(typeof a.id === "number" ? { id: a.id } : {}),
@@ -2714,19 +2815,16 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
           ...(typeof a.key === "string" ? { key: a.key } : {}),
           ...(typeof a.action === "string" ? { action: a.action } : {}),
         });
-        if (axRecentEdits.length > BATCH_NUDGE_AFTER * 2) axRecentEdits = axRecentEdits.slice(-BATCH_NUDGE_AFTER * 2);
-        const nudge = axBatchNudged.has(root) ? null : batchNudge(axRecentEdits);
-        if (nudge) {
-          axBatchNudged.add(root);
-          axLog(`nudged ${appName} toward computer_do after ${axRecentEdits.length} single actions`);
-        }
         const hint = typeof r.hint === "string" ? r.hint : null;
         // Only for the verbs that go through hit-testing. Telling a caller that
         // just sent a key to send a key is noise, and it is the click that
         // dies on a parked window.
         const clicked = tool === "computer_press" || tool === "computer_act" || tool === "computer_set_value";
+        // A press or a named action can change the selection, which is when the
+        // inspector's ids change; a key or a value write does not.
+        const inspector = tool === "computer_press" || tool === "computer_act" ? await inspectorBlock(appName) : null;
         return axText(
-          [renderActionResult(diff, hint, hint && clicked ? parkedNextCall(appName) : null), nudge].filter(Boolean).join("\n"),
+          [renderActionResult(diff, hint, hint && clicked ? parkedNextCall(appName) : null), inspector, nudge].filter(Boolean).join("\n"),
           true,
         );
       }
@@ -3796,6 +3894,59 @@ function projectsFile(): string {
   return join(app.getPath("userData"), "projects.json");
 }
 
+// Two different truths, deliberately reported separately: `connected` is
+// what the running engine actually has (authoritative, but empty while the
+// engine is down or before a restart), and `configured` is what the user
+// has asked for. A server present in the second and absent from the first
+// is exactly the "restart to apply" case the panel needs to show.
+function mcpConfigPath(): string {
+  return join(app.getPath("home"), ".unbiased", "mcp-servers.json");
+}
+type UserMcpServer = {
+  name: string;
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  url?: string;
+  bearerTokenEnvVar?: string;
+  /** Absent means on. Off keeps the entry — and its OAuth registration —
+   *  while leaving it out of the engine's config. */
+  enabled?: boolean;
+  /** An OAuth client WE registered with the provider, so its consent screen
+   *  shows Unbiased rather than codex's dynamically-registered "Codex". */
+  oauthClientId?: string;
+  /** Providers whose token exchange needs a secret (Google). Its presence
+   *  routes the server through the engine's managed-plugin path. */
+  oauthClientSecret?: string;
+  scopes?: string[];
+  startupTimeoutSec?: number;
+  toolTimeoutSec?: number;
+  enabledTools?: string[];
+};
+// Absent and unreadable are NOT the same answer. Returning [] for both let a
+// save overwrite a file we had failed to parse — a malformed file read as
+// "no servers", and the next Save wrote only the newly added one, silently
+// destroying the rest. The engine fails loudly on this file for exactly this
+// reason; so must we.
+function readMcpConfig(): { servers: UserMcpServer[]; error: string | null } {
+  let text: string;
+  try {
+    text = readFileSync(mcpConfigPath(), "utf8");
+  } catch (err) {
+    const missing = (err as NodeJS.ErrnoException)?.code === "ENOENT";
+    return { servers: [], error: missing ? null : `Could not read ${mcpConfigPath()}: ${String(err)}` };
+  }
+  try {
+    const raw = JSON.parse(text) as { servers?: unknown };
+    if (raw.servers !== undefined && !Array.isArray(raw.servers)) {
+      return { servers: [], error: `${mcpConfigPath()} has a "servers" value that is not a list.` };
+    }
+    return { servers: (raw.servers as UserMcpServer[]) ?? [], error: null };
+  } catch {
+    return { servers: [], error: `${mcpConfigPath()} is not valid JSON. Fix or delete it — saving now would discard whatever it holds.` };
+  }
+}
+
 // App-side thread → project assignment. The engine pins a thread's cwd at
 // creation, so "moving" a Recents chat into a project is a GROUPING override
 // the app owns, not an engine mutation.
@@ -3810,6 +3961,96 @@ function loadThreadProjects(): Record<string, string> {
   } catch {
     return {};
   }
+}
+
+// ── Per-conversation MCP servers ──────────────────────────────────────────
+// See src/main/thread-mcp.ts for the measurement. Keyed by ROOT thread so a
+// side chat or sub-agent sees what its conversation sees.
+function threadMcpFile(): string {
+  return join(app.getPath("userData"), THREAD_MCP_FILE);
+}
+
+const threadMcp: Map<string, Set<string>> = (() => {
+  try {
+    return parseThreadMcp(readFileSync(threadMcpFile(), "utf8"));
+  } catch {
+    return new Map();
+  }
+})();
+
+/** What the user chose for the conversation they have not sent a message in
+ *  yet: consumed by the next main-pane thread/start. */
+let pendingNewThreadMcp: string[] | null = null;
+
+function saveThreadMcp(): void {
+  const tmp = `${threadMcpFile()}.tmp`;
+  writeFileSync(tmp, serializeThreadMcp(threadMcp), { mode: 0o600 });
+  renameSync(tmp, threadMcpFile());
+}
+
+function enabledMcpFor(threadId: string | null): string[] {
+  if (!threadId) return pendingNewThreadMcp ?? [];
+  return [...(threadMcp.get(rootThreadOf(threadId)) ?? [])].sort();
+}
+
+/** Threads whose MCP set changed while a turn was running; applied at turn end. */
+const mcpApplyPending = new Set<string>();
+
+/** Swap a live thread's MCP servers. The engine gives back the loaded session
+ *  on a plain resume and never re-reads config, so the thread has to be
+ *  dropped first; unsubscribe + resume re-creates it with the new set in ~2 s,
+ *  same id, history intact (measured 2026-09-09). Never call this while a turn
+ *  is running — the resume would kill it. */
+async function applyThreadMcp(threadId: string): Promise<void> {
+  await engine.request("thread/unsubscribe", { threadId });
+  await engine.request("thread/resume", resumeParamsFor(threadId));
+  send("mcp:thread-applied", { threadId, enabled: enabledMcpFor(threadId) });
+}
+
+/** The `config` override for a thread: every server in mcp-servers.json the
+ *  conversation has not enabled is off. */
+function mcpOverrideFor(threadId: string | null): Record<string, unknown> {
+  const configured = readMcpConfig()
+    .servers.filter((s) => s.enabled !== false)
+    .map((s) => s.name);
+  return mcpConfigOverride(configured, new Set(enabledMcpFor(threadId)));
+}
+
+// Re-declare everything a thread/start would. Tools are declared per
+// session, not stored with the thread, so a resumed conversation had
+// NO dynamic tools at all — reopening a chat silently cost it the
+// agent browser and the scheduling tool, and the model discovered
+// that mid-task ("there are no browser_connect tools available").
+//
+// Same omission as the side-chat fork, in the path I did not check
+// when fixing that one. ThreadResumeParams accepts
+// developerInstructions; dynamicTools and experimentalRawEvents are
+// experimentalApi fields absent from the schema, and the engine
+// ignores unknown params, so this cannot break a resume. Whether it
+// HONOURS them on resume is unverified — experimentalRawEvents is
+// known to be ignored here (measured for the sub-agent nicknames),
+// so dynamicTools may be too. If it is, a reopened conversation
+// needs a fresh thread to regain tools, not this.
+/** Everything a thread/resume must re-declare, plus the conversation's MCP
+ *  set. One function so the reopen path and the MCP-switch path can never
+ *  disagree — a resume that forgot the override would silently hand the
+ *  thread the engine's whole default server set back. */
+function resumeParamsFor(id: string): Record<string, unknown> {
+  return {
+    threadId: id,
+    ...threadPolicy(),
+    dynamicTools: threadDynamicTools(),
+    // The thread's cwd is only known once the resume RETURNS, so the
+    // memory index rides along when this app session has seen the
+    // thread before, and is omitted on a cold reopen — no section
+    // beats injecting some other project's memory (mainCwd still
+    // points at the conversation being left).
+    developerInstructions: threadCwds.has(id)
+      ? developerInstructionsFor(threadCwds.get(id) ?? null)
+      : APP_DEVELOPER_INSTRUCTIONS,
+    experimentalRawEvents: true,
+    config: mcpOverrideFor(id),
+  };
 }
 
 // A project is a display name + one or more source folders (chats whose cwd
@@ -4136,11 +4377,62 @@ function computerUseSkillText(): string | null {
 /** Conversations that have already been handed the skill. */
 const axSkillSent = new Set<string>();
 
+// ── Working-memory checkpoint (see checkpoint.ts) ─────────────────────────
+// Context occupancy per thread and per root, from thread/tokenUsage/updated.
+const ctxPercent = new Map<string, number>();
+type CheckpointCycle = { savedThisCycle: boolean; gateUsed: boolean; thresholdWritten: boolean; compactions: number; notes: string | null };
+const checkpointCycles = new Map<string, CheckpointCycle>();
+const checkpointLedger = new Map<string, LedgerEntry[]>();
+// Roots whose next tool result must carry the checkpoint back: a compaction
+// happened and the model's verbatim history is gone.
+const checkpointReplayDue = new Set<string>();
+function checkpointCycle(root: string): CheckpointCycle {
+  let c = checkpointCycles.get(root);
+  if (!c) {
+    c = { savedThisCycle: false, gateUsed: false, thresholdWritten: false, compactions: 0, notes: null };
+    checkpointCycles.set(root, c);
+  }
+  return c;
+}
+function checkpointFile(root: string): string {
+  return checkpointPath(threadCwds.get(root) ?? defaultChatDir(), root);
+}
+function writeCheckpoint(root: string): string {
+  const c = checkpointCycle(root);
+  const file = checkpointFile(root);
+  mkdirSync(dirname(file), { recursive: true });
+  writeFileSync(file, renderCheckpoint({
+    root, notes: c.notes, facts: checkpointLedger.get(root) ?? [],
+    savedAt: new Date().toISOString(), percent: ctxPercent.get(root) ?? 0, compactions: c.compactions,
+  }));
+  return file;
+}
+/** A measured fact the app itself observed — a value read back, where a click
+ *  landed, what launched. Never a tree and never a picture. */
+function recordFact(threadId: string | null, text: string): void {
+  const root = rootThreadOf(threadId);
+  const ledger = checkpointLedger.get(root) ?? [];
+  pushFact(ledger, text);
+  checkpointLedger.set(root, ledger);
+}
+
 /** The trailing run of single-action desktop calls, and the conversations that
  *  have already been shown the batch nudge. See batchNudge: said once, because
  *  a reminder on every action would be noise. */
 let axRecentEdits: RecentEdit[] = [];
 const axBatchNudged = new Set<string>();
+/** Record one logical edit and, once per compaction cycle, hand back the batch
+ *  call that would have carried the recent run of them. */
+function recordEditAndNudge(root: string, appName: string, edit: RecentEdit): string | null {
+  axRecentEdits.push(edit);
+  if (axRecentEdits.length > BATCH_NUDGE_AFTER * 2) axRecentEdits = axRecentEdits.slice(-BATCH_NUDGE_AFTER * 2);
+  const nudge = axBatchNudged.has(root) ? null : batchNudge(axRecentEdits);
+  if (nudge) {
+    axBatchNudged.add(root);
+    axLog(`nudged ${appName} toward computer_do after ${axRecentEdits.length} single edits`);
+  }
+  return nudge;
+}
 
 function globalSkillsDir(): string {
   return join(app.getPath("home"), ".unbiased", "skills");
@@ -5513,7 +5805,24 @@ function wireNotifications(): void {
           }
         } else if (item?.type === "contextCompaction") {
           // Mark where the model's verbatim history got summarized.
-          if (phase === "completed") send("chat:compaction", { paneId });
+          if (phase === "completed") {
+            send("chat:compaction", { paneId });
+            if (threadId) {
+              const root = rootThreadOf(threadId);
+              const c = checkpointCycle(root);
+              c.compactions += 1;
+              c.savedThisCycle = false;
+              c.gateUsed = false;
+              c.thresholdWritten = false;
+              checkpointReplayDue.add(root);
+              // The summary ate the skill too: last run the model re-read it
+              // through the shell, 8KB and a turn. Send it again with the next call.
+              axSkillSent.delete(root);
+              // The nudge it heard is in the summary too, if at all. Say it again.
+              axBatchNudged.delete(root);
+              axLog(`checkpoint: compaction ${c.compactions} on ${root}; replay armed, skill and nudge re-armed`);
+            }
+          }
         } else if (item?.type === "fileChange") {
           // File changes render as command-style cards so the approval
           // buttons have a card to land on.
@@ -5563,6 +5872,23 @@ function wireNotifications(): void {
           // best-effort
         }
         if (paneId) send("chat:token-usage", { paneId, ...usage });
+        if (usage.percent !== null) {
+          const root = rootThreadOf(String(params.threadId));
+          ctxPercent.set(String(params.threadId), usage.percent);
+          ctxPercent.set(root, usage.percent);
+          // Past the threshold, write what the app knows right away; the model's
+          // own notes arrive when the gate hands it the call.
+          const c = checkpointCycle(root);
+          if (!c.thresholdWritten && checkpointDue({ percent: usage.percent, savedThisCycle: c.savedThisCycle, gateUsed: c.gateUsed })) {
+            c.thresholdWritten = true;
+            try {
+              writeCheckpoint(root);
+              axLog(`checkpoint: wrote app facts at ${usage.percent}% for ${root}`);
+            } catch {
+              // best-effort; the gate still fires
+            }
+          }
+        }
         break;
       }
       case "turn/completed": {
@@ -5582,6 +5908,12 @@ function wireNotifications(): void {
           // Idle again: nothing of the user's is competing for the gateway.
           if (runningTurns.size <= 1) learning?.setIdle(true);
           runningTurns.delete(threadId);
+          if (mcpApplyPending.delete(threadId)) {
+            // Queued while the turn ran; the thread is idle now.
+            void applyThreadMcp(threadId).catch((err) =>
+              send("mcp:thread-applied", { threadId, enabled: enabledMcpFor(threadId), error: String(err) }),
+            );
+          }
           bgStream.delete(threadId);
           // A turn can't end while the engine still waits on an approval —
           // it dropped the request (interrupt/failure). Retire the card so
@@ -5827,6 +6159,8 @@ function wireNotifications(): void {
         // the browser owns every dynamic tool.
         const call = tool.startsWith("schedule_")
           ? handleScheduleToolCall(tool, args, approvalThread)
+          : tool.startsWith("checkpoint_")
+            ? handleCheckpointToolCall(tool, args, approvalThread)
           : tool.startsWith("memory_")
             ? handleMemoryToolCall(tool, args, approvalThread)
             : routesToAx(tool)
@@ -5844,6 +6178,22 @@ function wireNotifications(): void {
             contentItems: [{ type: "inputText" as const, text: `tool crashed: ${String(err)}` }],
             success: false,
           }))
+          .then((response) => {
+            // The first tool result after a compaction carries the checkpoint
+            // back: the summary kept the plan and dropped the numbers.
+            const root = rootThreadOf(approvalThread);
+            if (!checkpointReplayDue.has(root)) return response;
+            checkpointReplayDue.delete(root);
+            try {
+              const file = checkpointFile(root);
+              if (!existsSync(file)) return response;
+              const md = readFileSync(file, "utf8");
+              axLog(`checkpoint: replayed ${md.length} chars after compaction (${tool})`);
+              return prependSkill(response, checkpointPreamble(md));
+            } catch {
+              return response;
+            }
+          })
           .then((response) => {
             if (!sendSkill) return response;
             const text = computerUseSkillText();
@@ -6125,6 +6475,31 @@ async function handleScheduleToolCall(
 }
 
 // ── Memory tools (model-initiated) ──────────────────────────────────────
+/** checkpoint_save: the model's half of the working memory. Validated (no
+ *  trees, no images, bounded), then written together with the app's ledger.
+ *  Allowed in plan mode: it is the agent's own notes about the conversation,
+ *  and losing them at a compaction is worse than a file under ./memories. */
+async function handleCheckpointToolCall(tool: string, rawArgs: unknown, threadId: string | null): Promise<DynamicToolResponse> {
+  const text = (t: string, ok: boolean): DynamicToolResponse => ({ contentItems: [{ type: "inputText", text: t }], success: ok });
+  if (tool !== "checkpoint_save") return text(`Unknown tool ${tool}`, false);
+  const notes = (rawArgs as { notes?: unknown } | null)?.notes;
+  if (typeof notes !== "string") return text("notes is required: the decisions and measured facts to keep.", false);
+  const v = validateCheckpointNotes(notes);
+  if (!v.ok) return text(v.error, false);
+  const root = rootThreadOf(threadId);
+  const c = checkpointCycle(root);
+  c.notes = notes.trim();
+  c.savedThisCycle = true;
+  try {
+    const file = writeCheckpoint(root);
+    const facts = checkpointLedger.get(root)?.length ?? 0;
+    axLog(`checkpoint: saved ${c.notes.length} chars of notes + ${facts} facts to ${file}`);
+    return text(`Saved working memory to ${file} (${c.notes.length} characters of notes, ${facts} recorded facts). It is handed back to you automatically after the next summary.`, true);
+  } catch (err) {
+    return text(`Could not write the checkpoint: ${String(err)}`, false);
+  }
+}
+
 async function handleMemoryToolCall(
   tool: string,
   rawArgs: unknown,
@@ -6332,6 +6707,10 @@ async function runScheduledTask(
       // thread, so it stays right for runs from previous app versions and
       // needs no pruning.
       threadSource: SCHEDULED_THREAD_SOURCE,
+      // A scheduled run has no one to switch a server on for it, and run 9
+      // measured what the default set costs: ~35k tokens of schemas before
+      // the first word. A run that needs a server is a later feature.
+      config: mcpConfigOverride(readMcpConfig().servers.map((sv) => sv.name), new Set()),
     })) as { thread: { id: string } };
     threadId = started.thread.id;
     threadCwds.set(threadId, cwd); // memory_save from this run targets ITS project
@@ -6830,6 +7209,8 @@ app.whenReady().then(async () => {
           dynamicTools: threadDynamicTools(),
           developerInstructions: developerInstructionsFor(mainCwd),
           experimentalRawEvents: true,
+          // A side chat sees what its conversation sees.
+          config: mcpOverrideFor(panes.main.threadId),
         })) as { thread: { id: string } };
       } else if (paneId.startsWith("side")) {
         // No parent conversation yet: a plain scratch thread.
@@ -6839,6 +7220,7 @@ app.whenReady().then(async () => {
           experimentalRawEvents: true,
           dynamicTools: threadDynamicTools(),
           developerInstructions: developerInstructionsFor(mainCwd),
+          config: mcpOverrideFor(null),
         })) as { thread: { id: string } };
       } else {
         // Explicit default when no project is chosen — left implicit, the
@@ -6866,10 +7248,18 @@ app.whenReady().then(async () => {
           // Raw response items feed the sub-agent viewer (task text + spawn
           // instructions). Sub-threads inherit this from their parent.
           experimentalRawEvents: true,
+          config: mcpOverrideFor(null),
         })) as { thread: { id: string }; cwd?: string };
         mainCwd = (started as { cwd?: string }).cwd ?? cwd;
       }
       pane.threadId = started.thread.id;
+      // The choice made in the composer before the first message belongs to
+      // the thread that message created.
+      if (paneId === "main" && pendingNewThreadMcp) {
+        if (pendingNewThreadMcp.length) threadMcp.set(started.thread.id, new Set(pendingNewThreadMcp));
+        pendingNewThreadMcp = null;
+        saveThreadMcp();
+      }
       // Side/fork threads inherit the main conversation's cwd; the main
       // branch just set mainCwd above. Recorded so a memory_save from any of
       // them resolves to the right project's store.
@@ -7160,6 +7550,7 @@ app.whenReady().then(async () => {
           sandbox: "read-only",
           cwd: defaultChatDir(),
           threadSource: "unbiased_prompt_tuner",
+          config: mcpConfigOverride(readMcpConfig().servers.map((sv) => sv.name), new Set()),
         })) as { thread: { id: string } };
         threadId = started.thread.id;
 
@@ -7522,58 +7913,6 @@ app.whenReady().then(async () => {
   // transcript looks identical to a live one, so the renderer has to ask —
   // otherwise a request whose turn died with the app still shows Allow/Deny.
   // ---- MCP servers -------------------------------------------------------
-  // Two different truths, deliberately reported separately: `connected` is
-  // what the running engine actually has (authoritative, but empty while the
-  // engine is down or before a restart), and `configured` is what the user
-  // has asked for. A server present in the second and absent from the first
-  // is exactly the "restart to apply" case the panel needs to show.
-  function mcpConfigPath(): string {
-    return join(app.getPath("home"), ".unbiased", "mcp-servers.json");
-  }
-  type UserMcpServer = {
-    name: string;
-    command?: string;
-    args?: string[];
-    env?: Record<string, string>;
-    url?: string;
-    bearerTokenEnvVar?: string;
-    /** Absent means on. Off keeps the entry — and its OAuth registration —
-     *  while leaving it out of the engine's config. */
-    enabled?: boolean;
-    /** An OAuth client WE registered with the provider, so its consent screen
-     *  shows Unbiased rather than codex's dynamically-registered "Codex". */
-    oauthClientId?: string;
-    /** Providers whose token exchange needs a secret (Google). Its presence
-     *  routes the server through the engine's managed-plugin path. */
-    oauthClientSecret?: string;
-    scopes?: string[];
-    startupTimeoutSec?: number;
-    toolTimeoutSec?: number;
-    enabledTools?: string[];
-  };
-  // Absent and unreadable are NOT the same answer. Returning [] for both let a
-  // save overwrite a file we had failed to parse — a malformed file read as
-  // "no servers", and the next Save wrote only the newly added one, silently
-  // destroying the rest. The engine fails loudly on this file for exactly this
-  // reason; so must we.
-  function readMcpConfig(): { servers: UserMcpServer[]; error: string | null } {
-    let text: string;
-    try {
-      text = readFileSync(mcpConfigPath(), "utf8");
-    } catch (err) {
-      const missing = (err as NodeJS.ErrnoException)?.code === "ENOENT";
-      return { servers: [], error: missing ? null : `Could not read ${mcpConfigPath()}: ${String(err)}` };
-    }
-    try {
-      const raw = JSON.parse(text) as { servers?: unknown };
-      if (raw.servers !== undefined && !Array.isArray(raw.servers)) {
-        return { servers: [], error: `${mcpConfigPath()} has a "servers" value that is not a list.` };
-      }
-      return { servers: (raw.servers as UserMcpServer[]) ?? [], error: null };
-    } catch {
-      return { servers: [], error: `${mcpConfigPath()} is not valid JSON. Fix or delete it — saving now would discard whatever it holds.` };
-    }
-  }
   // Mirrors internal/engine/mcp.go. Kept in sync by hand and deliberately
   // NOT authoritative: the engine revalidates before writing config.toml.
   // This copy exists only so the form can refuse a bad server immediately
@@ -7700,6 +8039,47 @@ app.whenReady().then(async () => {
     iconTrimCache.set(src, out);
     return out;
   }
+
+  ipcMain.handle("mcp:thread-get", (_e, threadId: string | null) => {
+    const cfg = readMcpConfig();
+    return {
+      configured: cfg.servers.filter((sv) => sv.enabled !== false).map((sv) => sv.name),
+      enabled: enabledMcpFor(threadId),
+      pending: threadId ? mcpApplyPending.has(threadId) : false,
+      running: threadId ? runningTurns.has(threadId) : false,
+    };
+  });
+
+  ipcMain.handle("mcp:thread-set", async (_e, payload: { threadId: string | null; enabled: string[] }) => {
+    const names = [...new Set(payload.enabled.filter((nm) => typeof nm === "string"))];
+    const decision = mcpApplyDecision({
+      threadId: payload.threadId,
+      running: payload.threadId ? runningTurns.has(payload.threadId) : false,
+    });
+    // No thread yet: the composer's choice is held and consumed by the
+    // thread/start the first message makes.
+    if (decision === "pending-new-thread") {
+      pendingNewThreadMcp = names;
+      return { status: "pending-new-thread" as const };
+    }
+    const threadId = payload.threadId as string;
+    const root = rootThreadOf(threadId);
+    if (names.length) threadMcp.set(root, new Set(names));
+    else threadMcp.delete(root);
+    saveThreadMcp();
+    if (decision === "queue") {
+      mcpApplyPending.add(threadId);
+      return { status: "queued" as const };
+    }
+    try {
+      await applyThreadMcp(threadId);
+      return { status: "applied" as const };
+    } catch (err) {
+      // "no rollout found": a thread that has not completed a turn cannot be
+      // resumed. The set is saved; it applies on the next load.
+      return { status: "saved" as const, error: String(err) };
+    }
+  });
 
   ipcMain.handle("mcp:list", async () => {
     const cfg = readMcpConfig();
@@ -9494,35 +9874,7 @@ app.whenReady().then(async () => {
           thread: WireThread;
           cwd?: string;
         })
-      : ((await engine.request("thread/resume", {
-          threadId: id,
-          ...threadPolicy(),
-          // Re-declare everything a thread/start would. Tools are declared per
-          // session, not stored with the thread, so a resumed conversation had
-          // NO dynamic tools at all — reopening a chat silently cost it the
-          // agent browser and the scheduling tool, and the model discovered
-          // that mid-task ("there are no browser_connect tools available").
-          //
-          // Same omission as the side-chat fork, in the path I did not check
-          // when fixing that one. ThreadResumeParams accepts
-          // developerInstructions; dynamicTools and experimentalRawEvents are
-          // experimentalApi fields absent from the schema, and the engine
-          // ignores unknown params, so this cannot break a resume. Whether it
-          // HONOURS them on resume is unverified — experimentalRawEvents is
-          // known to be ignored here (measured for the sub-agent nicknames),
-          // so dynamicTools may be too. If it is, a reopened conversation
-          // needs a fresh thread to regain tools, not this.
-          dynamicTools: threadDynamicTools(),
-          // The thread's cwd is only known once the resume RETURNS, so the
-          // memory index rides along when this app session has seen the
-          // thread before, and is omitted on a cold reopen — no section
-          // beats injecting some other project's memory (mainCwd still
-          // points at the conversation being left).
-          developerInstructions: threadCwds.has(id)
-            ? developerInstructionsFor(threadCwds.get(id) ?? null)
-            : APP_DEVELOPER_INSTRUCTIONS,
-          experimentalRawEvents: true,
-        })) as {
+      : ((await engine.request("thread/resume", resumeParamsFor(id))) as {
           thread: WireThread;
           cwd?: string;
         });
@@ -10348,6 +10700,9 @@ app.whenReady().then(async () => {
     }
     runningTurns.delete(id);
     settleLocalApprovals(id);
+    threadMcp.delete(id);
+    mcpApplyPending.delete(id);
+    saveThreadMcp();
     browserNetGrants.delete(id);
     browserConnectGrants.delete(id);
     threadAccessModes.delete(id);

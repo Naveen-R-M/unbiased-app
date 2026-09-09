@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-import { AX_TOOL_NAMES, SCREENSHOT_TOOL_NAMES, routesToAx, parseBatchSteps, describeBatch, summarizeBatch, MAX_BATCH_STEPS, AxClient, AxError, appOfStep, axConsent, axNeedsFocus, screenshotToolsOffered, coordinateToolAllowed, withScreenshotGuidance, SCREENSHOT_FRAME_SENTENCE, axReadOptsFrom, axFilterSwitched, AX_DEFAULT_READ_OPTS, shouldRecoverRaise, describeAxAction, indexElementLines, readAxManifest, resolveAxDir, shouldOpenAccessibilitySettings, axNotTrustedText, RAISE_DESCRIPTION, APP_STATE_SPACE_SENTENCE, LAUNCH_FRONT_SENTENCE, withSpaceGuidance, otherSpaceNote, launchOutcome, renderActionResult, ACTION_NO_CHANGE_SENTENCE, TASK_DISCIPLINE_SENTENCE, SCREENSHOT_SPACE_SENTENCE, parseCandidates, describeCandidates, parkedNextCall, parkedReadNote, batchNudge, traceStep, MAX_TYPE_LENGTH, type BatchStep, BATCH_NUDGE_AFTER, type RecentEdit, skillBody, skillPreamble, shouldSendSkill, prependSkill, MAX_SKILL_PREAMBLE, candidateWorked, summarizeCandidates, MAX_CANDIDATES, MAX_CANDIDATE_STEPS, type AxCallInfo } from "./ax-bridge";
+import { AX_TOOL_NAMES, SCREENSHOT_TOOL_NAMES, routesToAx, parseBatchSteps, describeBatch, summarizeBatch, MAX_BATCH_STEPS, AxClient, AxError, appOfStep, axConsent, axNeedsFocus, screenshotToolsOffered, coordinateToolAllowed, withScreenshotGuidance, SCREENSHOT_FRAME_SENTENCE, axReadOptsFrom, AX_DEFAULT_READ_OPTS, shouldRecoverRaise, describeAxAction, indexElementLines, readAxManifest, resolveAxDir, shouldOpenAccessibilitySettings, axNotTrustedText, RAISE_DESCRIPTION, APP_STATE_SPACE_SENTENCE, LAUNCH_FRONT_SENTENCE, withSpaceGuidance, otherSpaceNote, launchOutcome, renderActionResult, ACTION_NO_CHANGE_SENTENCE, TASK_DISCIPLINE_SENTENCE, SCREENSHOT_SPACE_SENTENCE, parseCandidates, describeCandidates, parkedNextCall, parkedReadNote, batchNudge, isSingleEdit, stepsForNudge, traceStep, MAX_TYPE_LENGTH, type BatchStep, BATCH_NUDGE_AFTER, type RecentEdit, skillBody, skillPreamble, shouldSendSkill, prependSkill, MAX_SKILL_PREAMBLE, candidateWorked, summarizeCandidates, MAX_CANDIDATES, MAX_CANDIDATE_STEPS, type AxCallInfo, touchedFieldIds, renderFieldValues, MAX_FIELDS_READ_BACK, type FieldValue, renderInspector, MAX_INSPECTOR_FIELDS, BATCH_VERBS, type InspectorField } from "./ax-bridge";
 
 const scratch = () => mkdtempSync(join(tmpdir(), "ax-"));
 
@@ -491,23 +491,15 @@ test("an action snapshots the way the app last read, or the diff is a lie", () =
     "it is handed out by reference to every action on an unread app; one mutation would rewrite the default for all of them");
 });
 
-test("a read that CHANGES the filter has no honest diff, so it asks for the whole tree", () => {
-  // The lie the rest of this commit kills, reached with two reads instead of
-  // an action: read interactive:true (46 nodes), read interactive:false (119
-  // nodes, brand-new ids), read true again — "- removed:" the 73 that were
-  // never gone. Fix C's description actively invites that middle read.
-  const on = { interactive: true, web: false };
-  assert.equal(axFilterSwitched(on, { interactive: false, web: false }), true);
-  assert.equal(axFilterSwitched(on, { interactive: true, web: true }), true);
-  assert.equal(axFilterSwitched({ interactive: true, web: false, depth: 5 }, on), true, "depth is a filter too");
-  assert.equal(axFilterSwitched(on, { interactive: true, web: false, depth: 5 }), true);
-  assert.equal(axFilterSwitched(on, on), false, "the same view twice is exactly when a diff is honest");
-  assert.equal(axFilterSwitched({ interactive: true, web: false, depth: 5 }, { interactive: true, web: false, depth: 5 }), false);
-  // An app nothing has read yet is not "no baseline": a launch or a raise may
-  // have written one, and it wrote it in the defaults.
-  assert.equal(axFilterSwitched(undefined, { interactive: false, web: false }), true,
-    "the first read after a launch, asking for static text, is a changed filter — the launch tree was interactive-only");
-  assert.equal(axFilterSwitched(undefined, { interactive: true, web: false }), false);
+// Measured 2026-09-08 on the Figma logo run: 28 web/interactive flips between
+// consecutive reads, and every one became a forced full tree (~9KB) because the
+// bridge held one baseline per app. It now holds one per filter, so a flip is a
+// diff against that filter's own last read and only a never-used filter is a
+// full tree. The app has nothing left to decide here.
+test("a read that changes the filter is a diff, not a forced full tree (the bridge keeps one baseline per filter)", () => {
+  const src = readFileSync(join(__dirname, "index.ts"), "utf8");
+  assert.ok(!src.includes("axFilterSwitched"), "the app no longer decides this; the bridge diffs against the filter's own baseline");
+  assert.ok(src.includes("full: a.full === true,"), "full is the model's explicit ask and nothing else");
 });
 
 /** The text of one call: from `ax.request(` forward to its matching `)`, with
@@ -579,7 +571,7 @@ test("every bridge call that rewrites the diff baseline carries the read's optio
   }
 });
 
-test("a read records its filter before anything snapshots, and takes a whole tree when it changed", () => {
+test("a read records its filter before anything snapshots", () => {
   const src = readFileSync(join(__dirname, "index.ts"), "utf8");
   const start = src.indexOf('case "computer_app_state": {');
   assert.ok(start > 0, "expected the computer_app_state case in index.ts");
@@ -589,8 +581,6 @@ test("a read records its filter before anything snapshots, and takes a whole tre
   assert.ok(recorded > 0 && firstCall > 0, "expected the read to record its filter and to call the bridge");
   assert.ok(recorded < firstCall,
     "record the filter BEFORE the auto-recovery raise: that raise snapshots and rewrites the baseline, and would write it in the previous read's view");
-  assert.match(block, /full:\s*a\.full === true \|\| switched/,
-    "a read that changed the filter has no honest diff — it has to ask for the whole tree");
 });
 
 test("a withheld verb is refused when it is called anyway, not merely left off the menu", () => {
@@ -828,6 +818,29 @@ test("an action with no visible change says to read before repeating, instead of
   const explained = renderActionResult("(no changes)", "Maps is behind a fullscreen Space.");
   assert.ok(explained.startsWith("Done. Maps is behind a fullscreen Space. ") && explained.includes(ACTION_NO_CHANGE_SENTENCE), explained);
   assert.equal(renderActionResult("+ 12 button \"Directions\" {press}"), "Done.\n+ 12 button \"Directions\" {press}");
+});
+
+// Rollout 01a081a0 (2026-09-08): with no human in the loop, three model turns
+// opened "You're right — let me stop…" in direct reply to this sentence and to
+// the batch caveat, and each began a re-plan. A tool result is evidence, not a
+// reviewer: it says what happened and what else is available.
+test("tool text states facts and options, never scolds or cites past runs", () => {
+  const batch = summarizeBatch({ ran: ["a", "b"], failed: null, remaining: 0, diff: "~ 1", unwatched: true });
+  for (const s of [ACTION_NO_CHANGE_SENTENCE, batch]) {
+    assert.ok(!/\bdo not\b|don't|\bnever\b|in the last run|cost \w+ turns|retries/i.test(s), s);
+  }
+});
+
+// The checkpoint's wiring lives in index.ts, which has no unit harness; this
+// pins the six places it must touch, the way the routing and skill tests do.
+test("the checkpoint is wired: declared, routed, gated before actions, written at the threshold, replayed after compaction, fed facts", () => {
+  const src = readFileSync(join(__dirname, "index.ts"), "utf8");
+  assert.ok(src.includes("...CHECKPOINT_TOOLS,"), "declared to every thread");
+  assert.ok(src.includes('tool.startsWith("checkpoint_")') && src.includes("handleCheckpointToolCall("), "routed by prefix");
+  assert.ok(src.includes("isGatedTool(tool) && checkpointDue("), "the first action past the threshold is held once");
+  assert.ok(src.includes("ctxPercent.set("), "the app tracks context occupancy per root thread");
+  assert.ok(src.includes("checkpointReplayDue.add(") && src.includes("checkpointPreamble("), "the file comes back on the first tool result after a compaction");
+  assert.ok(src.includes("recordFact("), "measured facts are recorded by the app");
 });
 
 test("a batch that ends with no visible change gets the same guidance", () => {
@@ -1168,7 +1181,7 @@ test("a run of single edits on one app becomes the batch call that would have do
   ];
   const out = batchNudge(recent);
   assert.ok(out, "three in a row is worth saying");
-  assert.ok(out.includes("3 separate actions to Figma"), out);
+  assert.ok(out.includes("3 separate calls to Figma"), out);
   assert.ok(out.includes('computer_do {"app":"Figma","steps":[{"do":"set_value","id":10,"text":"500"}'), out);
   assert.ok(out.includes("not five"), out);
 });
@@ -1201,11 +1214,59 @@ test("every batchable verb is rendered as its step, and an unbatchable one cance
   assert.equal(batchNudge(withRaise), null, "raise is not batchable, so there is no single call to suggest");
 });
 
-test("the nudge is said once per conversation and a batch resets the count", () => {
+// Run 6, 2026-09-08: 122 turns, 84 of them one call each; 30 were single
+// computer_pointer calls and 46 of 53 computer_do batches edited ONE field —
+// the four-keystroke recipe wrapped in a batch. The nudge saw none of it: it did
+// not know pointer, it counted a one-field batch as batching, and it had said
+// its one sentence before the first compaction erased it. It now counts logical
+// edits, whatever call carried them, and is re-armed when a compaction has
+// taken the earlier one away.
+test("a single pointer click counts as one edit; a drawn path does not, because it has no batch step", () => {
+  const clicks: RecentEdit[] = [
+    { tool: "computer_pointer", app: "Figma", id: 88, clicks: 2 },
+    { tool: "computer_pointer", app: "Figma", id: 89, clicks: 2 },
+    { tool: "computer_pointer", app: "Figma", id: 90 },
+  ];
+  const out = batchNudge(clicks);
+  assert.ok(out && out.includes('{"do":"pointer","id":88,"clicks":2}') && out.includes('{"do":"pointer","id":90}'), String(out));
+  const drawn: RecentEdit[] = [...clicks.slice(0, 2), { tool: "computer_pointer", app: "Figma", id: 14, path: true }];
+  assert.equal(batchNudge(drawn), null, "a stroke with a path cannot be written as a batch step");
+});
+
+test("a batch that edits one field is one edit, and its steps are spliced into the suggested call", () => {
+  const oneField: BatchStep[] = [
+    { do: "pointer", id: 88, clicks: 2, waitMs: 0 }, { do: "key", key: "a", modifiers: ["command"], waitMs: 0 },
+    { do: "type", text: "460", waitMs: 0 }, { do: "key", key: "return", waitMs: 0 }, { do: "read", waitMs: 0 },
+  ];
+  assert.equal(isSingleEdit(oneField), true, "four keystrokes into one field is one edit");
+  assert.equal(isSingleEdit([{ do: "set_value", id: 10, text: "1", waitMs: 0 }, { do: "set_value", id: 11, text: "2", waitMs: 0 }]), false, "two fields is batching");
+  assert.equal(isSingleEdit([{ do: "key", key: "return", waitMs: 0 }]), false, "nothing edited: nothing to combine");
+  assert.equal(isSingleEdit([{ do: "screenshot", waitMs: 0 }, { do: "read", waitMs: 0 }]), false);
+  assert.deepEqual(stepsForNudge(oneField), [
+    { do: "pointer", id: 88, clicks: 2 }, { do: "key", key: "a", modifiers: ["command"] }, { do: "type", text: "460" }, { do: "key", key: "return" }, { do: "read" },
+  ], "waitMs is dropped when zero and the wire name is used otherwise");
+  assert.deepEqual(stepsForNudge([{ do: "press", id: 3, waitMs: 500 }]), [{ do: "press", id: 3, wait_ms: 500 }]);
+  const recent: RecentEdit[] = [
+    { tool: "computer_pointer", app: "Figma", id: 87, clicks: 2 },
+    { tool: "computer_do", app: "Figma", steps: stepsForNudge(oneField) },
+    { tool: "computer_set_value", app: "Figma", id: 91, text: "512" },
+  ];
+  const out = batchNudge(recent);
+  assert.ok(out && out.includes("3 separate calls to Figma"), String(out));
+  assert.ok(out && out.includes('{"do":"pointer","id":87,"clicks":2},{"do":"pointer","id":88,"clicks":2},{"do":"key","key":"a","modifiers":["command"]}'), "the batch's own steps appear inline, in order: " + String(out));
+  assert.ok(out && out.includes('{"do":"set_value","id":91,"text":"512"}'), String(out));
+});
+
+test("the nudge is said once per compaction cycle; a real batch resets the count, a one-edit batch does not", () => {
   const src = readFileSync(join(__dirname, "index.ts"), "utf8");
-  assert.ok(src.includes("axBatchNudged.has(root) ? null : batchNudge(axRecentEdits)"), "once per conversation");
-  assert.ok(src.includes("axRecentEdits = []; // the caller batched"), "batching clears the run");
-  assert.ok(src.includes("axRecentEdits.push({"), "single actions are recorded");
+  assert.ok(src.includes("axBatchNudged.has(root) ? null : batchNudge(axRecentEdits)"), "gated on the armed set");
+  const compaction = src.slice(src.indexOf('item?.type === "contextCompaction"'), src.indexOf('item?.type === "fileChange"'));
+  assert.ok(compaction.includes("axBatchNudged.delete(root)"), "a compaction erased the earlier nudge, so it is said again");
+  const batch = src.slice(src.indexOf('case "computer_do": {'), src.indexOf('case "computer_scroll_view": {'));
+  assert.ok(batch.includes("isSingleEdit(steps)") && batch.includes("stepsForNudge(steps)"), "a one-edit batch is recorded as one edit");
+  assert.ok(!src.includes("axRecentEdits = []; // the caller batched"), "the unconditional reset is gone");
+  const pointer = src.slice(src.indexOf('case "computer_pointer": {'), src.indexOf('case "computer_app_screenshot": {'));
+  assert.ok(pointer.includes('tool: "computer_pointer"') && pointer.includes("recordEditAndNudge("), "a single click is recorded as one edit through the shared helper");
 });
 
 test("a batch skips the settle wait on every step but the last", () => {
@@ -1257,17 +1318,41 @@ test("the trace names the field and value, not just the verb", () => {
   assert.equal(traceStep({ do: "read", waitMs: 0 }), "read");
 });
 
-test("a multi-step batch does not claim more than it watched", () => {
-  const ran = ["step 1 (set_value #88 = \"550\")", "step 2 (press #12)"];
-  const many = summarizeBatch({ ran, failed: null, remaining: 0, diff: "~ 12 button", unwatched: true });
-  assert.ok(many.includes("Every value written was read back"), many);
-  assert.ok(many.includes("presses were not watched individually"), many);
-  // A single step DID settle and its diff is its own, so the caveat would be
-  // false there.
-  const one = summarizeBatch({ ran: [ran[0]], failed: null, remaining: 0, diff: "~ 88", unwatched: true });
-  assert.ok(!one.includes("not watched"), one);
+// Measured 2026-09-08: the four-step stepper recipe (pointer, ⌘a, type, return)
+// bypassed setValue's read-back, so after every batch the model read the app
+// again to check the fields — 32 finds in one run, a model turn each. The
+// batch now reads back every field it touched and prints them.
+test("a batch names the fields it touched so they can be read back", () => {
+  const steps: BatchStep[] = [
+    { do: "pointer", id: 88, clicks: 2, waitMs: 0 }, { do: "key", key: "a", modifiers: ["command"], waitMs: 0 },
+    { do: "type", text: "460", waitMs: 0 }, { do: "key", key: "return", waitMs: 0 },
+    { do: "set_value", id: 101, text: "360", waitMs: 0 }, { do: "type", text: "x", id: 88, waitMs: 0 },
+    { do: "press", id: 5, waitMs: 0 }, { do: "read", waitMs: 0 },
+  ];
+  assert.deepEqual(touchedFieldIds(steps), [88, 101], "pointer, set_value and type-with-id are field edits; press and read are not; ids are unique in first-seen order");
+  const many = Array.from({ length: 20 }, (_, i) => ({ do: "set_value", id: i, text: "1", waitMs: 0 }) as BatchStep);
+  assert.equal(touchedFieldIds(many).length, MAX_FIELDS_READ_BACK, "capped");
 });
 
+test("field values render one line per id, with what the bridge knows about it", () => {
+  const values: FieldValue[] = [
+    { id: 88, role: "incrementor", title: "X-position", value: "460" },
+    { id: 101, role: "text field", title: "Width", value: "360" },
+    { id: 7, role: null, title: null, value: null },
+  ];
+  assert.equal(renderFieldValues(values), 'Fields now:\n#88 incrementor "X-position" = 460\n#101 text field "Width" = 360\n#7 = (no value)');
+});
+
+test("a multi-step batch reports the fields it read back instead of a caveat about presses", () => {
+  const ran = ["step 1 (set_value #88 = \"550\")", "step 2 (press #12)"];
+  const out = summarizeBatch({ ran, failed: null, remaining: 0, diff: "~ 12 button", unwatched: true, fields: 'Fields now:\n#88 text field "Width" = 550' });
+  assert.ok(out.includes("Only the closing diff was watched"), out);
+  assert.ok(!out.includes("not watched individually") && !out.includes("Every value written was read back"), out);
+  assert.ok(out.endsWith('\nFields now:\n#88 text field "Width" = 550'), out);
+  // A single step DID settle and its diff is its own, so no caveat.
+  const one = summarizeBatch({ ran: [ran[0]], failed: null, remaining: 0, diff: "~ 88", unwatched: true });
+  assert.ok(!one.includes("closing diff"), one);
+});
 test("a stopped batch still reports which steps ran and which did not", () => {
   const out = summarizeBatch({
     ran: ["step 1 (set_value #88 = \"550\")"],
@@ -1343,4 +1428,109 @@ test("computer_do tells the model which field kind takes which route", () => {
   // The description is a TS string literal, so its quotes are escaped in source.
   assert.ok(decl.includes(String.raw`{\"do\":\"type\",\"text\":\"460\"}`), "hand over the literal recipe");
   assert.ok(decl.includes("clicks:2"), "and the double-click fallback");
+});
+
+// Second Figma run, 2026-09-08: 90 turns, of which 34 were finds for the id of an
+// inspector field so the next click could be aimed, 12 were screenshots that
+// each cost a turn, and one re-read the skill through the shell after the
+// compaction had summarized it away. Three mechanisms, one per waste.
+
+test("a screenshot can ride inside a batch, so a look does not cost a turn", () => {
+  assert.ok((BATCH_VERBS as readonly string[]).includes("screenshot"));
+  const r = parseBatchSteps([{ do: "press", id: 4 }, { do: "screenshot" }, { do: "screenshot", window: 2 }]);
+  assert.ok(!("error" in r), JSON.stringify(r));
+  const steps = (r as { steps: BatchStep[] }).steps;
+  assert.deepEqual(steps[1], { do: "screenshot", waitMs: 0 });
+  assert.deepEqual(steps[2], { do: "screenshot", window: 2, waitMs: 0 });
+  assert.equal(traceStep(steps[1]), "screenshot");
+  assert.ok(describeBatch("Figma", steps).includes("photograph"), describeBatch("Figma", steps));
+  assert.deepEqual(touchedFieldIds(steps), [], "a picture touches no field");
+});
+
+// Run 3, 2026-09-08: 49 inspector blocks, ~60KB, about a fifth of all tool
+// output, and it bought a second compaction. Most of each block repeats the
+// block before it — X and Y change, the other thirty lines do not.
+test("an inspector that follows another sends only what changed", () => {
+  const before: InspectorField[] = [
+    { id: 155, role: "incrementor", title: "X-position", value: "0" },
+    { id: 156, role: "incrementor", title: "Y-position", value: "0" },
+    { id: 183, role: "text field", title: "Width", value: "1024" },
+  ];
+  const after: InspectorField[] = [
+    { id: 155, role: "incrementor", title: "X-position", value: "256" },
+    { id: 156, role: "incrementor", title: "Y-position", value: "0" },
+    { id: 183, role: "text field", title: "Width", value: "1024" },
+    { id: 190, role: "check box", title: "Clip content", value: "1" },
+  ];
+  assert.equal(renderInspector(after, false, before),
+    'Inspector changes:\n#155 incrementor "X-position" = 256\n+#190 check box "Clip content" = 1\n(2 unchanged)');
+  // Nothing moved at all: one line, not thirty.
+  assert.equal(renderInspector(before, false, before), "Inspector unchanged (3 fields, same values).");
+  // A field that disappeared is named, because its id is now dead.
+  assert.equal(renderInspector([before[0]], false, before),
+    'Inspector changes:\n(gone: #156, #183)\n(1 unchanged)');
+  // No previous block: the whole thing, as before.
+  const whole = renderInspector(after, false);
+  assert.ok(whole !== null && whole.startsWith("Inspector now:"), whole ?? "");
+});
+
+test("the inspector block lists settable controls with ids, in tree order, capped", () => {
+  const out = renderInspector([
+    { id: 563, role: "text field", title: "Width", value: "510" },
+    { id: 545, role: "incrementor", title: "X-position", value: "257" },
+    { id: 9, role: "checkbox", title: "Clip content", value: "1" },
+  ], false);
+  assert.equal(out, 'Inspector now:\n#563 text field "Width" = 510\n#545 incrementor "X-position" = 257\n#9 checkbox "Clip content" = 1');
+  assert.equal(renderInspector([], false), null, "nothing settable: no block");
+  const cut = renderInspector([{ id: 1, role: "text field", title: "A", value: "" }], true);
+  assert.ok(cut !== null && cut.endsWith(`(… more than ${MAX_INSPECTOR_FIELDS}; use query for the rest)`), cut ?? "");
+});
+
+test("the three mechanisms are wired: inspector after selection-changing actions and batches, pictures inside batches, the skill re-sent after compaction", () => {
+  const src = readFileSync(join(__dirname, "index.ts"), "utf8");
+  const compaction = src.slice(src.indexOf('item?.type === "contextCompaction"'), src.indexOf('item?.type === "fileChange"'));
+  assert.ok(compaction.includes("axSkillSent.delete(root)"), "a summary eats the skill; the next desktop call must carry it again");
+  const batch = src.slice(src.indexOf('case "computer_do": {'), src.indexOf('case "computer_scroll_view": {'));
+  assert.ok(batch.includes('case "screenshot"') || src.slice(src.indexOf("async function runBatchStep")).includes('case "screenshot"'), "a screenshot step reaches the bridge");
+  assert.ok(batch.includes('type: "inputImage"'), "the batch result carries the pictures it took");
+  assert.ok(batch.includes("inspectorBlock("), "a batch ends with the inspector");
+  const pointer = src.slice(src.indexOf('case "computer_pointer": {'), src.indexOf('case "computer_app_screenshot": {'));
+  assert.ok(pointer.includes("inspectorBlock("), "a click changes the selection; the inspector follows");
+  const press = src.slice(src.indexOf('case "computer_press":'), src.indexOf('default:\n        return axText(`Unknown tool ${tool}`'));
+  assert.ok(press.includes("inspectorBlock("), "a press changes the selection; the inspector follows");
+});
+
+// The mechanisms are app-neutral — there is no per-app branching anywhere in
+// the desktop path — but the PROSE had drifted: one third-party app was named
+// nine times across the tool descriptions and the bundled skill, which is
+// tuning the model toward one app in the layer this codebase has repeatedly
+// measured to be the weakest. Evidence belongs in comments, where naming the
+// app makes it checkable; guidance should describe the shape of the problem.
+test("model-facing text describes shapes of apps, not one app by name", () => {
+  const src = readFileSync(join(__dirname, "index.ts"), "utf8");
+  const decls = src.slice(src.indexOf("const AX_TOOLS = ["), src.indexOf("// Declared and routed must be the same set"));
+  const strings = decls.split("\n").filter((l) => !l.trim().startsWith("//")).join("\n");
+  for (const app of ["Figma", "Sketch", "Photoshop", "Illustrator"]) {
+    assert.ok(!strings.includes(app), `tool descriptions name ${app}; say what KIND of app it is instead`);
+  }
+  const skill = readFileSync(join(__dirname, "..", "..", "resources", "skills", "computer-use", "SKILL.md"), "utf8");
+  const named = (skill.match(/Figma/g) ?? []).length;
+  assert.ok(named === 0, `the skill names Figma ${named} time(s); describe the kind of app instead`);
+});
+
+// Measured 2026-09-08: return, delete, return, delete in one unwatched batch;
+// the second delete removed the frame the task lived in, the closing diff said
+// "- removed: 859-880", and the model wrote "the frame is clean now".
+test("a step the bridge watched on its own is reported with its own diff, before the closing diff", () => {
+  const out = summarizeBatch({
+    ran: ["step 1 (key return)", "step 2 (key delete)", "step 3 (key return)", "step 4 (key delete)"],
+    failed: null, remaining: 0, diff: "- removed: 859-880", unwatched: true,
+    watched: [
+      { step: "step 2 (key delete)", diff: "(no changes)" },
+      { step: "step 4 (key delete)", diff: '- removed: 859-880, among them: application group "Unbiased, Design frame"; term "Dimensions" and 20 more' },
+    ],
+  });
+  assert.match(out, /Watched on its own, because a delete outside a text field removes objects — step 4 \(key delete\) did this:\n- removed: 859-880, among them: application group "Unbiased, Design frame"/);
+  assert.equal((out.match(/Watched on its own/g) ?? []).length, 1, "a watched step that changed nothing is not reported");
+  assert.ok(out.indexOf("Watched on its own") < out.indexOf("\n- removed: 859-880\n") || out.trim().endsWith("- removed: 859-880"), "the step's diff comes before the closing diff");
 });

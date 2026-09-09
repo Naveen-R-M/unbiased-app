@@ -30,14 +30,19 @@ typing), a value, a press, a read.
 
 A turn costs about fifteen seconds whatever it carries, so the unit of work is
 the turn, not the action. Setting one shape's x, y, width, height and colour is
-ONE call with five steps, not five calls. Measured on a Figma icon: 372 actions
+ONE call with five steps, not five calls. Measured on a drawing task: 372 actions
 arrived nearly one per turn and the run took 23 minutes, where the same actions
 batched by shape would have been about 40 turns. Every step in a batch also
 skips the wait for the app to react — only the last one waits — so a batch of
 five is faster than five singles by more than the round trips alone.
 
 **Read again only when the ids you need are not in front of you**, or when an
-action reports that nothing changed and you expected something.
+action reports that nothing changed and you expected something. After a press,
+a click or a batch the reply ends with `Inspector now:` — every settable
+control with its id and current value — so the next field to click is already
+named; do not search for it. To look while you work, put
+`{"do":"screenshot"}` inside the batch: the picture comes back with the same
+result, and a separate screenshot call is a whole turn spent on looking.
 
 **When you can see several ways to do one thing and cannot tell which the app
 will honour, send them as candidates.** `computer_do` takes `candidates`
@@ -157,8 +162,9 @@ area. The tree shows one big element and no controls inside it. Two things get
 you in.
 
 **A tool is usually a letter.** `computer_press_key` takes a single letter or
-digit, with modifiers. This is often the only way to reach a tool at all —
-Figma's pen is `p` and it has no element, no menu item and no other route. Keys
+digit, with modifiers. This is often the only way to reach a tool at all — a
+pen or shape tool is one letter, with no element, no menu item and no other
+route. Keys
 work on a background app on any Space, because a key event does not care where
 the window is.
 
@@ -195,7 +201,7 @@ exactly:
 For a stepper, do what a person does — in ONE call:
 
 ```json
-{"app": "Figma", "steps": [
+{"app": "<the app>", "steps": [
   {"do": "pointer", "id": 84},
   {"do": "key", "key": "a", "modifiers": ["command"]},
   {"do": "type", "text": "-19.6875"},
@@ -219,26 +225,40 @@ Design tools expose exact position, size, stroke weight and colour as fields in
 the tree — set those by id afterwards, which is faster and more accurate than
 trying to click precisely.
 
-## Keep your measurements in a file
+## Your working memory survives a summary only if you save it
 
-Long visual work accumulates facts worth more than one turn: the colours you
-sampled, the coordinates of each shape, which ids belong to which layer, what
-you have finished. A long conversation gets compacted, and then those facts are
-gone while the task is not — measured, a run re-derived the same palette three
-times because each summary kept the plan and dropped the numbers.
+A long conversation gets summarized, and the summary keeps the plan and drops
+the numbers — measured, a run re-derived the same palette three times, and
+another lost track of whether it had drawn its shapes or duplicated them. So
+there is a checkpoint, and it works in three parts.
 
-So write them down as you get them. A small file in the working directory,
-whatever shape suits the job:
+- **Save it with `checkpoint_save`** whenever you finish a stage of a long
+  task, and whenever a tool result tells you the context is nearly full. Write
+  decisions, the plan, the measured numbers, names and colours, what is done
+  and what is next. It replaces the previous checkpoint, so write everything
+  you would need to resume. Element trees and screenshots are refused: they
+  can be read again, and they are what fills the window.
+- **The app records measured facts on its own** — every field a batch read
+  back, where pointer clicks landed, what launched — into the same file under
+  `./memories/` in the working directory.
+- **After a summary the file is handed back to you** with your next tool
+  result. Read it before you act: it is the ground truth for what you already
+  finished, and the tree says whether it is still there.
 
-    # unbiased logo, Figma frame "Unbiased"
+The first action you send past the threshold is held once until you have
+saved; the reply carries the exact call. Save, then send the action again.
+
+What a good note looks like — small, exact, and about the work rather than the
+screen:
+
+    # logo, design-app frame "Unbiased"
     palette: outer #1B4B8F, inner #E8F0FA, mark #F5A623
     circle: 500x500 at 320,180  DONE
     arc: 180x180 at 480,340     stroke 12  DONE
     text: not started
 
-Re-read it after any compaction, and before you decide you are finished. This
-is also how you answer "is it done?" honestly: the file says what you actually
-completed, and the tree says whether it is still there.
+This is also how you answer "is it done?" honestly: the checkpoint says what
+you actually completed, and the tree says whether it is still there.
 
 ## Pictures
 

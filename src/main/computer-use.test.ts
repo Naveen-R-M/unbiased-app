@@ -402,6 +402,7 @@ test("the computer-use skill carries the findings that cost the most to learn", 
     "computer_app_screenshot", // how to look without taking the screen
     "menu bar", // the path that always works on a parked window
     "do not raise", // the reaction that costs the user their screen
+    "checkpoint_save", // how working memory survives a compaction
   ]) {
     assert.ok(text.toLowerCase().includes(needle.toLowerCase()), `the skill no longer mentions ${needle}`);
   }

@@ -129,19 +129,6 @@ export function axReadOptsFrom(args: { interactive?: unknown; web?: unknown; dep
   };
 }
 
-/** Whether this read asks for a DIFFERENT view than the last one, which means
- *  there is no honest diff to show: the bridge would report every element the
- *  old filter hid as added, and every one the new filter hides as removed —
- *  the same +73/-73 lie, reached with two reads instead of an action. The
- *  caller answers by asking for the whole tree instead.
- *
- *  An app nothing has read yet counts as the defaults rather than as "no
- *  baseline": a launch or a raise may already have written one, and it wrote
- *  it in exactly those defaults (see axActionOpts). */
-export function axFilterSwitched(prev: AxReadOpts | undefined, want: AxReadOpts): boolean {
-  const from = prev ?? AX_DEFAULT_READ_OPTS;
-  return from.interactive !== want.interactive || from.web !== want.web || from.depth !== want.depth;
-}
 
 /** The app a computer step acted on, so the transcript can show that app's own
  *  icon instead of a generic terminal glyph. */
@@ -176,6 +163,7 @@ export type BatchStep =
   | { do: "act"; id: number; action: string; waitMs: number }
   | { do: "type"; text: string; id?: number; waitMs: number }
   | { do: "pointer"; id: number; clicks?: number; waitMs: number }
+  | { do: "screenshot"; window?: number; waitMs: number }
   | { do: "read"; waitMs: number };
 
 /** Deliberately NOT batchable: launch and raise both take over the user's
@@ -193,7 +181,7 @@ export const KEY_MODIFIERS = ["command", "shift", "option", "control"];
  *  ignored on a `stepper`, and Codex's own run hit the identical split.
  *
  *  Still NOT batchable: launch and raise, which take over the user's screen. */
-export const BATCH_VERBS = ["press", "set_value", "key", "type", "pointer", "scroll", "act", "read"] as const;
+export const BATCH_VERBS = ["press", "set_value", "key", "type", "pointer", "screenshot", "scroll", "act", "read"] as const;
 /** Measured against Codex on the same Figma icon: its densest single turn ran
  *  17 primitive actions (four fields, each a click + select-all + type +
  *  Return, then a colour click). A cap of 10 split work like that across turns
@@ -228,6 +216,14 @@ export function parseBatchSteps(raw: unknown): { steps: BatchStep[] } | { error:
       case "read":
         steps.push({ do: "read", waitMs });
         break;
+      case "screenshot": {
+        // A look that rides inside the batch. Second Figma run: 12 screenshots,
+        // each a whole turn, when the picture could have come back with the
+        // actions that made it worth taking.
+        const window = typeof e.window === "number" ? e.window : undefined;
+        steps.push({ do: "screenshot", ...(window !== undefined ? { window } : {}), waitMs });
+        break;
+      }
       case "type": {
         if (typeof e.text !== "string" || !e.text) return { error: `${at}: text is required for do=type.` };
         if (e.text.length > MAX_TYPE_LENGTH) {
@@ -376,6 +372,7 @@ export function describeBatch(app: string, steps: BatchStep[], lines?: Map<numbe
     const pause = st.waitMs > 0 ? ` (then wait ${st.waitMs}ms)` : "";
     switch (st.do) {
       case "read": return `${n} read ${app}${pause}`;
+      case "screenshot": return `${n} photograph the window${pause}`;
       case "press": return `${n} press ${target(st.id)}${pause}`;
       case "set_value": return `${n} set ${target(st.id)} to "${clip(st.text)}"${pause}`;
       case "key": return `${n} press ${st.key}${st.id !== undefined ? ` in ${target(st.id)}` : ""}${pause}`;
@@ -395,6 +392,7 @@ export function describeBatch(app: string, steps: BatchStep[], lines?: Map<numbe
 export function traceStep(st: BatchStep): string {
   switch (st.do) {
     case "read": return "read";
+    case "screenshot": return "screenshot";
     case "key": return `key ${st.modifiers?.length ? st.modifiers.join("+") + "+" : ""}${st.key}${st.id !== undefined ? ` in #${st.id}` : ""}`;
     case "press": return `press #${st.id}`;
     case "act": return `act #${st.id} "${st.action}"`;
@@ -406,16 +404,87 @@ export function traceStep(st: BatchStep): string {
   }
 }
 
+/** The ids a batch wrote into: set_value, type aimed at an id, and pointer
+ *  (the click that starts the four-step stepper recipe). Presses are not field
+ *  edits. Unique, first-seen order, capped — thirty edits read back the first
+ *  dozen, which is every field on one Figma shape.
+ *
+ *  Measured 2026-09-08: that recipe bypassed setValue's read-back, so after
+ *  every batch the model read the app again to check the fields — 32 finds in
+ *  one run, a model turn each. The batch now hands the values over itself. */
+export const MAX_FIELDS_READ_BACK = 12;
+export function touchedFieldIds(steps: BatchStep[]): number[] {
+  const ids: number[] = [];
+  for (const st of steps) {
+    const id = st.do === "set_value" || st.do === "pointer" || st.do === "type" ? st.id : undefined;
+    if (typeof id === "number" && !ids.includes(id)) ids.push(id);
+    if (ids.length >= MAX_FIELDS_READ_BACK) break;
+  }
+  return ids;
+}
+
+/** One entry of the bridge's `values` reply. */
+export type FieldValue = { id: number; role: string | null; title: string | null; value: string | null };
+export function renderFieldValues(values: FieldValue[]): string {
+  const lines = values.map((v) => {
+    const what = [v.role, v.title ? JSON.stringify(v.title) : null].filter(Boolean).join(" ");
+    return `#${v.id}${what ? ` ${what}` : ""} = ${v.value ?? "(no value)"}`;
+  });
+  return `Fields now:\n${lines.join("\n")}`;
+}
+
+/** The settable controls in the app's latest snapshot, with their ids. Sent
+ *  after every action that can change the selection and after every batch, so
+ *  the next step can be aimed without a read. Second Figma run, 2026-09-08:
+ *  34 of 90 turns were finds for exactly these ids. */
+export const MAX_INSPECTOR_FIELDS = 40;
+export type InspectorField = { id: number; role: string | null; title: string | null; value: string | null };
+export function renderInspector(fields: InspectorField[], truncated: boolean, previous?: InspectorField[]): string | null {
+  if (!fields.length) return null;
+  const line = (f: InspectorField) => `#${f.id}${f.role ? ` ${f.role}` : ""}${f.title ? ` ${JSON.stringify(f.title)}` : ""} = ${f.value ?? ""}`;
+  const tail = truncated ? [`(… more than ${MAX_INSPECTOR_FIELDS}; use query for the rest)`] : [];
+  if (!previous?.length) return ["Inspector now:", ...fields.map(line), ...tail].join("\n");
+  // Only what moved. Measured 2026-09-08: 49 blocks, ~60KB, a fifth of all tool
+  // output, and most of each block repeated the one before it — two coordinates
+  // changed and thirty lines did not.
+  const was = new Map(previous.map((f) => [f.id, line(f)]));
+  const changed: string[] = [];
+  let same = 0;
+  for (const f of fields) {
+    const now = line(f);
+    if (!was.has(f.id)) changed.push(`+${now}`);
+    else if (was.get(f.id) !== now) changed.push(now);
+    else same += 1;
+    was.delete(f.id);
+  }
+  const gone = [...was.keys()];
+  if (!changed.length && !gone.length) return `Inspector unchanged (${same} fields, same values).`;
+  return [
+    "Inspector changes:",
+    ...changed,
+    ...(gone.length ? [`(gone: ${gone.map((id) => `#${id}`).join(", ")})`] : []),
+    ...(same ? [`(${same} unchanged)`] : []),
+    ...tail,
+  ].join("\n");
+}
+
 export function summarizeBatch(opts: {
   ran: string[];
   failed: { step: string; message: string } | null;
   remaining: number;
   diff: string;
+  /** renderFieldValues() of every field the batch touched, read back after it. */
+  fields?: string;
   /** True when mid-sequence steps skipped their settle wait, so the only
    *  evidence about them is the closing diff. Said out loud rather than
    *  implied: a press that quietly did nothing at step 4 is invisible here,
    *  and a summary that reads "Done" for all 30 would be overclaiming. */
   unwatched?: boolean;
+  /** Steps the bridge watched on its own despite the sequence — a delete
+   *  outside a text field — with each one's own diff. Measured 2026-09-08: a
+   *  frame deleted at step 4 of an unwatched batch left "- removed: 859-880"
+   *  in the closing diff and the model wrote "the frame is clean now". */
+  watched?: { step: string; diff: string }[];
 }): string {
   const head = opts.failed
     ? [
@@ -427,11 +496,16 @@ export function summarizeBatch(opts: {
     : [
         `Done: ${opts.ran.join("; ")}.`,
         opts.unwatched && opts.ran.length > 1
-          ? "Every value written was read back; the presses were not watched individually, so check the diff below for what they did."
+          ? opts.fields
+            ? "Only the closing diff was watched; the field values below were read back afterwards."
+            : "Only the closing diff was watched."
           : "",
       ].filter(Boolean).join(" ");
-  if (opts.diff.trim() === "(no changes)") return `${head}\n${ACTION_NO_CHANGE_SENTENCE}`;
-  return opts.diff ? `${head}\n${opts.diff}` : `${head}\n(nothing in the tree changed)`;
+  const body = opts.diff.trim() === "(no changes)" ? ACTION_NO_CHANGE_SENTENCE : opts.diff || "(nothing in the tree changed)";
+  const watched = (opts.watched ?? [])
+    .filter((w) => w.diff.trim() && w.diff.trim() !== "(no changes)")
+    .map((w) => `Watched on its own, because a delete outside a text field removes objects — ${w.step} did this:\n${w.diff}`);
+  return [head, ...watched, body, opts.fields].filter(Boolean).join("\n");
 }
 
 /** The desktop tools the accessibility bridge owns. This list lives next to
@@ -534,9 +608,15 @@ export function coordinateToolAllowed(tool: string, mode: "all" | "screenshot-on
  *  unchanged. "(no changes)" is a fine answer to a READ; after an ACTION the
  *  model heard it as "nothing there" and pressed again — which, on a Maps
  *  result, opened the card the first press had already asked for, and on a
- *  settings row toggled Location Tracking back. */
+ *  settings row toggled Location Tracking back.
+ *
+ *  Voice: facts and options, no imperatives and no anecdotes. Rollout 01a081a0
+ *  (2026-09-08) showed the model answering the previous wording — "Do NOT
+ *  repeat it… five retries of one dead button cost six turns" — with
+ *  "You're right — let me stop…" and a re-plan, three times, with no human in
+ *  the loop. A tool result read as a reviewer starts detours. */
 export const ACTION_NO_CHANGE_SENTENCE =
-  "The app accepted the action but showed no change while the bridge waited. Do NOT repeat it on this element: a second press undoes a toggle or opens a second copy, and in the last run five retries of one dead button cost six turns. Take a different path instead: the keyboard (arrow keys and return choose from a list, escape closes), or the app's menu bar, whose items are in the tree and reliably reach every command.";
+  "The app accepted the action and nothing in the tree changed while the bridge waited. The same action again would do the same. Other paths that reach a control: the keyboard (arrows and return choose from a list, escape closes), or a menu bar item — both are in the tree.";
 
 /** The literal call to send after a click died on a parked window.
  *
@@ -634,6 +714,15 @@ export interface RecentEdit {
   text?: string;
   key?: string;
   action?: string;
+  /** A single pointer click: how many clicks; `path` true means a drawn stroke,
+   *  which has no batch step and so cannot be part of a suggested call. */
+  clicks?: number;
+  path?: boolean;
+  /** A computer_do that edited ONE thing: its steps, already in wire form, so
+   *  the suggested call can splice them in. Run 6, 2026-09-08: 46 of 53 batches
+   *  were the four-keystroke recipe on a single field — one edit per turn wearing
+   *  a batch's clothes. */
+  steps?: Record<string, unknown>[];
 }
 
 export const BATCH_NUDGE_AFTER = 3;
@@ -644,6 +733,7 @@ function asStep(e: RecentEdit): Record<string, unknown> | null {
     case "computer_act": return e.id === undefined || !e.action ? null : { do: "act", id: e.id, action: e.action };
     case "computer_set_value": return e.id === undefined || e.text === undefined ? null : { do: "set_value", id: e.id, text: e.text };
     case "computer_press_key": return !e.key ? null : { do: "key", key: e.key, ...(e.id !== undefined ? { id: e.id } : {}) };
+    case "computer_pointer": return e.id === undefined || e.path ? null : { do: "pointer", id: e.id, ...(e.clicks && e.clicks > 1 ? { clicks: e.clicks } : {}) };
     default: return null;
   }
 }
@@ -656,13 +746,31 @@ export function batchNudge(recent: RecentEdit[]): string | null {
   const run: RecentEdit[] = [];
   for (let i = recent.length - 1; i >= 0 && recent[i].app === app; i -= 1) run.unshift(recent[i]);
   if (run.length < BATCH_NUDGE_AFTER) return null;
-  const steps = run.map(asStep);
+  const steps = run.flatMap((e) => (e.steps ? e.steps : [asStep(e)]));
   if (steps.some((st) => st === null)) return null;
   return (
-    `You have sent ${run.length} separate actions to ${app} in a row, and each one costs a whole turn. ` +
+    `You have sent ${run.length} separate calls to ${app} in a row, each editing one thing, and each costs a whole turn. ` +
     `They fit in one call: computer_do {"app":${JSON.stringify(app)},"steps":${JSON.stringify(steps)}}. ` +
     "Batch the moves you already know — setting one object's position, size and colour is one call, not five."
   );
+}
+
+/** Whether a batch edited a single thing — one field, one control — however
+ *  many keystrokes it took. Steps without an id (keys, reads, pictures) are the
+ *  means, not the edit. Zero ids is nothing to combine. */
+export function isSingleEdit(steps: BatchStep[]): boolean {
+  const ids = new Set<number>();
+  for (const st of steps) if ("id" in st && typeof st.id === "number") ids.add(st.id);
+  return ids.size === 1;
+}
+
+/** Batch steps as the wire shape the model would send: `wait_ms` only when
+ *  set, internal field names dropped. For splicing into a suggested call. */
+export function stepsForNudge(steps: BatchStep[]): Record<string, unknown>[] {
+  return steps.map((st) => {
+    const { waitMs, ...rest } = st as BatchStep & { waitMs: number };
+    return waitMs > 0 ? { ...rest, wait_ms: waitMs } : { ...rest };
+  });
 }
 
 export function renderActionResult(diff: string, hint?: string | null, nextCall?: string | null): string {
