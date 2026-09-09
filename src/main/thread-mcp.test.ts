@@ -32,10 +32,10 @@ test("the store round-trips and tolerates garbage", () => {
   assert.equal(THREAD_MCP_FILE, "thread-mcp.json");
 });
 
-test("the chip says off, the one name, or a count", () => {
+test("the chip says only on or off", () => {
   assert.equal(mcpChipLabel([]), "MCP off");
-  assert.equal(mcpChipLabel(["figma_mcp"]), "MCP: figma_mcp");
-  assert.equal(mcpChipLabel(["a", "b", "c"]), "MCP: 3 on");
+  assert.equal(mcpChipLabel(["figma_mcp"]), "MCP on");
+  assert.equal(mcpChipLabel(["a", "b", "c"]), "MCP on", "the names live in the panel, not the chip");
 });
 
 test("a switch applies now on an idle thread, queues while a turn runs, and is only a note for a thread that has not started", () => {

@@ -48,10 +48,12 @@ export function parseThreadMcp(text: string): Map<string, Set<string>> {
   return m;
 }
 
+/** The composer chip says only whether this conversation has any server on.
+ *  The switches themselves live in the MCP panel under +: a second popover
+ *  hanging off the composer sat on top of the + menu with both open at once,
+ *  and the names are long enough that the chip grew with them. */
 export function mcpChipLabel(enabled: readonly string[]): string {
-  if (enabled.length === 0) return "MCP off";
-  if (enabled.length === 1) return `MCP: ${enabled[0]}`;
-  return `MCP: ${enabled.length} on`;
+  return enabled.length ? "MCP on" : "MCP off";
 }
 
 /** Measured 2026-09-09: thread/resume on a LOADED thread hands back the

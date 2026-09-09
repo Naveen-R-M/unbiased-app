@@ -8060,6 +8060,7 @@ app.whenReady().then(async () => {
     // thread/start the first message makes.
     if (decision === "pending-new-thread") {
       pendingNewThreadMcp = names;
+      send("mcp:thread-applied", { threadId: null, enabled: names, status: "pending-new-thread" });
       return { status: "pending-new-thread" as const };
     }
     const threadId = payload.threadId as string;
@@ -8069,6 +8070,7 @@ app.whenReady().then(async () => {
     saveThreadMcp();
     if (decision === "queue") {
       mcpApplyPending.add(threadId);
+      send("mcp:thread-applied", { threadId, enabled: names, status: "queued" });
       return { status: "queued" as const };
     }
     try {
@@ -8077,6 +8079,7 @@ app.whenReady().then(async () => {
     } catch (err) {
       // "no rollout found": a thread that has not completed a turn cannot be
       // resumed. The set is saved; it applies on the next load.
+      send("mcp:thread-applied", { threadId, enabled: names, status: "saved", error: String(err) });
       return { status: "saved" as const, error: String(err) };
     }
   });
