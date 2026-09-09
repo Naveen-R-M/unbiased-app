@@ -95,7 +95,7 @@ import {
 } from "./ax-bridge";
 import {
   CHECKPOINT_TOOLS, checkpointPath, validateCheckpointNotes, renderCheckpoint, pushFact, checkpointDue,
-  checkpointGateText, checkpointPreamble, isGatedTool, type LedgerEntry,
+  checkpointGateText, checkpointPreamble, isGatedTool, pathsInCommand, remeasureNudge, type LedgerEntry,
 } from "./checkpoint";
 import { isProductionBuild } from "./runtime-mode";
 import {
@@ -2693,6 +2693,7 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
           inspector,
           ...captions,
           batchNudgeText,
+          remeasureNote(root),
         ].filter(Boolean).join("\n");
         return {
           contentItems: [
@@ -2754,7 +2755,7 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         const pointerNudge = recordEditAndNudge(root, appName, {
           tool: "computer_pointer", app: appName, id: a.id as number, ...(typeof a.clicks === "number" ? { clicks: a.clicks } : {}), ...(path ? { path: true } : {}),
         });
-        return axText([`${hold ? "Dragged" : "Clicked"} ${path ? `${path.length} point(s)` : "the centre"} in ${appName}.${where}\n${diff || "(nothing in the tree changed — a canvas often shows its result only as a new object, so read the app)"}`, inspector, pointerNudge].filter(Boolean).join("\n"), true);
+        return axText([`${hold ? "Dragged" : "Clicked"} ${path ? `${path.length} point(s)` : "the centre"} in ${appName}.${where}\n${diff || "(nothing in the tree changed — a canvas often shows its result only as a new object, so read the app)"}`, inspector, pointerNudge, remeasureNote(root)].filter(Boolean).join("\n"), true);
       }
       case "computer_app_screenshot": {
         const r = await ax.request("screenshot", { app: appName, ...(typeof a.window === "number" ? { window: a.window } : {}) }, 15_000);
@@ -2824,7 +2825,7 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         // inspector's ids change; a key or a value write does not.
         const inspector = tool === "computer_press" || tool === "computer_act" ? await inspectorBlock(appName) : null;
         return axText(
-          [renderActionResult(diff, hint, hint && clicked ? parkedNextCall(appName) : null), inspector, nudge].filter(Boolean).join("\n"),
+          [renderActionResult(diff, hint, hint && clicked ? parkedNextCall(appName) : null), inspector, nudge, remeasureNote(root)].filter(Boolean).join("\n"),
           true,
         );
       }
@@ -4405,6 +4406,41 @@ function writeCheckpoint(root: string): string {
   }));
   return file;
 }
+// Files the model has run a command against, per conversation, and the
+// conversations already told about it. See remeasureNudge: the same source
+// file was analysed 5, 4 and 3 times across three runs of one task.
+const measuredPaths = new Map<string, Map<string, number>>();
+const remeasureNudged = new Set<string>();
+
+/** Tally one shell command's file paths, and put the first sighting of each in
+ *  the ledger — so the checkpoint file says which files were measured even
+ *  though only the model knows what the numbers were. */
+function recordMeasuredPaths(threadId: string | null, command: string): void {
+  const root = rootThreadOf(threadId);
+  const tally = measuredPaths.get(root) ?? new Map<string, number>();
+  for (const path of pathsInCommand(command)) {
+    const runs = (tally.get(path) ?? 0) + 1;
+    tally.set(path, runs);
+    if (runs === 1) recordFact(threadId, `measured ${path}`);
+  }
+  measuredPaths.set(root, tally);
+}
+
+/** The re-measurement note for this conversation's next desktop result, or
+ *  null. Once per conversation, like the batch nudge — a reminder on every
+ *  call is noise, and the point is made the first time. */
+function remeasureNote(root: string): string | null {
+  if (remeasureNudged.has(root)) return null;
+  let worst: { path: string; runs: number } | null = null;
+  for (const [path, runs] of measuredPaths.get(root) ?? []) {
+    if (!worst || runs > worst.runs) worst = { path, runs };
+  }
+  if (!worst) return null;
+  const text = remeasureNudge({ path: worst.path, runs: worst.runs, savedCheckpoint: checkpointCycle(root).savedThisCycle });
+  if (text) remeasureNudged.add(root);
+  return text;
+}
+
 /** A measured fact the app itself observed — a value read back, where a click
  *  landed, what launched. Never a tree and never a picture. */
 function recordFact(threadId: string | null, text: string): void {
@@ -5743,6 +5779,7 @@ function wireNotifications(): void {
           const ce = item as { command?: string; status?: string; exitCode?: number; aggregatedOutput?: string };
           if (phase === "started") {
             observeLearning("tool_call", threadId, ce.command ?? "(command)", { argsSummary: ce.command ?? "" });
+            recordMeasuredPaths(threadId, ce.command ?? "");
           } else if (phase === "completed") {
             observeLearning("tool_output", threadId, ce.command ?? "(command)", {
               exitCode: typeof ce.exitCode === "number" ? ce.exitCode : 0,
@@ -5813,6 +5850,7 @@ function wireNotifications(): void {
               c.gateUsed = false;
               c.thresholdWritten = false;
               checkpointReplayDue.add(root);
+              remeasureNudged.delete(root);
               // The summary ate the skill too: last run the model re-read it
               // through the shell, 8KB and a turn. Send it again with the next call.
               axSkillSent.delete(root);

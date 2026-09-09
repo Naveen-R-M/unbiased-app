@@ -248,6 +248,14 @@ there is a checkpoint, and it works in three parts.
 The first action you send past the threshold is held once until you have
 saved; the reply carries the exact call. Save, then send the action again.
 
+**Measure once.** What you work out before acting — sizes and colours read
+from a source file, a scale, an offset — cannot be read off the app later.
+Save it with `checkpoint_save` before the first action and work from what you
+wrote. Across three runs of one task the same file was analysed five, four
+and three times; one analysis printed 8k tokens and cost a summary, and two
+of those runs still had the numbers in front of them. Measure again only if
+the checkpoint is missing or something on screen proves a number wrong.
+
 What a good note looks like — small, exact, and about the work rather than the
 screen:
 

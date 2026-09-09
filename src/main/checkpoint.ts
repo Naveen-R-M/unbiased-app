@@ -120,3 +120,31 @@ export const CHECKPOINT_TOOLS = [
     },
   },
 ];
+
+/** Absolute file paths a shell command names, deduplicated.
+ *
+ *  The charset stops at quotes, parentheses and spaces, which is what makes it
+ *  work on a path buried inside a one-liner — `Image.open('/Users/n/a.png')`
+ *  is the commonest shape by far. A path with no extension is not a file
+ *  being measured (`/dev/null`, a directory), and a relative one cannot be
+ *  compared between two commands run from different directories. */
+export function pathsInCommand(command: string): string[] {
+  const found = command.match(/\/[A-Za-z0-9._~/-]+\.[A-Za-z0-9]{1,6}\b/g) ?? [];
+  return [...new Set(found)];
+}
+
+/** Said once per conversation, when the model measures the same file again.
+ *
+ *  Measured across three runs of one drawing task: the same source file was
+ *  analysed 5, 4 and 3 times. One analysis printed 8.4k tokens and pushed the
+ *  context from 85k to 103k, which is a compaction bought for nothing. The
+ *  last run re-analysed with no compaction and the numbers still in context,
+ *  so this is a reflex and not only a memory failure — hence a note that says
+ *  the measurement stands, rather than a refusal. */
+export function remeasureNudge(opts: { path: string; runs: number; savedCheckpoint: boolean }): string | null {
+  if (opts.runs < 2) return null;
+  const head = `You have now run ${opts.runs} commands against ${opts.path}.`;
+  return opts.savedCheckpoint
+    ? `${head} You already saved a checkpoint — read what you wrote there instead of measuring again. Measure again only if it is missing or something you can see proves it wrong.`
+    : `${head} Measuring the same thing twice costs a turn and can disagree with itself. Save what you measured with checkpoint_save and read it back instead of measuring again.`;
+}

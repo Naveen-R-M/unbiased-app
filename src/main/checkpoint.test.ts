@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import {
   checkpointPath, validateCheckpointNotes, renderCheckpoint, pushFact, checkpointDue, checkpointGateText,
   checkpointPreamble, isGatedTool, CHECKPOINT_PERCENT, MAX_CHECKPOINT_NOTES, MAX_LEDGER, MAX_FACT_CHARS,
-  CHECKPOINT_TOOLS, type LedgerEntry,
+  CHECKPOINT_TOOLS, pathsInCommand, remeasureNudge, type LedgerEntry,
 } from "./checkpoint";
 
 // Measured 2026-09-08 (Figma logo run, 124,518-token window): two automatic
@@ -91,4 +91,34 @@ test("checkpoint_save is declared with notes as its only required field", () => 
   assert.deepEqual(t.inputSchema.required, ["notes"]);
   assert.ok("notes" in t.inputSchema.properties);
   assert.ok(/decisions/i.test(t.description) && /refused/i.test(t.description), "the description says what belongs and what is refused");
+});
+
+// Measured across three runs of one drawing task: the model analysed the same
+// source file 5, 4 and 3 times. Once it cost a compaction outright — a single
+// analysis printed 8.4k tokens and pushed the context from 85k to 103k. The
+// re-analysis in the last run happened with NO compaction and the numbers
+// still in context, so this is not only a memory problem: measuring again is
+// a reflex worth naming.
+
+test("the paths a command names are the absolute ones with a file extension", () => {
+  assert.deepEqual(
+    pathsInCommand(`python3 -c "from PIL import Image; img = Image.open('/Users/n/Downloads/icon.png'); print(img.size)"`),
+    ["/Users/n/Downloads/icon.png"],
+  );
+  assert.deepEqual(pathsInCommand("cat /Users/n/proj/resources/skills/computer-use/SKILL.md"), ["/Users/n/proj/resources/skills/computer-use/SKILL.md"]);
+  assert.deepEqual(pathsInCommand("magick /Users/n/a.png -format '%[pixel:p{0,0}]' info:"), ["/Users/n/a.png"]);
+  assert.deepEqual(pathsInCommand("open /Users/n/a.png && file /Users/n/a.png"), ["/Users/n/a.png"], "named twice in one command is one measurement");
+  assert.deepEqual(pathsInCommand("ls -la && cat notes.txt"), [], "a relative path is not worth tracking");
+  assert.deepEqual(pathsInCommand("sleep 10 && cat /dev/null"), [], "no extension, not a file being measured");
+});
+
+test("the second run against a path is nudged once, and says the checkpoint is where the answer lives", () => {
+  assert.equal(remeasureNudge({ path: "/Users/n/a.png", runs: 1, savedCheckpoint: false }), null, "measuring once is the point");
+  const first = remeasureNudge({ path: "/Users/n/a.png", runs: 2, savedCheckpoint: false });
+  assert.match(String(first), /2 commands against \/Users\/n\/a\.png/);
+  assert.match(String(first), /checkpoint_save/);
+  const after = remeasureNudge({ path: "/Users/n/a.png", runs: 3, savedCheckpoint: true });
+  assert.match(String(after), /already saved/);
+  assert.match(String(after), /missing or something you can see proves it wrong/, "says the one reason to measure again");
+  assert.ok(!/checkpoint_save \{/.test(String(after)), "no need to spell the call once it has been used");
 });
