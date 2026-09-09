@@ -1517,3 +1517,20 @@ test("model-facing text describes shapes of apps, not one app by name", () => {
   const named = (skill.match(/Figma/g) ?? []).length;
   assert.ok(named === 0, `the skill names Figma ${named} time(s); describe the kind of app instead`);
 });
+
+// Measured 2026-09-08: return, delete, return, delete in one unwatched batch;
+// the second delete removed the frame the task lived in, the closing diff said
+// "- removed: 859-880", and the model wrote "the frame is clean now".
+test("a step the bridge watched on its own is reported with its own diff, before the closing diff", () => {
+  const out = summarizeBatch({
+    ran: ["step 1 (key return)", "step 2 (key delete)", "step 3 (key return)", "step 4 (key delete)"],
+    failed: null, remaining: 0, diff: "- removed: 859-880", unwatched: true,
+    watched: [
+      { step: "step 2 (key delete)", diff: "(no changes)" },
+      { step: "step 4 (key delete)", diff: '- removed: 859-880, among them: application group "Unbiased, Design frame"; term "Dimensions" and 20 more' },
+    ],
+  });
+  assert.match(out, /Watched on its own, because a delete outside a text field removes objects — step 4 \(key delete\) did this:\n- removed: 859-880, among them: application group "Unbiased, Design frame"/);
+  assert.equal((out.match(/Watched on its own/g) ?? []).length, 1, "a watched step that changed nothing is not reported");
+  assert.ok(out.indexOf("Watched on its own") < out.indexOf("\n- removed: 859-880\n") || out.trim().endsWith("- removed: 859-880"), "the step's diff comes before the closing diff");
+});

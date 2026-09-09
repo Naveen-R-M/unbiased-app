@@ -480,6 +480,11 @@ export function summarizeBatch(opts: {
    *  implied: a press that quietly did nothing at step 4 is invisible here,
    *  and a summary that reads "Done" for all 30 would be overclaiming. */
   unwatched?: boolean;
+  /** Steps the bridge watched on its own despite the sequence — a delete
+   *  outside a text field — with each one's own diff. Measured 2026-09-08: a
+   *  frame deleted at step 4 of an unwatched batch left "- removed: 859-880"
+   *  in the closing diff and the model wrote "the frame is clean now". */
+  watched?: { step: string; diff: string }[];
 }): string {
   const head = opts.failed
     ? [
@@ -497,7 +502,10 @@ export function summarizeBatch(opts: {
           : "",
       ].filter(Boolean).join(" ");
   const body = opts.diff.trim() === "(no changes)" ? ACTION_NO_CHANGE_SENTENCE : opts.diff || "(nothing in the tree changed)";
-  return [head, body, opts.fields].filter(Boolean).join("\n");
+  const watched = (opts.watched ?? [])
+    .filter((w) => w.diff.trim() && w.diff.trim() !== "(no changes)")
+    .map((w) => `Watched on its own, because a delete outside a text field removes objects — ${w.step} did this:\n${w.diff}`);
+  return [head, ...watched, body, opts.fields].filter(Boolean).join("\n");
 }
 
 /** The desktop tools the accessibility bridge owns. This list lives next to

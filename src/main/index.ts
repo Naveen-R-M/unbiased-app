@@ -1376,6 +1376,7 @@ const AX_TOOLS = [
     description:
       "Send one real key event. Use it for what pressing a control cannot express: committing a field with return, dismissing with escape, moving with tab or the arrows, and SELECTING A TOOL by its shortcut. " +
       "A single letter or digit is a key, which is often the only way in: a design app puts its tools behind one-character shortcuts and exposes no element for them at all, a pen or shape tool is one letter and nothing else reaches it. modifiers holds command, shift, option or control around the keystroke. " +
+      "A bare digit is text: with keyboard focus off a field it is refused, because it would reach the app as a shortcut — enter numbers with type or set_value on the field. A delete with focus off a field removes objects and is watched even inside computer_do, with what it removed named. " +
       "Pass id to aim the key at an element, which is focused first — WITHOUT id it goes wherever keyboard focus already happens to be, which may be another field entirely. Reaches a background app on any Space without taking the user's screen, because a key event does not depend on where the window is. " +
       "It waits for the app to react and returns what changed — committing a search with return comes back with the results in it, so do not read again straight afterwards.",
     inputSchema: {
@@ -2628,6 +2629,7 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         axLog(`do ${appName} ${steps.length} step(s): ${steps.map((x) => x.do).join(",")}`);
         const ran: string[] = [];
         const pictures: AxResult[] = [];
+        const watched: { step: string; diff: string }[] = [];
         let failed: { step: string; message: string } | null = null;
         // One bridge call per step. That is the cheap round trip — 3-70ms over
         // a local pipe — and collapsing them into ONE model round trip is the
@@ -2637,6 +2639,10 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
           try {
             const stepResult = await runBatchStep(appName, st, i === steps.length - 1);
             if (st.do === "screenshot") pictures.push(stepResult);
+            // The bridge watches a delete outside a text field even mid-sequence
+            // and hands back that step's own diff: show it, or a frame removed
+            // at step 4 is one id range in the closing diff.
+            if (typeof stepResult.watched === "string" && typeof stepResult.diff === "string") watched.push({ step: label, diff: stepResult.diff });
             ran.push(label);
             if (st.waitMs > 0) await new Promise((r) => setTimeout(r, st.waitMs));
           } catch (err) {
@@ -2681,7 +2687,7 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         const text = [
           summarizeBatch({
             ran, failed, remaining: steps.length - ran.length - (failed ? 1 : 0), diff,
-            unwatched: steps.length > 1, fields,
+            unwatched: steps.length > 1, fields, watched,
           }),
           inspector,
           ...captions,
