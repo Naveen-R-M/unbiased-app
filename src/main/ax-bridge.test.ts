@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-import { AX_TOOL_NAMES, SCREENSHOT_TOOL_NAMES, routesToAx, parseBatchSteps, describeBatch, summarizeBatch, MAX_BATCH_STEPS, AxClient, AxError, appOfStep, axConsent, axNeedsFocus, screenshotToolsOffered, coordinateToolAllowed, withScreenshotGuidance, SCREENSHOT_FRAME_SENTENCE, axReadOptsFrom, AX_DEFAULT_READ_OPTS, shouldRecoverRaise, describeAxAction, indexElementLines, readAxManifest, resolveAxDir, shouldOpenAccessibilitySettings, axNotTrustedText, RAISE_DESCRIPTION, APP_STATE_SPACE_SENTENCE, LAUNCH_FRONT_SENTENCE, withSpaceGuidance, otherSpaceNote, launchOutcome, renderActionResult, ACTION_NO_CHANGE_SENTENCE, TASK_DISCIPLINE_SENTENCE, SCREENSHOT_SPACE_SENTENCE, parseCandidates, describeCandidates, parkedNextCall, parkedReadNote, batchNudge, isSingleEdit, stepsForNudge, traceStep, MAX_TYPE_LENGTH, type BatchStep, BATCH_NUDGE_AFTER, type RecentEdit, skillBody, skillPreamble, shouldSendSkill, prependSkill, MAX_SKILL_PREAMBLE, candidateWorked, summarizeCandidates, MAX_CANDIDATES, MAX_CANDIDATE_STEPS, type AxCallInfo, touchedFieldIds, renderFieldValues, MAX_FIELDS_READ_BACK, type FieldValue, renderInspector, MAX_INSPECTOR_FIELDS, BATCH_VERBS, type InspectorField } from "./ax-bridge";
+import { AX_TOOL_NAMES, SCREENSHOT_TOOL_NAMES, routesToAx, parseBatchSteps, describeBatch, summarizeBatch, MAX_BATCH_STEPS, AxClient, AxError, appOfStep, axConsent, axNeedsFocus, screenshotToolsOffered, coordinateToolAllowed, withScreenshotGuidance, SCREENSHOT_FRAME_SENTENCE, axReadOptsFrom, AX_DEFAULT_READ_OPTS, shouldRecoverRaise, describeAxAction, indexElementLines, readAxManifest, resolveAxDir, shouldOpenAccessibilitySettings, axNotTrustedText, RAISE_DESCRIPTION, APP_STATE_SPACE_SENTENCE, LAUNCH_FRONT_SENTENCE, withSpaceGuidance, otherSpaceNote, launchOutcome, renderActionResult, ACTION_NO_CHANGE_SENTENCE, TASK_DISCIPLINE_SENTENCE, SCREENSHOT_SPACE_SENTENCE, parseCandidates, describeCandidates, parkedNextCall, parkedReadNote, batchNudge, isSingleEdit, stepsForNudge, traceStep, MAX_TYPE_LENGTH, type BatchStep, BATCH_NUDGE_AFTER, type RecentEdit, pointerHeadline, skillBody, skillPreamble, shouldSendSkill, prependSkill, MAX_SKILL_PREAMBLE, candidateWorked, summarizeCandidates, MAX_CANDIDATES, MAX_CANDIDATE_STEPS, type AxCallInfo, touchedFieldIds, renderFieldValues, MAX_FIELDS_READ_BACK, type FieldValue, renderInspector, MAX_INSPECTOR_FIELDS, BATCH_VERBS, type InspectorField } from "./ax-bridge";
 
 const scratch = () => mkdtempSync(join(tmpdir(), "ax-"));
 
@@ -1533,4 +1533,20 @@ test("a step the bridge watched on its own is reported with its own diff, before
   assert.match(out, /Watched on its own, because a delete outside a text field removes objects — step 4 \(key delete\) did this:\n- removed: 859-880, among them: application group "Unbiased, Design frame"/);
   assert.equal((out.match(/Watched on its own/g) ?? []).length, 1, "a watched step that changed nothing is not reported");
   assert.ok(out.indexOf("Watched on its own") < out.indexOf("\n- removed: 859-880\n") || out.trim().endsWith("- removed: 859-880"), "the step's diff comes before the closing diff");
+});
+
+// Measured 2026-09-09: the bridge stopped a 106-point pen trace at click 63,
+// in front of a toolbar that had appeared over the surface, and said so in
+// its `note`. The app printed "Clicked 106 point(s)" and dropped the note. The
+// model, seeing 47 anchors on screen after the next pass, concluded the bridge
+// "executes only the first 47 anchors per call" and spent the rest of the run
+// deleting and redrawing. The count must be what landed, and the note must ride.
+test("a pointer result counts what landed, not what was asked, and carries the bridge's note", () => {
+  assert.equal(pointerHeadline({ app: "Figma", hold: false, asked: 106, landed: 63, note: null }), "Clicked 63 of 106 point(s) in Figma.");
+  assert.equal(pointerHeadline({ app: "Figma", hold: false, asked: 5, landed: 5, note: null }), "Clicked 5 point(s) in Figma.");
+  assert.equal(pointerHeadline({ app: "Figma", hold: true, asked: 90, landed: 90, note: null }), "Dragged 90 point(s) in Figma.");
+  assert.equal(pointerHeadline({ app: "Figma", hold: false, asked: null, landed: 1, note: null }), "Clicked the centre in Figma.");
+  const withNote = pointerHeadline({ app: "Figma", hold: false, asked: 106, landed: 63, note: "Clicked 63 of 106 points, then stopped: point 64 lands on toggle button \"Cut\"." });
+  assert.ok(withNote.startsWith("Clicked 63 of 106 point(s) in Figma.\n"), withNote);
+  assert.ok(withNote.includes("then stopped: point 64"), "the bridge's own words come through: " + withNote);
 });

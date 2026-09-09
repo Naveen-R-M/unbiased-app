@@ -83,6 +83,7 @@ import {
   routesToAx,
   parseBatchSteps,
   summarizeBatch,
+  pointerHeadline,
   traceStep,
   MAX_CLICKS,
   MAX_BATCH_STEPS,
@@ -2756,7 +2757,11 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         const pointerNudge = recordEditAndNudge(root, appName, {
           tool: "computer_pointer", app: appName, id: a.id as number, ...(typeof a.clicks === "number" ? { clicks: a.clicks } : {}), ...(path ? { path: true } : {}),
         });
-        return axText([`${hold ? "Dragged" : "Clicked"} ${path ? `${path.length} point(s)` : "the centre"} in ${appName}.${where}\n${diff || "(nothing in the tree changed — a canvas often shows its result only as a new object, so read the app)"}`, inspector, pointerNudge, remeasureNote(root)].filter(Boolean).join("\n"), true);
+        const headline = pointerHeadline({
+          app: appName, hold, asked: path ? path.length : null, landed: at.length || 1,
+          note: typeof r.note === "string" ? r.note : null,
+        });
+        return axText([`${headline}${where}\n${diff || "(nothing in the tree changed — a canvas often shows its result only as a new object, so read the app)"}`, inspector, pointerNudge, remeasureNote(root)].filter(Boolean).join("\n"), true);
       }
       case "computer_app_screenshot": {
         const r = await ax.request("screenshot", { app: appName, ...(typeof a.window === "number" ? { window: a.window } : {}) }, 15_000);

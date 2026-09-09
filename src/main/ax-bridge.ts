@@ -468,6 +468,17 @@ export function renderInspector(fields: InspectorField[], truncated: boolean, pr
   ].join("\n");
 }
 
+/** The first line of a pointer result. Counts what LANDED, because the bridge
+ *  may stop short — a repeated pixel skipped, a control that appeared under the
+ *  path — and says so in `note`; a headline that repeats the request instead
+ *  hides both. Measured 2026-09-09: "Clicked 106 point(s)" over 63 landed clicks
+ *  sent the model looking for a point limit that did not exist. */
+export function pointerHeadline(o: { app: string; hold: boolean; asked: number | null; landed: number; note: string | null }): string {
+  const what = o.asked === null ? "the centre" : o.landed < o.asked ? `${o.landed} of ${o.asked} point(s)` : `${o.asked} point(s)`;
+  const head = `${o.hold ? "Dragged" : "Clicked"} ${what} in ${o.app}.`;
+  return o.note ? `${head}\n${o.note}` : head;
+}
+
 export function summarizeBatch(opts: {
   ran: string[];
   failed: { step: string; message: string } | null;
