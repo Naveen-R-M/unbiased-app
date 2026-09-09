@@ -99,7 +99,7 @@ export function checkpointPreamble(markdown: string): string {
  *  about to be lost. */
 const GATED = new Set([
   "computer_press", "computer_set_value", "computer_press_key", "computer_scroll_view", "computer_act",
-  "computer_do", "computer_pointer", "computer_launch", "computer_raise",
+  "computer_do", "computer_pointer", "computer_launch", "computer_raise", "computer_menu",
 ]);
 export function isGatedTool(tool: string): boolean {
   return GATED.has(tool);

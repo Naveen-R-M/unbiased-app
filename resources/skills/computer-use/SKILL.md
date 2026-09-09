@@ -173,17 +173,18 @@ of that element's box, so `{"x":0.5,"y":0.5}` is its centre and you never touch
 a screen pixel or a display scale. Give it the id of the canvas or web area,
 not the window. Several points are separate clicks, which is exactly how a pen
 tool takes a path; `hold=true` makes them one press-drag-release. The reply
-tells you the screen points your fractions landed on.
+tells you where your fractions landed.
 
-**Pointer input needs the window really visible.** It aims at screen
+**Pointer input needs the window really visible:** it aims at screen
 coordinates the app hit-tests, so it is refused when the window is parked or
-on another Space. Raise the app, tell the user drawing needs the screen, do it.
+on another Space. Raise the app, tell the user, and do it.
 
-**Clear the surface before the first point.** Apps float toolbars and popups
-over a drawing surface, often only once drawing begins, and a click on one of
-them ends the path or switches the tool. Fit the target to the view, hide the
-app's panels and toolbars or go full screen, then draw the whole shape in ONE
-call: an app may not join a path continued in a second call.
+**Clear the surface before the first point.** Apps float toolbars over a
+drawing surface, often only once drawing begins, and a click on one ends the
+path or switches the tool. Fit the target to the view and hide the app's
+panels or go full screen — `computer_menu` runs the app's own command by name;
+never guess a shortcut — then draw the whole shape in ONE call: an app may not
+join a path continued in a second call.
 
 **If you are asked to draw, draw.** Pasting an SVG or importing a file is not
 drawing, and substituting one for the other is answering a different request.

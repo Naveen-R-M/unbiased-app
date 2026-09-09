@@ -1523,6 +1523,23 @@ const AX_TOOLS = [
   },
   {
     type: "function",
+    name: "computer_menu",
+    description:
+      "The app's menu bar commands by NAME, read from the closed menus — nothing opens. Without item: lists the menus (query narrows to the commands whose name or menu contains it, e.g. query \"hide\" or \"full screen\" or \"zoom\"), each with its real shortcut. With item: runs that command by its title, or by \"Menu > Title\" when the title is in several menus. " +
+      "Use this for view and window commands — hide panels or toolbars, full screen, zoom to fit or to selection, undo, select all — instead of guessing a shortcut: a wrong guess lands in the app as some other command. " +
+      "Running a command brings the app to the front, because a menu action in a background app does nothing.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        app: { type: "string" },
+        query: { type: "string", description: "Filter the listing to commands whose \"Menu > Title\" contains this text." },
+        item: { type: "string", description: "Run this command: its exact title, or \"Menu > Title\"." },
+      },
+      required: ["app"],
+    },
+  },
+  {
+    type: "function",
     name: "computer_act",
     description:
       "Perform a NAMED action other than a plain press — the actions an element lists in braces, e.g. \"show menu\", \"cancel\", \"scroll to visible\", \"focus\". For an ordinary press use computer_click, to fill a field use computer_type, and to send a key use computer_key.",
@@ -1699,6 +1716,7 @@ function dynamicToolCommandText(tool: string | undefined, rawArgs: unknown): str
   }
   if (t === "computer_apps") return "list apps";
   if (t === "computer_raise") return `raise ${String(args.app)}`;
+  if (t === "computer_menu") return typeof args.item === "string" && args.item.trim() ? `run menu command "${args.item}" in ${String(args.app)}` : `list menu commands in ${String(args.app)}`;
   if (t === "computer_app_state") return typeof args.query === "string" ? `find "${args.query}" in ${String(args.app)}` : `read ${String(args.app)}`;
   if (t === "computer_launch") return `open ${String(args.app)}`;
   if (t === "computer_do") {
@@ -2528,6 +2546,30 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         const r = await ax.request("apps", {}, 3_000);
         const apps = (r.apps as { name: string; bundleId?: string; frontmost: boolean }[]) ?? [];
         return axText(apps.map((x) => `${x.name}${x.frontmost ? " [frontmost]" : ""}${x.bundleId ? ` (${x.bundleId})` : ""}`).join("\n") || "(no apps)", true);
+      }
+      case "computer_menu": {
+        if (typeof a.item === "string" && a.item.trim()) {
+          axLog(`menu ${appName} run "${a.item}"`);
+          const r = await ax.request("menu", { app: appName, item: a.item.trim(), ...axActionOpts(appName) });
+          const diff = String(r.diff ?? "");
+          remember(diff);
+          recordFact(threadId, `${appName} ran menu command ${String(r.ran ?? a.item)}`);
+          const shortcut = typeof r.shortcut === "string" ? ` (its shortcut is ${r.shortcut})` : "";
+          const ranText = `Ran ${String(r.ran ?? a.item)} in ${appName}${shortcut}.\n${diff || "(nothing in the tree changed)"}`;
+          const note = remeasureNote(root);
+          return axText(note ? `${ranText}\n${note}` : ranText, true);
+        }
+        const query = typeof a.query === "string" && a.query.trim() ? a.query.trim() : undefined;
+        axLog(`menus ${appName}${query ? ` "${query}"` : ""}`);
+        const r = await ax.request("menus", { app: appName, ...(query ? { query } : {}) });
+        if (Array.isArray(r.items)) {
+          const items = r.items as string[];
+          return axText(items.length
+            ? [`${String(r.count)} menu command(s) matching "${query}" in ${appName}:`, ...items, ...(typeof r.hint === "string" ? [r.hint] : []), 'Run one with computer_menu {item: "<title or Menu > Title>"}.'].join("\n")
+            : `No menu command in ${appName} matches "${query}". Call computer_menu without query to see the menus, or try another word.`, true);
+        }
+        const menus = Array.isArray(r.menus) ? (r.menus as string[]).join(", ") : "";
+        return axText(`${appName} menus: ${menus}. ${String(r.hint ?? "")}`, true);
       }
       case "computer_raise": {
         axLog(`raise ${appName} (the model asked)`);

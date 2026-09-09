@@ -539,6 +539,7 @@ export const AX_TOOL_NAMES = [
   "computer_scroll_view",
   "computer_act",
   "computer_do",
+  "computer_menu",
 ] as const;
 
 /** The older coordinate-and-screenshot tools. All of them when there is no
@@ -760,7 +761,8 @@ export function drawGate(o: { points: number; hold: boolean; used: boolean }): s
   if (o.used || o.hold || o.points < DRAW_GATE_POINTS) return null;
   return (
     `Held once, before the first long path in this conversation: ${o.points} points is a drawing, and a control floating over the surface takes a click meant for it — one usually appears the moment drawing begins, and ends the path or switches the tool. ` +
-    "Nothing was clicked. Before you send it again: fit the target to the view, and hide the app's panels and toolbars or go full screen. " +
+    "Nothing was clicked. Before you send it again: fit the target to the view, and hide the app's panels and toolbars or go full screen — " +
+    'find the app\'s own command for it with computer_menu (query "hide" or "full screen") and run it by name; do not guess a shortcut, a wrong one lands as some other command. ' +
     "Then send the same path again; it goes through, and this hold does not repeat."
   );
 }
@@ -1099,6 +1101,8 @@ export function describeAxAction(tool: string, rawArgs: unknown, lines?: Map<num
       }
       return "error" in parsed ? `Run steps in ${app}` : describeBatch(app, parsed.steps, lines);
     }
+    case "computer_menu":
+      return typeof a.item === "string" && a.item.trim() ? `Run menu command "${a.item.trim()}" in ${app}` : `List menu commands in ${app}`;
     case "computer_press":
     case "computer_set_value":
     case "computer_press_key":
