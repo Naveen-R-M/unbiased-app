@@ -738,6 +738,33 @@ export interface RecentEdit {
 
 export const BATCH_NUDGE_AFTER = 3;
 
+/** A click path this long is a drawing, not a click. */
+export const DRAW_GATE_POINTS = 20;
+
+/** Held ONCE per conversation, before the first long click path: clear the
+ *  surface first.
+ *
+ *  Measured 2026-09-09, five runs of one drawing task. Every run lost its first
+ *  pass to a control floating over the surface — a toolbar the app raises the
+ *  moment drawing begins — and hid the app's panels only after the bridge
+ *  stopped the path in front of it. By the last run the rule "clear the
+ *  surface before the first point" was in the skill AND in the pointer tool's
+ *  description, both in context, and the model still drew first and hid the
+ *  panels second. Prose lost; the refusal is what it acted on. So the reminder
+ *  is delivered the same way, once, at the exact moment it applies: the first
+ *  long path is held, the model clears the surface, and the same path goes
+ *  through on the next call. One turn, against the two or three the first pass
+ *  cost every time. Drags are not gated — they are one gesture, and a control
+ *  under a mid-drag point receives nothing. */
+export function drawGate(o: { points: number; hold: boolean; used: boolean }): string | null {
+  if (o.used || o.hold || o.points < DRAW_GATE_POINTS) return null;
+  return (
+    `Held once, before the first long path in this conversation: ${o.points} points is a drawing, and a control floating over the surface takes a click meant for it — one usually appears the moment drawing begins, and ends the path or switches the tool. ` +
+    "Nothing was clicked. Before you send it again: fit the target to the view, and hide the app's panels and toolbars or go full screen. " +
+    "Then send the same path again; it goes through, and this hold does not repeat."
+  );
+}
+
 function asStep(e: RecentEdit): Record<string, unknown> | null {
   switch (e.tool) {
     case "computer_press": return e.id === undefined ? null : { do: "press", id: e.id };

@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-import { AX_TOOL_NAMES, SCREENSHOT_TOOL_NAMES, routesToAx, parseBatchSteps, describeBatch, summarizeBatch, MAX_BATCH_STEPS, AxClient, AxError, appOfStep, axConsent, axNeedsFocus, screenshotToolsOffered, coordinateToolAllowed, withScreenshotGuidance, SCREENSHOT_FRAME_SENTENCE, axReadOptsFrom, AX_DEFAULT_READ_OPTS, shouldRecoverRaise, describeAxAction, indexElementLines, readAxManifest, resolveAxDir, shouldOpenAccessibilitySettings, axNotTrustedText, RAISE_DESCRIPTION, APP_STATE_SPACE_SENTENCE, LAUNCH_FRONT_SENTENCE, withSpaceGuidance, otherSpaceNote, launchOutcome, renderActionResult, ACTION_NO_CHANGE_SENTENCE, TASK_DISCIPLINE_SENTENCE, SCREENSHOT_SPACE_SENTENCE, parseCandidates, describeCandidates, parkedNextCall, parkedReadNote, batchNudge, isSingleEdit, stepsForNudge, traceStep, MAX_TYPE_LENGTH, type BatchStep, BATCH_NUDGE_AFTER, type RecentEdit, pointerHeadline, skillBody, skillPreamble, shouldSendSkill, prependSkill, MAX_SKILL_PREAMBLE, candidateWorked, summarizeCandidates, MAX_CANDIDATES, MAX_CANDIDATE_STEPS, type AxCallInfo, touchedFieldIds, renderFieldValues, MAX_FIELDS_READ_BACK, type FieldValue, renderInspector, MAX_INSPECTOR_FIELDS, BATCH_VERBS, type InspectorField } from "./ax-bridge";
+import { AX_TOOL_NAMES, SCREENSHOT_TOOL_NAMES, routesToAx, parseBatchSteps, describeBatch, summarizeBatch, MAX_BATCH_STEPS, AxClient, AxError, appOfStep, axConsent, axNeedsFocus, screenshotToolsOffered, coordinateToolAllowed, withScreenshotGuidance, SCREENSHOT_FRAME_SENTENCE, axReadOptsFrom, AX_DEFAULT_READ_OPTS, shouldRecoverRaise, describeAxAction, indexElementLines, readAxManifest, resolveAxDir, shouldOpenAccessibilitySettings, axNotTrustedText, RAISE_DESCRIPTION, APP_STATE_SPACE_SENTENCE, LAUNCH_FRONT_SENTENCE, withSpaceGuidance, otherSpaceNote, launchOutcome, renderActionResult, ACTION_NO_CHANGE_SENTENCE, TASK_DISCIPLINE_SENTENCE, SCREENSHOT_SPACE_SENTENCE, parseCandidates, describeCandidates, parkedNextCall, parkedReadNote, batchNudge, isSingleEdit, stepsForNudge, traceStep, MAX_TYPE_LENGTH, type BatchStep, BATCH_NUDGE_AFTER, type RecentEdit, pointerHeadline, drawGate, DRAW_GATE_POINTS, skillBody, skillPreamble, shouldSendSkill, prependSkill, MAX_SKILL_PREAMBLE, candidateWorked, summarizeCandidates, MAX_CANDIDATES, MAX_CANDIDATE_STEPS, type AxCallInfo, touchedFieldIds, renderFieldValues, MAX_FIELDS_READ_BACK, type FieldValue, renderInspector, MAX_INSPECTOR_FIELDS, BATCH_VERBS, type InspectorField } from "./ax-bridge";
 
 const scratch = () => mkdtempSync(join(tmpdir(), "ax-"));
 
@@ -1549,4 +1549,17 @@ test("a pointer result counts what landed, not what was asked, and carries the b
   const withNote = pointerHeadline({ app: "Figma", hold: false, asked: 106, landed: 63, note: "Clicked 63 of 106 points, then stopped: point 64 lands on toggle button \"Cut\"." });
   assert.ok(withNote.startsWith("Clicked 63 of 106 point(s) in Figma.\n"), withNote);
   assert.ok(withNote.includes("then stopped: point 64"), "the bridge's own words come through: " + withNote);
+});
+
+// Measured 2026-09-09: five runs, every first pass lost to a toolbar that
+// appears once drawing begins; the rule was in the skill and the tool
+// description and the model still drew first. The refusal is what it acted on.
+test("the first long click path in a conversation is held once, with the clear-the-surface rule, and only that one", () => {
+  const first = drawGate({ points: 92, hold: false, used: false });
+  assert.ok(first && /Held once/.test(first) && /92 points/.test(first), String(first));
+  assert.ok(/hide the app's panels and toolbars or go full screen/.test(String(first)) && /fit the target to the view/.test(String(first)));
+  assert.ok(/Nothing was clicked/.test(String(first)) && /send the same path again/.test(String(first)), "says the action did not run and how to proceed");
+  assert.equal(drawGate({ points: 92, hold: false, used: true }), null, "the second long path goes through");
+  assert.equal(drawGate({ points: DRAW_GATE_POINTS - 1, hold: false, used: false }), null, "a short path is a few clicks, not a drawing");
+  assert.equal(drawGate({ points: 92, hold: true, used: false }), null, "a drag is one gesture and is never held");
 });

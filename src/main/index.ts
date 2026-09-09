@@ -84,6 +84,7 @@ import {
   parseBatchSteps,
   summarizeBatch,
   pointerHeadline,
+  drawGate,
   traceStep,
   MAX_CLICKS,
   MAX_BATCH_STEPS,
@@ -2735,6 +2736,15 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         const clicks = typeof a.clicks === "number" ? Math.round(a.clicks) : 1;
         if (clicks < 1 || clicks > MAX_CLICKS) return axText(`clicks must be 1 to ${MAX_CLICKS}; 2 is a double click.`, false);
         const mods = Array.isArray(a.modifiers) ? a.modifiers.filter((m) => typeof m === "string") : [];
+        // The first drawing in a conversation is held once so the surface is
+        // cleared BEFORE the first point lands, not after a toolbar eats the
+        // last dozen. See drawGate for the five runs that made this a gate.
+        const gate = drawGate({ points: path?.length ?? 0, hold, used: drawGateUsed.has(root) });
+        if (gate) {
+          drawGateUsed.add(root);
+          axLog(`draw gate: held the first ${path?.length ?? 0}-point path in ${appName} until the surface is cleared`);
+          return axText(gate, false);
+        }
         axLog(`pointer ${appName} #${String(a.id)} ${path ? `${path.length} point(s)` : "centre"}${clicks > 1 ? ` x${clicks}` : ""}${hold ? " held" : ""}${mods.length ? ` +${mods.join("+")}` : ""}`);
         const r = await ax.request("pointer", {
           app: appName,
@@ -4480,6 +4490,8 @@ function recordFact(threadId: string | null, text: string): void {
  *  a reminder on every action would be noise. */
 let axRecentEdits: RecentEdit[] = [];
 const axBatchNudged = new Set<string>();
+/** Conversations whose first long click path has been held once — see drawGate. */
+const drawGateUsed = new Set<string>();
 /** Record one logical edit and, once per compaction cycle, hand back the batch
  *  call that would have carried the recent run of them. */
 function recordEditAndNudge(root: string, appName: string, edit: RecentEdit): string | null {
@@ -5876,6 +5888,7 @@ function wireNotifications(): void {
               c.thresholdWritten = false;
               checkpointReplayDue.add(root);
               remeasureNudged.delete(root);
+              drawGateUsed.delete(root);
               // The summary ate the skill too: last run the model re-read it
               // through the shell, 8KB and a turn. Send it again with the next call.
               axSkillSent.delete(root);
