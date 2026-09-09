@@ -10094,6 +10094,7 @@ function ChatPane({
                   +
                 </button>
               </span>
+              <ConversationMcp threadId={threadId ?? null} onStopTurn={() => void window.unbiased.interrupt(paneId)} />
               {planMode && (
                 <button
                   onClick={onTogglePlanMode}
@@ -13152,6 +13153,10 @@ function McpPanel({ onClose }: { onClose: () => void }) {
           Model Context Protocol servers give Pareto extra tools. Some are a program
           Pareto runs; others already listen on a URL — including apps on this
           machine, like Figma's Dev Mode server.
+        </p>
+        <p style={{ color: colors.dim, fontSize: 14, lineHeight: 1.55, margin: "4px 0 0" }}>
+          Servers are off in each conversation until you turn them on from the MCP
+          chip in the composer.
         </p>
         </div>
 
@@ -16675,6 +16680,163 @@ function MenuChevron() {
 /** Current state for a row that toggles rather than navigates. Says what IS,
  *  not what clicking will do — the description already covers the action, and
  *  a label that flips between "on" and "off" is the classic ambiguous toggle. */
+/** The chip's own label. Duplicated from src/main/thread-mcp.ts rather than
+ *  imported — main and renderer are separate bundles here — and the copy in
+ *  main is the one under test. */
+function mcpChipLabel(enabled: readonly string[]): string {
+  if (enabled.length === 0) return "MCP off";
+  if (enabled.length === 1) return `MCP: ${enabled[0]}`;
+  return `MCP: ${enabled.length} on`;
+}
+
+/** MCP servers for THIS conversation. Off by default: measured 2026-09-09,
+ *  four connected servers cost ~35k tokens of a 124k window before the first
+ *  message. A switch applies in place when the thread is idle, and at the end
+ *  of the current turn otherwise — see mcp:thread-set. */
+function ConversationMcp({ threadId, onStopTurn }: { threadId: string | null; onStopTurn: () => void }) {
+  const [open, setOpen] = useState(false);
+  const [configured, setConfigured] = useState<string[]>([]);
+  const [enabled, setEnabled] = useState<string[]>([]);
+  const [status, setStatus] = useState<Record<string, McpConnected>>({});
+  const [pending, setPending] = useState(false);
+  const [running, setRunning] = useState(false);
+  const [note, setNote] = useState<string | null>(null);
+
+  const refresh = useCallback(() => {
+    void window.unbiased.mcpThreadGet(threadId).then((r) => {
+      setConfigured(r.configured);
+      setEnabled(r.enabled);
+      setPending(r.pending);
+      setRunning(r.running);
+    });
+    void window.unbiased.mcpList().then((r) => {
+      const byName: Record<string, McpConnected> = {};
+      for (const c of r.connected ?? []) byName[c.name] = c;
+      setStatus(byName);
+    });
+  }, [threadId]);
+  useEffect(refresh, [refresh]);
+  useEffect(
+    () =>
+      window.unbiased.onMcpThreadApplied((p) => {
+        if (p.threadId !== threadId) return;
+        setPending(false);
+        setNote(p.error ? `Could not apply: ${p.error}` : null);
+        refresh();
+      }),
+    [threadId, refresh],
+  );
+
+  const toggle = async (name: string) => {
+    const next = enabled.includes(name) ? enabled.filter((nm) => nm !== name) : [...enabled, name];
+    setEnabled(next);
+    const r = await window.unbiased.mcpThreadSet(threadId, next);
+    if (r.status === "queued") {
+      setPending(true);
+      setNote(null);
+    } else if (r.status === "saved") {
+      setNote("Saved. It applies when the conversation is next opened.");
+    } else {
+      setNote(null);
+    }
+    refresh();
+  };
+
+  return (
+    <span style={{ position: "relative", display: "flex" }}>
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        title="MCP servers for this conversation"
+        aria-expanded={open}
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 7,
+          background: "var(--chip)",
+          border: "none",
+          borderRadius: 999,
+          padding: "4px 10px",
+          color: enabled.length ? colors.accent : colors.dim,
+          fontSize: 13.5,
+          cursor: "pointer",
+          fontFamily: "inherit",
+        }}
+      >
+        <McpIcon size={13} />
+        {mcpChipLabel(enabled)}
+      </button>
+      {open && (
+        <div
+          role="menu"
+          data-popover
+          style={{
+            position: "absolute",
+            bottom: "calc(100% + 8px)",
+            left: 0,
+            width: 340,
+            background: colors.panel,
+            border: `1px solid ${colors.border}`,
+            borderRadius: 14,
+            padding: 6,
+            zIndex: 20,
+            boxShadow: "0 12px 32px rgba(0,0,0,0.5)",
+            transformOrigin: "bottom left",
+          }}
+        >
+          <div style={{ padding: "8px 12px", color: colors.dim, fontSize: 12, lineHeight: 1.5 }}>
+            Servers are off in each conversation until you turn them on here.
+          </div>
+          {configured.length === 0 && (
+            <div style={{ padding: 12, color: colors.dim, fontSize: 13 }}>
+              No MCP servers configured. Add one under MCP in the + menu.
+            </div>
+          )}
+          {configured.map((name) => {
+            const srv = status[name];
+            const tools = srv?.tools ? Object.keys(srv.tools).length : null;
+            const on = enabled.includes(name);
+            return (
+              <MenuItem
+                key={name}
+                icon={<McpIcon />}
+                label={name}
+                desc={
+                  srv
+                    ? `${srv.authStatus === "notLoggedIn" ? "Sign in required" : "Connected"}${tools !== null ? ` · ${tools} tools` : ""}`
+                    : "Not connected"
+                }
+                trailing={<StatePill on={on} />}
+                onClick={() => void toggle(name)}
+              />
+            );
+          })}
+          {(pending || running) && (
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                gap: 10,
+                padding: "8px 12px",
+                borderTop: `1px solid ${colors.border}`,
+              }}
+            >
+              <span style={{ color: colors.amber, fontSize: 12, lineHeight: 1.5 }}>
+                {pending ? "Changes apply when this turn finishes." : "A turn is running; changes apply when it finishes."}
+              </span>
+              <button type="button" onClick={onStopTurn} className="u-chip" style={btnSmallStyle}>
+                Stop and apply now
+              </button>
+            </div>
+          )}
+          {note && <div style={{ padding: "6px 12px", color: colors.dim, fontSize: 12, lineHeight: 1.5 }}>{note}</div>}
+        </div>
+      )}
+    </span>
+  );
+}
+
 function StatePill({ on }: { on: boolean }) {
   return (
     <span
