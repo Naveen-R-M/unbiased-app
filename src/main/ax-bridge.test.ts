@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-import { AX_TOOL_NAMES, SCREENSHOT_TOOL_NAMES, routesToAx, parseBatchSteps, describeBatch, summarizeBatch, MAX_BATCH_STEPS, AxClient, AxError, appOfStep, axConsent, axNeedsFocus, screenshotToolsOffered, coordinateToolAllowed, withScreenshotGuidance, SCREENSHOT_FRAME_SENTENCE, axReadOptsFrom, AX_DEFAULT_READ_OPTS, shouldRecoverRaise, describeAxAction, indexElementLines, readAxManifest, resolveAxDir, shouldOpenAccessibilitySettings, axNotTrustedText, RAISE_DESCRIPTION, APP_STATE_SPACE_SENTENCE, LAUNCH_FRONT_SENTENCE, withSpaceGuidance, otherSpaceNote, launchOutcome, renderActionResult, ACTION_NO_CHANGE_SENTENCE, TASK_DISCIPLINE_SENTENCE, SCREENSHOT_SPACE_SENTENCE, parseCandidates, describeCandidates, parkedNextCall, parkedReadNote, batchNudge, isSingleEdit, stepsForNudge, traceStep, MAX_TYPE_LENGTH, type BatchStep, BATCH_NUDGE_AFTER, type RecentEdit, pointerHeadline, drawGate, DRAW_GATE_POINTS, skillBody, skillPreamble, shouldSendSkill, prependSkill, MAX_SKILL_PREAMBLE, candidateWorked, summarizeCandidates, MAX_CANDIDATES, MAX_CANDIDATE_STEPS, type AxCallInfo, touchedFieldIds, renderFieldValues, MAX_FIELDS_READ_BACK, type FieldValue, renderInspector, MAX_INSPECTOR_FIELDS, BATCH_VERBS, type InspectorField } from "./ax-bridge";
+import { AX_TOOL_NAMES, SCREENSHOT_TOOL_NAMES, routesToAx, parseBatchSteps, describeBatch, summarizeBatch, MAX_BATCH_STEPS, AxClient, AxError, appOfStep, axConsent, axNeedsFocus, screenshotToolsOffered, coordinateToolAllowed, withScreenshotGuidance, SCREENSHOT_FRAME_SENTENCE, axReadOptsFrom, AX_DEFAULT_READ_OPTS, shouldRecoverRaise, describeAxAction, indexElementLines, readAxManifest, resolveAxDir, shouldOpenAccessibilitySettings, axNotTrustedText, RAISE_DESCRIPTION, APP_STATE_SPACE_SENTENCE, LAUNCH_FRONT_SENTENCE, withSpaceGuidance, otherSpaceNote, launchOutcome, renderActionResult, ACTION_NO_CHANGE_SENTENCE, TASK_DISCIPLINE_SENTENCE, SCREENSHOT_SPACE_SENTENCE, parseCandidates, describeCandidates, parkedNextCall, parkedReadNote, batchNudge, isSingleEdit, stepsForNudge, traceStep, MAX_TYPE_LENGTH, type BatchStep, BATCH_NUDGE_AFTER, type RecentEdit, pointerHeadline, drawGate, DRAW_GATE_POINTS, surfaceCommands, skillBody, skillPreamble, shouldSendSkill, prependSkill, appendSkill, MAX_SKILL_PREAMBLE, candidateWorked, summarizeCandidates, MAX_CANDIDATES, MAX_CANDIDATE_STEPS, type AxCallInfo, touchedFieldIds, renderFieldValues, MAX_FIELDS_READ_BACK, type FieldValue, renderInspector, MAX_INSPECTOR_FIELDS, BATCH_VERBS, type InspectorField } from "./ax-bridge";
 
 const scratch = () => mkdtempSync(join(tmpdir(), "ax-"));
 
@@ -1123,7 +1123,7 @@ test("the dispatch site sends it once, before the tool result", () => {
   const src = readFileSync(join(__dirname, "index.ts"), "utf8");
   assert.ok(src.includes("shouldSendSkill(tool, axSkillSent.has(skillRoot))"), "decided per conversation");
   assert.ok(src.includes("axSkillSent.add(skillRoot)"), "and only once");
-  assert.ok(src.includes("prependSkill(response, preamble)"));
+  assert.ok(src.includes("appendSkill(response, preamble)"), "the skill rides after the result, so the result is not missed");
   // An unreadable file must not break a turn.
   assert.ok(src.includes("first-call preamble disabled"), "a missing skill file degrades quietly");
 });
@@ -1562,4 +1562,33 @@ test("the first long click path in a conversation is held once, with the clear-t
   assert.equal(drawGate({ points: 92, hold: false, used: true }), null, "the second long path goes through");
   assert.equal(drawGate({ points: DRAW_GATE_POINTS - 1, hold: false, used: false }), null, "a short path is a few clicks, not a drawing");
   assert.equal(drawGate({ points: 92, hold: true, used: false }), null, "a drag is one gesture and is never held");
+});
+
+// Measured 2026-09-10: given only the advice, the model looked the commands
+// up, ran them, read the tree, took a screenshot and re-chose its tool before
+// resending — 80 seconds between the hold and the redraw. With the commands
+// in the hold it is two calls.
+test("when the app's menu has the commands, the hold names them in order and says the same path stays valid", () => {
+  const items = [
+    "App > Hide App  ⌘H", "App > Hide Others  ⌥⌘H",
+    "Object > Show/Hide Selection  ⇧⌘H  (disabled)",
+    "View > Zoom In  ⌘+", "View > Zoom to Selection  ⇧2",
+    "View > Toggle Full Screen  F", "View > Show/Hide UI  ⌘\\",
+  ];
+  const picked = surfaceCommands(items);
+  assert.deepEqual(picked, ["View > Show/Hide UI  ⌘\\", "View > Toggle Full Screen  F", "View > Zoom to Selection  ⇧2"]);
+  const held = String(drawGate({ points: 83, hold: false, used: false, commands: picked }));
+  assert.ok(/1\. View > Show\/Hide UI/.test(held) && /3\. View > Zoom to Selection/.test(held), held);
+  assert.ok(/SAME path again, unchanged/.test(held) && /No read or screenshot is needed/.test(held), held);
+  assert.ok(!/query "hide"/.test(held), "no lookup is asked for when the answer is in hand");
+  assert.equal(surfaceCommands(["App > Hide App  ⌘H", "Object > Show/Hide Selection  ⇧⌘H  (disabled)"]).length, 0, "hiding the app or a greyed item is not clearing the surface");
+  const plain = String(drawGate({ points: 83, hold: false, used: false, commands: [] }));
+  assert.ok(/query "hide"/.test(plain), "without commands the hold says how to find them");
+});
+
+test("the skill rides after the tool's own result, so a list is not missed under it", () => {
+  const out = appendSkill({ contentItems: [{ type: "inputText", text: "the apps" }], success: true }, "=== skill ===");
+  assert.equal(out.contentItems.length, 2);
+  assert.equal((out.contentItems[0] as { text: string }).text, "the apps");
+  assert.equal((out.contentItems[1] as { text: string }).text, "=== skill ===");
 });

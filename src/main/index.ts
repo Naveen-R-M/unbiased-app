@@ -85,6 +85,8 @@ import {
   summarizeBatch,
   pointerHeadline,
   drawGate,
+  surfaceCommands,
+  appendSkill,
   traceStep,
   MAX_CLICKS,
   MAX_BATCH_STEPS,
@@ -2783,11 +2785,24 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         // The first drawing in a conversation is held once so the surface is
         // cleared BEFORE the first point lands, not after a toolbar eats the
         // last dozen. See drawGate for the five runs that made this a gate.
-        const gate = drawGate({ points: path?.length ?? 0, hold, used: drawGateUsed.has(root) });
-        if (gate) {
+        if (drawGate({ points: path?.length ?? 0, hold, used: drawGateUsed.has(root) })) {
           drawGateUsed.add(root);
-          axLog(`draw gate: held the first ${path?.length ?? 0}-point path in ${appName} until the surface is cleared`);
-          return axText(gate, false);
+          // Hand over the commands with the hold, so it costs two calls and not
+          // a lookup, a read and a screenshot. Listing the menu bar is a read.
+          let commands: string[] = [];
+          try {
+            const found: string[] = [];
+            for (const query of ["hide", "full screen", "zoom"]) {
+              const r = await ax.request("menus", { app: appName, query });
+              if (Array.isArray(r.items)) found.push(...(r.items as string[]));
+            }
+            commands = surfaceCommands(found);
+          } catch {
+            // The hold stands either way; the text then says how to look them up.
+          }
+          const gate = drawGate({ points: path?.length ?? 0, hold, used: false, commands });
+          axLog(`draw gate: held the first ${path?.length ?? 0}-point path in ${appName} until the surface is cleared${commands.length ? `, naming ${commands.length} command(s)` : ""}`);
+          return axText(gate ?? "", false);
         }
         axLog(`pointer ${appName} #${String(a.id)} ${path ? `${path.length} point(s)` : "centre"}${clicks > 1 ? ` x${clicks}` : ""}${hold ? " held" : ""}${mods.length ? ` +${mods.join("+")}` : ""}`);
         const r = await ax.request("pointer", {
@@ -6321,7 +6336,7 @@ function wireNotifications(): void {
             if (!preamble) return response;
             axSkillSent.add(skillRoot);
             axLog(`sent the computer-use skill with the first desktop call (${tool})`);
-            return prependSkill(response, preamble);
+            return appendSkill(response, preamble);
           })
           .then((response) => engine.respond(msg.id, response));
         return;

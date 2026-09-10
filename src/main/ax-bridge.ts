@@ -685,6 +685,13 @@ export function prependSkill<T extends { contentItems: { type: string }[] }>(res
   return { ...response, contentItems: [{ type: "inputText" as const, text: preamble }, ...response.contentItems] };
 }
 
+/** The skill rides AFTER the tool's own result. Measured on four runs in a
+ *  row: with the skill in front, the model read it, missed the app list at
+ *  the bottom, and asked for the list again five seconds later. */
+export function appendSkill<T extends { contentItems: { type: string }[] }>(response: T, preamble: string): T {
+  return { ...response, contentItems: [...response.contentItems, { type: "inputText" as const, text: preamble }] };
+}
+
 /** One line at the top of a read when the app's window is parked.
  *
  *  Until now this was discovered by pressing something and watching it fail.
@@ -757,14 +764,43 @@ export const DRAW_GATE_POINTS = 20;
  *  through on the next call. One turn, against the two or three the first pass
  *  cost every time. Drags are not gated — they are one gesture, and a control
  *  under a mid-drag point receives nothing. */
-export function drawGate(o: { points: number; hold: boolean; used: boolean }): string | null {
+export function drawGate(o: { points: number; hold: boolean; used: boolean; commands?: string[] }): string | null {
   if (o.used || o.hold || o.points < DRAW_GATE_POINTS) return null;
-  return (
+  const head =
     `Held once, before the first long path in this conversation: ${o.points} points is a drawing, and a control floating over the surface takes a click meant for it — one usually appears the moment drawing begins, and ends the path or switches the tool. ` +
-    "Nothing was clicked. Before you send it again: fit the target to the view, and hide the app's panels and toolbars or go full screen — " +
+    "Nothing was clicked. ";
+  // With the commands in hand the hold costs two calls, not six. Measured
+  // 2026-09-10: given only the advice, the model looked the commands up (two
+  // calls), ran them, then read the tree, took a screenshot and re-chose its
+  // tool before resending — 80 seconds between the hold and the redraw.
+  if (o.commands && o.commands.length) {
+    return (
+      head +
+      "The app's menu bar has what clears the surface. Run these with computer_menu {item}, in this order:\n" +
+      o.commands.map((c, i) => `${i + 1}. ${c}`).join("\n") +
+      "\nThen send the SAME path again, unchanged: the points are fractions of the element's box, and the bridge measures that box afresh on every call, so they stay right after the panels go and the view changes. No read or screenshot is needed in between. This hold does not repeat."
+    );
+  }
+  return (
+    head +
+    "Before you send it again: fit the target to the view, and hide the app's panels and toolbars or go full screen — " +
     'find the app\'s own command for it with computer_menu (query "hide" or "full screen") and run it by name; do not guess a shortcut, a wrong one lands as some other command. ' +
     "Then send the same path again; it goes through, and this hold does not repeat."
   );
+}
+
+/** From menu lines as the bridge lists them ("Menu > Title  shortcut", with
+ *  "(disabled)" when greyed out), the ones that clear a drawing surface: hide
+ *  the interface, go full screen, fit the target. Hide first, fit last, so
+ *  the fit sees the room the hide made. At most one of each. */
+export function surfaceCommands(items: string[]): string[] {
+  const live = items.filter((l) => !/\(disabled\)/i.test(l));
+  const title = (l: string) => (l.split(" > ").pop() ?? l).toLowerCase();
+  const pick = (re: RegExp) => live.find((l) => re.test(title(l)));
+  const hide = pick(/hide.*\b(ui|interface|panels?|toolbars?|sidebars?|chrome)\b|\b(ui|interface|panels?|toolbars?)\b.*hide/);
+  const full = pick(/full ?screen/);
+  const fit = pick(/zoom.*\b(selection|selected|fit)\b|\bfit\b.*\b(selection|selected|screen|view|window)\b/);
+  return [hide, full, fit].filter((c): c is string => typeof c === "string");
 }
 
 function asStep(e: RecentEdit): Record<string, unknown> | null {
