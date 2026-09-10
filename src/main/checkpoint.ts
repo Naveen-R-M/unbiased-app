@@ -112,7 +112,7 @@ export const CHECKPOINT_TOOLS = [
     description:
       "Save your working memory for THIS conversation so it survives the context being summarized: the decisions you have made, the plan, the numbers, names and colours you measured, what is done and what is next. " +
       "It replaces the previous checkpoint, so write everything you would need to resume. Decisions and measured facts only — element trees and screenshots are refused; they can be read again. " +
-      "Call it when a tool result asks you to, and whenever you finish a stage of a long task. The saved file is handed back to you automatically after a summary.",
+      "Call it when a tool result asks you to — not on your own schedule: measured, unasked checkpoints at 15% of the window cost a long turn each and protected nothing. The saved file is handed back to you automatically after a summary.",
     inputSchema: {
       type: "object",
       properties: { notes: { type: "string", description: `Markdown, at most ${MAX_CHECKPOINT_NOTES} characters.` } },
