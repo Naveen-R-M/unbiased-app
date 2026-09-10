@@ -1572,7 +1572,7 @@ test("when the app's menu has the commands, the hold names them in order and say
   const items = [
     "App > Hide App  ⌘H", "App > Hide Others  ⌥⌘H",
     "Object > Show/Hide Selection  ⇧⌘H  (disabled)",
-    "View > Zoom In  ⌘+", "View > Zoom to Selection  ⇧2",
+    "View > Zoom In  ⌘+", "View > Zoom to Fit  ⇧1", "View > Zoom to Selection  ⇧2",
     "View > Toggle Full Screen  F", "View > Show/Hide UI  ⌘\\",
   ];
   const picked = surfaceCommands(items);
@@ -1582,6 +1582,10 @@ test("when the app's menu has the commands, the hold names them in order and say
   assert.ok(/SAME path again, unchanged/.test(held) && /No read or screenshot is needed/.test(held), held);
   assert.ok(!/query "hide"/.test(held), "no lookup is asked for when the answer is in hand");
   assert.equal(surfaceCommands(["App > Hide App  ⌘H", "Object > Show/Hide Selection  ⇧⌘H  (disabled)"]).length, 0, "hiding the app or a greyed item is not clearing the surface");
+  // Measured on a live menu: the preference toggles list first and matched.
+  const withPrefs = ["App > Preferences > Hide Canvas UI During Changes", "App > Preferences > Keyboard Zooms into Selection", ...items];
+  assert.deepEqual(surfaceCommands(withPrefs), picked, "a preference is a setting, never picked");
+  assert.deepEqual(surfaceCommands(["View > Zoom to Fit  ⇧1"]), ["View > Zoom to Fit  ⇧1"], "fitting everything is the fallback when nothing fits the selection");
   const plain = String(drawGate({ points: 83, hold: false, used: false, commands: [] }));
   assert.ok(/query "hide"/.test(plain), "without commands the hold says how to find them");
 });

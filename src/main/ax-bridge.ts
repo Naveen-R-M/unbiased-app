@@ -794,12 +794,19 @@ export function drawGate(o: { points: number; hold: boolean; used: boolean; comm
  *  the interface, go full screen, fit the target. Hide first, fit last, so
  *  the fit sees the room the hide made. At most one of each. */
 export function surfaceCommands(items: string[]): string[] {
-  const live = items.filter((l) => !/\(disabled\)/i.test(l));
+  // Not greyed out, and not a preference: a toggle under Preferences or
+  // Settings changes how the app behaves from now on, which is the user's to
+  // change and not what clearing a surface means. Measured on a live menu:
+  // "Preferences > Hide Canvas UI During Changes" listed before the real
+  // hide command and would have been picked.
+  const live = items.filter((l) => !/\(disabled\)/i.test(l) && !/\b(preferences|settings|options)\b\s*>/i.test(l));
   const title = (l: string) => (l.split(" > ").pop() ?? l).toLowerCase();
   const pick = (re: RegExp) => live.find((l) => re.test(title(l)));
   const hide = pick(/hide.*\b(ui|interface|panels?|toolbars?|sidebars?|chrome)\b|\b(ui|interface|panels?|toolbars?)\b.*hide/);
   const full = pick(/full ?screen/);
-  const fit = pick(/zoom.*\b(selection|selected|fit)\b|\bfit\b.*\b(selection|selected|screen|view|window)\b/);
+  // The target first: fitting the selection frames what is being drawn on,
+  // fitting everything frames the whole document around it.
+  const fit = pick(/zoom.*\b(selection|selected)\b|\bfit\b.*\b(selection|selected)\b/) ?? pick(/zoom.*\bfit\b|\bfit\b.*\b(screen|view|window|page)\b/);
   return [hide, full, fit].filter((c): c is string => typeof c === "string");
 }
 
