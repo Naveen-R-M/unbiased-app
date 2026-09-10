@@ -1,6 +1,6 @@
 ---
 name: computer-use
-description: How to drive the user's own macOS apps with the computer_ tools — reading the element tree, acting by id, what to do when a press is accepted but nothing happens, and working on apps that are on another Space. Read this before the first computer_ call in a task.
+description: How to drive the user's own macOS apps with the computer_ tools — reading the element tree, acting by id, what to do when a press is accepted but nothing happens, and working on apps that are on another Space. It is handed to you automatically with the result of your first computer_ call in a conversation — do not open this file yourself; reading it here and receiving it there costs a turn and puts it in context twice.
 ---
 
 # Driving the user's apps
