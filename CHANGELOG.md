@@ -6,6 +6,32 @@ Format matters: `## <version> — <date>`, then `### <section>`, then `-` bullet
 
 Write for the person using the app, not the person who wrote the code.
 
+## 1.10.0 — September 10, 2026
+
+### New
+
+- **Draw in your design apps.** Pareto can now trace a shape with a pen tool in one pass — up to 120 points in a single step — instead of one click per turn. Clicks are paced so two nearby points never register as a double-click, which used to end the path early and leave a dozen fragments. Every point is checked before it lands, so a floating toolbar that appears once drawing begins cannot swallow the last few clicks, and the first drawing in a conversation is held until the app's panels are out of the way, with the app's own hide, full-screen and fit commands named so nothing has to be looked up.
+- **Trace a picture instead of guessing at it.** When a task is to reproduce an attached image, Pareto measures the shape's outline from the picture's pixels and gets its exact fill colour, rather than estimating points by eye. Outlines drawn by eye came out wrong two times in three; traced ones did not.
+- **Menu commands by name.** Pareto reads an app's menu bar — every command, with its real keyboard shortcut — and runs a command by its title. It no longer guesses a shortcut from memory, which in another app could be a different command entirely.
+- **Connectors are per conversation, and off by default.** Each conversation chooses which MCP servers it uses, from the **MCP** section under the **+** button; a chip below the message box shows whether any are on. Switching servers takes effect immediately when the conversation is idle, or at the end of the current turn. Conversations that do not need a connector no longer start with all of them loaded, which was costing a third of the available context before the first word.
+- **A working memory for long tasks.** Before a long conversation is summarized, Pareto writes down its decisions and the numbers, names and colours it measured, and gets them back after the summary — so it no longer forgets that it already drew something and draws it again. What it has measured once, it does not measure twice.
+
+### Improved
+
+- Several desktop steps go in one round trip — fill a field and confirm it, press a tab and read the result — up to 30 steps at a time, and each batch reads back every field it touched so nothing has to be re-read to check a value. A run of single steps is nudged into a batch.
+- Apps on another Mission Control Space are read where they are, without pulling you over to them. A picture of a window works on any Space, and Pareto brings an app forward only when it genuinely needs the pointer, saying so.
+- Reading an app is lighter: switching what to read yields only what changed, the panel that describes the selected object rides along with every selection change, and the pictures a task asks for arrive inside the batch that needs them.
+- An attached image the app cannot display — WebP, for one — is converted so Pareto actually sees it, instead of quietly arriving as a plain file and being drawn from memory.
+- The guide to working in desktop apps is handed over once, with the first desktop step, after that step's own result, and again after a summary — so it is not re-read from disk mid-task.
+
+### Fixed
+
+- Sending a message failed with an "invalid transport" error when Google Drive was connected. Servers the engine manages as plugins are no longer touched by the per-conversation switches.
+- Desktop actions that would have gone astray are refused before they happen, with what to do instead: a digit typed where there is no field to hold it, a click while a menu is open, the same action repeated after it already changed nothing, bringing a window forward when that cannot help, and a traced outline that crosses itself.
+- A delete pressed outside a text field is watched, and what it removed is named in the result, even in the middle of a batch.
+- A route the task ruled out is no longer taken as a fallback after repeated failure — Pareto stops and says what failed instead. Numbers in an answer come from something it actually read this turn.
+- Opening the connector chip while the **+** menu was open stacked two popovers; the chip is now a plain on/off indicator that opens the MCP panel.
+
 ## 1.9.2 — September 3, 2026
 
 ### Fixed
