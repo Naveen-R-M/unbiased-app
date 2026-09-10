@@ -100,6 +100,7 @@ import {
   checkpointGateText, checkpointPreamble, isGatedTool, pathsInCommand, remeasureNudge, type LedgerEntry,
 } from "./checkpoint";
 import { looksLikeImage, convertedImagePath, sipsArgs } from "./attachments";
+import { IMAGE_OUTLINE_TOOL, outlineOf, renderOutline } from "./image-outline";
 import { isProductionBuild } from "./runtime-mode";
 import {
   dueAt,
@@ -1767,6 +1768,7 @@ function threadDynamicTools(): Record<string, unknown>[] | undefined {
     ...SCHEDULE_TOOLS,
     ...MEMORY_TOOLS,
     ...CHECKPOINT_TOOLS,
+    IMAGE_OUTLINE_TOOL,
     ...(agentBrowserTools() ?? []),
   ];
   return tools.length ? (tools as Record<string, unknown>[]) : undefined;
@@ -6277,6 +6279,8 @@ function wireNotifications(): void {
           ? handleScheduleToolCall(tool, args, approvalThread)
           : tool.startsWith("checkpoint_")
             ? handleCheckpointToolCall(tool, args, approvalThread)
+          : tool.startsWith("image_")
+            ? handleImageToolCall(tool, args)
           : tool.startsWith("memory_")
             ? handleMemoryToolCall(tool, args, approvalThread)
             : routesToAx(tool)
@@ -6591,6 +6595,44 @@ async function handleScheduleToolCall(
 }
 
 // ── Memory tools (model-initiated) ──────────────────────────────────────
+/** image_outline: the main shape in a picture as a click path. Read-only, so
+ *  no approval; pure geometry over the decoded bitmap, see image-outline.ts.
+ *  Files the decoder cannot read are converted the way attachments are. */
+async function handleImageToolCall(tool: string, rawArgs: unknown): Promise<DynamicToolResponse> {
+  const text = (t: string, ok: boolean): DynamicToolResponse => ({ contentItems: [{ type: "inputText", text: t }], success: ok });
+  if (tool !== "image_outline") return text(`Unknown tool ${tool}`, false);
+  const a = (rawArgs ?? {}) as { path?: unknown; max_points?: unknown; fit?: unknown };
+  const path = typeof a.path === "string" ? a.path.trim() : "";
+  if (!path || !isAbsolute(path)) return text("path is required: the absolute path of the image file.", false);
+  if (!existsSync(path)) return text(`No file at ${path}.`, false);
+  let img = nativeImage.createFromPath(path);
+  if (img.isEmpty() && looksLikeImage(path)) {
+    const dir = join(app.getPath("temp"), "unbiased-converted");
+    const out = convertedImagePath(path, dir);
+    try {
+      if (!existsSync(out) || statSync(out).size === 0) {
+        mkdirSync(dir, { recursive: true });
+        execFileSync("/usr/bin/sips", sipsArgs(path, out), { stdio: "ignore", timeout: 15_000 });
+      }
+      img = nativeImage.createFromPath(out);
+    } catch {
+      // falls through to the empty check
+    }
+  }
+  if (img.isEmpty()) return text(`${path} could not be decoded as an image.`, false);
+  // Enough pixels for three-decimal fractions; more only costs time.
+  const size = img.getSize();
+  const longest = Math.max(size.width, size.height);
+  if (longest > 1024) img = img.resize(size.width >= size.height ? { width: 1024 } : { height: 1024 });
+  const { width, height } = img.getSize();
+  const fit = a.fit === "shape" ? "shape" : "image";
+  const maxPoints = typeof a.max_points === "number" && Number.isFinite(a.max_points) ? Math.round(a.max_points) : undefined;
+  const result = outlineOf({ width, height, data: img.toBitmap() }, { maxPoints, fit });
+  if ("error" in result) return text(`Nothing to trace in ${path}: ${result.error}.`, false);
+  axLog(`image_outline ${path.split("/").pop()}: ${result.points.length} points, ${result.color}, fit ${fit}`);
+  return text(renderOutline(path.split("/").pop() ?? path, result), true);
+}
+
 /** checkpoint_save: the model's half of the working memory. Validated (no
  *  trees, no images, bounded), then written together with the app's ledger.
  *  Allowed in plan mode: it is the agent's own notes about the conversation,
