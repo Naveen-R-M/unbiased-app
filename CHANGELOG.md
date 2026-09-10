@@ -6,6 +6,13 @@ Format matters: `## <version> — <date>`, then `### <section>`, then `-` bullet
 
 Write for the person using the app, not the person who wrote the code.
 
+## 1.10.1 — September 10, 2026
+
+### Fixed
+
+- With **Computer** switched on, a plain "hello" no longer sends Pareto off to read the list of running apps before it says hello back. The switch means work in your apps is done through desktop control; it does not mean every message is work in your apps. A message that needs no app gets a direct answer.
+- Asking something Pareto already knows — "what is today?" — no longer opens an app to look it up. An earlier rule said every number in an answer had to come from something read on screen this turn, and it stayed in force even after Computer was switched off. The rule now applies to facts Pareto presents as read from an app; what it knows without one, it simply says.
+
 ## 1.10.0 — September 10, 2026
 
 ### New
