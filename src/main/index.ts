@@ -3814,8 +3814,14 @@ const PLAN_DIRECTIVE =
   "and open questions. End by asking whether to proceed with the plan.";
 
 const COMPUTER_DIRECTIVE =
-  "COMPUTER is selected for this turn. The user has explicitly chosen the computer tools, so use them: start with " +
-  "computer_apps or computer_app_state and work through the apps on their machine. If the app you need is not running, " +
+  // Measured 2026-09-10: with the toggle on, "Hello" got the app list read
+  // before the greeting, because this opened with "use them: start with
+  // computer_apps". The toggle says where work in apps should be done, not
+  // that every message is work in apps.
+  "COMPUTER is selected for this turn: work in the user's apps is done through the computer_ tools, not the browser " +
+  "or the shell. Use them for anything that involves their apps, starting with computer_apps or computer_app_state. " +
+  "A message that needs no app — a greeting, a question you can answer from what you know or from this conversation — " +
+  "gets a direct answer and no desktop call. If the app you need is not running, " +
   "call computer_launch — it waits until the app is readable and hands you its tree. " +
   "Do NOT call browser_connect or the other browser_* tools for this turn — those open a SEPARATE browser window and " +
   "cannot see the user's own windows or tabs, which is the opposite of what they asked for. This applies even when the " +
@@ -3840,8 +3846,13 @@ const COMPUTER_DIRECTIVE =
   // licence to switch routes.
   "A route the task ruled out is not a fallback. If the app's own tools cannot do what was asked the way it was " +
   "asked, after a real attempt, stop and say exactly what failed — do not quietly switch to the route that was forbidden. " +
-  "Report only what you actually read. Every number, name, distance, time or price in your answer must appear in a tool " +
-  "result from this turn; if the app never showed it, say what you could not get instead of filling the gap. " +
+  // Scoped to what is PRESENTED as read from an app. Measured 2026-09-10:
+  // "every number must appear in a tool result" sent "what is today?" to the
+  // Calendar app for 27 seconds, on a turn where the toggle was not even on —
+  // the sentence was still in context from earlier turns.
+  "Report only what you actually read: a fact you present as coming from an app — a number, name, distance, time or " +
+  "price — must appear in a tool result from this turn; if the app never showed it, say what you could not get instead " +
+  "of filling the gap. What you know without an app, you may simply say. " +
   // The input-side twin of the sentence above, and measured the same way.
   // 2026-09-09: an attached WebP logo could not be decoded, so it reached the
   // model as nothing at all. The model inferred the subject from the target

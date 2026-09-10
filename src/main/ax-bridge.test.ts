@@ -650,6 +650,23 @@ test("the directive never names a tool that does not exist", () => {
     `the directive points at coordinate-based tools that are not offered while the bridge runs: ${wrongFamily.join(", ")}`);
 });
 
+// Measured 2026-09-10, one conversation: with the toggle on, "Hello" got the
+// app list read before the greeting; with it off, "what is today?" opened a
+// calendar app for 27 seconds because an earlier turn's directive said every
+// number must come from a tool result. The toggle is where app work goes,
+// not a claim that every message is app work.
+test("the directive leaves messages that need no app alone, and scopes the source rule to app-read facts", () => {
+  const src = readFileSync(join(__dirname, "index.ts"), "utf8");
+  const start = src.indexOf("const COMPUTER_DIRECTIVE");
+  const directive = src.slice(start, src.indexOf("approval.\";", start));
+  assert.match(directive, /needs no app/);
+  assert.match(directive, /direct answer and no desktop call/);
+  assert.match(directive, /present as coming from an app/);
+  assert.match(directive, /What you know without an app, you may simply say/);
+  assert.doesNotMatch(directive, /Every number, name, distance, time or price in your answer must/);
+  assert.doesNotMatch(directive, /so use them: start with/);
+});
+
 // ── Batching ──────────────────────────────────────────────────────────────
 // A bridge call costs 3-70ms over a local pipe; a model round trip costs
 // seconds. Batching exists to spend one of the expensive kind instead of five.
