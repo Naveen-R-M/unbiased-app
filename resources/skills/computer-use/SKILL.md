@@ -175,13 +175,13 @@ tells you where your fractions landed.
 
 **Pointer input is the one verb that needs the window visible:** it aims at
 screen coordinates the app hit-tests; reading, keys and menus do not. A window
-elsewhere is brought forward — do not raise it first — and the pointer goes
-back where the user left it. Say the app came forward.
+elsewhere is brought forward — do not raise it first. Clicks do not move the
+user's pointer. Say the app came forward.
 
 **Clear the surface before the first point.** Apps float toolbars over a
 drawing surface, often only once drawing begins, and a click on one ends the
 path or switches the tool. Fit the target and hide the app's panels or go full
-screen — `computer_menu` runs the app's own command by name; never guess a
+screen — `computer_menu` runs the app's own command by name, never guess a
 shortcut — then draw the whole shape in ONE call: an app may not join a path
 continued in a second.
 
