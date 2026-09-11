@@ -164,27 +164,26 @@ you in.
 **A tool is usually a letter.** `computer_press_key` takes a single letter or
 digit, with modifiers. This is often the only way to reach a tool at all — a
 pen or shape tool is one letter, with no element, no menu item and no other
-route. Keys
-work on a background app on any Space, because a key event does not care where
-the window is.
+route. Keys work on a background app on any Space.
 
 **Then aim inside the element with `computer_pointer`.** Points are fractions
-of that element's box, so `{"x":0.5,"y":0.5}` is its centre and you never touch
-a screen pixel or a display scale. Give it the id of the canvas or web area,
+of that element's box, so `{"x":0.5,"y":0.5}` is its centre and no screen
+pixel or display scale is involved. Give it the id of the canvas or web area,
 not the window. Several points are separate clicks, which is exactly how a pen
 tool takes a path; `hold=true` makes them one press-drag-release. The reply
 tells you where your fractions landed.
 
-**Pointer input needs the window really visible:** it aims at screen
-coordinates the app hit-tests, so it is refused when the window is parked or
-on another Space. Raise the app, tell the user, and do it.
+**Pointer input is the one verb that needs the window visible:** it aims at
+screen coordinates the app hit-tests; reading, keys and menus do not. A window
+elsewhere is brought forward — do not raise it first — and the pointer goes
+back where the user left it. Say the app came forward.
 
 **Clear the surface before the first point.** Apps float toolbars over a
 drawing surface, often only once drawing begins, and a click on one ends the
-path or switches the tool. Fit the target to the view and hide the app's
-panels or go full screen — `computer_menu` runs the app's own command by name;
-never guess a shortcut — then draw the whole shape in ONE call: an app may not
-join a path continued in a second call.
+path or switches the tool. Fit the target and hide the app's panels or go full
+screen — `computer_menu` runs the app's own command by name; never guess a
+shortcut — then draw the whole shape in ONE call: an app may not join a path
+continued in a second.
 
 **If you are asked to draw, draw.** Pasting an SVG or importing a file is not
 drawing, and substituting one for the other is answering a different request.

@@ -1482,8 +1482,8 @@ const AX_TOOLS = [
       'Points are FRACTIONS of the anchor element\'s box, never screen pixels: {"x":0,"y":0} is its top-left, {"x":0.5,"y":0.5} its centre, {"x":1,"y":1} its bottom-right. Pass the id of the element you are aiming inside — the canvas or web area, not the window — and the reply tells you the screen points your fractions landed on. ' +
       "Several points are separate clicks, which is how a pen tool takes a path; add hold=true to make them one press-drag-release instead. modifiers holds shift, option, command or control throughout. " +
       "Before a long path, clear the surface: fit the target to the view, and hide the app's panels and toolbars or go full screen — a control floating over the surface, often one that appears only once drawing begins, takes the click instead and ends the path or switches the tool. Then draw the whole shape in ONE call; an app may not join a path continued in a second. " +
-      "This is the ONE verb that needs the window actually visible on this Space, because it aims at real screen coordinates and the app hit-tests them: it is refused when the window is parked or elsewhere, since the click would land on whatever is there instead. So raise the app first for this kind of work and tell the user why. " +
-      "It moves the real pointer. Do not use it to press something that IS in the tree — press that by id.",
+      "This is the ONE verb that needs the window actually visible on this Space, because it aims at real screen coordinates and the app hit-tests them. If the window is elsewhere it is BROUGHT FORWARD for you — do not raise it yourself first, and the reply says when that happened so you can tell the user. " +
+      "It borrows the real pointer for the length of the path and puts it back where the user left it. Do not use it to press something that IS in the tree — press that by id.",
     inputSchema: {
       type: "object",
       properties: {
