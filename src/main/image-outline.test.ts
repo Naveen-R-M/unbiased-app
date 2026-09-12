@@ -2,7 +2,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   shapeMask, largestComponent, traceBoundary, simplifyClosed, dominantColor, outlineOf, renderOutline,
-  IMAGE_OUTLINE_TOOL, MAX_OUTLINE_POINTS, DEFAULT_OUTLINE_POINTS, type Bitmap, type Pt,
+  IMAGE_OUTLINE_TOOL, MAX_OUTLINE_POINTS, DEFAULT_OUTLINE_POINTS, outlineReminder, OUTLINE_REMINDER_AFTER,
+  type Bitmap, type Pt,
 } from "./image-outline";
 
 // Measured over four runs reproducing a 12-ray icon from a picture: the run
@@ -160,4 +161,21 @@ test("the tool describes itself without naming any application", () => {
   for (const word of ["figma", "sketch", "photoshop", "illustrator", "pen tool"]) assert.ok(!text.includes(word), word);
   assert.equal(IMAGE_OUTLINE_TOOL.name, "image_outline");
   assert.match(IMAGE_OUTLINE_TOOL.description, /computer_pointer/);
+});
+
+// Measured 2026-09-11: a run traced a 59-point outline, spent ten turns and
+// three screenshots hunting for the right frame, pressed the pen key, and gave
+// up without ever sending the path. By then the points were ten turns back.
+test("an outline that has not been drawn is brought back once it starts to drift", () => {
+  const pending = { name: "icon.png", path: "/tmp/icon.png", points: 59, color: "#D97757", callsSince: 0 };
+  assert.equal(outlineReminder(null), null, "nothing measured, nothing said");
+  assert.equal(outlineReminder({ ...pending, callsSince: 1 }), null, "a run that draws straight away never sees it");
+  assert.equal(outlineReminder({ ...pending, callsSince: OUTLINE_REMINDER_AFTER - 1 }), null);
+  const said = outlineReminder({ ...pending, callsSince: 6 });
+  assert.ok(said, "six calls without drawing is drift");
+  assert.match(said!, /59 points/);
+  assert.match(said!, /#D97757/);
+  assert.match(said!, /icon\.png/);
+  assert.match(said!, /image_outline/, "and says re-reading them is free");
+  assert.match(said!, /computer_pointer/);
 });

@@ -85,6 +85,7 @@ import {
   summarizeBatch,
   pointerHeadline,
   drawGate,
+  DRAW_GATE_POINTS,
   surfaceCommands,
   appendSkill,
   traceStep,
@@ -102,7 +103,7 @@ import {
   checkpointGateText, checkpointPreamble, isGatedTool, pathsInCommand, remeasureNudge, type LedgerEntry,
 } from "./checkpoint";
 import { looksLikeImage, convertedImagePath, sipsArgs } from "./attachments";
-import { IMAGE_OUTLINE_TOOL, outlineOf, renderOutline } from "./image-outline";
+import { IMAGE_OUTLINE_TOOL, outlineOf, renderOutline, outlineReminder, type PendingOutline } from "./image-outline";
 import { isProductionBuild } from "./runtime-mode";
 import {
   dueAt,
@@ -2744,6 +2745,7 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
           ...captions,
           batchNudgeText,
           remeasureNote(root),
+          outlineNote(root),
         ].filter(Boolean).join("\n");
         return {
           contentItems: [
@@ -2804,6 +2806,7 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
           axLog(`draw gate: held the first ${path?.length ?? 0}-point path in ${appName} until the surface is cleared${commands.length ? `, naming ${commands.length} command(s)` : ""}`);
           return axText(gate ?? "", false);
         }
+        if ((path?.length ?? 0) >= DRAW_GATE_POINTS) agePendingOutline(root, true);
         axLog(`pointer ${appName} #${String(a.id)} ${path ? `${path.length} point(s)` : "centre"}${clicks > 1 ? ` x${clicks}` : ""}${hold ? " held" : ""}${mods.length ? ` +${mods.join("+")}` : ""}`);
         const r = await ax.request("pointer", {
           app: appName,
@@ -2831,7 +2834,7 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
           app: appName, hold, asked: path ? path.length : null, landed: at.length || 1,
           note: typeof r.note === "string" ? r.note : null,
         });
-        return axText([`${headline}${where}\n${diff || "(nothing in the tree changed — a canvas often shows its result only as a new object, so read the app)"}`, inspector, pointerNudge, remeasureNote(root)].filter(Boolean).join("\n"), true);
+        return axText([`${headline}${where}\n${diff || "(nothing in the tree changed — a canvas often shows its result only as a new object, so read the app)"}`, inspector, pointerNudge, remeasureNote(root), outlineNote(root)].filter(Boolean).join("\n"), true);
       }
       case "computer_app_screenshot": {
         const r = await ax.request("screenshot", { app: appName, ...(typeof a.window === "number" ? { window: a.window } : {}) }, 15_000);
@@ -2901,7 +2904,7 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         // inspector's ids change; a key or a value write does not.
         const inspector = tool === "computer_press" || tool === "computer_act" ? await inspectorBlock(appName) : null;
         return axText(
-          [renderActionResult(diff, hint, hint && clicked ? parkedNextCall(appName) : null), inspector, nudge, remeasureNote(root)].filter(Boolean).join("\n"),
+          [renderActionResult(diff, hint, hint && clicked ? parkedNextCall(appName) : null), inspector, nudge, remeasureNote(root), outlineNote(root)].filter(Boolean).join("\n"),
           true,
         );
       }
@@ -4562,6 +4565,22 @@ let axRecentEdits: RecentEdit[] = [];
 const axBatchNudged = new Set<string>();
 /** Conversations whose first long click path has been held once — see drawGate. */
 const drawGateUsed = new Set<string>();
+
+/** The outline a conversation measured and has not drawn yet, and how many
+ *  desktop calls ago. See outlineReminder for the run this is for. */
+const pendingOutline = new Map<string, PendingOutline>();
+
+/** Every desktop call ages it; a long path spends it. */
+function agePendingOutline(root: string, drewAPath: boolean): void {
+  const p = pendingOutline.get(root);
+  if (!p) return;
+  if (drewAPath) { pendingOutline.delete(root); return; }
+  p.callsSince += 1;
+}
+
+function outlineNote(root: string): string | null {
+  return outlineReminder(pendingOutline.get(root) ?? null);
+}
 /** Record one logical edit and, once per compaction cycle, hand back the batch
  *  call that would have carried the recent run of them. */
 function recordEditAndNudge(root: string, appName: string, edit: RecentEdit): string | null {
@@ -6306,7 +6325,7 @@ function wireNotifications(): void {
           : tool.startsWith("checkpoint_")
             ? handleCheckpointToolCall(tool, args, approvalThread)
           : tool.startsWith("image_")
-            ? handleImageToolCall(tool, args)
+            ? handleImageToolCall(tool, args, approvalThread)
           : tool.startsWith("memory_")
             ? handleMemoryToolCall(tool, args, approvalThread)
             : routesToAx(tool)
@@ -6317,6 +6336,8 @@ function wireNotifications(): void {
         // The first desktop call of a conversation carries the computer-use
         // skill. See skillPreamble: the model does open it on its own, but
         // reactively, mid-task, after it has already stalled.
+        // A desktop call the outline was not used in is a call it drifts by.
+        if (routesToAx(tool)) agePendingOutline(rootThreadOf(approvalThread), false);
         const skillRoot = rootThreadOf(approvalThread);
         const sendSkill = shouldSendSkill(tool, axSkillSent.has(skillRoot));
         void call
@@ -6624,7 +6645,7 @@ async function handleScheduleToolCall(
 /** image_outline: the main shape in a picture as a click path. Read-only, so
  *  no approval; pure geometry over the decoded bitmap, see image-outline.ts.
  *  Files the decoder cannot read are converted the way attachments are. */
-async function handleImageToolCall(tool: string, rawArgs: unknown): Promise<DynamicToolResponse> {
+async function handleImageToolCall(tool: string, rawArgs: unknown, threadId: string | null): Promise<DynamicToolResponse> {
   const text = (t: string, ok: boolean): DynamicToolResponse => ({ contentItems: [{ type: "inputText", text: t }], success: ok });
   if (tool !== "image_outline") return text(`Unknown tool ${tool}`, false);
   const a = (rawArgs ?? {}) as { path?: unknown; max_points?: unknown; fit?: unknown };
@@ -6655,8 +6676,12 @@ async function handleImageToolCall(tool: string, rawArgs: unknown): Promise<Dyna
   const maxPoints = typeof a.max_points === "number" && Number.isFinite(a.max_points) ? Math.round(a.max_points) : undefined;
   const result = outlineOf({ width, height, data: img.toBitmap() }, { maxPoints, fit });
   if ("error" in result) return text(`Nothing to trace in ${path}: ${result.error}.`, false);
-  axLog(`image_outline ${path.split("/").pop()}: ${result.points.length} points, ${result.color}, fit ${fit}`);
-  return text(renderOutline(path.split("/").pop() ?? path, result), true);
+  const name = path.split("/").pop() ?? path;
+  axLog(`image_outline ${name}: ${result.points.length} points, ${result.color}, fit ${fit}`);
+  // Held until it is drawn, so it can be brought back if the run wanders. See
+  // outlineReminder for the run that measured one and never used it.
+  pendingOutline.set(rootThreadOf(threadId), { name, path, points: result.points.length, color: result.color, callsSince: 0 });
+  return text(renderOutline(name, result), true);
 }
 
 /** checkpoint_save: the model's half of the working memory. Validated (no
