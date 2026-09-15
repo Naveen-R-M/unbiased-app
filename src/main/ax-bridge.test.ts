@@ -954,6 +954,23 @@ test("while Spaces are crossed, raise says looking is not a reason either", () =
   assert.ok(crossed.includes("computer_app_screenshot") && crossed.includes("Not to look"), crossed);
 });
 
+test("a batch says when its writes moved nothing, but only when the tree agrees", () => {
+  const ran = ["step 1 (press #4)", "step 2 (type \"abc\")"];
+  const quiet = ["step 2 (type \"abc\")"];
+  // Both signals: the values did not move AND nothing in the tree moved.
+  const both = summarizeBatch({ ran, failed: null, remaining: 0, diff: "(no changes)", quiet });
+  assert.ok(both.includes("wrote nothing that can be observed"), both);
+  assert.ok(both.includes("step 2"), "it names which step: " + both);
+  // One signal only: the tree moved, so the write did something even though
+  // the value reads the same — the case that made refusing this wrong.
+  const moved = summarizeBatch({ ran, failed: null, remaining: 0, diff: "~4 button \"OK\"", quiet });
+  assert.ok(!moved.includes("wrote nothing"), "a tree that changed acquits the write: " + moved);
+  // No quiet steps: unchanged from before.
+  const clean = summarizeBatch({ ran, failed: null, remaining: 0, diff: "(no changes)" });
+  assert.ok(!clean.includes("wrote nothing"), clean);
+  assert.ok(clean.includes(ACTION_NO_CHANGE_SENTENCE), clean);
+});
+
 test("a launch that showed the app and a blank picture are marked in the call line", async () => {
   const { describeAxCall } = await import("./ax-bridge");
   const base = { method: "launch", app: "Maps", ms: 3000, waitedMs: null, bytes: 900, lines: 20, flags: "", marks: "shown", error: null, code: null };

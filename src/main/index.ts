@@ -2747,6 +2747,7 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         // One bridge call per step. That is the cheap round trip — 3-70ms over
         // a local pipe — and collapsing them into ONE model round trip is the
         // entire point of this tool.
+        const quietSteps: string[] = [];
         for (const [i, st] of steps.entries()) {
           const label = `step ${i + 1} (${traceStep(st)})`;
           try {
@@ -2756,6 +2757,11 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
             // and hands back that step's own diff: show it, or a frame removed
             // at step 4 is one id range in the closing diff.
             if (typeof stepResult.watched === "string" && typeof stepResult.diff === "string") watched.push({ step: label, diff: stepResult.diff });
+            // A write whose target held the same value afterwards. On its own
+            // that is not a verdict — some controls take a write and report
+            // the old value — so it is collected here and judged against the
+            // batch's closing diff, which is the second signal.
+            if (stepResult.valueUnchanged === true) quietSteps.push(label);
             ran.push(label);
             if (st.waitMs > 0) await new Promise((r) => setTimeout(r, st.waitMs));
           } catch (err) {
@@ -2800,7 +2806,7 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         const text = [
           summarizeBatch({
             ran, failed, remaining: steps.length - ran.length - (failed ? 1 : 0), diff,
-            unwatched: steps.length > 1, fields, watched,
+            unwatched: steps.length > 1, fields, watched, quiet: quietSteps,
           }),
           inspector,
           ...captions,

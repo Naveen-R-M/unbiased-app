@@ -497,6 +497,11 @@ export function summarizeBatch(opts: {
    *  frame deleted at step 4 of an unwatched batch left "- removed: 859-880"
    *  in the closing diff and the model wrote "the frame is clean now". */
   watched?: { step: string; diff: string }[];
+  /** Steps whose write left their target holding the same value. Only half a
+   *  verdict on its own — some controls take a write and report the old value
+   *  — so it is said out loud ONLY when the batch's closing diff agrees that
+   *  nothing moved. Two signals, same rule as a single action. */
+  quiet?: string[];
 }): string {
   const head = opts.failed
     ? [
@@ -513,7 +518,13 @@ export function summarizeBatch(opts: {
             : "Only the closing diff was watched."
           : "",
       ].filter(Boolean).join(" ");
-  const body = opts.diff.trim() === "(no changes)" ? ACTION_NO_CHANGE_SENTENCE : opts.diff || "(nothing in the tree changed)";
+  const nothingMoved = opts.diff.trim() === "(no changes)";
+  const quiet = nothingMoved && (opts.quiet?.length ?? 0) > 0
+    ? `${opts.quiet!.length} of these wrote nothing that can be observed — ${opts.quiet!.join("; ")} — and no part of the tree changed either. `
+      + "The writes were accepted by the accessibility API and had no effect, which happens when the control is not taking input rather than when the value is wrong. "
+      + "Put the caret in the control first (press it, then select all, then type) instead of sending the same steps again."
+    : null;
+  const body = nothingMoved ? [quiet, ACTION_NO_CHANGE_SENTENCE].filter(Boolean).join("\n") : opts.diff || "(nothing in the tree changed)";
   const watched = (opts.watched ?? [])
     .filter((w) => w.diff.trim() && w.diff.trim() !== "(no changes)")
     .map((w) => `Watched on its own, because a delete outside a text field removes objects — ${w.step} did this:\n${w.diff}`);
