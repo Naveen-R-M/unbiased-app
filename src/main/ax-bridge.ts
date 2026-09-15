@@ -937,9 +937,16 @@ export interface AxCallInfo {
   /** Read options in force, e.g. "interactive,query". */
   flags: string;
   /** Result facts worth a glance in the log: "shown" for a launch that showed
-   *  the app once, "blank" for a picture with nothing in it. */
+   *  the app once, "blank" for a picture with nothing in it, "backgrounded"
+   *  for a pointer the window took without being raised. */
   marks: string;
   error: string | null;
+  /** The bridge's error CODE, beside its message. The messages are written for
+   *  the model to read and get rewritten whenever they read badly; the codes
+   *  are the contract. Anything classifying failures — which run is failing on
+   *  stale element ids, which on timeouts — has to key off this and not off
+   *  prose that will drift out from under it. */
+  code: string | null;
 }
 
 export function describeAxCall(c: AxCallInfo): string {
@@ -1066,8 +1073,9 @@ export class AxClient {
         bytes: r ? JSON.stringify(r).length : 0,
         lines: text ? text.split("\n").length : 0,
         flags: flags.join(","),
-        marks: (["shown", "blank"] as const).filter((k) => r?.[k] === true).join(","),
+        marks: (["shown", "blank", "backgrounded"] as const).filter((k) => r?.[k] === true).join(","),
         error: e ? e.message : null,
+        code: e instanceof AxError ? e.code : null,
       });
     } catch {
       // diagnostics must never break a request

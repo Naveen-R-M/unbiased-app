@@ -895,6 +895,11 @@ test("every finished request reports its timing and size, errors included", asyn
   assert.ok(echo.ms >= 0 && echo.bytes > 0 && echo.error === null);
   const boom = calls.find((x) => x.method === "boom");
   assert.ok(boom && boom.error && boom.error.includes("No running app"), JSON.stringify(boom));
+  // The code travels beside the prose. Anything sorting failures into kinds —
+  // stale element ids apart from timeouts apart from a dead bridge — keys off
+  // this, because the messages are written to be read and get rewritten.
+  assert.equal(boom.code, "no_such_app");
+  assert.equal(echo.code, null, "a call that worked carries no code");
 });
 
 // Run 3 of the Maps task: the model wanted to look, screenshotted a Space Maps
@@ -928,11 +933,13 @@ test("while Spaces are crossed, raise says looking is not a reason either", () =
 
 test("a launch that showed the app and a blank picture are marked in the call line", async () => {
   const { describeAxCall } = await import("./ax-bridge");
-  const base = { method: "launch", app: "Maps", ms: 3000, waitedMs: null, bytes: 900, lines: 20, flags: "", marks: "shown", error: null };
+  const base = { method: "launch", app: "Maps", ms: 3000, waitedMs: null, bytes: 900, lines: 20, flags: "", marks: "shown", error: null, code: null };
   assert.ok(describeAxCall(base).includes("[shown]"));
   assert.ok(describeAxCall({ ...base, method: "screenshot", marks: "blank" }).includes("[blank]"));
+  assert.ok(describeAxCall({ ...base, method: "pointer", marks: "backgrounded" }).includes("[backgrounded]"));
   assert.ok(!describeAxCall({ ...base, marks: "" }).includes("["));
 });
+
 
 // Candidates: several plausible routes to one state, tried locally, so a wrong
 // guess costs a bridge call instead of a model turn.

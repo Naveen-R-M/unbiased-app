@@ -97,7 +97,19 @@ import {
   withSpaceGuidance,
   otherSpaceNote,
   launchOutcome,
+  ACTION_NO_CHANGE_SENTENCE,
 } from "./ax-bridge";
+import { AsyncLocalStorage } from "node:async_hooks";
+import {
+  METRICS_VERSION,
+  MetricsLog,
+  classifyFailure,
+  metricsEnabled,
+  payloadOf,
+  type DriverRecord,
+  type ToolRecord,
+  type TurnRecord,
+} from "./run-metrics";
 import {
   CHECKPOINT_TOOLS, checkpointPath, validateCheckpointNotes, renderCheckpoint, pushFact, checkpointDue,
   checkpointGateText, checkpointPreamble, isGatedTool, pathsInCommand, remeasureNudge, type LedgerEntry,
@@ -2354,6 +2366,33 @@ function axLog(line: string): void {
   }
 }
 
+/** Phase 0 instrumentation. Off unless UNBIASED_AX_METRICS=1, and separate
+ *  from the debug log above: that one quotes element lines and belongs to a
+ *  single debugging session, this one carries verbs, counts and durations only
+ *  and is meant to accumulate until the baseline is real. It answers whether a
+ *  code mode is worth building, so it lives in userData rather than a
+ *  world-readable /tmp, and it never records a word from the user's screen. */
+let metrics = new MetricsLog(null);
+
+function startMetrics(): void {
+  if (!metricsEnabled(process.env)) return;
+  const file = join(app.getPath("userData"), "run-metrics.ndjson");
+  metrics = new MetricsLog((line) => appendFileSync(file, line + "\n"));
+  axLog(`metrics: recording to ${file}`);
+}
+
+/** Which tool call a bridge call happened inside. AsyncLocalStorage rather
+ *  than a module variable because two threads can have turns in flight at
+ *  once, and a counter would file one thread's driver calls under the other's
+ *  tool call — which is exactly the kind of quietly wrong number this whole
+ *  exercise exists to avoid producing. */
+const inToolCall = new AsyncLocalStorage<{ seq: number; thread: string | null }>();
+let toolSeq = 0;
+
+function metricNow(thread: string | null): { v: number; at: string; thread: string | null } {
+  return { v: METRICS_VERSION, at: new Date().toISOString(), thread };
+}
+
 /** The icon for a step, if we have already fetched it. Synchronous on purpose:
  *  a transcript row must not wait on IPC, and the icon arrives on the next
  *  read of the same app. */
@@ -2387,7 +2426,27 @@ async function startAxBridge(): Promise<void> {
     return;
   }
   const client = new AxClient(manifest);
-  client.onCall = (c) => axLog(describeAxCall(c));
+  client.onCall = (c) => {
+    axLog(describeAxCall(c));
+    const here = inToolCall.getStore();
+    const rec: DriverRecord & { of: number | null } = {
+      ...metricNow(here?.thread ?? null),
+      kind: "driver",
+      method: c.method,
+      app: c.app,
+      ms: c.ms,
+      waitedMs: c.waitedMs,
+      bytes: c.bytes,
+      lines: c.lines,
+      // Which pointer route carried it, when the bridge said. Phase 1 adds the
+      // snapshot generation beside this; it does not exist yet, so the field
+      // is absent rather than invented.
+      route: c.marks.includes("backgrounded") ? "background" : null,
+      failure: c.error ? classifyFailure(c.code ?? null, c.error) : null,
+      of: here?.seq ?? null,
+    };
+    metrics.record(rec);
+  };
   try {
     const hello = await client.start();
     ax = client;
@@ -6026,6 +6085,18 @@ function wireNotifications(): void {
           // at 154% while every request was already failing.
           percent: window ? Math.round((used / window) * 100) : null,
         };
+        metrics.record({
+          ...metricNow(params.threadId ? String(params.threadId) : null),
+          kind: "turn",
+          turn: runningTurns.get(String(params.threadId)) ?? null,
+          // `last` is the latest REQUEST's prompt and completion, so input is
+          // the whole context re-sent on that turn. Summed over a run that is
+          // the real bill; it is not the conversation's size.
+          input: last?.inputTokens ?? 0,
+          cached: (last as { cachedInputTokens?: number } | undefined)?.cachedInputTokens ?? 0,
+          output: last?.outputTokens ?? 0,
+          total: used,
+        } satisfies TurnRecord);
         // Persist per thread so the gauge survives restarts and resumes.
         try {
           const map = loadCtxUsage();
@@ -6320,7 +6391,15 @@ function wireNotifications(): void {
         const args = (params as { arguments?: unknown }).arguments;
         // Three families now, dispatched by prefix rather than by assuming
         // the browser owns every dynamic tool.
-        const call = tool.startsWith("schedule_")
+        const seq = ++toolSeq;
+        const startedAt = Date.now();
+        const shape = payloadOf(tool, args);
+        // The whole dispatch runs inside the scope, so every bridge call it
+        // makes — one for a press, a dozen for a batch — files itself under
+        // this tool call rather than under whichever thread happened to be
+        // running at the same moment.
+        const call = inToolCall.run({ seq, thread: approvalThread }, () =>
+          tool.startsWith("schedule_")
           ? handleScheduleToolCall(tool, args, approvalThread)
           : tool.startsWith("checkpoint_")
             ? handleCheckpointToolCall(tool, args, approvalThread)
@@ -6332,7 +6411,8 @@ function wireNotifications(): void {
               ? handleAxCall(tool, args, approvalThread)
             : tool.startsWith("computer_")
               ? handleComputerUseCall(tool, args, approvalThread)
-              : handleAgentBrowserCall(tool, args, approvalThread);
+              : handleAgentBrowserCall(tool, args, approvalThread),
+        );
         // The first desktop call of a conversation carries the computer-use
         // skill. See skillPreamble: the model does open it on its own, but
         // reactively, mid-task, after it has already stalled.
@@ -6369,6 +6449,36 @@ function wireNotifications(): void {
             axSkillSent.add(skillRoot);
             axLog(`sent the computer-use skill with the first desktop call (${tool})`);
             return appendSkill(response, preamble);
+          })
+          .then((response) => {
+            // Recorded after the skill and checkpoint passes so ms is the
+            // whole cost of answering the call, which is what a per-binding
+            // budget would have to clear.
+            const text = response.contentItems
+              .map((c) => (typeof (c as { text?: unknown }).text === "string" ? (c as { text: string }).text : ""))
+              .join("\n");
+            const ok = response.success !== false;
+            const rec: ToolRecord & { seq: number } = {
+              ...metricNow(approvalThread),
+              kind: "tool",
+              turn: approvalThread ? (runningTurns.get(approvalThread) ?? null) : null,
+              tool,
+              app: appOfStep(tool, (args && typeof args === "object" ? args : {}) as Record<string, unknown>),
+              verb: shape.verb,
+              size: shape.size,
+              unit: shape.unit,
+              ms: Date.now() - startedAt,
+              ok,
+              // What ambiguity looks like before anything resolves an element
+              // by label: the app took the action and the tree did not move.
+              noChange: ok && text.includes(ACTION_NO_CHANGE_SENTENCE),
+              // The tool layer has prose, not a code — the classified reason
+              // lives on the driver record underneath it, which has both.
+              failure: ok ? null : classifyFailure(null, text),
+              seq,
+            };
+            metrics.record(rec);
+            return response;
           })
           .then((response) => engine.respond(msg.id, response));
         return;
@@ -7220,6 +7330,8 @@ async function startEngine(): Promise<void> {
   // After the engine, and never blocking it: an absent or broken sidecar
   // leaves the app exactly as it was.
   void startLearning();
+  // Before the bridge, so the bridge's own hello is the first thing recorded.
+  startMetrics();
   // Same footing as the sidecar: absent or broken, the app is exactly as it was.
   void startAxBridge();
 }
