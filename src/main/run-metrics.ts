@@ -130,7 +130,7 @@ export function payloadOf(tool: string, rawArgs: unknown): Payload {
  *  operations than a model does between turns — so if it is already common,
  *  the generation-bound handles have to land before the kernel does, and if it
  *  is rare, that ordering is a free choice rather than a prerequisite. */
-export type Failure = "stale" | "gone" | "timeout" | "refused" | "crashed" | "bad_call" | "other";
+export type Failure = "stale" | "ambiguous" | "gone" | "timeout" | "refused" | "crashed" | "bad_call" | "other";
 
 /** Classified from the bridge's error CODE, never from its prose. The messages
  *  are written for the model and get rewritten; the codes are the contract. */
@@ -139,7 +139,14 @@ export function classifyFailure(code: string | null, message?: string | null): F
   switch (code) {
     case "no_such_element":
     case "no_such_window":
+    case "element_gone":
       return "stale";
+    // The bridge refused to guess between several controls matching the one
+    // the caller named. Counted apart from stale because it is a different
+    // problem with a different repair — and because until the bridge said
+    // which it was, every one of these was recorded as a missing element.
+    case "ambiguous_element":
+      return "ambiguous";
     case "no_such_app":
       return "gone";
     case "timeout":

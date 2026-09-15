@@ -124,6 +124,11 @@ test("malformed arguments do not throw", () => {
 test("a named element that has gone is the stale failure we are counting", () => {
   assert.equal(classifyFailure("no_such_element"), "stale");
   assert.equal(classifyFailure("no_such_window"), "stale");
+  assert.equal(classifyFailure("element_gone"), "stale");
+  // Ambiguity is its own kind: "read again" repairs a stale id and does
+  // nothing for this one, so a metric that merges them hides the difference
+  // between a UI that moved and a caller that has not said what it meant.
+  assert.equal(classifyFailure("ambiguous_element"), "ambiguous");
   assert.equal(classifyFailure("no_such_app"), "gone");
   assert.equal(classifyFailure("timeout"), "timeout");
   assert.equal(classifyFailure("not_trusted"), "refused");
