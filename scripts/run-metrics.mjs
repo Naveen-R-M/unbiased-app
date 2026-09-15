@@ -2,7 +2,8 @@
 /** Reads the Phase 0 metrics log and prints what a run cost.
  *
  *  Usage:  node scripts/run-metrics.mjs [path-to.ndjson] [--per-thread]
- *  Default path: ~/Library/Application Support/Unbiased/run-metrics.ndjson
+ *  Default path: ~/Library/Application Support/unbiased-app/run-metrics.ndjson
+ *  (the dev app's userData; a packaged build uses its productName instead)
  *
  *  The log is written only while UNBIASED_AX_METRICS=1. Records are shapes —
  *  verbs, counts, durations — and carry no text from the user's screen. */
@@ -13,7 +14,7 @@ import { rollup } from "../src/main/run-metrics.ts";
 
 const args = process.argv.slice(2);
 const perThread = args.includes("--per-thread");
-const file = args.find((a) => !a.startsWith("--")) ?? join(homedir(), "Library", "Application Support", "Unbiased", "run-metrics.ndjson");
+const file = args.find((a) => !a.startsWith("--")) ?? join(homedir(), "Library", "Application Support", "unbiased-app", "run-metrics.ndjson");
 
 let text;
 try {
