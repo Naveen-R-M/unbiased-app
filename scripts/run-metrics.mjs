@@ -50,7 +50,8 @@ function show(label, rs) {
   const wallMs = measured ? r.wall.ms : span;
   const model = Math.max(0, wallMs - r.toolMs.total);
   console.log(`\n${label}  [${r.shape}]`);
-  console.log(`  turns ${r.turns}   tool calls ${r.toolCalls}   driver calls ${r.driverCalls}`);
+  const retried = r.retries > 0 ? `   retries ${r.retries}` : "";
+  console.log(`  turns ${r.turns}   tool calls ${r.toolCalls}   driver calls ${r.driverCalls}${retried}`);
   console.log(
     `  tokens billed ${r.tokens.billed.total.toLocaleString()} ` +
       `(in ${r.tokens.billed.input.toLocaleString()}, cached ${r.tokens.billed.cached.toLocaleString()}, out ${r.tokens.billed.output.toLocaleString()})` +

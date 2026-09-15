@@ -217,6 +217,14 @@ export type TurnRecord = Base & {
   cached: number;
   output: number;
   total: number;
+  /** The engine re-emitted the same usage without a new request completing —
+   *  what a retry loop looks like from here. Measured on a run killed by
+   *  upstream 429s: eight usage reports, two distinct, six of them the same
+   *  numbers again. Counting those as turns would have reported 170,860 billed
+   *  tokens where 40,522 were actually sent, and eight model turns where there
+   *  were two. Kept rather than dropped, because the repeats ARE the evidence
+   *  that something retried. */
+  repeat?: boolean;
 };
 
 /** A run's actual boundaries, as the engine reports them.
@@ -349,6 +357,9 @@ export type Rollup = {
   noChange: number;
   /** Biggest payload seen, per unit — what a payload-derived budget gets set from. */
   largest: Record<string, number>;
+  /** Usage reports that repeated the previous numbers — retries that never
+   *  completed. Excluded from `turns` and from `tokens`, counted here. */
+  retries: number;
   /** Measured from the engine's own turn boundaries, so it does not drift when
    *  the thread is touched again later. Null for records written before those
    *  boundaries were logged: a reader should fall back to the record span and
@@ -386,8 +397,20 @@ function sum(ns: readonly number[]): number {
 export function rollup(records: readonly MetricRecord[]): Rollup {
   const tools = records.filter((r): r is ToolRecord => r.kind === "tool");
   const drivers = records.filter((r): r is DriverRecord => r.kind === "driver");
-  const turns = records.filter((r): r is TurnRecord => r.kind === "turn");
+  const allTurns = records.filter((r): r is TurnRecord => r.kind === "turn");
   const runs = records.filter((r): r is RunRecord => r.kind === "run");
+  // Records written before `repeat` existed do not carry it, and the run that
+  // motivated the field is among them — so consecutive identical usage for one
+  // thread is treated as a repeat when the flag is absent.
+  const seen = new Map<string, string>();
+  const repeats = new Set<TurnRecord>();
+  for (const t of allTurns) {
+    const key = t.thread ?? "";
+    const sig = `${t.input}/${t.cached}/${t.output}/${t.total}`;
+    if (t.repeat === true || (t.repeat === undefined && seen.get(key) === sig)) repeats.add(t);
+    seen.set(key, sig);
+  }
+  const turns = allTurns.filter((t) => !repeats.has(t));
   const tally = (rs: readonly { failure: Failure | null }[]): Record<string, number> => {
     const out: Record<string, number> = {};
     for (const r of rs) if (r.failure) out[r.failure] = (out[r.failure] ?? 0) + 1;
@@ -420,6 +443,7 @@ export function rollup(records: readonly MetricRecord[]): Rollup {
       },
       context: last?.input ?? 0,
     },
+    retries: repeats.size,
     toolCalls: tools.length,
     driverCalls: drivers.length,
     toolMs: span(tools.map((t) => t.ms)),

@@ -3379,6 +3379,9 @@ function paneForThread(threadId: unknown): PaneId | null {
 // backgrounded conversation be reopened mid-turn with its busy state, the
 // partial assistant text, and any approval request the agent is blocked on.
 const runningTurns = new Map<string, string>(); // threadId → turnId
+/** threadId → the last token-usage numbers seen, so a retry that re-emits them
+ *  unchanged can be told from a new request. */
+const lastUsageSig = new Map<string, string>();
 // The in-flight assistant message per thread. Deltas reach the renderer only
 // while a pane owns the thread, so this is the sole record of text streamed
 // while a conversation was backgrounded. Cleared when the message completes.
@@ -6087,9 +6090,17 @@ function wireNotifications(): void {
           // at 154% while every request was already failing.
           percent: window ? Math.round((used / window) * 100) : null,
         };
+        // A retry that never completes leaves tokenUsage.last exactly where it
+        // was, so the same numbers arrive again. Marked, not dropped: the
+        // repeats are the only evidence here that something retried at all.
+        const usageKey = String(params.threadId);
+        const usageSig = `${last?.inputTokens ?? 0}/${last?.outputTokens ?? 0}/${used}`;
+        const repeated = lastUsageSig.get(usageKey) === usageSig;
+        lastUsageSig.set(usageKey, usageSig);
         metrics.record({
           ...metricNow(params.threadId ? String(params.threadId) : null),
           kind: "turn",
+          ...(repeated ? { repeat: true as const } : {}),
           turn: runningTurns.get(String(params.threadId)) ?? null,
           // `last` is the latest REQUEST's prompt and completion, so input is
           // the whole context re-sent on that turn. Summed over a run that is

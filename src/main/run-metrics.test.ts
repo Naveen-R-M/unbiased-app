@@ -291,6 +291,34 @@ test("records with no boundaries say so instead of reporting zero", () => {
   assert.equal(rollup([tool({ ms: 500 }), turn()]).wall, null);
 });
 
+test("a retry that re-emits the same usage is not a second turn", () => {
+  // Measured on a run killed by upstream 429s: eight usage reports, two
+  // distinct. Counted naively that is 8 turns and 170,860 billed tokens; two
+  // requests were actually sent, for 40,522.
+  const one = turn({ input: 18_799, cached: 0, output: 35, total: 18_834 });
+  const two = turn({ input: 21_723, cached: 0, output: 17, total: 21_740 });
+  const r = rollup([one, two, { ...two }, { ...two }, { ...two }, { ...two }, { ...two }, { ...two }]);
+  assert.equal(r.turns, 2);
+  assert.equal(r.retries, 6);
+  assert.equal(r.tokens.billed.input, 40_522);
+  assert.equal(r.tokens.context, 21_723, "the context is the last real request, not a repeat of it");
+});
+
+test("the repeat flag is believed over the guess when it is present", () => {
+  // A genuine second request that happens to cost exactly the same is a turn,
+  // not a retry — the writer knows which, and says so.
+  const a = turn({ input: 1000, output: 10, total: 1010 });
+  const b = turn({ input: 1000, output: 10, total: 1010, repeat: false });
+  assert.equal(rollup([a, b]).turns, 2);
+  assert.equal(rollup([a, b]).retries, 0);
+});
+
+test("identical usage on two different threads is two turns, not a repeat", () => {
+  const a = turn({ thread: "t1", input: 500, output: 5, total: 505 });
+  const b = turn({ thread: "t2", input: 500, output: 5, total: 505 });
+  assert.equal(rollup([a, b]).turns, 2);
+});
+
 test("an empty run rolls up to zeroes rather than throwing", () => {
   const r = rollup([] as MetricRecord[]);
   assert.equal(r.shape, "none");
@@ -299,4 +327,5 @@ test("an empty run rolls up to zeroes rather than throwing", () => {
   assert.equal(r.toolMs.p95, 0);
   assert.deepEqual(r.failures, { tool: {}, driver: {} });
   assert.equal(r.wall, null);
+  assert.equal(r.retries, 0);
 });
