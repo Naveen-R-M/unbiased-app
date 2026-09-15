@@ -1,0 +1,100 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Phase 0 benchmark — navigate</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  :root { color-scheme: light dark; --line:#d5d2cc; --ink:#1b1917; --bg:#faf9f7; --accent:#d97757; --soft:#f0eee9; }
+  @media (prefers-color-scheme: dark) { :root { --line:#3a3733; --ink:#eeebe6; --bg:#1b1917; --soft:#262320; } }
+  body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+  main { max-width:660px; margin:0 auto; padding:28px 20px 64px; }
+  h1 { font-size:21px; margin:0 0 20px; }
+  [role=tablist] { display:flex; gap:4px; border-bottom:1px solid var(--line); margin-bottom:18px; flex-wrap:wrap; }
+  [role=tab] { padding:9px 15px; font:inherit; color:inherit; background:transparent; border:0;
+    border-bottom:2px solid transparent; cursor:pointer; }
+  [role=tab][aria-selected=true] { border-bottom-color:var(--accent); font-weight:600; }
+  [role=tabpanel] { padding-top:4px; }
+  .acc { border:1px solid var(--line); border-radius:7px; margin-bottom:10px; overflow:hidden; }
+  .acc > button { width:100%; text-align:left; padding:11px 14px; font:inherit; font-weight:500; color:inherit;
+    background:var(--soft); border:0; cursor:pointer; display:flex; justify-content:space-between; gap:12px; }
+  .acc .body { padding:6px 14px 12px; }
+  .row { width:100%; text-align:left; padding:9px 12px; margin:6px 0; font:inherit; color:inherit;
+    background:transparent; border:1px solid var(--line); border-radius:6px; cursor:pointer; }
+  .detail { margin:8px 0 4px; padding:12px 14px; border-left:3px solid var(--accent);
+    background:color-mix(in srgb, var(--accent) 7%, transparent); border-radius:0 6px 6px 0; }
+  .detail dl { margin:0; display:grid; grid-template-columns:auto 1fr; gap:4px 14px; }
+  .detail dt { opacity:.65; } .detail dd { margin:0; font-weight:600; }
+  [hidden] { display:none !important; }
+</style>
+<main>
+  <h1>Workspace settings</h1>
+
+  <div role="tablist" aria-label="Sections">
+    <button role="tab" id="tab-overview" aria-controls="p-overview" aria-selected="true">Overview</button>
+    <button role="tab" id="tab-billing"  aria-controls="p-billing"  aria-selected="false">Billing</button>
+    <button role="tab" id="tab-access"   aria-controls="p-access"   aria-selected="false">Access</button>
+  </div>
+
+  <div role="tabpanel" id="p-overview" aria-labelledby="tab-overview">
+    <p>Plan: Team · Seats in use: 12 of 25 · Region: ap-south-1</p>
+  </div>
+
+  <div role="tabpanel" id="p-billing" aria-labelledby="tab-billing" hidden>
+    <div class="acc">
+      <button id="acc-recent" aria-expanded="false" aria-controls="b-recent">Recent charges<span>3</span></button>
+      <div class="body" id="b-recent" hidden><p>INV-2310 · INV-2301 · INV-2296 — all settled.</p></div>
+    </div>
+    <div class="acc">
+      <button id="acc-failed" aria-expanded="false" aria-controls="b-failed">Failed charges<span>4</span></button>
+      <div class="body" id="b-failed" hidden>
+        <button class="row" data-inv="INV-2288">INV-2288 — 14 Aug 2026</button>
+        <button class="row" data-inv="INV-2291">INV-2291 — 22 Aug 2026</button>
+        <button class="row" data-inv="INV-2294">INV-2294 — 03 Sep 2026</button>
+        <button class="row" data-inv="INV-2299">INV-2299 — 11 Sep 2026</button>
+        <div id="inv-detail" role="status" aria-live="polite" class="detail" hidden></div>
+      </div>
+    </div>
+    <div class="acc">
+      <button id="acc-methods" aria-expanded="false" aria-controls="b-methods">Payment methods<span>2</span></button>
+      <div class="body" id="b-methods" hidden><p>Visa ending 4021 (default) · ACH ending 8890</p></div>
+    </div>
+  </div>
+
+  <div role="tabpanel" id="p-access" aria-labelledby="tab-access" hidden>
+    <p>3 admins · 9 members · SSO not configured</p>
+  </div>
+</main>
+<script>
+  const DETAIL = {
+    "INV-2288": { reason: "insufficient_funds",      amount: "$1,204.00", retry: "no" },
+    "INV-2291": { reason: "card_velocity_exceeded",  amount: "$3,880.50", retry: "yes — 24 Aug" },
+    "INV-2294": { reason: "do_not_honor",            amount: "$980.25",   retry: "no" },
+    "INV-2299": { reason: "expired_card",            amount: "$2,140.00", retry: "yes — 13 Sep" },
+  };
+  for (const tab of document.querySelectorAll('[role=tab]')) {
+    tab.addEventListener("click", () => {
+      for (const t of document.querySelectorAll('[role=tab]')) {
+        const on = t === tab;
+        t.setAttribute("aria-selected", String(on));
+        document.getElementById(t.getAttribute("aria-controls")).hidden = !on;
+      }
+    });
+  }
+  for (const acc of document.querySelectorAll('.acc > button')) {
+    acc.addEventListener("click", () => {
+      const open = acc.getAttribute("aria-expanded") === "true";
+      acc.setAttribute("aria-expanded", String(!open));
+      document.getElementById(acc.getAttribute("aria-controls")).hidden = open;
+    });
+  }
+  for (const row of document.querySelectorAll('.row')) {
+    row.addEventListener("click", () => {
+      const d = DETAIL[row.dataset.inv];
+      const box = document.getElementById("inv-detail");
+      box.innerHTML = `<dl><dt>Invoice</dt><dd>${row.dataset.inv}</dd>`
+        + `<dt>Decline reason</dt><dd>${d.reason}</dd>`
+        + `<dt>Amount</dt><dd>${d.amount}</dd>`
+        + `<dt>Retry scheduled</dt><dd>${d.retry}</dd></dl>`;
+      box.hidden = false;
+    });
+  }
+</script>
