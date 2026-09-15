@@ -11,6 +11,7 @@ import {
   taskShape,
   type DriverRecord,
   type MetricRecord,
+  type RunRecord,
   type ToolRecord,
   type TurnRecord,
 } from "./run-metrics";
@@ -38,6 +39,10 @@ function tool(over: Partial<ToolRecord> = {}): ToolRecord {
 
 function driver(over: Partial<DriverRecord> = {}): DriverRecord {
   return { ...base, kind: "driver", method: "act", app: "Figma", ms: 50, waitedMs: 20, bytes: 400, lines: 8, route: null, failure: null, ...over };
+}
+
+function run(phase: "started" | "completed", at: string, id = "u1"): RunRecord {
+  return { ...base, at, kind: "run", turn: id, phase, status: phase === "completed" ? "completed" : null };
 }
 
 function turn(over: Partial<TurnRecord> = {}): TurnRecord {
@@ -234,6 +239,58 @@ test("a record written before batches were measured still rolls up", () => {
   assert.equal(r.shape, "draw");
 });
 
+test("wall time comes from the engine's turn boundaries", () => {
+  const r = rollup([
+    run("started", "2026-09-15T12:00:00.000Z"),
+    tool({ ms: 500 }),
+    run("completed", "2026-09-15T12:06:55.000Z"),
+  ]);
+  assert.deepEqual(r.wall, { ms: 415_000, runs: 1, unfinished: 0 });
+});
+
+test("a late record on the same thread no longer stretches the run", () => {
+  // The defect this replaced: wall was first-record-to-last-record, so a
+  // drawing run measured 910s just after it finished and 3113s an hour later,
+  // when one stray token-usage record landed on the same thread. The boundary
+  // records are indifferent to anything that arrives after them.
+  const boundaries = [run("started", "2026-09-15T12:00:00.000Z"), run("completed", "2026-09-15T12:06:55.000Z")];
+  const prompt = rollup(boundaries);
+  const anHourLater = rollup([...boundaries, turn({ at: "2026-09-15T13:00:00.000Z" })]);
+  assert.deepEqual(anHourLater.wall, prompt.wall);
+});
+
+test("two runs on one thread add up, and are counted", () => {
+  const r = rollup([
+    run("started", "2026-09-15T12:00:00.000Z", "u1"),
+    run("completed", "2026-09-15T12:01:00.000Z", "u1"),
+    run("started", "2026-09-15T12:05:00.000Z", "u2"),
+    run("completed", "2026-09-15T12:07:30.000Z", "u2"),
+  ]);
+  assert.deepEqual(r.wall, { ms: 210_000, runs: 2, unfinished: 0 });
+});
+
+test("a run that never finished is counted, not guessed at", () => {
+  const r = rollup([
+    run("started", "2026-09-15T12:00:00.000Z", "u1"),
+    run("completed", "2026-09-15T12:01:00.000Z", "u1"),
+    run("started", "2026-09-15T12:05:00.000Z", "u2"),
+  ]);
+  assert.deepEqual(r.wall, { ms: 60_000, runs: 1, unfinished: 1 });
+});
+
+test("a completion with no start is ignored rather than invented", () => {
+  // The app was restarted mid-turn: the start record is in the previous
+  // process's run and there is nothing here to measure from.
+  const r = rollup([run("completed", "2026-09-15T12:01:00.000Z", "orphan")]);
+  assert.deepEqual(r.wall, { ms: 0, runs: 0, unfinished: 0 });
+});
+
+test("records with no boundaries say so instead of reporting zero", () => {
+  // 654 of these predate the boundary records. Null tells a reader to fall
+  // back to the span and say that it is doing so; 0 would read as instant.
+  assert.equal(rollup([tool({ ms: 500 }), turn()]).wall, null);
+});
+
 test("an empty run rolls up to zeroes rather than throwing", () => {
   const r = rollup([] as MetricRecord[]);
   assert.equal(r.shape, "none");
@@ -241,4 +298,5 @@ test("an empty run rolls up to zeroes rather than throwing", () => {
   assert.equal(r.tokens.context, 0);
   assert.equal(r.toolMs.p95, 0);
   assert.deepEqual(r.failures, { tool: {}, driver: {} });
+  assert.equal(r.wall, null);
 });

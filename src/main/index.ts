@@ -107,6 +107,7 @@ import {
   metricsEnabled,
   payloadOf,
   type DriverRecord,
+  type RunRecord,
   type ToolRecord,
   type TurnRecord,
 } from "./run-metrics";
@@ -5818,6 +5819,7 @@ function wireNotifications(): void {
           // gateway's per-org concurrency.
           learning?.setIdle(false);
           runningTurns.set(threadId, turn.id);
+          metrics.record({ ...metricNow(threadId), kind: "run", turn: turn.id, phase: "started", status: null } satisfies RunRecord);
           bgStream.delete(threadId);
           send("chat:thread-activity", { threadId, running: true });
           const sub = subAgents.get(threadId);
@@ -6138,6 +6140,16 @@ function wireNotifications(): void {
           observeLearning("turn_completed", threadId, `turn ${turn?.status ?? "completed"}`, {
             status: turn?.status ?? "completed",
           });
+          // Before runningTurns is cleared below: the id is what pairs this
+          // with its start record, and after the delete there is nothing to
+          // pair with.
+          metrics.record({
+            ...metricNow(threadId),
+            kind: "run",
+            turn: runningTurns.get(threadId) ?? null,
+            phase: "completed",
+            status: turn?.status ?? "completed",
+          } satisfies RunRecord);
           learning?.flush();
           // Idle again: nothing of the user's is competing for the gateway.
           if (runningTurns.size <= 1) learning?.setIdle(true);

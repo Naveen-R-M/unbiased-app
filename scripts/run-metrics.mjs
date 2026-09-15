@@ -41,9 +41,14 @@ const pct = (a, b) => (b > 0 ? `${Math.round((a / b) * 100)}%` : "—");
 
 function show(label, rs) {
   const r = rollup(rs);
-  const span =
-    rs.length > 1 ? new Date(rs.at(-1).at).getTime() - new Date(rs[0].at).getTime() : 0;
-  const model = Math.max(0, span - r.toolMs.total);
+  // Prefer the engine's own turn boundaries. The record span is only a
+  // fallback for logs written before those existed, and it stretches whenever
+  // the thread is touched again later — so it is labelled as approximate
+  // rather than printed as though it were measured.
+  const span = rs.length > 1 ? new Date(rs.at(-1).at).getTime() - new Date(rs[0].at).getTime() : 0;
+  const measured = r.wall !== null && r.wall.runs > 0;
+  const wallMs = measured ? r.wall.ms : span;
+  const model = Math.max(0, wallMs - r.toolMs.total);
   console.log(`\n${label}  [${r.shape}]`);
   console.log(`  turns ${r.turns}   tool calls ${r.toolCalls}   driver calls ${r.driverCalls}`);
   console.log(
@@ -51,8 +56,12 @@ function show(label, rs) {
       `(in ${r.tokens.billed.input.toLocaleString()}, cached ${r.tokens.billed.cached.toLocaleString()}, out ${r.tokens.billed.output.toLocaleString()})` +
       `   context ended at ${r.tokens.context.toLocaleString()}`,
   );
-  if (span > 0) {
-    console.log(`  wall ${ms(span)}   in tools ${ms(r.toolMs.total)} (${pct(r.toolMs.total, span)})   model+idle ${ms(model)} (${pct(model, span)})`);
+  if (wallMs > 0) {
+    const how = measured
+      ? `wall ${ms(wallMs)} over ${r.wall.runs} run${r.wall.runs === 1 ? "" : "s"}`
+      : `span ${ms(wallMs)} (approximate: no turn boundaries in these records)`;
+    console.log(`  ${how}   in tools ${ms(r.toolMs.total)} (${pct(r.toolMs.total, wallMs)})   model+idle ${ms(model)} (${pct(model, wallMs)})`);
+    if (measured && r.wall.unfinished > 0) console.log(`  ${r.wall.unfinished} run(s) started and never finished — interrupted, or the app restarted mid-turn`);
   }
   console.log(`  tool ms  p50 ${r.toolMs.p50}  p95 ${r.toolMs.p95}  max ${r.toolMs.max}`);
   console.log(`  driver ms p50 ${r.driverMs.p50}  p95 ${r.driverMs.p95}  max ${r.driverMs.max}`);

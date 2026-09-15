@@ -219,7 +219,23 @@ export type TurnRecord = Base & {
   total: number;
 };
 
-export type MetricRecord = ToolRecord | DriverRecord | TurnRecord;
+/** A run's actual boundaries, as the engine reports them.
+ *
+ *  Wall time used to be inferred as first-record-to-last-record for a thread,
+ *  and that is only right if you read it immediately. Measured: a drawing run
+ *  reported 910s just after it finished and 3113s an hour later, because one
+ *  late token-usage record joined the same thread and stretched the span. A
+ *  number that decays after you stop looking at it is not a measurement. */
+export type RunRecord = Base & {
+  kind: "run";
+  turn: string | null;
+  phase: "started" | "completed";
+  /** What the engine said became of it — completed, aborted, failed. Null on
+   *  the start record, where nothing is known yet. */
+  status: string | null;
+};
+
+export type MetricRecord = ToolRecord | DriverRecord | TurnRecord | RunRecord;
 
 export function nowIso(clock: () => number = Date.now): string {
   return new Date(clock()).toISOString();
@@ -333,7 +349,35 @@ export type Rollup = {
   noChange: number;
   /** Biggest payload seen, per unit — what a payload-derived budget gets set from. */
   largest: Record<string, number>;
+  /** Measured from the engine's own turn boundaries, so it does not drift when
+   *  the thread is touched again later. Null for records written before those
+   *  boundaries were logged: a reader should fall back to the record span and
+   *  say that it is doing so. `unfinished` counts starts with no completion —
+   *  an interrupted run, or one the app was restarted in the middle of. */
+  wall: { ms: number; runs: number; unfinished: number } | null;
 };
+
+/** Pairs start records with their completions by turn id. Out-of-order arrival
+ *  is fine; a completion with no start is ignored rather than guessed at. */
+function wallOf(runs: readonly RunRecord[]): Rollup["wall"] {
+  if (runs.length === 0) return null;
+  const started = new Map<string, number>();
+  let ms = 0;
+  let paired = 0;
+  for (const r of runs) {
+    const key = r.turn ?? "";
+    const at = new Date(r.at).getTime();
+    if (r.phase === "started") started.set(key, at);
+    else {
+      const from = started.get(key);
+      if (from === undefined) continue;
+      started.delete(key);
+      ms += Math.max(0, at - from);
+      paired++;
+    }
+  }
+  return { ms, runs: paired, unfinished: started.size };
+}
 
 function sum(ns: readonly number[]): number {
   return ns.reduce((a, b) => a + b, 0);
@@ -343,6 +387,7 @@ export function rollup(records: readonly MetricRecord[]): Rollup {
   const tools = records.filter((r): r is ToolRecord => r.kind === "tool");
   const drivers = records.filter((r): r is DriverRecord => r.kind === "driver");
   const turns = records.filter((r): r is TurnRecord => r.kind === "turn");
+  const runs = records.filter((r): r is RunRecord => r.kind === "run");
   const tally = (rs: readonly { failure: Failure | null }[]): Record<string, number> => {
     const out: Record<string, number> = {};
     for (const r of rs) if (r.failure) out[r.failure] = (out[r.failure] ?? 0) + 1;
@@ -382,5 +427,6 @@ export function rollup(records: readonly MetricRecord[]): Rollup {
     failures: { tool: tally(tools), driver: tally(drivers) },
     noChange: tools.filter((t) => t.noChange).length,
     largest,
+    wall: wallOf(runs),
   };
 }
