@@ -2,6 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
+import { AsyncResource } from "node:async_hooks";
 
 /** The accessibility bridge: apps, windows, and element trees as text with
  *  stable ids, plus actions on those elements. Lives in the unbiased-ax repo;
@@ -1044,8 +1045,19 @@ export class AxClient {
     const id = this.nextId++;
     const started = Date.now();
     return new Promise<AxResult>((resolve, reject) => {
+      // Bound to the async context of the CALLER, not of whoever resolves it.
+      // A reply arrives on the bridge's stdout 'line' event, and that listener
+      // was registered once at start(), so anything reading async-local state
+      // inside report() sees startup's context rather than the tool call's —
+      // measured: every driver record came back with a null thread while the
+      // tool records above them were correct. Only the diagnostics call is
+      // bound; resolve and reject are left alone, since a promise continuation
+      // already carries the context of whoever awaited it.
+      const reportIn = AsyncResource.bind((r: AxResult | null, e: Error | null) =>
+        this.report(method, params, started, r, e),
+      );
       const done = (r: AxResult | null, e: Error | null) => {
-        this.report(method, params, started, r, e);
+        reportIn(r, e);
         if (e) reject(e);
         else resolve(r ?? {});
       };

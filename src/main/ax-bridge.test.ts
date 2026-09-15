@@ -902,6 +902,29 @@ test("every finished request reports its timing and size, errors included", asyn
   assert.equal(echo.code, null, "a call that worked carries no code");
 });
 
+test("a call reports inside the async context of whoever asked for it", async () => {
+  const { AsyncLocalStorage } = await import("node:async_hooks");
+  const m = fakeBridge();
+  assert.ok(m && !("error" in m));
+  const c = new AxClient(m);
+  const seen: (string | undefined)[] = [];
+  const store = new AsyncLocalStorage<string>();
+  c.onCall = () => seen.push(store.getStore());
+  await c.start();
+  // A reply arrives on the bridge's stdout 'line' event, and that listener is
+  // registered once in start(). Without binding, report() runs in startup's
+  // context and every caller's async-local state is invisible — measured on a
+  // real run as 222 driver records with a null thread while the tool records
+  // wrapping them were all correct.
+  await store.run("the caller", () => c.request("echo", { app: "Maps" }));
+  c.stop();
+  assert.deepEqual(
+    seen.filter((x) => x !== undefined),
+    ["the caller"],
+    `the echo reported outside its caller's context: ${JSON.stringify(seen)}`,
+  );
+});
+
 // Run 3 of the Maps task: the model wanted to look, screenshotted a Space Maps
 // was not on, and raised Maps to see it — twice. The window picture is a tool
 // of its own now, and the display screenshot says so while Spaces are crossed.
