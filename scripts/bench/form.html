@@ -76,7 +76,7 @@
     <button type="submit" id="submit">Save details</button>
   </form>
 
-  <div id="result" hidden></div>
+  <div id="result" role="status" aria-live="polite" hidden></div>
 </main>
 <script>
   document.getElementById("f").addEventListener("submit", (e) => {

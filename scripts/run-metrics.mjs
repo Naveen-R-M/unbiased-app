@@ -14,6 +14,7 @@ import { rollup } from "../src/main/run-metrics.ts";
 
 const args = process.argv.slice(2);
 const perThread = args.includes("--per-thread");
+const perRun = args.includes("--per-run");
 const file = args.find((a) => !a.startsWith("--")) ?? join(homedir(), "Library", "Application Support", "unbiased-app", "run-metrics.ndjson");
 
 let text;
@@ -75,6 +76,32 @@ function show(label, rs) {
 
 console.log(`${records.length} records from ${file}${skipped ? ` (${skipped} unreadable)` : ""}`);
 show("ALL RUNS", records);
+
+// A thread can hold several runs — a failure and the retry that finished the
+// work land on the same thread, and averaging them describes neither. Runs are
+// the unit anyone actually asks about.
+if (perRun) {
+  const byThread = new Map();
+  for (const r of records) {
+    const k = r.thread ?? "(none)";
+    if (!byThread.has(k)) byThread.set(k, []);
+    byThread.get(k).push(r);
+  }
+  let n = 0;
+  for (const [k, rs] of byThread) {
+    const at = (r) => new Date(r.at).getTime();
+    let open = null;
+    for (const b of rs.filter((r) => r.kind === "run")) {
+      if (b.phase === "started") open = b;
+      else if (open) {
+        const seg = rs.filter((r) => at(r) >= at(open) && at(r) <= at(b));
+        show(`run ${++n} — thread ${k.slice(0, 8)} [${b.status ?? "?"}]`, seg);
+        open = null;
+      }
+    }
+  }
+  if (n === 0) console.log("\nNo run boundaries in these records — they predate boundary logging.");
+}
 
 if (perThread) {
   const byThread = new Map();
