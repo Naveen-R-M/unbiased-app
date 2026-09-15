@@ -977,6 +977,11 @@ test("a launch that showed the app and a blank picture are marked in the call li
   assert.ok(describeAxCall(base).includes("[shown]"));
   assert.ok(describeAxCall({ ...base, method: "screenshot", marks: "blank" }).includes("[blank]"));
   assert.ok(describeAxCall({ ...base, method: "pointer", marks: "backgrounded" }).includes("[backgrounded]"));
+  // Both spellings of "this write did nothing". A settling call reports the
+  // verdict; a batch step reports the one signal it has. Watching for only the
+  // first counted zero across two runs in which every write was batched.
+  assert.ok(describeAxCall({ ...base, method: "setValue", marks: "wroteNothing" }).includes("[wroteNothing]"));
+  assert.ok(describeAxCall({ ...base, method: "setValue", marks: "valueUnchanged" }).includes("[valueUnchanged]"));
   assert.ok(!describeAxCall({ ...base, marks: "" }).includes("["));
 });
 
