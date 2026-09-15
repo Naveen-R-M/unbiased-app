@@ -2443,6 +2443,7 @@ async function startAxBridge(): Promise<void> {
       // snapshot generation beside this; it does not exist yet, so the field
       // is absent rather than invented.
       route: c.marks.includes("backgrounded") ? "background" : null,
+      ...(c.marks.includes("wroteNothing") ? { silent: true } : {}),
       failure: c.error ? classifyFailure(c.code ?? null, c.error) : null,
       of: here?.seq ?? null,
     };

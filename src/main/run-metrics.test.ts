@@ -324,6 +324,22 @@ test("identical usage on two different threads is two turns, not a repeat", () =
   assert.equal(rollup([a, b]).turns, 2);
 });
 
+test("a write that did nothing is counted apart from a call that failed", () => {
+  // The half of "accepted but nothing changed" that no selector work can fix:
+  // the target was right and the write still did not happen. Separating it is
+  // what makes the rest of that bucket attributable to anything.
+  const r = rollup([
+    driver({ silent: true }),
+    driver({ silent: true }),
+    driver({ failure: "stale" }),
+    driver(),
+    tool({ noChange: true }),
+  ]);
+  assert.equal(r.silentWrites, 2);
+  assert.deepEqual(r.failures.driver, { stale: 1 }, "a quiet write is not a failure — nothing was refused");
+  assert.equal(r.noChange, 1);
+});
+
 test("an empty run rolls up to zeroes rather than throwing", () => {
   const r = rollup([] as MetricRecord[]);
   assert.equal(r.shape, "none");
@@ -333,4 +349,5 @@ test("an empty run rolls up to zeroes rather than throwing", () => {
   assert.deepEqual(r.failures, { tool: {}, driver: {} });
   assert.equal(r.wall, null);
   assert.equal(r.retries, 0);
+  assert.equal(r.silentWrites, 0);
 });

@@ -208,6 +208,12 @@ export type DriverRecord = Base & {
   waitedMs: number | null;
   bytes: number;
   lines: number;
+  /** The write was accepted and changed nothing observable. Not a failure —
+   *  nothing was refused — but not a success either, and it is the half of
+   *  "accepted but nothing changed" that no selector work can fix: the target
+   *  was right and the write still did not happen. Counting it apart is what
+   *  makes the rest of that bucket attributable. */
+  silent?: boolean;
   /** Which pointer route carried it, when the reply said. Phase 1 adds the
    *  snapshot generation next to this; it does not exist yet and is left out
    *  rather than faked. */
@@ -362,6 +368,8 @@ export type Rollup = {
    *  fails inside a batch that goes on to succeed. */
   failures: { tool: Record<string, number>; driver: Record<string, number> };
   noChange: number;
+  /** Of the driver calls, how many were writes that did nothing observable. */
+  silentWrites: number;
   /** Biggest payload seen, per unit — what a payload-derived budget gets set from. */
   largest: Record<string, number>;
   /** Usage reports that repeated the previous numbers — retries that never
@@ -457,6 +465,7 @@ export function rollup(records: readonly MetricRecord[]): Rollup {
     driverMs: span(drivers.map((d) => d.ms)),
     failures: { tool: tally(tools), driver: tally(drivers) },
     noChange: tools.filter((t) => t.noChange).length,
+    silentWrites: drivers.filter((d) => d.silent === true).length,
     largest,
     wall: wallOf(runs),
   };

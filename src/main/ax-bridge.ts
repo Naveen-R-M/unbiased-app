@@ -939,7 +939,8 @@ export interface AxCallInfo {
   flags: string;
   /** Result facts worth a glance in the log: "shown" for a launch that showed
    *  the app once, "blank" for a picture with nothing in it, "backgrounded"
-   *  for a pointer the window took without being raised. */
+   *  for a pointer the window took without being raised, "wroteNothing" for a
+   *  write the API accepted that changed neither its target nor the tree. */
   marks: string;
   error: string | null;
   /** The bridge's error CODE, beside its message. The messages are written for
@@ -1085,7 +1086,7 @@ export class AxClient {
         bytes: r ? JSON.stringify(r).length : 0,
         lines: text ? text.split("\n").length : 0,
         flags: flags.join(","),
-        marks: (["shown", "blank", "backgrounded"] as const).filter((k) => r?.[k] === true).join(","),
+        marks: (["shown", "blank", "backgrounded", "wroteNothing"] as const).filter((k) => r?.[k] === true).join(","),
         error: e ? e.message : null,
         code: e instanceof AxError ? e.code : null,
       });
