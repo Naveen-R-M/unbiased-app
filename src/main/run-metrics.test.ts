@@ -27,6 +27,7 @@ function tool(over: Partial<ToolRecord> = {}): ToolRecord {
     verb: "press",
     size: 0,
     unit: "none",
+    parts: {},
     ms: 100,
     ok: true,
     noChange: false,
@@ -51,7 +52,7 @@ test("the switch is its own, not the debug log's", () => {
 
 test("a payload is a shape, never the screen's text", () => {
   const typed = payloadOf("computer_type", { text: "hunter2", app: "1Password" });
-  assert.deepEqual(typed, { verb: "type", size: 7, unit: "chars" });
+  assert.deepEqual(typed, { verb: "type", size: 7, unit: "chars", parts: { chars: 7 } });
   assert.ok(!JSON.stringify(typed).includes("hunter2"));
 
   const set = payloadOf("computer_set_value", { id: 4, value: "naveen@circuitandchisel.com" });
@@ -61,16 +62,52 @@ test("a payload is a shape, never the screen's text", () => {
 
 test("a pen path is counted in points, and a drag is told from a click", () => {
   const path = Array.from({ length: 105 }, (_, i) => [i / 105, 0.5]);
-  assert.deepEqual(payloadOf("computer_pointer", { path, hold: true }), { verb: "pointer:drag", size: 105, unit: "points" });
-  assert.deepEqual(payloadOf("computer_pointer", { path: [[0.5, 0.5]] }), { verb: "pointer", size: 1, unit: "points" });
+  assert.deepEqual(payloadOf("computer_pointer", { path, hold: true }), { verb: "pointer:drag", size: 105, unit: "points", parts: { points: 105 } });
+  assert.deepEqual(payloadOf("computer_pointer", { path: [[0.5, 0.5]] }), { verb: "pointer", size: 1, unit: "points", parts: { points: 1 } });
 });
 
 test("a batch is counted in steps", () => {
-  assert.deepEqual(payloadOf("computer_do", { steps: [{ do: "press" }, { do: "key" }] }), { verb: "do", size: 2, unit: "steps" });
+  assert.deepEqual(payloadOf("computer_do", { steps: [{ do: "press" }, { do: "key" }] }), {
+    verb: "do",
+    size: 2,
+    unit: "steps",
+    parts: { steps: 2, keys: 1 },
+  });
+});
+
+test("a batch says what is inside it, not just how many steps", () => {
+  // The four-step recipe for setting a field in a web app's inspector: click,
+  // select all, type, commit. Counted as steps alone this is "4" and the text
+  // is invisible — which is how a whole run of field edits measured as zero
+  // characters typed while plainly typing all afternoon.
+  const p = payloadOf("computer_do", {
+    app: "Figma",
+    steps: [
+      { do: "pointer", id: 71 },
+      { do: "key", key: "a", modifiers: ["command"] },
+      { do: "type", text: "D97757" },
+      { do: "key", key: "return" },
+    ],
+  });
+  assert.equal(p.verb, "do");
+  assert.equal(p.size, 4, "the headline is still what the call IS");
+  assert.deepEqual(p.parts, { steps: 4, clicks: 1, keys: 2, chars: 6 });
+  assert.ok(!JSON.stringify(p).includes("D97757"), "the value typed never reaches the record");
+});
+
+test("a double click inside a batch counts both clicks", () => {
+  const p = payloadOf("computer_do", { steps: [{ do: "pointer", id: 3, clicks: 2 }] });
+  assert.equal(p.parts.clicks, 2);
+});
+
+test("a batch of nonsense steps is measured as best it can be, never thrown on", () => {
+  const p = payloadOf("computer_do", { steps: [null, 7, { do: "type" }, { do: "type", text: "ok" }] });
+  assert.equal(p.size, 4);
+  assert.deepEqual(p.parts, { steps: 4, chars: 2 });
 });
 
 test("a call with nothing to measure still names its verb", () => {
-  assert.deepEqual(payloadOf("computer_app_state", { app: "Figma" }), { verb: "app_state", size: 0, unit: "none" });
+  assert.deepEqual(payloadOf("computer_app_state", { app: "Figma" }), { verb: "app_state", size: 0, unit: "none", parts: {} });
 });
 
 test("malformed arguments do not throw", () => {
@@ -163,7 +200,7 @@ test("the rollup separates tool time from driver time", () => {
     tool({ ms: 200 }),
     driver({ ms: 50 }),
     driver({ ms: 90 }),
-    tool({ ms: 27_000, verb: "pointer:drag", size: 105, unit: "points" }),
+    tool({ ms: 27_000, verb: "pointer:drag", size: 105, unit: "points", parts: { points: 105 } }),
   ]);
   assert.equal(r.toolCalls, 2);
   assert.equal(r.driverCalls, 2);
@@ -185,6 +222,16 @@ test("failures are counted by class across both layers", () => {
   assert.deepEqual(r.failures.tool, { stale: 1 });
   assert.deepEqual(r.failures.driver, { stale: 1, timeout: 1 });
   assert.equal(r.noChange, 1);
+});
+
+test("a record written before batches were measured still rolls up", () => {
+  // 381 of these are already on disk. Dropping them because they predate the
+  // field would throw away the only baseline we have.
+  const old = tool({ verb: "pointer:drag", size: 105, unit: "points" });
+  delete (old as { parts?: unknown }).parts;
+  const r = rollup([old]);
+  assert.equal(r.largest.points, 105, "size and unit still answer when parts is absent");
+  assert.equal(r.shape, "draw");
 });
 
 test("an empty run rolls up to zeroes rather than throwing", () => {

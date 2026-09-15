@@ -6467,6 +6467,7 @@ function wireNotifications(): void {
               verb: shape.verb,
               size: shape.size,
               unit: shape.unit,
+              parts: shape.parts,
               ms: Date.now() - startedAt,
               ok,
               // What ambiguity looks like before anything resolves an element

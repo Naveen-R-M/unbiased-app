@@ -31,15 +31,60 @@ export function metricsEnabled(env: Record<string, string | undefined>): boolean
 
 // ---------------------------------------------------------------- payloads
 
-/** How big a call was, in the unit that call is actually measured in. A
- *  105-point pen path and a 105-character password are both "105" and have
- *  nothing to do with each other, so the unit travels with the number. */
-export type Payload = { verb: string; size: number; unit: "points" | "steps" | "chars" | "keys" | "none" };
+/** The units a call's work is measured in. A 105-point pen path and a
+ *  105-character password are both "105" and have nothing to do with each
+ *  other, so the unit always travels with the number. */
+export type Unit = "points" | "steps" | "chars" | "keys" | "clicks";
 
-const NO_PAYLOAD: Payload = { verb: "", size: 0, unit: "none" };
+/** How big a call was.
+ *
+ *  `size`/`unit` is the headline — what the call IS. `parts` is everything it
+ *  carries, including work nested inside a batch, and the two differ exactly
+ *  where it matters: a ten-step batch is "10 steps", which says nothing about
+ *  why it took four seconds. The reliable way to set a field in a web app's
+ *  inspector is the four-step recipe — click, select all, type, commit — so
+ *  batches are where almost all typing happens, and counting only the steps
+ *  made every batched edit look like zero characters of text. */
+export type Payload = {
+  verb: string;
+  size: number;
+  unit: Unit | "none";
+  parts: Partial<Record<Unit, number>>;
+};
 
 function count(v: unknown): number {
   return Array.isArray(v) ? v.length : 0;
+}
+
+function textLength(v: unknown): number {
+  return typeof v === "string" ? v.length : 0;
+}
+
+/** What a batch's steps add up to. Reads the raw step objects the model sent,
+ *  not parsed ones, so a malformed batch is measured as best it can be rather
+ *  than throwing inside a diagnostics path. Never returns the text itself. */
+function batchParts(raw: unknown): Partial<Record<Unit, number>> {
+  const steps = Array.isArray(raw) ? raw : [];
+  const parts: Partial<Record<Unit, number>> = { steps: steps.length };
+  for (const s of steps) {
+    if (!s || typeof s !== "object") continue;
+    const step = s as Record<string, unknown>;
+    switch (step.do) {
+      case "type":
+      case "set_value":
+        parts.chars = (parts.chars ?? 0) + textLength(step.text);
+        break;
+      case "key":
+        parts.keys = (parts.keys ?? 0) + 1;
+        break;
+      case "pointer":
+        parts.clicks = (parts.clicks ?? 0) + (typeof step.clicks === "number" ? step.clicks : 1);
+        break;
+      default:
+        break;
+    }
+  }
+  return parts;
 }
 
 /** The verb and size of one tool call, from its arguments alone.
@@ -51,21 +96,27 @@ export function payloadOf(tool: string, rawArgs: unknown): Payload {
   const a = (rawArgs && typeof rawArgs === "object" ? rawArgs : {}) as Record<string, unknown>;
   const verb = tool.startsWith("computer_") ? tool.slice("computer_".length) : tool;
   switch (tool) {
-    case "computer_pointer":
+    case "computer_pointer": {
       // The one that matters most: a long path is a drawing, and a drawing is
       // the case where a single binding legitimately runs for half a minute.
-      return { verb: a.hold === true ? "pointer:drag" : "pointer", size: count(a.path), unit: "points" };
+      const points = count(a.path);
+      return { verb: a.hold === true ? "pointer:drag" : "pointer", size: points, unit: "points", parts: { points } };
+    }
     case "computer_do":
-      return { verb: "do", size: count(a.steps), unit: "steps" };
-    case "computer_type":
-      return { verb: "type", size: typeof a.text === "string" ? a.text.length : 0, unit: "chars" };
-    case "computer_set_value":
-      return { verb: "set_value", size: typeof a.value === "string" ? a.value.length : 0, unit: "chars" };
+      return { verb: "do", size: count(a.steps), unit: "steps", parts: batchParts(a.steps) };
+    case "computer_type": {
+      const chars = textLength(a.text);
+      return { verb: "type", size: chars, unit: "chars", parts: { chars } };
+    }
+    case "computer_set_value": {
+      const chars = textLength(a.value);
+      return { verb: "set_value", size: chars, unit: "chars", parts: { chars } };
+    }
     case "computer_key":
     case "computer_press_key":
-      return { verb: verb, size: 1, unit: "keys" };
+      return { verb, size: 1, unit: "keys", parts: { keys: 1 } };
     default:
-      return { verb, size: 0, unit: "none" };
+      return { verb, size: 0, unit: "none", parts: {} };
   }
 }
 
@@ -124,6 +175,10 @@ export type ToolRecord = Base & {
   verb: string;
   size: number;
   unit: Payload["unit"];
+  /** Everything the call carried, batch contents included. Optional because
+   *  records written before batches were measured do not have it, and those
+   *  are on disk and still worth reading — every writer here sets it. */
+  parts?: Partial<Record<Unit, number>>;
   ms: number;
   ok: boolean;
   /** True when the call succeeded and the app's tree did not move. The
@@ -212,14 +267,20 @@ export const DRAW_POINTS = 20;
  *  have almost nothing in common economically: without this tag a token
  *  comparison between tool mode and code mode reports whatever the mix of
  *  tasks happened to be that week. */
-export function taskShape(tools: readonly { verb: string; size: number }[]): TaskShape {
+type Shaped = { verb: string; size: number; parts?: Partial<Record<Unit, number>> };
+
+export function taskShape(tools: readonly Shaped[]): TaskShape {
   if (tools.length === 0) return "none";
-  const drew = tools.some((t) => t.verb.startsWith("pointer") && t.size >= DRAW_POINTS);
-  if (drew) return "draw";
+  const points = (t: Shaped) => t.parts?.points ?? (t.verb.startsWith("pointer") ? t.size : 0);
+  if (tools.some((t) => points(t) >= DRAW_POINTS)) return "draw";
   const kinds = new Set<string>();
   for (const t of tools) {
     const v = t.verb;
-    if (v === "type" || v === "set_value") kinds.add("edit");
+    // Text anywhere makes it an edit, batch contents included: the reliable
+    // way to set a field is click, select all, type, commit, so the presses in
+    // such a batch are in service of the typing rather than a navigation of
+    // their own. Counting them separately reported every field edit as mixed.
+    if ((t.parts?.chars ?? 0) > 0 || v === "type" || v === "set_value") kinds.add("edit");
     else if (v === "press" || v === "act" || v === "menu" || v === "key" || v === "press_key" || v === "do" || v.startsWith("pointer")) kinds.add("navigate");
     else if (v === "app_state" || v === "screenshot" || v === "app_screenshot" || v === "apps" || v === "scroll_view" || v === "scroll") kinds.add("read");
   }
@@ -288,7 +349,12 @@ export function rollup(records: readonly MetricRecord[]): Rollup {
     return out;
   };
   const largest: Record<string, number> = {};
-  for (const t of tools) if (t.unit !== "none") largest[t.unit] = Math.max(largest[t.unit] ?? 0, t.size);
+  for (const t of tools) {
+    const parts = t.parts ?? (t.unit !== "none" ? ({ [t.unit]: t.size } as Partial<Record<Unit, number>>) : {});
+    for (const [unit, n] of Object.entries(parts)) {
+      if (typeof n === "number" && n > 0) largest[unit] = Math.max(largest[unit] ?? 0, n);
+    }
+  }
   const last = turns.at(-1);
   const span = (ms: number[]) => ({
     total: sum(ms),
