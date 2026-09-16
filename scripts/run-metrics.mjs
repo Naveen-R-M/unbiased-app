@@ -72,7 +72,10 @@ function show(label, rs) {
   const f = (m) => Object.entries(m).map(([k, n]) => `${k} ${n}`).join(", ") || "none";
   console.log(`  failures  tool: ${f(r.failures.tool)}   driver: ${f(r.failures.driver)}`);
   console.log(`  accepted but nothing changed: ${r.noChange}`);
-  if (r.silentWrites > 0) console.log(`  writes accepted that did nothing observable: ${r.silentWrites}`);
+  if (r.silentWrites > 0) {
+    const by = Object.entries(r.silentByRole).sort((a, b) => b[1] - a[1]).map(([k, n]) => `${n} ${k}`).join(", ");
+    console.log(`  writes accepted that did nothing observable: ${r.silentWrites}  (${by})`);
+  }
 }
 
 console.log(`${records.length} records from ${file}${skipped ? ` (${skipped} unreadable)` : ""}`);

@@ -214,6 +214,11 @@ export type DriverRecord = Base & {
    *  was right and the write still did not happen. Counting it apart is what
    *  makes the rest of that bucket attributable. */
   silent?: boolean;
+  /** What the call was aimed at. Without these, a count of writes that did
+   *  nothing cannot be turned into WHICH writes — and a number nobody can
+   *  break down is a number that gets generalised wrongly. */
+  targetId?: number | null;
+  targetRole?: string | null;
   /** Which pointer route carried it, when the reply said. Phase 1 adds the
    *  snapshot generation next to this; it does not exist yet and is left out
    *  rather than faked. */
@@ -370,6 +375,10 @@ export type Rollup = {
   noChange: number;
   /** Of the driver calls, how many were writes that did nothing observable. */
   silentWrites: number;
+  /** Those same writes by the role they were aimed at. The whole point: five
+   *  against a stepper and three against a pop-up button is a control-type
+   *  story, and the same eight without roles reads as "writes are broken". */
+  silentByRole: Record<string, number>;
   /** Biggest payload seen, per unit — what a payload-derived budget gets set from. */
   largest: Record<string, number>;
   /** Usage reports that repeated the previous numbers — retries that never
@@ -466,6 +475,11 @@ export function rollup(records: readonly MetricRecord[]): Rollup {
     failures: { tool: tally(tools), driver: tally(drivers) },
     noChange: tools.filter((t) => t.noChange).length,
     silentWrites: drivers.filter((d) => d.silent === true).length,
+    silentByRole: drivers.filter((d) => d.silent === true).reduce<Record<string, number>>((acc, d) => {
+      const k = d.targetRole ?? "(role unknown)";
+      acc[k] = (acc[k] ?? 0) + 1;
+      return acc;
+    }, {}),
     largest,
     wall: wallOf(runs),
   };

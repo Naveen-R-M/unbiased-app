@@ -340,6 +340,27 @@ test("a write that did nothing is counted apart from a call that failed", () => 
   assert.equal(r.noChange, 1);
 });
 
+test("writes that did nothing are broken down by what they were aimed at", () => {
+  // The breakdown is the point. Eight silent writes reads as "writes are
+  // broken"; five against a stepper and three against a pop-up button reads as
+  // "two control types refuse AXValue", which is the true and much smaller
+  // claim. Reporting the first when the second was the case cost a whole
+  // afternoon's conclusion.
+  const r = rollup([
+    driver({ silent: true, targetRole: "incrementor" }),
+    driver({ silent: true, targetRole: "incrementor" }),
+    driver({ silent: true, targetRole: "pop up button" }),
+    driver({ silent: true }),
+    driver({ targetRole: "text field" }),
+  ]);
+  assert.equal(r.silentWrites, 4);
+  assert.deepEqual(r.silentByRole, {
+    incrementor: 2,
+    "pop up button": 1,
+    "(role unknown)": 1,
+  });
+});
+
 test("an empty run rolls up to zeroes rather than throwing", () => {
   const r = rollup([] as MetricRecord[]);
   assert.equal(r.shape, "none");
@@ -350,4 +371,5 @@ test("an empty run rolls up to zeroes rather than throwing", () => {
   assert.equal(r.wall, null);
   assert.equal(r.retries, 0);
   assert.equal(r.silentWrites, 0);
+  assert.deepEqual(r.silentByRole, {});
 });

@@ -969,6 +969,11 @@ export interface AxCallInfo {
    *  watching only for the first counted zero across two whole runs. */
   marks: string;
   error: string | null;
+  /** The element the call was aimed at, when it named one. A verb alone does
+   *  not say what a call did: "8 writes changed nothing" is unreadable without
+   *  it, and reading it wrongly is how a whole afternoon's conclusion about
+   *  writes turned out to be about two control types. */
+  targetId: number | null;
   /** The bridge's error CODE, beside its message. The messages are written for
    *  the model to read and get rewritten whenever they read badly; the codes
    *  are the contract. Anything classifying failures — which run is failing on
@@ -1115,6 +1120,7 @@ export class AxClient {
         marks: (["shown", "blank", "backgrounded", "wroteNothing", "valueUnchanged"] as const).filter((k) => r?.[k] === true).join(","),
         error: e ? e.message : null,
         code: e instanceof AxError ? e.code : null,
+        targetId: typeof params.id === "number" ? params.id : null,
       });
     } catch {
       // diagnostics must never break a request
@@ -1147,6 +1153,16 @@ export class AxClient {
 /** id -> element line, accumulated across every tree and diff the model saw of
  *  an app. A diff omits unchanged elements, so the last text alone cannot name
  *  an id the model read two turns ago; the index can. */
+/** The role at the head of an element line — `text field "Last name" = Kumar
+ *  {press}` is a `text field`. Everything up to the first quote, equals,
+ *  bracket or brace: the role is the one part of the line with no delimiter of
+ *  its own, so it is read by where it stops rather than by what it contains. */
+export function roleOfLine(line: string | undefined): string | null {
+  if (!line) return null;
+  const role = line.split(/["=[{]/)[0]!.trim();
+  return role || null;
+}
+
 export function indexElementLines(text: string, into: Map<number, string> = new Map()): Map<number, string> {
   for (const line of text.split("\n")) {
     const m = /^[~+]?\s*(\d+)\s+(.*)$/.exec(line);

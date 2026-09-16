@@ -76,6 +76,7 @@ import {
   axNeedsFocus,
   describeAxAction,
   indexElementLines,
+  roleOfLine,
   readAxManifest,
   resolveAxDir,
   shouldOpenAccessibilitySettings,
@@ -2442,6 +2443,10 @@ async function startAxBridge(): Promise<void> {
       // Which pointer route carried it, when the bridge said. Phase 1 adds the
       // snapshot generation beside this; it does not exist yet, so the field
       // is absent rather than invented.
+      targetId: c.targetId,
+      // The role comes from the app's own index of element lines: the bridge
+      // reply does not carry it, and the line the model was shown does.
+      targetRole: c.app && c.targetId !== null ? roleOfLine(axLines.get(c.app)?.get(c.targetId)) : null,
       route: c.marks.includes("backgrounded") ? "background" : null,
       ...(c.marks.includes("wroteNothing") || c.marks.includes("valueUnchanged") ? { silent: true } : {}),
       failure: c.error ? classifyFailure(c.code ?? null, c.error) : null,
