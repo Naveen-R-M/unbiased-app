@@ -2388,7 +2388,7 @@ function startMetrics(): void {
  *  once, and a counter would file one thread's driver calls under the other's
  *  tool call — which is exactly the kind of quietly wrong number this whole
  *  exercise exists to avoid producing. */
-const inToolCall = new AsyncLocalStorage<{ seq: number; thread: string | null }>();
+const inToolCall = new AsyncLocalStorage<{ seq: number; thread: string | null; quiet: { id: number | null; role: string | null }[] }>();
 let toolSeq = 0;
 
 function metricNow(thread: string | null): { v: number; at: string; thread: string | null } {
@@ -2448,7 +2448,10 @@ async function startAxBridge(): Promise<void> {
       // reply does not carry it, and the line the model was shown does.
       targetRole: c.app && c.targetId !== null ? roleOfLine(axLines.get(c.app)?.get(c.targetId)) : null,
       route: c.marks.includes("backgrounded") ? "background" : null,
-      ...(c.marks.includes("wroteNothing") || c.marks.includes("valueUnchanged") ? { silent: true } : {}),
+      // wroteNothing only. valueUnchanged is the half-signal a batch step can
+      // report; its verdict is reached in the batch handler, once the closing
+      // diff is in, and recorded on the tool call there.
+      ...(c.marks.includes("wroteNothing") ? { silent: true } : {}),
       failure: c.error ? classifyFailure(c.code ?? null, c.error) : null,
       of: here?.seq ?? null,
     };
@@ -2757,6 +2760,9 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         // a local pipe — and collapsing them into ONE model round trip is the
         // entire point of this tool.
         const quietSteps: string[] = [];
+        /** The ids behind those steps, so the verdict below can say what the
+         *  writes were aimed at rather than only how many there were. */
+        const quietCandidates: (number | null)[] = [];
         for (const [i, st] of steps.entries()) {
           const label = `step ${i + 1} (${traceStep(st)})`;
           try {
@@ -2770,7 +2776,10 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
             // that is not a verdict — some controls take a write and report
             // the old value — so it is collected here and judged against the
             // batch's closing diff, which is the second signal.
-            if (stepResult.valueUnchanged === true) quietSteps.push(label);
+            if (stepResult.valueUnchanged === true) {
+              quietSteps.push(label);
+              quietCandidates.push("id" in st && typeof st.id === "number" ? st.id : null);
+            }
             ran.push(label);
             if (st.waitMs > 0) await new Promise((r) => setTimeout(r, st.waitMs));
           } catch (err) {
@@ -2804,6 +2813,17 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
             for (const v of values) recordFact(threadId, `${appName} #${v.id}${v.title ? ` ${JSON.stringify(v.title)}` : ""} = ${v.value ?? "(no value)"}`);
           } catch {
             // the diff still stands
+          }
+        }
+        // The verdict, reached here because here is where both signals are: the
+        // steps that reported their value unmoved, and the closing diff that
+        // says whether anything in the tree moved. Either alone is not it —
+        // counting the step's half-signal on its own read ten landed writes as
+        // ten failures on a run that succeeded.
+        if (diff.trim() === "(no changes)" && quietCandidates.length) {
+          const store = inToolCall.getStore();
+          for (const qid of quietCandidates) {
+            store?.quiet.push({ id: qid, role: qid !== null ? roleOfLine(axLines.get(appName)?.get(qid)) : null });
           }
         }
         const inspector = await inspectorBlock(appName);
@@ -6437,7 +6457,8 @@ function wireNotifications(): void {
         // makes — one for a press, a dozen for a batch — files itself under
         // this tool call rather than under whichever thread happened to be
         // running at the same moment.
-        const call = inToolCall.run({ seq, thread: approvalThread }, () =>
+        const quietWrites: { id: number | null; role: string | null }[] = [];
+        const call = inToolCall.run({ seq, thread: approvalThread, quiet: quietWrites }, () =>
           tool.startsWith("schedule_")
           ? handleScheduleToolCall(tool, args, approvalThread)
           : tool.startsWith("checkpoint_")
@@ -6512,6 +6533,7 @@ function wireNotifications(): void {
               // What ambiguity looks like before anything resolves an element
               // by label: the app took the action and the tree did not move.
               noChange: ok && text.includes(ACTION_NO_CHANGE_SENTENCE),
+              ...(quietWrites.length ? { quietWrites } : {}),
               // The tool layer has prose, not a code — the classified reason
               // lives on the driver record underneath it, which has both.
               failure: ok ? null : classifyFailure(null, text),

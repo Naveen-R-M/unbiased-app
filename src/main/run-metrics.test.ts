@@ -340,6 +340,49 @@ test("a write that did nothing is counted apart from a call that failed", () => 
   assert.equal(r.noChange, 1);
 });
 
+test("a batch step's half-signal is not counted; the batch's verdict is", () => {
+  // The bug this replaced: a batch step reports "the value did not move",
+  // which on this platform is stale-prone, and counting it alone read ten
+  // landed writes as ten failures on a run that succeeded. The verdict needs
+  // the closing diff too, and the closing diff belongs to the tool call.
+  const stepFactOnly = rollup([
+    driver({ method: "setValue", targetRole: "text field" }), // reported valueUnchanged; NOT silent
+    tool({ tool: "computer_do", verb: "do" }),                 // no verdict: the tree moved
+  ]);
+  assert.equal(stepFactOnly.silentWrites, 0, "a half-signal counts for nothing");
+
+  const withVerdict = rollup([
+    driver({ method: "setValue", targetRole: "text field" }),
+    tool({
+      tool: "computer_do",
+      verb: "do",
+      quietWrites: [
+        { id: 95, role: "text field" },
+        { id: 103, role: "incrementor" },
+      ],
+    }),
+  ]);
+  assert.equal(withVerdict.silentWrites, 2);
+  assert.deepEqual(withVerdict.silentByRole, { "text field": 1, incrementor: 1 });
+});
+
+test("a rollup reports the records' version, not the code's", () => {
+  // A run written before the rule changed must not be read as though it were
+  // written after it. Four published numbers came from records that counted a
+  // half-signal; they keep what they said, and say when they said it.
+  const old = rollup([{ ...driver({ silent: true }), v: 1 }]);
+  assert.equal(old.v, 1);
+  assert.equal(rollup([driver({ silent: true })]).v, METRICS_VERSION);
+  assert.equal(rollup([]).v, METRICS_VERSION, "an empty run is not retroactively old");
+});
+
+test("a standalone call still reaches the verdict on its own", () => {
+  // It has a diff of its own, so it needs no batch to judge it.
+  const r = rollup([driver({ silent: true, targetRole: "pop up button" })]);
+  assert.equal(r.silentWrites, 1);
+  assert.deepEqual(r.silentByRole, { "pop up button": 1 });
+});
+
 test("writes that did nothing are broken down by what they were aimed at", () => {
   // The breakdown is the point. Eight silent writes reads as "writes are
   // broken"; five against a stepper and three against a pop-up button reads as

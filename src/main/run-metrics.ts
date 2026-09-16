@@ -19,8 +19,14 @@
  *  A log that quotes the screen is one that has to be argued about first. */
 
 /** Bumped when a field changes meaning, so a later reader can tell two runs
- *  apart instead of averaging them together. */
-export const METRICS_VERSION = 1;
+ *  apart instead of averaging them together.
+ *
+ *  2: a write counts as having done nothing only on the two-signal VERDICT.
+ *  Version 1 counted a batch step's half-signal as well, which on this
+ *  platform reads landed writes as failures — four runs of that number were
+ *  published and all four were wrong. Records at 1 keep whatever they said;
+ *  the reader says they cannot be compared rather than quietly mixing them. */
+export const METRICS_VERSION = 2;
 
 /** The env switch. Separate from UNBIASED_AX_DEBUG on purpose: that log quotes
  *  element lines and belongs to one debugging session, this one is shapes only
@@ -182,6 +188,11 @@ export type ToolRecord = Base & {
   verb: string;
   size: number;
   unit: Payload["unit"];
+  /** Writes inside this call that did nothing observable, as judged with BOTH
+   *  signals: a step reported its value unmoved, and the call's closing diff
+   *  agreed that nothing in the tree moved either. The verdict lives here
+   *  rather than on the driver calls because the diff does. */
+  quietWrites?: { id: number | null; role: string | null }[];
   /** Everything the call carried, batch contents included. Optional because
    *  records written before batches were measured do not have it, and those
    *  are on disk and still worth reading — every writer here sets it. */
@@ -208,11 +219,16 @@ export type DriverRecord = Base & {
   waitedMs: number | null;
   bytes: number;
   lines: number;
-  /** The write was accepted and changed nothing observable. Not a failure —
-   *  nothing was refused — but not a success either, and it is the half of
-   *  "accepted but nothing changed" that no selector work can fix: the target
-   *  was right and the write still did not happen. Counting it apart is what
-   *  makes the rest of that bucket attributable. */
+  /** The write was accepted and changed nothing observable — the VERDICT, which
+   *  needs two signals: the target's value did not move AND nothing in the tree
+   *  did. Only a settling call can reach it, because only a settling call has a
+   *  diff.
+   *
+   *  A batch step cannot, and must not be counted here. It reports the one
+   *  signal it has, the app pairs that with the batch's closing diff, and the
+   *  verdict belongs to the TOOL call that owns the diff — see ToolRecord's
+   *  quietWrites. Counting the bare fact here read ten landed writes as ten
+   *  failures on a run that succeeded. */
   silent?: boolean;
   /** What the call was aimed at. Without these, a count of writes that did
    *  nothing cannot be turned into WHICH writes — and a number nobody can
@@ -342,6 +358,9 @@ export function percentile(values: readonly number[], p: number): number {
 }
 
 export type Rollup = {
+  /** The OLDEST record version in this run, not the code's. Below 2,
+   *  silentWrites counted a batch step's half-signal and cannot be compared
+   *  with anything measured after the rule changed. */
   v: number;
   shape: TaskShape;
   turns: number;
@@ -435,6 +454,12 @@ export function rollup(records: readonly MetricRecord[]): Rollup {
     seen.set(key, sig);
   }
   const turns = allTurns.filter((t) => !repeats.has(t));
+  // Both routes to the same verdict: a standalone call reaches it in the
+  // bridge, a batch reaches it in the app once its closing diff is in.
+  const quiet: { role: string | null }[] = [
+    ...drivers.filter((d) => d.silent === true).map((d) => ({ role: d.targetRole ?? null })),
+    ...tools.flatMap((t) => t.quietWrites ?? []),
+  ];
   const tally = (rs: readonly { failure: Failure | null }[]): Record<string, number> => {
     const out: Record<string, number> = {};
     for (const r of rs) if (r.failure) out[r.failure] = (out[r.failure] ?? 0) + 1;
@@ -455,7 +480,9 @@ export function rollup(records: readonly MetricRecord[]): Rollup {
     max: ms.length ? Math.max(...ms) : 0,
   });
   return {
-    v: METRICS_VERSION,
+    // The records' version, not the code's: a rollup describes what was
+    // written, and what was written may predate the rule now in force.
+    v: records.length ? Math.min(...records.map((r) => r.v)) : METRICS_VERSION,
     shape: taskShape(tools),
     turns: turns.length,
     tokens: {
@@ -474,9 +501,9 @@ export function rollup(records: readonly MetricRecord[]): Rollup {
     driverMs: span(drivers.map((d) => d.ms)),
     failures: { tool: tally(tools), driver: tally(drivers) },
     noChange: tools.filter((t) => t.noChange).length,
-    silentWrites: drivers.filter((d) => d.silent === true).length,
-    silentByRole: drivers.filter((d) => d.silent === true).reduce<Record<string, number>>((acc, d) => {
-      const k = d.targetRole ?? "(role unknown)";
+    silentWrites: quiet.length,
+    silentByRole: quiet.reduce<Record<string, number>>((acc, q) => {
+      const k = q.role ?? "(role unknown)";
       acc[k] = (acc[k] ?? 0) + 1;
       return acc;
     }, {}),

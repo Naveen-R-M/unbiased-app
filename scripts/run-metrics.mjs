@@ -74,7 +74,8 @@ function show(label, rs) {
   console.log(`  accepted but nothing changed: ${r.noChange}`);
   if (r.silentWrites > 0) {
     const by = Object.entries(r.silentByRole).sort((a, b) => b[1] - a[1]).map(([k, n]) => `${n} ${k}`).join(", ");
-    console.log(`  writes accepted that did nothing observable: ${r.silentWrites}  (${by})`);
+    const stale = r.v < 2 ? "  [v1 — counted a half-signal; not comparable with later runs]" : "";
+    console.log(`  writes accepted that did nothing observable: ${r.silentWrites}  (${by})${stale}`);
   }
 }
 

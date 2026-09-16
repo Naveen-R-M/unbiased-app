@@ -1118,6 +1118,9 @@ export class AxClient {
         lines: text ? text.split("\n").length : 0,
         flags: flags.join(","),
         marks: (["shown", "blank", "backgrounded", "wroteNothing", "valueUnchanged"] as const).filter((k) => r?.[k] === true).join(","),
+        // Deliberately NOT derived from marks: valueUnchanged appears there for
+        // the log's benefit, but it is half a verdict and counting it as a
+        // whole one is what made this metric lie.
         error: e ? e.message : null,
         code: e instanceof AxError ? e.code : null,
         targetId: typeof params.id === "number" ? params.id : null,
