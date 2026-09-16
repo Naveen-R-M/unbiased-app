@@ -6504,7 +6504,7 @@ function wireNotifications(): void {
           .then((response) => {
             if (!sendSkill) return response;
             const text = computerUseSkillText();
-            const preamble = text ? skillPreamble(text) : null;
+            const preamble = text ? skillPreamble(text, join(bundledSkillsDir(), "computer-use")) : null;
             if (!preamble) return response;
             axSkillSent.add(skillRoot);
             axLog(`sent the computer-use skill with the first desktop call (${tool})`);

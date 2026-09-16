@@ -395,6 +395,32 @@ test("every bundled skill has the frontmatter the engine matches on", () => {
   }
 });
 
+test("the skill states the rules that took a whole night of wrong numbers to learn", () => {
+  const dir = join(__dirname, "..", "..", "resources", "skills", "computer-use");
+  const text = readFileSync(join(dir, "SKILL.md"), "utf8").toLowerCase();
+  for (const [needle, why] of [
+    ["`ok` is not proof", "every silent failure measured returned ok"],
+    ["describe the past", "a read after an action can report the state before it"],
+    ["unverified", "the honest outcome when only weak evidence exists"],
+    ["select_text", "typing without selecting appends, which is how 12 becomes 121212"],
+    ["empty string is ignored", "clearing a field as its own step does nothing"],
+  ]) {
+    assert.ok(text.includes(needle.toLowerCase()), `the skill no longer says: ${needle} — ${why}`);
+  }
+});
+
+test("every reference the skill names exists, and every reference is named", () => {
+  // The skill is PUSHED, so its detail lives beside it. A named file that is
+  // missing reads as detail withheld; a file nothing names is never opened.
+  const dir = join(__dirname, "..", "..", "resources", "skills", "computer-use");
+  const text = readFileSync(join(dir, "SKILL.md"), "utf8");
+  const named = new Set([...text.matchAll(/references\/([a-z0-9-]+\.md)/g)].map((m) => m[1]!));
+  assert.ok(named.size >= 3, `the skill names only ${named.size} reference(s)`);
+  const onDisk = new Set(readdirSync(join(dir, "references")));
+  for (const f of named) assert.ok(onDisk.has(f), `SKILL.md names references/${f}, which does not exist`);
+  for (const f of onDisk) assert.ok(named.has(f), `references/${f} exists but nothing in SKILL.md sends the reader to it`);
+});
+
 test("the computer-use skill carries the findings that cost the most to learn", () => {
   const text = readFileSync(join(__dirname, "..", "..", "resources", "skills", "computer-use", "SKILL.md"), "utf8");
   for (const needle of [

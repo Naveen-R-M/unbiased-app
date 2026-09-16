@@ -690,10 +690,19 @@ export function skillBody(markdown: string): string {
   return trimmed.length > MAX_SKILL_PREAMBLE ? `${trimmed.slice(0, MAX_SKILL_PREAMBLE)}\n…(truncated)` : trimmed;
 }
 
-export function skillPreamble(markdown: string): string | null {
+/** `dir` is where the skill's own folder lives, so the reference files it names
+ *  can actually be opened. The skill is PUSHED, not discovered: everything in
+ *  it is paid for once per conversation, so the deep material sits in files
+ *  beside it — and a file the reader cannot locate is worse than no file, since
+ *  it reads as detail withheld. One absolute path is cheaper than the pages it
+ *  stands in for. */
+export function skillPreamble(markdown: string, dir?: string): string | null {
   const body = skillBody(markdown);
   if (!body) return null;
-  return `=== How to drive desktop apps (read this before acting; sent once per conversation) ===\n${body}\n=== end ===`;
+  const where = dir
+    ? `\n\nThe files named above are in ${dir}/references/ — open one with a shell command when you hit what it covers.`
+    : "";
+  return `=== How to drive desktop apps (read this before acting; sent once per conversation) ===\n${body}${where}\n=== end ===`;
 }
 
 /** Whether this call should carry it: a desktop tool, and not sent yet. */

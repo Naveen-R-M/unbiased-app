@@ -980,6 +980,17 @@ test("a role is read off an element line by where it stops", () => {
   assert.equal(roleOfLine(""), null);
 });
 
+test("the preamble says where the reference files are, when it knows", () => {
+  const md = "---\nname: x\n---\n# Body\ntext";
+  const withDir = skillPreamble(md, "/Apps/Unbiased.app/Contents/Resources/skills/computer-use");
+  assert.ok(withDir!.includes("/references/"), withDir!);
+  assert.ok(withDir!.includes("shell command"), "it must say how to open one: " + withDir);
+  // A file the reader cannot locate reads as detail withheld, so without a
+  // directory the pointer is simply absent rather than dangling.
+  assert.ok(!skillPreamble(md)!.includes("/references/"));
+  assert.ok(skillPreamble(md)!.includes("# Body"));
+});
+
 test("a batch says when its writes moved nothing, but only when the tree agrees", () => {
   const ran = ["step 1 (press #4)", "step 2 (type \"abc\")"];
   const quiet = ["step 2 (type \"abc\")"];
