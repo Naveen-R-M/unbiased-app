@@ -5,6 +5,13 @@ control below reports its value as settable, and several silently discard the
 write. Recognise the family, pick the route, then verify — see
 `verification.md`.
 
+**`set_value` now escalates on its own.** It writes the value, checks whether
+it took, and if it did not, clicks in, selects what is there, and types it
+instead — reporting `route: "typed"` when it had to. A control that discards
+value writes therefore still ends up holding the value, and the reply tells you
+which route worked so the next one can go straight there. What follows is what
+that escalation is doing, and what to reach for when even it is not enough.
+
 ## Recognising the family
 
 Read it off the element's line. The role and the action list are both in it:
