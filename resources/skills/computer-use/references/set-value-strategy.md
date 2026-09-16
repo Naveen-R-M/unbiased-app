@@ -53,15 +53,25 @@ known current value.
 
 ## Pop-up button / native select
 
-`set_value` is silently ignored. Open it and choose:
+`set_value` is silently ignored.
 
-1. `act` with `show menu`, or press it.
-2. Read — the options appear as menu items only once it is open.
-3. Press the option you want.
+**`show menu` is a trap on a control inside a web page.** It is in the action
+list, and it opens the BROWSER's context menu rather than the control's own
+options — measured, and it costs a turn plus an escape to get out of. The
+action being advertised is not the action you get.
 
-A first letter plus `return` often works too, and is one call instead of three.
-Do not send `return` while the closed control has focus: on a form that submits
-it.
+What has worked:
+
+1. **Focus it and type the first letter of the option**, then `return`. One
+   call, and it is how a person uses a closed select. Do not send `return`
+   while a closed select has focus inside a FORM unless you mean to submit —
+   on a form it submits.
+2. **Or press it and read again.** A native menu opens as its own small tree,
+   separate from the page; its items are not in the page's element list and
+   the ids you had before may no longer resolve. Read, then press the item.
+
+Verify which option is selected afterwards. The control's value is the option's
+text, so a read tells you — weakly; see `verification.md`.
 
 ## Date field
 

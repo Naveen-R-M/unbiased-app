@@ -16,6 +16,7 @@ native AppKit controls, other browsers, or other Chrome versions.**
 | `increment` / `decrement` on an incrementor | advertised, returns `ok`, **value does not move** |
 | `AXUIElementIsAttributeSettable` on all of the above | reports `true` — **it does not predict whether the write lands** |
 | typing into a field that already holds text | **appends**; select first to replace |
+| `show menu` on a pop-up button in a page | opens the BROWSER's context menu, not the control's options |
 | arrow keys on a stepper | works |
 | typing into a date sub-field | works |
 | reading a value straight after writing it | may return the **previous** value |
