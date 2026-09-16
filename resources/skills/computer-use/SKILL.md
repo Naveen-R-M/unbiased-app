@@ -19,9 +19,9 @@ one when you hit the thing it covers — not before.
 ## What to believe
 
 **`ok` is not proof.** A tool returning success means the API accepted the
-request. It does not mean the app changed. Every silent failure measured so far
-returned `ok`: value writes discarded by two whole control families, an
-`increment` that moves nothing, a write of an empty string that vanishes.
+request. It does not mean the app changed. Writes that are accepted and
+discarded, and actions that are advertised and inert, both return `ok` — every
+silent failure measured so far did.
 
 **A read can describe the past.** Reads through the accessibility layer can
 report state from before your last action — a value lagging one update, and
@@ -131,32 +131,62 @@ things that look like fixes and are not.
 
 ## Setting a value
 
-Recognise the control family from its line, then pick the route it honours. The
-role and the action list are both there:
+A control's line tells you what it is and what it claims to support — the role,
+and the actions in braces:
 
     32  incrementor "Seats" {press,increment,decrement}
-    25  pop up button "Country" = India {press,show menu}
     21  text field "Last name" = Kumar {press,show menu}
 
-- **Text field, text area** — `set_value` works. To REPLACE existing content,
-  `select_text` first and then type: typing without selecting appends, which is
-  how a `12` becomes `121212`. `set_value` with an empty string is ignored, so
-  never clear as a separate step.
-- **Incrementor / stepper** — `set_value` does nothing. So do `increment` and
-  `decrement`, despite being advertised. Click it, `select_text`, type, commit.
-- **Pop-up button / select** — `set_value` does nothing. Open the menu, read
-  the options that appear, press the one you want.
-- **Date field** — its month, day and year are separate steppers. Focus one,
-  select, type, move on with `right`.
-- **Canvas or custom control** — nothing to set; pointer and keyboard only.
+Use that to choose a first route, and then hold two things loosely:
 
-`references/set-value-strategy.md` has the worked calls and the reasoning;
-`references/chromium-ax-known-failures.md` has what was measured and when.
+**What a control advertises is not what it honours.** Roles and action lists
+say what an element is *for*. Whether a given app implements it is a separate
+question, and the answer differs between apps, between frameworks, and between
+versions of the same app. Treat the advertised route as the first thing to
+try, never as a guarantee.
 
-Never open a replace with `command+a` then `delete` before clicking into the
-field. With focus outside a field those select every object in the document and
-delete them — measured, it cleared a canvas mid-task. `select_text` is scoped
-to the element and cannot do that.
+**So set a value in three steps, not one.**
+
+1. **Try the direct route.** `set_value` on anything that holds text. The
+   action a control names for itself — `increment` on a stepper, `show menu`
+   on something that opens — where that is what you want.
+2. **Check whether it took.** Evidence the app produced beats a value read
+   back; see `references/verification.md`.
+3. **If it did not take, change route — do not repeat it.** The general
+   fallback is to do what a person does: click into the control, select what is
+   there, type the new value, commit. In one call:
+
+```json
+{"app": "<app>", "steps": [
+  {"do": "pointer", "id": 84},
+  {"do": "select_text", "id": 84},
+  {"do": "type", "text": "12"},
+  {"do": "key", "key": "return"}
+]}
+```
+
+That sequence works on far more controls than any single write does, because
+it goes through the same path a person's keystrokes take rather than through a
+property nothing is obliged to implement.
+
+**Select before you type.** Typing into a control that already holds text
+appends to it: a `12` typed over a `12` becomes `1212`. `select_text` with no
+`text` selects the whole value so the typing replaces it.
+
+**Never open a replace with `command+a` then `delete` before clicking into the
+field.** With focus outside a field those select every object in the document
+and delete them — measured, it cleared a canvas mid-task. `select_text` is
+scoped to the element you name and cannot reach past it.
+
+**A composite control may be several elements.** A date, a time, a paired
+range: the tree often shows the parts separately. Set each part, and move
+between them with `right` or `tab` rather than looking for one field that takes
+the whole thing.
+
+`references/set-value-strategy.md` has worked calls per control family.
+`references/chromium-ax-known-failures.md` lists what was measured, against
+which app, on which date — read it as examples of the rule above, not as the
+list of things that can go wrong.
 
 ## Never take the user's screen
 

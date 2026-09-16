@@ -395,6 +395,24 @@ test("every bundled skill has the frontmatter the engine matches on", () => {
   }
 });
 
+test("the pushed skill stays generic — platform findings live in references", () => {
+  // The skill is read by a model driving an unknown app. A named browser in
+  // the rules teaches it to expect that browser's behaviour everywhere, and
+  // the finding has a half-life of weeks. Policy travels; measurements rot.
+  const dir = join(__dirname, "..", "..", "resources", "skills", "computer-use");
+  const skill = readFileSync(join(dir, "SKILL.md"), "utf8");
+  const rules = skill.replace(/references\/[a-z0-9-]+\.md/g, ""); // pointers may name them
+  for (const named of ["chromium", "chrome", "figma", "electron", "safari", "webkit"]) {
+    assert.ok(
+      !new RegExp(named, "i").test(rules),
+      `SKILL.md names ${named} outside a reference path — state the rule, and put the measurement in references/`,
+    );
+  }
+  // And the measurements must still exist somewhere, dated.
+  const known = readFileSync(join(dir, "references", "chromium-ax-known-failures.md"), "utf8");
+  assert.ok(/measured 2\d{3}-\d{2}-\d{2}/i.test(known), "the known-failures file must say when it was measured");
+});
+
 test("the skill states the rules that took a whole night of wrong numbers to learn", () => {
   const dir = join(__dirname, "..", "..", "resources", "skills", "computer-use");
   const text = readFileSync(join(dir, "SKILL.md"), "utf8").toLowerCase();
@@ -402,8 +420,9 @@ test("the skill states the rules that took a whole night of wrong numbers to lea
     ["`ok` is not proof", "every silent failure measured returned ok"],
     ["describe the past", "a read after an action can report the state before it"],
     ["unverified", "the honest outcome when only weak evidence exists"],
-    ["select_text", "typing without selecting appends, which is how 12 becomes 121212"],
-    ["empty string is ignored", "clearing a field as its own step does nothing"],
+    ["select before you type", "typing into a control that already holds text appends"],
+    ["not what it honours", "a role and an action list say what an element is for, not what the app implements"],
+    ["change route", "the repair for a write that did not land is a different route, never the same one again"],
   ]) {
     assert.ok(text.includes(needle.toLowerCase()), `the skill no longer says: ${needle} — ${why}`);
   }
