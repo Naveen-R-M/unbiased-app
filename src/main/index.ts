@@ -2483,6 +2483,10 @@ async function runBatchStep(appName: string, st: BatchStep, settle = true): Prom
       return await ax!.request("act", { app: appName, id: st.id, action: st.action, ...opts });
     case "set_value":
       return await ax!.request("setValue", { app: appName, id: st.id, value: st.text, ...opts });
+    case "select_text":
+      // No settle: selecting changes nothing an app reports, so a diff for it
+      // would always be "(no changes)" and cost the deadline to say so.
+      return await ax!.request("selectText", { app: appName, id: st.id, ...(st.text !== undefined ? { text: st.text } : {}), ...axActionOpts(appName) });
     case "type":
       return await ax!.request("type", { app: appName, text: st.text, ...(st.id !== undefined ? { id: st.id } : {}), ...opts });
     case "pointer":

@@ -163,6 +163,10 @@ export type BatchStep =
   | { do: "scroll"; id: number; direction: string; amount?: number; waitMs: number }
   | { do: "act"; id: number; action: string; waitMs: number }
   | { do: "type"; text: string; id?: number; waitMs: number }
+  /** Select inside a field so the type after it REPLACES. `text` absent means
+   *  the whole value. Scoped to the element, unlike command+a, which is scoped
+   *  to focus and selects the document when focus is not where it was assumed. */
+  | { do: "select_text"; id: number; text?: string; waitMs: number }
   | { do: "pointer"; id: number; clicks?: number; waitMs: number }
   | { do: "screenshot"; window?: number; waitMs: number }
   | { do: "read"; waitMs: number };
@@ -182,7 +186,7 @@ export const KEY_MODIFIERS = ["command", "shift", "option", "control"];
  *  ignored on a `stepper`, and Codex's own run hit the identical split.
  *
  *  Still NOT batchable: launch and raise, which take over the user's screen. */
-export const BATCH_VERBS = ["press", "set_value", "key", "type", "pointer", "screenshot", "scroll", "act", "read"] as const;
+export const BATCH_VERBS = ["press", "set_value", "select_text", "key", "type", "pointer", "screenshot", "scroll", "act", "read"] as const;
 /** Measured against Codex on the same Figma icon: its densest single turn ran
  *  17 primitive actions (four fields, each a click + select-all + type +
  *  Return, then a colour click). A cap of 10 split work like that across turns
@@ -261,6 +265,12 @@ export function parseBatchSteps(raw: unknown): { steps: BatchStep[] } | { error:
         if (id === null) return { error: `${at}: id is required.` };
         if (typeof e.text !== "string") return { error: `${at}: text is required.` };
         steps.push({ do: "set_value", id, text: e.text, waitMs });
+        break;
+      }
+      case "select_text": {
+        if (id === null) return { error: `${at}: id is required.` };
+        if (e.text !== undefined && typeof e.text !== "string") return { error: `${at}: text must be a string, or leave it out to select the whole value.` };
+        steps.push({ do: "select_text", id, ...(typeof e.text === "string" ? { text: e.text } : {}), waitMs });
         break;
       }
       case "scroll": {
@@ -398,6 +408,7 @@ export function traceStep(st: BatchStep): string {
     case "press": return `press #${st.id}`;
     case "act": return `act #${st.id} "${st.action}"`;
     case "set_value": return `set_value #${st.id} = ${JSON.stringify(st.text)}`;
+    case "select_text": return `select_text #${st.id}${st.text !== undefined ? ` ${JSON.stringify(st.text)}` : " (all)"}`;
     case "type": return `type ${JSON.stringify(st.text)}${st.id !== undefined ? ` in #${st.id}` : ""}`;
     case "pointer": return `click${(st.clicks ?? 1) > 1 ? ` x${st.clicks}` : ""} #${st.id}`;
     case "scroll": return `scroll #${st.id} ${st.direction ?? ""}`.trim();

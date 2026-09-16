@@ -954,6 +954,22 @@ test("while Spaces are crossed, raise says looking is not a reason either", () =
   assert.ok(crossed.includes("computer_app_screenshot") && crossed.includes("Not to look"), crossed);
 });
 
+test("select_text parses, traces, and defaults to the whole value", () => {
+  const all = parseBatchSteps([{ do: "select_text", id: 7 }]);
+  assert.ok("steps" in all, JSON.stringify(all));
+  assert.deepEqual(all.steps[0], { do: "select_text", id: 7, waitMs: 0 });
+  assert.equal(traceStep(all.steps[0]), "select_text #7 (all)");
+
+  const some = parseBatchSteps([{ do: "select_text", id: 7, text: "121212" }]);
+  assert.ok("steps" in some);
+  assert.equal(traceStep(some.steps[0]), 'select_text #7 "121212"');
+
+  // id is what scopes it to a field rather than to the document; without one
+  // this would be command+a by another name.
+  assert.ok("error" in parseBatchSteps([{ do: "select_text" }]));
+  assert.ok("error" in parseBatchSteps([{ do: "select_text", id: 7, text: 12 }]));
+});
+
 test("a batch says when its writes moved nothing, but only when the tree agrees", () => {
   const ran = ["step 1 (press #4)", "step 2 (type \"abc\")"];
   const quiet = ["step 2 (type \"abc\")"];
