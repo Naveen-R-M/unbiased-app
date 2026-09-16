@@ -1558,6 +1558,32 @@ const AX_TOOLS = [
   },
   {
     type: "function",
+    name: "computer_find",
+    description:
+      "Find the ONE element matching a description, when you know what you want but not its id — or after a read has gone stale. " +
+      "It returns exactly one element or refuses: several matches come back as a list to choose between, none comes back with what nearly matched. " +
+      "It never picks for you, because picking would act on something you did not see. " +
+      "Matching is exact and case-sensitive unless you ask otherwise. When a label repeats across panels, `within` (an ancestor's id) is usually faster than adding more fields.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        app: { type: "string" },
+        role: { type: "string", description: "Exactly as the tree prints it: \"text field\", \"pop up button\", \"tab button\"." },
+        label: { type: "string", description: "The element's name, as quoted in the tree." },
+        value: { type: "string" },
+        action: { type: "string", description: "An action it must offer, e.g. \"press\" — separates a control from the text that labels it." },
+        enabled: { type: "boolean" },
+        selected: { type: "boolean" },
+        within: { type: "integer", description: "Only look inside this element's subtree. The way to make a repeated label unique." },
+        contains: { type: "boolean", description: "Substring instead of exact match on label and value. Off by default: \"Save\" matching \"Save as…\" is how the wrong button gets pressed." },
+        caseInsensitive: { type: "boolean" },
+      },
+      required: ["app"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
     name: "computer_act",
     description:
       "Perform a NAMED action other than a plain press — the actions an element lists in braces, e.g. \"show menu\", \"cancel\", \"scroll to visible\", \"focus\". For an ordinary press use computer_click, to fill a field use computer_type, and to send a key use computer_key.",
@@ -2946,6 +2972,34 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
           ],
           success: true,
         };
+      }
+      case "computer_find": {
+        const sel: Record<string, unknown> = { app: appName, ...axActionOpts(appName) };
+        for (const k of ["role", "label", "value", "action"]) if (typeof a[k] === "string") sel[k] = a[k];
+        for (const k of ["enabled", "selected", "contains", "caseInsensitive"]) if (typeof a[k] === "boolean") sel[k] = a[k];
+        if (typeof a.within === "number") sel.within = a.within;
+        axLog(`find ${appName} ${JSON.stringify(Object.fromEntries(Object.entries(sel).filter(([k]) => k !== "app")))}`);
+        const r = await ax.request("findUnique", sel);
+        if (r.ok === true) {
+          const frame = r.frame as { x: number; y: number; w: number; h: number } | undefined;
+          return axText(
+            `#${String(r.id)} ${String(r.role)}${r.label ? ` ${JSON.stringify(r.label)}` : ""}` +
+              `${r.value ? ` = ${String(r.value)}` : ""}` +
+              `${Array.isArray(r.actions) && r.actions.length ? ` {${(r.actions as string[]).join(",")}}` : ""}` +
+              `${frame ? ` @${frame.x},${frame.y} ${frame.w}x${frame.h}` : ""}`,
+            true,
+          );
+        }
+        // Fails closed, and hands back what it saw so the next call is aimed
+        // rather than guessed. Reading again does not repair an ambiguity.
+        const rows = (r.matches ?? r.near ?? []) as Record<string, unknown>[];
+        const listed = rows
+          .map((m) => {
+            const f = m.frame as { x: number; y: number } | undefined;
+            return `  #${String(m.id)} ${String(m.role)}${m.label ? ` ${JSON.stringify(m.label)}` : ""}${f ? ` @${f.x},${f.y}` : ""}`;
+          })
+          .join("\n");
+        return axText([String(r.note ?? r.error ?? "no match"), listed].filter(Boolean).join("\n"), false);
       }
       case "computer_press":
       case "computer_set_value":

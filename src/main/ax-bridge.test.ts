@@ -991,6 +991,19 @@ test("the preamble says where the reference files are, when it knows", () => {
   assert.ok(skillPreamble(md)!.includes("# Body"));
 });
 
+test("computer_find is routed, and its description sells the refusal", () => {
+  assert.ok(AX_TOOL_NAMES.includes("computer_find"), "declared but not routed sends it to the screenshot handler");
+  assert.ok(routesToAx("computer_find"));
+  const src = readFileSync(join(__dirname, "index.ts"), "utf8");
+  const at = src.indexOf('name: "computer_find"');
+  assert.ok(at > 0, "computer_find must be declared to the model");
+  const decl = src.slice(at, src.indexOf("inputSchema", at));
+  // The value is that it refuses. A description that only promises to find
+  // something invites the model to treat a list of two as an answer.
+  assert.ok(/never picks for you/i.test(decl), "the description must say it does not choose");
+  assert.ok(/exact/i.test(decl), "and that matching is exact by default");
+});
+
 test("a batch says when its writes moved nothing, but only when the tree agrees", () => {
   const ran = ["step 1 (press #4)", "step 2 (type \"abc\")"];
   const quiet = ["step 2 (type \"abc\")"];

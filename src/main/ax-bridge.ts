@@ -136,6 +136,7 @@ export function axReadOptsFrom(args: { interactive?: unknown; web?: unknown; dep
 const APP_STEP_TOOLS = new Set([
   "computer_app_state",
   "computer_act",
+  "computer_find",
   "computer_raise",
   "computer_launch",
   "computer_press",
@@ -561,6 +562,7 @@ export const AX_TOOL_NAMES = [
   "computer_press_key",
   "computer_scroll_view",
   "computer_act",
+  "computer_find",
   "computer_do",
   "computer_menu",
 ] as const;
