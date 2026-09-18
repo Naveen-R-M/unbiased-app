@@ -14,7 +14,7 @@ const defaultAppRoot = join(launcherRoot, "default-app");
 const defaultAppAsar = join(launcherApp, "Contents", "Resources", "default_app.asar");
 const version = require(join(root, "node_modules", "electron", "package.json")).version;
 const markerPath = join(launcherRoot, "version");
-const launcherRevision = "10";
+const launcherRevision = "11";
 
 function run(command, args) {
   const result = require("node:child_process").spawnSync(command, args, { stdio: "inherit" });
@@ -117,6 +117,11 @@ function prepareMacLauncher() {
       // in the bridge, which inherits this environment when we spawn it.
       `  --env "UNBIASED_AX_DIR=$UNBIASED_AX_DIR" \\`,
       `  --env "UNBIASED_AX_DEBUG=$UNBIASED_AX_DEBUG" \\`,
+      // And the metrics switch. `open` does not pass the caller's environment
+      // through — only what is named here — so a run started with
+      // UNBIASED_AX_METRICS=1 in the shell recorded nothing, silently, and the
+      // run was over before anyone could tell. Named here, it arrives.
+      `  --env "UNBIASED_AX_METRICS=$UNBIASED_AX_METRICS" \\`,
       `  --args "$entry" "$@"`,
       "",
     ].join("\n"),
