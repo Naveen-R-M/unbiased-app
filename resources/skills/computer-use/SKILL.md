@@ -46,6 +46,13 @@ accepted and did nothing does nothing the second time. If it did not land, the
 route is wrong — not the number of attempts. This reflex is the single largest
 measured waste in these tasks.
 
+**On a control with an open or closed state, a repeat is worse than waste — it
+undoes the first press.** The second press returns it to where it started, and
+that looks exactly like the first one having failed. When an action says it
+proved nothing, ask what state the control is in rather than pressing it again:
+`computer_verify` answers satisfied, unsatisfied, or **unknown, which is not
+success**. Act on the answer, never on the uncertainty.
+
 ## The loop
 
 **Read once, then act.** `computer_app_state` returns the tree. Every action
