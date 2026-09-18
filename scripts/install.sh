@@ -13,7 +13,7 @@
 # Open. Removing com.apple.quarantine here does the same thing, once, in a way
 # the whole team can copy-paste.
 #
-# This file lives in unbiased-app/scripts/ (private, source of truth) and is
+# This file lives in unbiased-app/scripts/ (the source of truth) and is
 # pushed verbatim to the public releases repo by .github/workflows/release.yml.
 set -euo pipefail
 

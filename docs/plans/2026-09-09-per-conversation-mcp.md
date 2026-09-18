@@ -566,7 +566,7 @@ Run the Figma logo task once more with the dev app (user clears the frame first)
 From the app worktree:
 
 ```bash
-UNBIASED_ENGINE_DIR=/Users/naveen/Projects/Work/unbiased-app-engine/dist/bundle UNBIASED_AX_DIR=/Users/naveen/Projects/Work/unbiased-ax/.claude/worktrees/folder-comprehension-subagents-4e96f9/dist UNBIASED_AX_DEBUG=1 npm run dev
+UNBIASED_ENGINE_DIR=/path/to/unbiased-app-engine/dist/bundle UNBIASED_AX_DIR=/path/to/unbiased-ax/dist UNBIASED_AX_DEBUG=1 npm run dev
 ```
 
 Restart = kill `open -W -n`, `MacOS/Unbiased Dev`, `electron-vite dev`, `dev-launcher.cjs`, then `pkill -9 -f pareto-app-server; pkill -9 -f dist/unbiased-ax`. The engine's stdio traffic is not in the dev log; MCP startup notifications are visible in the renderer via `mcp:status` and, for a thread, via the `mcp:thread-applied` event added here. To watch raw notifications, add a temporary `console.log(msg.method, JSON.stringify(msg.params).slice(0, 200))` inside the `engine.on("notification"` block at ~5871 and remove it before committing.

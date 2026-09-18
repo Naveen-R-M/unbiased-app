@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { generateKeyPairSync, sign } from "node:crypto";
+import { resolve } from "node:path";
 import {
   isAcceptableSuccessor,
   CATALOGUE_PUBLIC_KEY,
@@ -14,7 +15,7 @@ import {
 } from "./connector-catalogue";
 
 const NOW = "2026-08-31T00:00:00.000Z";
-const REPO = "/Users/naveen/Projects/Work/unbiased-connectors";
+const REPO = process.env.UNBIASED_CONNECTORS_DIR || resolve(process.cwd(), "../unbiased-connectors");
 const entry = (over: Record<string, unknown> = {}) => ({ name: "linear", url: "https://mcp.linear.app/mcp", ...over });
 const PUBLISHED = "2026-08-30T00:00:00.000Z";
 const payload = (connectors: unknown[], schema = CATALOGUE_SCHEMA, publishedAt: unknown = PUBLISHED) =>
