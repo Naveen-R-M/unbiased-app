@@ -1004,6 +1004,33 @@ test("computer_find is routed, and its description sells the refusal", () => {
   assert.ok(/exact/i.test(decl), "and that matching is exact by default");
 });
 
+test("computer_verify is routed, and its description refuses to let unknown pass as yes", () => {
+  assert.ok(AX_TOOL_NAMES.includes("computer_verify"), "declared but not routed sends it to the screenshot handler");
+  assert.ok(routesToAx("computer_verify"));
+  const src = readFileSync(join(__dirname, "index.ts"), "utf8");
+  const at = src.indexOf('name: "computer_verify"');
+  assert.ok(at > 0, "computer_verify must be declared to the model");
+  const decl = src.slice(at, src.indexOf("inputSchema", at));
+  // The whole point is the third answer. A description that offers only yes
+  // and no teaches the model that anything else is a yes.
+  assert.ok(/unknown is NOT success/i.test(decl), "the description must say unknown is not success");
+  // And the reason it exists at all: the retry that undoes the thing.
+  assert.ok(/UNDO/i.test(decl), "it must warn that pressing a toggle again may undo the first press");
+  assert.ok(/looking again|read.*again/i.test(decl), "and that a stale tree is answered by reading, not by acting again");
+});
+
+test("a verify verdict is reported as an answer, never as a failed call", () => {
+  // "unsatisfied" means the check ran and said no. Marking that as a failed
+  // tool call is how a caller learns to retry what it just proved did not
+  // happen — which on a toggle undoes the press that did.
+  const src = readFileSync(join(__dirname, "index.ts"), "utf8");
+  const at = src.indexOf('case "computer_verify"');
+  assert.ok(at > 0, "computer_verify must be handled");
+  const body = src.slice(at, at + 1600);
+  assert.ok(/ok is about whether the CHECK RAN/i.test(body), "the reasoning must be stated where someone would change it");
+  assert.ok(/return axText\([\s\S]*?,\s*true,?\s*\);/.test(body), "the verdict is data; the call itself succeeded");
+});
+
 test("a batch says when its writes moved nothing, but only when the tree agrees", () => {
   const ran = ["step 1 (press #4)", "step 2 (type \"abc\")"];
   const quiet = ["step 2 (type \"abc\")"];

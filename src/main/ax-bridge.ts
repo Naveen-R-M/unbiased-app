@@ -563,6 +563,7 @@ export const AX_TOOL_NAMES = [
   "computer_scroll_view",
   "computer_act",
   "computer_find",
+  "computer_verify",
   "computer_do",
   "computer_menu",
 ] as const;

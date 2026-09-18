@@ -1584,6 +1584,46 @@ const AX_TOOLS = [
   },
   {
     type: "function",
+    name: "computer_verify",
+    description:
+      "Check a postcondition YOU define: describe an element and the state you expect, and get one of three answers. " +
+      "satisfied — proven true. unsatisfied — proven false, after looking again until the timeout. unknown — cannot be proved either way, and unknown is NOT success. " +
+      "Use it when an action reported that nothing changed and you need to know whether it actually did nothing. " +
+      "Reading again is how a stale tree is answered; sending the action again is not. " +
+      "This is especially important for anything with an open/closed or on/off state: pressing it a second time may UNDO the first press rather than repeat it, so ask where it stands before you touch it again. " +
+      "Expectations: exists (default true), expanded, selected, focused, value. " +
+      "A state the element does not actually expose comes back unknown rather than false — the two are different, and only one of them means 'not open'.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        app: { type: "string" },
+        role: { type: "string", description: "Exactly as the tree prints it, e.g. \"button\", \"tab button\"." },
+        label: { type: "string", description: "The element's name, as quoted in the tree." },
+        value: { type: "string" },
+        action: { type: "string", description: "An action it must offer — separates a control from the text that labels it." },
+        within: { type: "integer", description: "Only look inside this element's subtree." },
+        contains: { type: "boolean", description: "Substring instead of exact match on label and value." },
+        caseInsensitive: { type: "boolean" },
+        expect: {
+          type: "object",
+          description: "What should be true of it. Omit for a plain existence check.",
+          properties: {
+            exists: { type: "boolean" },
+            expanded: { type: "boolean", description: "Open or closed. Returns unknown when the element has no such state." },
+            selected: { type: "boolean" },
+            focused: { type: "boolean" },
+            value: { type: "string" },
+          },
+          additionalProperties: false,
+        },
+        timeoutMs: { type: "integer", description: "How long to keep looking before answering unsatisfied. Default 1500." },
+      },
+      required: ["app"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
     name: "computer_act",
     description:
       "Perform a NAMED action other than a plain press — the actions an element lists in braces, e.g. \"show menu\", \"cancel\", \"scroll to visible\", \"focus\". For an ordinary press use computer_click, to fill a field use computer_type, and to send a key use computer_key.",
@@ -3000,6 +3040,26 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
           })
           .join("\n");
         return axText([String(r.note ?? r.error ?? "no match"), listed].filter(Boolean).join("\n"), false);
+      }
+      case "computer_verify": {
+        const sel: Record<string, unknown> = { app: appName, ...axActionOpts(appName) };
+        for (const k of ["role", "label", "value", "action"]) if (typeof a[k] === "string") sel[k] = a[k];
+        for (const k of ["contains", "caseInsensitive"]) if (typeof a[k] === "boolean") sel[k] = a[k];
+        if (typeof a.within === "number") sel.within = a.within;
+        if (a.expect && typeof a.expect === "object") sel.expect = a.expect;
+        if (typeof a.timeoutMs === "number") sel.timeoutMs = a.timeoutMs;
+        axLog(`verify ${appName} ${JSON.stringify(a.expect ?? {})}`);
+        // The bridge polls until its own deadline, so give the request room.
+        const r = await ax.request("verify", sel, 20_000);
+        const verdict = String(r.verdict ?? "unknown");
+        // ok is about whether the CHECK RAN, never about which way it came out.
+        // "unsatisfied" is a successful answer; reporting it as a failed call
+        // is how a caller learns to retry the thing it just proved did not
+        // happen — which on a toggle undoes the press that did.
+        return axText(
+          `${verdict.toUpperCase()}${r.id !== undefined ? ` — element #${String(r.id)}` : ""}\n${String(r.note ?? "")}`,
+          true,
+        );
       }
       case "computer_press":
       case "computer_set_value":
