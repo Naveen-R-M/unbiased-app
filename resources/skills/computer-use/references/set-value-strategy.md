@@ -88,8 +88,15 @@ text, so a read tells you — weakly; see `verification.md`.
 ## Date field
 
 The field itself refuses a write; its month, day and year sub-fields are
-separate steppers in the tree. Focus a sub-field, select, type, then move on
-with `right` or `tab`. Typing into a sub-field works and sets it exactly.
+separate steppers in the tree. Aim at a sub-field and type it: typing into one
+works and sets it exactly.
+
+Aim every sub-field explicitly, and do not steer between them with arrows. A
+segment that is full usually advances focus to the next one BY ITSELF, so a
+`right` or `tab` after a complete segment moves two places and leaves one
+behind — measured: typing a two-digit month left focus on the day, and a single
+`right` then skipped to the year. Address each sub-field by id and let the
+field advance on its own.
 
 ## Canvas or unknown custom control
 
