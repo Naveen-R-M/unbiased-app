@@ -391,6 +391,12 @@ export type Rollup = {
    *  no driver call behind it when the arguments were bad, and a driver call
    *  fails inside a batch that goes on to succeed. */
   failures: { tool: Record<string, number>; driver: Record<string, number> };
+  /** Pointer calls by the route that carried them. "window" is the one that
+   *  costs the user nothing — nothing raised, the pointer never moved, and the
+   *  agent cursor drawn instead. Anything beginning "cursor" took the user's
+   *  own pointer, which is a thing they can see happening and, until this was
+   *  recorded, the only way it could be noticed. */
+  pointerRoutes: Record<string, number>;
   noChange: number;
   /** Of the driver calls, how many were writes that did nothing observable. */
   silentWrites: number;
@@ -500,6 +506,10 @@ export function rollup(records: readonly MetricRecord[]): Rollup {
     toolMs: span(tools.map((t) => t.ms)),
     driverMs: span(drivers.map((d) => d.ms)),
     failures: { tool: tally(tools), driver: tally(drivers) },
+    pointerRoutes: drivers.reduce<Record<string, number>>((acc, d) => {
+      if (d.route) acc[d.route] = (acc[d.route] ?? 0) + 1;
+      return acc;
+    }, {}),
     noChange: tools.filter((t) => t.noChange).length,
     silentWrites: quiet.length,
     silentByRole: quiet.reduce<Record<string, number>>((acc, q) => {

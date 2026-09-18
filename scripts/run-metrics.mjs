@@ -71,6 +71,12 @@ function show(label, rs) {
   if (big) console.log(`  largest payload  ${big}`);
   const f = (m) => Object.entries(m).map(([k, n]) => `${k} ${n}`).join(", ") || "none";
   console.log(`  failures  tool: ${f(r.failures.tool)}   driver: ${f(r.failures.driver)}`);
+  const routes = Object.entries(r.pointerRoutes ?? {});
+  if (routes.length) {
+    const took = routes.filter(([k]) => k.startsWith("cursor")).reduce((n, [, v]) => n + v, 0);
+    console.log(`  pointer routes  ${routes.map(([k, v]) => `${k}:${v}`).join("  ")}` +
+      (took ? `   <- ${took} took the user's pointer` : "   (none touched the user's pointer)"));
+  }
   console.log(`  accepted but nothing changed: ${r.noChange}`);
   if (r.silentWrites > 0) {
     const by = Object.entries(r.silentByRole).sort((a, b) => b[1] - a[1]).map(([k, n]) => `${n} ${k}`).join(", ");

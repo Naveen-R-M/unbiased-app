@@ -99,6 +99,7 @@ import {
   otherSpaceNote,
   launchOutcome,
   ACTION_NO_CHANGE_SENTENCE,
+  pointerRoute,
 } from "./ax-bridge";
 import { AsyncLocalStorage } from "node:async_hooks";
 import {
@@ -2513,7 +2514,7 @@ async function startAxBridge(): Promise<void> {
       // The role comes from the app's own index of element lines: the bridge
       // reply does not carry it, and the line the model was shown does.
       targetRole: c.app && c.targetId !== null ? roleOfLine(axLines.get(c.app)?.get(c.targetId)) : null,
-      route: c.marks.includes("backgrounded") ? "background" : null,
+      route: pointerRoute(c.method, c.marks),
       // wroteNothing only. valueUnchanged is the half-signal a batch step can
       // report; its verdict is reached in the batch handler, once the closing
       // diff is in, and recorded on the tool call there.

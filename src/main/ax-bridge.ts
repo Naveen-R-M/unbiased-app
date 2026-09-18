@@ -584,6 +584,31 @@ export const SCREENSHOT_TOOL_NAMES = [
   "computer_scroll",
 ] as const;
 
+/** Which of the three pointer routes actually carried a call.
+ *
+ *  This used to be "background" or null, and null meant two opposite things:
+ *  a quiet click that never touched the cursor, and the event route that takes
+ *  the user's pointer and brings the app forward. Measured 2026-09-18 on a
+ *  drawing run — thirteen pointer calls, every one recorded as null, while the
+ *  user watched their own cursor turn into a pen and their typing stop. The
+ *  only instrument that caught it was a person looking at the screen, which is
+ *  the wrong way round.
+ *
+ *  "window" is the one that costs the user nothing: nothing raised, the window
+ *  stays on its Space, the pointer never moves — and it is the only route that
+ *  draws the agent cursor, because it is the only one where there is no real
+ *  cursor to watch. */
+export function pointerRoute(method: string, marks: string): string | null {
+  if (method !== "pointer") return null;
+  const has = (k: string) => marks.split(",").includes(k);
+  if (has("backgrounded")) return "window";
+  if (has("pointerUntouched")) return "quiet";
+  if (has("raised")) return "cursor+raised";
+  // Moved the pointer. Whether it was put back is the difference between a
+  // borrowed cursor and an abandoned one.
+  return has("pointerReturned") ? "cursor" : "cursor-left";
+}
+
 export function routesToAx(tool: string): boolean {
   return (AX_TOOL_NAMES as readonly string[]).includes(tool);
 }
@@ -1129,7 +1154,7 @@ export class AxClient {
         bytes: r ? JSON.stringify(r).length : 0,
         lines: text ? text.split("\n").length : 0,
         flags: flags.join(","),
-        marks: (["shown", "blank", "backgrounded", "wroteNothing", "valueUnchanged"] as const).filter((k) => r?.[k] === true).join(","),
+        marks: (["shown", "blank", "backgrounded", "pointerUntouched", "raised", "pointerReturned", "wroteNothing", "valueUnchanged"] as const).filter((k) => r?.[k] === true).join(","),
         // Deliberately NOT derived from marks: valueUnchanged appears there for
         // the log's benefit, but it is half a verdict and counting it as a
         // whole one is what made this metric lie.

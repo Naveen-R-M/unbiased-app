@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-import { roleOfLine, AX_TOOL_NAMES, SCREENSHOT_TOOL_NAMES, routesToAx, parseBatchSteps, describeBatch, summarizeBatch, MAX_BATCH_STEPS, AxClient, AxError, appOfStep, axConsent, axNeedsFocus, screenshotToolsOffered, coordinateToolAllowed, withScreenshotGuidance, SCREENSHOT_FRAME_SENTENCE, axReadOptsFrom, AX_DEFAULT_READ_OPTS, shouldRecoverRaise, describeAxAction, indexElementLines, readAxManifest, resolveAxDir, shouldOpenAccessibilitySettings, axNotTrustedText, RAISE_DESCRIPTION, APP_STATE_SPACE_SENTENCE, LAUNCH_FRONT_SENTENCE, withSpaceGuidance, otherSpaceNote, launchOutcome, renderActionResult, ACTION_NO_CHANGE_SENTENCE, TASK_DISCIPLINE_SENTENCE, SCREENSHOT_SPACE_SENTENCE, parseCandidates, describeCandidates, parkedNextCall, parkedReadNote, batchNudge, isSingleEdit, stepsForNudge, traceStep, MAX_TYPE_LENGTH, type BatchStep, BATCH_NUDGE_AFTER, type RecentEdit, pointerHeadline, drawGate, DRAW_GATE_POINTS, surfaceCommands, skillBody, skillPreamble, shouldSendSkill, prependSkill, appendSkill, MAX_SKILL_PREAMBLE, candidateWorked, summarizeCandidates, MAX_CANDIDATES, MAX_CANDIDATE_STEPS, type AxCallInfo, touchedFieldIds, renderFieldValues, MAX_FIELDS_READ_BACK, type FieldValue, renderInspector, MAX_INSPECTOR_FIELDS, BATCH_VERBS, type InspectorField } from "./ax-bridge";
+import { roleOfLine, pointerRoute, AX_TOOL_NAMES, SCREENSHOT_TOOL_NAMES, routesToAx, parseBatchSteps, describeBatch, summarizeBatch, MAX_BATCH_STEPS, AxClient, AxError, appOfStep, axConsent, axNeedsFocus, screenshotToolsOffered, coordinateToolAllowed, withScreenshotGuidance, SCREENSHOT_FRAME_SENTENCE, axReadOptsFrom, AX_DEFAULT_READ_OPTS, shouldRecoverRaise, describeAxAction, indexElementLines, readAxManifest, resolveAxDir, shouldOpenAccessibilitySettings, axNotTrustedText, RAISE_DESCRIPTION, APP_STATE_SPACE_SENTENCE, LAUNCH_FRONT_SENTENCE, withSpaceGuidance, otherSpaceNote, launchOutcome, renderActionResult, ACTION_NO_CHANGE_SENTENCE, TASK_DISCIPLINE_SENTENCE, SCREENSHOT_SPACE_SENTENCE, parseCandidates, describeCandidates, parkedNextCall, parkedReadNote, batchNudge, isSingleEdit, stepsForNudge, traceStep, MAX_TYPE_LENGTH, type BatchStep, BATCH_NUDGE_AFTER, type RecentEdit, pointerHeadline, drawGate, DRAW_GATE_POINTS, surfaceCommands, skillBody, skillPreamble, shouldSendSkill, prependSkill, appendSkill, MAX_SKILL_PREAMBLE, candidateWorked, summarizeCandidates, MAX_CANDIDATES, MAX_CANDIDATE_STEPS, type AxCallInfo, touchedFieldIds, renderFieldValues, MAX_FIELDS_READ_BACK, type FieldValue, renderInspector, MAX_INSPECTOR_FIELDS, BATCH_VERBS, type InspectorField } from "./ax-bridge";
 
 const scratch = () => mkdtempSync(join(tmpdir(), "ax-"));
 
@@ -1002,6 +1002,22 @@ test("computer_find is routed, and its description sells the refusal", () => {
   // something invites the model to treat a list of two as an answer.
   assert.ok(/never picks for you/i.test(decl), "the description must say it does not choose");
   assert.ok(/exact/i.test(decl), "and that matching is exact by default");
+});
+
+test("the pointer route is recorded, and the two that used to look alike no longer do", () => {
+  // The bug: "quiet" and "took the user's cursor and raised the app" both
+  // recorded as null, so the metrics could not answer which had happened. On a
+  // drawing run all thirteen pointer calls read null while the user watched
+  // their own cursor turn into a pen.
+  assert.equal(pointerRoute("pointer", "backgrounded,pointerUntouched"), "window");
+  assert.equal(pointerRoute("pointer", "pointerUntouched"), "quiet");
+  assert.equal(pointerRoute("pointer", "raised"), "cursor+raised");
+  assert.equal(pointerRoute("pointer", "pointerReturned"), "cursor");
+  assert.equal(pointerRoute("pointer", ""), "cursor-left");
+  assert.notEqual(pointerRoute("pointer", "pointerUntouched"), pointerRoute("pointer", "raised"));
+  // Only pointer calls have a route; everything else would be inventing one.
+  assert.equal(pointerRoute("act", "backgrounded"), null);
+  assert.equal(pointerRoute("tree", ""), null);
 });
 
 test("computer_verify is routed, and its description refuses to let unknown pass as yes", () => {
