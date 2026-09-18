@@ -1,0 +1,44 @@
+name: ai-review-gate
+
+on:
+  pull_request_target:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - labeled
+      - unlabeled
+      - ready_for_review
+    branches:
+      - main
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  ai-review-gate:
+    name: ai-review-gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require maintainer review label
+        if: ${{ !contains(github.event.pull_request.labels.*.name, 'ai-review') }}
+        run: |
+          echo "A maintainer must add the ai-review label before this PR can merge."
+          exit 1
+
+      - name: Fetch pull request diff
+        if: ${{ contains(github.event.pull_request.labels.*.name, 'ai-review') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: |
+          gh pr diff "$PR_URL" --repo "$GITHUB_REPOSITORY" > pr.diff
+          test -s pr.diff
+
+      - name: Run AI review
+        if: ${{ contains(github.event.pull_request.labels.*.name, 'ai-review') }}
+        run: |
+          echo "AI review provider is not wired yet."
+          echo "Replace this step with a diff-only AI review command before requiring this check."
+          exit 1
