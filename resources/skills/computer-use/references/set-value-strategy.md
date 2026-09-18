@@ -5,12 +5,17 @@ control below reports its value as settable, and several silently discard the
 write. Recognise the family, pick the route, then verify — see
 `verification.md`.
 
-**`set_value` now escalates on its own.** It writes the value, checks whether
-it took, and if it did not, clicks in, selects what is there, and types it
-instead — reporting `route: "typed"` when it had to. A control that discards
-value writes therefore still ends up holding the value, and the reply tells you
-which route worked so the next one can go straight there. What follows is what
-that escalation is doing, and what to reach for when even it is not enough.
+**`set_value` does not retry for you.** It can — pass `escalate: true` and it
+will click in, select what is there and type the value when the write does not
+take, reporting `route: "typed"` if it had to. That is off by default, and the
+reason is worth knowing before you turn it on: deciding *when* a write failed
+means telling "it landed and the read is stale" from "it was discarded", and
+those look identical through the accessibility layer. Getting that wrong types
+the value on top of itself — measured, a name became "NaveenNaveen" and an
+email was written three times over.
+
+So ask for it only where you already know the control refuses writes, and
+expect to check the result either way. What follows is the route to use.
 
 ## Recognising the family
 
