@@ -14,7 +14,7 @@ const defaultAppRoot = join(launcherRoot, "default-app");
 const defaultAppAsar = join(launcherApp, "Contents", "Resources", "default_app.asar");
 const version = require(join(root, "node_modules", "electron", "package.json")).version;
 const markerPath = join(launcherRoot, "version");
-const launcherRevision = "11";
+const launcherRevision = "12";
 
 function run(command, args) {
   const result = require("node:child_process").spawnSync(command, args, { stdio: "inherit" });
@@ -122,6 +122,14 @@ function prepareMacLauncher() {
       // UNBIASED_AX_METRICS=1 in the shell recorded nothing, silently, and the
       // run was over before anyone could tell. Named here, it arrives.
       `  --env "UNBIASED_AX_METRICS=$UNBIASED_AX_METRICS" \\`,
+      // The pointer-route switches. Same reason as the line above, and the
+      // same bug caught twice: a run started with one of these set in the
+      // shell behaved as though it were unset, silently. An unset variable
+      // arrives here as an empty string, which every switch reads as "use the
+      // default" — so forwarding them unconditionally costs nothing.
+      `  --env "UNBIASED_AX_BACKGROUND_POINTER=$UNBIASED_AX_BACKGROUND_POINTER" \\`,
+      `  --env "UNBIASED_AX_QUIET_POINTER=$UNBIASED_AX_QUIET_POINTER" \\`,
+      `  --env "UNBIASED_AX_AGENT_CURSOR=$UNBIASED_AX_AGENT_CURSOR" \\`,
       `  --args "$entry" "$@"`,
       "",
     ].join("\n"),
