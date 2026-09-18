@@ -1,4 +1,4 @@
-name: ci
+name: CI
 
 on:
   pull_request:
@@ -12,8 +12,8 @@ permissions:
   contents: read
 
 jobs:
-  ci:
-    name: ci
+  tests-gate:
+    name: Tests gate
     runs-on: macos-latest
     steps:
       - name: Checkout

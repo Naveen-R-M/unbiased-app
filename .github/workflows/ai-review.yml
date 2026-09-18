@@ -1,0 +1,26 @@
+name: AI Code Review
+
+on:
+  pull_request_target:
+    types:
+      - opened
+      - reopened
+      - ready_for_review
+      - synchronize
+      - labeled
+    branches:
+      - main
+
+concurrency:
+  group: ai-review-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    if: >-
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.user.login != 'dependabot[bot]' &&
+      contains(github.event.pull_request.labels.*.name, 'ai-review')
+    uses: circuitandchisel/.github/.github/workflows/ai-review.yml@main
+    secrets:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
