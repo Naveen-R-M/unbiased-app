@@ -6,6 +6,23 @@ Format matters: `## <version> — <date>`, then `### <section>`, then `-` bullet
 
 Write for the person using the app, not the person who wrote the code.
 
+## 1.11.0 — September 19, 2026
+
+### New
+
+- **Pareto works in the background, and your pointer stays yours.** Clicks and drags are delivered to the window itself instead of by moving your mouse, so an app on another Space is worked in where it is — nothing is brought forward, nothing takes your focus, and the cursor stays where you left it. A marker is drawn where Pareto is working, so you can still see what it is doing. Tracing a shape in a design app used to take ten minutes with the pointer commandeered the whole time; it now takes under three with the pointer untouched.
+
+### Improved
+
+- **Pareto reads what an app answers.** A result, a status line, a validation message — the part of a screen that appears in order to tell you something — was invisible when reading only the controls. A form could be filled in correctly and its printed confirmation still come back as unreadable. Those replies are now read.
+- **It asks where something stands instead of pressing it again.** When an action reports that nothing changed, Pareto can check what state a control is actually in. On anything that opens and closes, pressing a second time undoes the first — which looked like the controls had stopped responding, and left tasks half finished.
+
+### Fixed
+
+- **Typing into a form no longer scrambles the fields.** Keystrokes aimed at separate boxes were sent faster than the app could take them in, so a date and a seat count could pile into one field — "1 October 2026, seats 12" arrived as a nine-digit number in the wrong place. Each keystroke is now paced to the app that receives it.
+- **Pasting an image works again.** The newer macOS clipboard hands images over differently; a pasted screenshot arrived empty. Copy a picture and paste it into the message box and it attaches as before.
+- **A shift-click or a triple-click on a window on another Space no longer lands on the wrong app.** Those clicks take a different route to the screen than a plain one, and the check that the window was where its coordinates said had been skipped for them.
+
 ## 1.10.1 — September 10, 2026
 
 ### Fixed
