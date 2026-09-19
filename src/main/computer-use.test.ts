@@ -395,6 +395,51 @@ test("every bundled skill has the frontmatter the engine matches on", () => {
   }
 });
 
+test("the pushed skill stays generic — platform findings live in references", () => {
+  // The skill is read by a model driving an unknown app. A named browser in
+  // the rules teaches it to expect that browser's behaviour everywhere, and
+  // the finding has a half-life of weeks. Policy travels; measurements rot.
+  const dir = join(__dirname, "..", "..", "resources", "skills", "computer-use");
+  const skill = readFileSync(join(dir, "SKILL.md"), "utf8");
+  const rules = skill.replace(/references\/[a-z0-9-]+\.md/g, ""); // pointers may name them
+  for (const named of ["chromium", "chrome", "figma", "electron", "safari", "webkit"]) {
+    assert.ok(
+      !new RegExp(named, "i").test(rules),
+      `SKILL.md names ${named} outside a reference path — state the rule, and put the measurement in references/`,
+    );
+  }
+  // And the measurements must still exist somewhere, dated.
+  const known = readFileSync(join(dir, "references", "chromium-ax-known-failures.md"), "utf8");
+  assert.ok(/measured 2\d{3}-\d{2}-\d{2}/i.test(known), "the known-failures file must say when it was measured");
+});
+
+test("the skill states the rules that took a whole night of wrong numbers to learn", () => {
+  const dir = join(__dirname, "..", "..", "resources", "skills", "computer-use");
+  const text = readFileSync(join(dir, "SKILL.md"), "utf8").toLowerCase();
+  for (const [needle, why] of [
+    ["`ok` is not proof", "every silent failure measured returned ok"],
+    ["describe the past", "a read after an action can report the state before it"],
+    ["unverified", "the honest outcome when only weak evidence exists"],
+    ["select before you type", "typing into a control that already holds text appends"],
+    ["not what it honours", "a role and an action list say what an element is for, not what the app implements"],
+    ["change route", "the repair for a write that did not land is a different route, never the same one again"],
+  ]) {
+    assert.ok(text.includes(needle.toLowerCase()), `the skill no longer says: ${needle} — ${why}`);
+  }
+});
+
+test("every reference the skill names exists, and every reference is named", () => {
+  // The skill is PUSHED, so its detail lives beside it. A named file that is
+  // missing reads as detail withheld; a file nothing names is never opened.
+  const dir = join(__dirname, "..", "..", "resources", "skills", "computer-use");
+  const text = readFileSync(join(dir, "SKILL.md"), "utf8");
+  const named = new Set([...text.matchAll(/references\/([a-z0-9-]+\.md)/g)].map((m) => m[1]!));
+  assert.ok(named.size >= 3, `the skill names only ${named.size} reference(s)`);
+  const onDisk = new Set(readdirSync(join(dir, "references")));
+  for (const f of named) assert.ok(onDisk.has(f), `SKILL.md names references/${f}, which does not exist`);
+  for (const f of onDisk) assert.ok(named.has(f), `references/${f} exists but nothing in SKILL.md sends the reader to it`);
+});
+
 test("the computer-use skill carries the findings that cost the most to learn", () => {
   const text = readFileSync(join(__dirname, "..", "..", "resources", "skills", "computer-use", "SKILL.md"), "utf8");
   for (const needle of [
