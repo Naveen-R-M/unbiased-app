@@ -118,6 +118,7 @@ import {
   checkpointGateText, checkpointPreamble, isGatedTool, pathsInCommand, remeasureNudge, type LedgerEntry,
 } from "./checkpoint";
 import { looksLikeImage, convertedImagePath, sipsArgs } from "./attachments";
+import { clipboardImageBuffer } from "./clipboard-image";
 import { IMAGE_OUTLINE_TOOL, outlineOf, renderOutline, outlineReminder, type PendingOutline } from "./image-outline";
 import { isProductionBuild } from "./runtime-mode";
 import {
@@ -11183,8 +11184,12 @@ app.whenReady().then(async () => {
 
   // A copied/pasted image lives in the native clipboard; persist it to a
   // temp PNG so it can ride the next turn as a localImage input item.
-  ipcMain.handle("attach:clipboard-image", () => {
-    const image = clipboard.readImage();
+  ipcMain.handle("attach:clipboard-image", async () => {
+    const items = await clipboard.read();
+    const bytes = await clipboardImageBuffer(items);
+    if (!bytes) return { attachment: null };
+
+    const image = nativeImage.createFromBuffer(bytes);
     if (image.isEmpty()) return { attachment: null };
     const dir = join(app.getPath("temp"), "unbiased-pastes");
     mkdirSync(dir, { recursive: true });
