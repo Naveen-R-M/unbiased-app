@@ -74,8 +74,12 @@ function show(label, rs) {
   const routes = Object.entries(r.pointerRoutes ?? {});
   if (routes.length) {
     const took = routes.filter(([k]) => k.startsWith("cursor")).reduce((n, [, v]) => n + v, 0);
+    const raised = routes.filter(([k]) => k.endsWith("+raised")).reduce((n, [, v]) => n + v, 0);
+    const notes = [];
+    if (took) notes.push(`${took} took the user's pointer`);
+    if (raised) notes.push(`${raised} brought the app forward`);
     console.log(`  pointer routes  ${routes.map(([k, v]) => `${k}:${v}`).join("  ")}` +
-      (took ? `   <- ${took} took the user's pointer` : "   (none touched the user's pointer)"));
+      (notes.length ? `   <- ${notes.join(", ")}` : "   (nothing touched the user's pointer or Space)"));
   }
   console.log(`  accepted but nothing changed: ${r.noChange}`);
   if (r.silentWrites > 0) {

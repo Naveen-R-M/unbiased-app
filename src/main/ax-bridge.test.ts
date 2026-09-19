@@ -1011,10 +1011,21 @@ test("the pointer route is recorded, and the two that used to look alike no long
   // their own cursor turn into a pen.
   assert.equal(pointerRoute("pointer", "backgrounded,pointerUntouched"), "window");
   assert.equal(pointerRoute("pointer", "pointerUntouched"), "quiet");
-  assert.equal(pointerRoute("pointer", "raised"), "cursor+raised");
   assert.equal(pointerRoute("pointer", "pointerReturned"), "cursor");
-  assert.equal(pointerRoute("pointer", ""), "cursor-left");
   assert.notEqual(pointerRoute("pointer", "pointerUntouched"), pointerRoute("pointer", "raised"));
+
+  // Raising is orthogonal to the route, not a fourth alternative. A quiet
+  // click on an off-Space window comes back pointerUntouched AND raised; this
+  // used to match pointerUntouched first and file it as plain "quiet", so the
+  // report said nobody was disturbed about a run that switched the user's Space.
+  assert.equal(pointerRoute("pointer", "pointerUntouched,raised"), "quiet+raised");
+  assert.equal(pointerRoute("pointer", "raised,pointerReturned"), "cursor+raised");
+  assert.equal(pointerRoute("pointer", "raised"), "cursor-left+raised");
+
+  // A call that FAILED reports no marks at all. It used to fall through to
+  // "cursor-left" — announcing a pointer taken and abandoned by a call that
+  // moved nothing. Unknown is null, the same as a non-pointer call.
+  assert.equal(pointerRoute("pointer", ""), null);
   // Only pointer calls have a route; everything else would be inventing one.
   assert.equal(pointerRoute("act", "backgrounded"), null);
   assert.equal(pointerRoute("tree", ""), null);
