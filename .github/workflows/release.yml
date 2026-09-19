@@ -38,7 +38,7 @@ jobs:
     runs-on: macos-15
     steps:
       - name: checkout app
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: unbiased-app
 
@@ -61,7 +61,7 @@ jobs:
       # The engine must sit BESIDE the app: package.json's extraResources
       # copies from ../unbiased-app-engine/dist/bundle.
       - name: checkout engine
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: circuitandchisel/unbiased-app-engine
           token: ${{ steps.app-token.outputs.token }}
@@ -72,7 +72,7 @@ jobs:
       # the copy, which would only show up on a tag push.
       # No token: this checkout uses only public repository data.
       - name: checkout accessibility bridge
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: circuitandchisel/unbiased-ax
           path: unbiased-ax
