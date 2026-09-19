@@ -60,9 +60,9 @@ test("a payload is a shape, never the screen's text", () => {
   assert.deepEqual(typed, { verb: "type", size: 7, unit: "chars", parts: { chars: 7 } });
   assert.ok(!JSON.stringify(typed).includes("hunter2"));
 
-  const set = payloadOf("computer_set_value", { id: 4, value: "naveen@circuitandchisel.com" });
-  assert.equal(set.size, 27);
-  assert.ok(!JSON.stringify(set).includes("naveen"));
+  const set = payloadOf("computer_set_value", { id: 4, value: "someone@example.invalid" });
+  assert.equal(set.size, 23);
+  assert.ok(!JSON.stringify(set).includes("someone"));
 });
 
 test("a pen path is counted in points, and a drag is told from a click", () => {
