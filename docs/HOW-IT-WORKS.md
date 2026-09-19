@@ -65,7 +65,9 @@ that is the renderer's complete view of the world.
 
 ### 3. `unbiased-app-engine` — the supervisor
 
-A small Go program (separate private repo) whose whole job is to make the
+A small Go program (the separate
+[`unbiased-app-engine`](https://github.com/circuitandchisel/unbiased-app-engine)
+repository) whose whole job is to make the
 engine **Pareto-only by construction**. On every launch it:
 
 - resolves your API key — `UNBIASED_API_KEY`, else `~/.unbiased/credentials.json`
