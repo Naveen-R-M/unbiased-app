@@ -600,13 +600,26 @@ export const SCREENSHOT_TOOL_NAMES = [
  *  cursor to watch. */
 export function pointerRoute(method: string, marks: string): string | null {
   if (method !== "pointer") return null;
-  const has = (k: string) => marks.split(",").includes(k);
-  if (has("backgrounded")) return "window";
-  if (has("pointerUntouched")) return "quiet";
-  if (has("raised")) return "cursor+raised";
-  // Moved the pointer. Whether it was put back is the difference between a
+  const set = new Set(marks.split(",").filter(Boolean));
+  // No marks at all means the call FAILED — a stale id, a refused aim point, a
+  // timeout — and the bridge never got as far as reporting a route. This used
+  // to fall through to "cursor-left", announcing that the user's pointer had
+  // been taken and abandoned by a call that moved nothing. Absent evidence is
+  // not evidence of the worst case; an unknown route is null, exactly as it is
+  // for a non-pointer call.
+  if (set.size === 0) return null;
+  // Raising is ORTHOGONAL to which route carried the click: the bridge sets
+  // `raised` in its own branch, and a quiet click on an off-Space window comes
+  // back as pointerUntouched AND raised. Treating raised as a fourth exclusive
+  // option meant `pointerUntouched` matched first and the run was filed as
+  // "quiet" — so the report said nobody's pointer was touched about a run that
+  // had switched the user's Space. It is a suffix, not an alternative.
+  const raised = set.has("raised") ? "+raised" : "";
+  if (set.has("backgrounded")) return `window${raised}`;
+  if (set.has("pointerUntouched")) return `quiet${raised}`;
+  // The pointer moved. Whether it was put back is the difference between a
   // borrowed cursor and an abandoned one.
-  return has("pointerReturned") ? "cursor" : "cursor-left";
+  return `${set.has("pointerReturned") ? "cursor" : "cursor-left"}${raised}`;
 }
 
 export function routesToAx(tool: string): boolean {
