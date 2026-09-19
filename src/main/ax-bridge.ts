@@ -2,6 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
+import { AsyncResource } from "node:async_hooks";
 
 /** The accessibility bridge: apps, windows, and element trees as text with
  *  stable ids, plus actions on those elements. Lives in the unbiased-ax repo;
@@ -135,6 +136,7 @@ export function axReadOptsFrom(args: { interactive?: unknown; web?: unknown; dep
 const APP_STEP_TOOLS = new Set([
   "computer_app_state",
   "computer_act",
+  "computer_find",
   "computer_raise",
   "computer_launch",
   "computer_press",
@@ -162,6 +164,10 @@ export type BatchStep =
   | { do: "scroll"; id: number; direction: string; amount?: number; waitMs: number }
   | { do: "act"; id: number; action: string; waitMs: number }
   | { do: "type"; text: string; id?: number; waitMs: number }
+  /** Select inside a field so the type after it REPLACES. `text` absent means
+   *  the whole value. Scoped to the element, unlike command+a, which is scoped
+   *  to focus and selects the document when focus is not where it was assumed. */
+  | { do: "select_text"; id: number; text?: string; waitMs: number }
   | { do: "pointer"; id: number; clicks?: number; waitMs: number }
   | { do: "screenshot"; window?: number; waitMs: number }
   | { do: "read"; waitMs: number };
@@ -181,7 +187,7 @@ export const KEY_MODIFIERS = ["command", "shift", "option", "control"];
  *  ignored on a `stepper`, and Codex's own run hit the identical split.
  *
  *  Still NOT batchable: launch and raise, which take over the user's screen. */
-export const BATCH_VERBS = ["press", "set_value", "key", "type", "pointer", "screenshot", "scroll", "act", "read"] as const;
+export const BATCH_VERBS = ["press", "set_value", "select_text", "key", "type", "pointer", "screenshot", "scroll", "act", "read"] as const;
 /** Measured against Codex on the same Figma icon: its densest single turn ran
  *  17 primitive actions (four fields, each a click + select-all + type +
  *  Return, then a colour click). A cap of 10 split work like that across turns
@@ -260,6 +266,12 @@ export function parseBatchSteps(raw: unknown): { steps: BatchStep[] } | { error:
         if (id === null) return { error: `${at}: id is required.` };
         if (typeof e.text !== "string") return { error: `${at}: text is required.` };
         steps.push({ do: "set_value", id, text: e.text, waitMs });
+        break;
+      }
+      case "select_text": {
+        if (id === null) return { error: `${at}: id is required.` };
+        if (e.text !== undefined && typeof e.text !== "string") return { error: `${at}: text must be a string, or leave it out to select the whole value.` };
+        steps.push({ do: "select_text", id, ...(typeof e.text === "string" ? { text: e.text } : {}), waitMs });
         break;
       }
       case "scroll": {
@@ -397,6 +409,7 @@ export function traceStep(st: BatchStep): string {
     case "press": return `press #${st.id}`;
     case "act": return `act #${st.id} "${st.action}"`;
     case "set_value": return `set_value #${st.id} = ${JSON.stringify(st.text)}`;
+    case "select_text": return `select_text #${st.id}${st.text !== undefined ? ` ${JSON.stringify(st.text)}` : " (all)"}`;
     case "type": return `type ${JSON.stringify(st.text)}${st.id !== undefined ? ` in #${st.id}` : ""}`;
     case "pointer": return `click${(st.clicks ?? 1) > 1 ? ` x${st.clicks}` : ""} #${st.id}`;
     case "scroll": return `scroll #${st.id} ${st.direction ?? ""}`.trim();
@@ -496,6 +509,11 @@ export function summarizeBatch(opts: {
    *  frame deleted at step 4 of an unwatched batch left "- removed: 859-880"
    *  in the closing diff and the model wrote "the frame is clean now". */
   watched?: { step: string; diff: string }[];
+  /** Steps whose write left their target holding the same value. Only half a
+   *  verdict on its own — some controls take a write and report the old value
+   *  — so it is said out loud ONLY when the batch's closing diff agrees that
+   *  nothing moved. Two signals, same rule as a single action. */
+  quiet?: string[];
 }): string {
   const head = opts.failed
     ? [
@@ -512,7 +530,13 @@ export function summarizeBatch(opts: {
             : "Only the closing diff was watched."
           : "",
       ].filter(Boolean).join(" ");
-  const body = opts.diff.trim() === "(no changes)" ? ACTION_NO_CHANGE_SENTENCE : opts.diff || "(nothing in the tree changed)";
+  const nothingMoved = opts.diff.trim() === "(no changes)";
+  const quiet = nothingMoved && (opts.quiet?.length ?? 0) > 0
+    ? `${opts.quiet!.length} of these wrote nothing that can be observed — ${opts.quiet!.join("; ")} — and no part of the tree changed either. `
+      + "The writes were accepted by the accessibility API and had no effect, which happens when the control is not taking input rather than when the value is wrong. "
+      + "Put the caret in the control first (press it, then select all, then type) instead of sending the same steps again."
+    : null;
+  const body = nothingMoved ? [quiet, ACTION_NO_CHANGE_SENTENCE].filter(Boolean).join("\n") : opts.diff || "(nothing in the tree changed)";
   const watched = (opts.watched ?? [])
     .filter((w) => w.diff.trim() && w.diff.trim() !== "(no changes)")
     .map((w) => `Watched on its own, because a delete outside a text field removes objects — ${w.step} did this:\n${w.diff}`);
@@ -538,6 +562,8 @@ export const AX_TOOL_NAMES = [
   "computer_press_key",
   "computer_scroll_view",
   "computer_act",
+  "computer_find",
+  "computer_verify",
   "computer_do",
   "computer_menu",
 ] as const;
@@ -557,6 +583,31 @@ export const SCREENSHOT_TOOL_NAMES = [
   "computer_key",
   "computer_scroll",
 ] as const;
+
+/** Which of the three pointer routes actually carried a call.
+ *
+ *  This used to be "background" or null, and null meant two opposite things:
+ *  a quiet click that never touched the cursor, and the event route that takes
+ *  the user's pointer and brings the app forward. Measured 2026-09-18 on a
+ *  drawing run — thirteen pointer calls, every one recorded as null, while the
+ *  user watched their own cursor turn into a pen and their typing stop. The
+ *  only instrument that caught it was a person looking at the screen, which is
+ *  the wrong way round.
+ *
+ *  "window" is the one that costs the user nothing: nothing raised, the window
+ *  stays on its Space, the pointer never moves — and it is the only route that
+ *  draws the agent cursor, because it is the only one where there is no real
+ *  cursor to watch. */
+export function pointerRoute(method: string, marks: string): string | null {
+  if (method !== "pointer") return null;
+  const has = (k: string) => marks.split(",").includes(k);
+  if (has("backgrounded")) return "window";
+  if (has("pointerUntouched")) return "quiet";
+  if (has("raised")) return "cursor+raised";
+  // Moved the pointer. Whether it was put back is the difference between a
+  // borrowed cursor and an abandoned one.
+  return has("pointerReturned") ? "cursor" : "cursor-left";
+}
 
 export function routesToAx(tool: string): boolean {
   return (AX_TOOL_NAMES as readonly string[]).includes(tool);
@@ -667,10 +718,19 @@ export function skillBody(markdown: string): string {
   return trimmed.length > MAX_SKILL_PREAMBLE ? `${trimmed.slice(0, MAX_SKILL_PREAMBLE)}\n…(truncated)` : trimmed;
 }
 
-export function skillPreamble(markdown: string): string | null {
+/** `dir` is where the skill's own folder lives, so the reference files it names
+ *  can actually be opened. The skill is PUSHED, not discovered: everything in
+ *  it is paid for once per conversation, so the deep material sits in files
+ *  beside it — and a file the reader cannot locate is worse than no file, since
+ *  it reads as detail withheld. One absolute path is cheaper than the pages it
+ *  stands in for. */
+export function skillPreamble(markdown: string, dir?: string): string | null {
   const body = skillBody(markdown);
   if (!body) return null;
-  return `=== How to drive desktop apps (read this before acting; sent once per conversation) ===\n${body}\n=== end ===`;
+  const where = dir
+    ? `\n\nThe files named above are in ${dir}/references/ — open one with a shell command when you hit what it covers.`
+    : "";
+  return `=== How to drive desktop apps (read this before acting; sent once per conversation) ===\n${body}${where}\n=== end ===`;
 }
 
 /** Whether this call should carry it: a desktop tool, and not sent yet. */
@@ -937,9 +997,26 @@ export interface AxCallInfo {
   /** Read options in force, e.g. "interactive,query". */
   flags: string;
   /** Result facts worth a glance in the log: "shown" for a launch that showed
-   *  the app once, "blank" for a picture with nothing in it. */
+   *  the app once, "blank" for a picture with nothing in it, "backgrounded"
+   *  for a pointer the window took without being raised, "wroteNothing" for a
+   *  write the API accepted that changed neither its target nor the tree, and
+   *  "valueUnchanged" for the same thing seen from a step that did not settle
+   *  and so has only that one signal. BOTH are needed: a batch's steps report
+   *  the second, and batches are where essentially every write happens —
+   *  watching only for the first counted zero across two whole runs. */
   marks: string;
   error: string | null;
+  /** The element the call was aimed at, when it named one. A verb alone does
+   *  not say what a call did: "8 writes changed nothing" is unreadable without
+   *  it, and reading it wrongly is how a whole afternoon's conclusion about
+   *  writes turned out to be about two control types. */
+  targetId: number | null;
+  /** The bridge's error CODE, beside its message. The messages are written for
+   *  the model to read and get rewritten whenever they read badly; the codes
+   *  are the contract. Anything classifying failures — which run is failing on
+   *  stale element ids, which on timeouts — has to key off this and not off
+   *  prose that will drift out from under it. */
+  code: string | null;
 }
 
 export function describeAxCall(c: AxCallInfo): string {
@@ -1037,8 +1114,19 @@ export class AxClient {
     const id = this.nextId++;
     const started = Date.now();
     return new Promise<AxResult>((resolve, reject) => {
+      // Bound to the async context of the CALLER, not of whoever resolves it.
+      // A reply arrives on the bridge's stdout 'line' event, and that listener
+      // was registered once at start(), so anything reading async-local state
+      // inside report() sees startup's context rather than the tool call's —
+      // measured: every driver record came back with a null thread while the
+      // tool records above them were correct. Only the diagnostics call is
+      // bound; resolve and reject are left alone, since a promise continuation
+      // already carries the context of whoever awaited it.
+      const reportIn = AsyncResource.bind((r: AxResult | null, e: Error | null) =>
+        this.report(method, params, started, r, e),
+      );
       const done = (r: AxResult | null, e: Error | null) => {
-        this.report(method, params, started, r, e);
+        reportIn(r, e);
         if (e) reject(e);
         else resolve(r ?? {});
       };
@@ -1066,8 +1154,13 @@ export class AxClient {
         bytes: r ? JSON.stringify(r).length : 0,
         lines: text ? text.split("\n").length : 0,
         flags: flags.join(","),
-        marks: (["shown", "blank"] as const).filter((k) => r?.[k] === true).join(","),
+        marks: (["shown", "blank", "backgrounded", "pointerUntouched", "raised", "pointerReturned", "wroteNothing", "valueUnchanged"] as const).filter((k) => r?.[k] === true).join(","),
+        // Deliberately NOT derived from marks: valueUnchanged appears there for
+        // the log's benefit, but it is half a verdict and counting it as a
+        // whole one is what made this metric lie.
         error: e ? e.message : null,
+        code: e instanceof AxError ? e.code : null,
+        targetId: typeof params.id === "number" ? params.id : null,
       });
     } catch {
       // diagnostics must never break a request
@@ -1100,6 +1193,16 @@ export class AxClient {
 /** id -> element line, accumulated across every tree and diff the model saw of
  *  an app. A diff omits unchanged elements, so the last text alone cannot name
  *  an id the model read two turns ago; the index can. */
+/** The role at the head of an element line — `text field "Last name" = Kumar
+ *  {press}` is a `text field`. Everything up to the first quote, equals,
+ *  bracket or brace: the role is the one part of the line with no delimiter of
+ *  its own, so it is read by where it stops rather than by what it contains. */
+export function roleOfLine(line: string | undefined): string | null {
+  if (!line) return null;
+  const role = line.split(/["=[{]/)[0]!.trim();
+  return role || null;
+}
+
 export function indexElementLines(text: string, into: Map<number, string> = new Map()): Map<number, string> {
   for (const line of text.split("\n")) {
     const m = /^[~+]?\s*(\d+)\s+(.*)$/.exec(line);

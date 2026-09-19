@@ -76,6 +76,7 @@ import {
   axNeedsFocus,
   describeAxAction,
   indexElementLines,
+  roleOfLine,
   readAxManifest,
   resolveAxDir,
   shouldOpenAccessibilitySettings,
@@ -85,6 +86,7 @@ import {
   summarizeBatch,
   pointerHeadline,
   drawGate,
+  DRAW_GATE_POINTS,
   surfaceCommands,
   appendSkill,
   traceStep,
@@ -96,14 +98,28 @@ import {
   withSpaceGuidance,
   otherSpaceNote,
   launchOutcome,
+  ACTION_NO_CHANGE_SENTENCE,
+  pointerRoute,
 } from "./ax-bridge";
+import { AsyncLocalStorage } from "node:async_hooks";
+import {
+  METRICS_VERSION,
+  MetricsLog,
+  classifyFailure,
+  metricsEnabled,
+  payloadOf,
+  type DriverRecord,
+  type RunRecord,
+  type ToolRecord,
+  type TurnRecord,
+} from "./run-metrics";
 import {
   CHECKPOINT_TOOLS, checkpointPath, validateCheckpointNotes, renderCheckpoint, pushFact, checkpointDue,
   checkpointGateText, checkpointPreamble, isGatedTool, pathsInCommand, remeasureNudge, type LedgerEntry,
 } from "./checkpoint";
 import { looksLikeImage, convertedImagePath, sipsArgs } from "./attachments";
 import { clipboardImageBuffer } from "./clipboard-image";
-import { IMAGE_OUTLINE_TOOL, outlineOf, renderOutline } from "./image-outline";
+import { IMAGE_OUTLINE_TOOL, outlineOf, renderOutline, outlineReminder, type PendingOutline } from "./image-outline";
 import { isProductionBuild } from "./runtime-mode";
 import {
   dueAt,
@@ -1483,8 +1499,8 @@ const AX_TOOLS = [
       'Points are FRACTIONS of the anchor element\'s box, never screen pixels: {"x":0,"y":0} is its top-left, {"x":0.5,"y":0.5} its centre, {"x":1,"y":1} its bottom-right. Pass the id of the element you are aiming inside — the canvas or web area, not the window — and the reply tells you the screen points your fractions landed on. ' +
       "Several points are separate clicks, which is how a pen tool takes a path; add hold=true to make them one press-drag-release instead. modifiers holds shift, option, command or control throughout. " +
       "Before a long path, clear the surface: fit the target to the view, and hide the app's panels and toolbars or go full screen — a control floating over the surface, often one that appears only once drawing begins, takes the click instead and ends the path or switches the tool. Then draw the whole shape in ONE call; an app may not join a path continued in a second. " +
-      "This is the ONE verb that needs the window actually visible on this Space, because it aims at real screen coordinates and the app hit-tests them: it is refused when the window is parked or elsewhere, since the click would land on whatever is there instead. So raise the app first for this kind of work and tell the user why. " +
-      "It moves the real pointer. Do not use it to press something that IS in the tree — press that by id.",
+      "This is the ONE verb that needs the window actually visible on this Space, because it aims at real screen coordinates and the app hit-tests them. If the window is elsewhere it is BROUGHT FORWARD for you — do not raise it yourself first, and the reply says when that happened so you can tell the user. " +
+      "It does NOT move the user's pointer: the clicks are delivered to the window where they land, so their mouse is free while you work. Do not use it to press something that IS in the tree — press that by id.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1540,6 +1556,72 @@ const AX_TOOLS = [
         item: { type: "string", description: "Run this command: its exact title, or \"Menu > Title\"." },
       },
       required: ["app"],
+    },
+  },
+  {
+    type: "function",
+    name: "computer_find",
+    description:
+      "Find the ONE element matching a description, when you know what you want but not its id — or after a read has gone stale. " +
+      "It returns exactly one element or refuses: several matches come back as a list to choose between, none comes back with what nearly matched. " +
+      "It never picks for you, because picking would act on something you did not see. " +
+      "Matching is exact and case-sensitive unless you ask otherwise. When a label repeats across panels, `within` (an ancestor's id) is usually faster than adding more fields.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        app: { type: "string" },
+        role: { type: "string", description: "Exactly as the tree prints it: \"text field\", \"pop up button\", \"tab button\"." },
+        label: { type: "string", description: "The element's name, as quoted in the tree." },
+        value: { type: "string" },
+        action: { type: "string", description: "An action it must offer, e.g. \"press\" — separates a control from the text that labels it." },
+        enabled: { type: "boolean" },
+        selected: { type: "boolean" },
+        within: { type: "integer", description: "Only look inside this element's subtree. The way to make a repeated label unique." },
+        contains: { type: "boolean", description: "Substring instead of exact match on label and value. Off by default: \"Save\" matching \"Save as…\" is how the wrong button gets pressed." },
+        caseInsensitive: { type: "boolean" },
+      },
+      required: ["app"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "computer_verify",
+    description:
+      "Check a postcondition YOU define: describe an element and the state you expect, and get one of three answers. " +
+      "satisfied — proven true. unsatisfied — proven false, after looking again until the timeout. unknown — cannot be proved either way, and unknown is NOT success. " +
+      "Use it when an action reported that nothing changed and you need to know whether it actually did nothing. " +
+      "Reading again is how a stale tree is answered; sending the action again is not. " +
+      "This is especially important for anything with an open/closed or on/off state: pressing it a second time may UNDO the first press rather than repeat it, so ask where it stands before you touch it again. " +
+      "Expectations: exists (default true), expanded, selected, focused, value. " +
+      "A state the element does not actually expose comes back unknown rather than false — the two are different, and only one of them means 'not open'.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        app: { type: "string" },
+        role: { type: "string", description: "Exactly as the tree prints it, e.g. \"button\", \"tab button\"." },
+        label: { type: "string", description: "The element's name, as quoted in the tree." },
+        value: { type: "string" },
+        action: { type: "string", description: "An action it must offer — separates a control from the text that labels it." },
+        within: { type: "integer", description: "Only look inside this element's subtree." },
+        contains: { type: "boolean", description: "Substring instead of exact match on label and value." },
+        caseInsensitive: { type: "boolean" },
+        expect: {
+          type: "object",
+          description: "What should be true of it. Omit for a plain existence check.",
+          properties: {
+            exists: { type: "boolean" },
+            expanded: { type: "boolean", description: "Open or closed. Returns unknown when the element has no such state." },
+            selected: { type: "boolean" },
+            focused: { type: "boolean" },
+            value: { type: "string" },
+          },
+          additionalProperties: false,
+        },
+        timeoutMs: { type: "integer", description: "How long to keep looking before answering unsatisfied. Default 1500." },
+      },
+      required: ["app"],
+      additionalProperties: false,
     },
   },
   {
@@ -2354,6 +2436,33 @@ function axLog(line: string): void {
   }
 }
 
+/** Phase 0 instrumentation. Off unless UNBIASED_AX_METRICS=1, and separate
+ *  from the debug log above: that one quotes element lines and belongs to a
+ *  single debugging session, this one carries verbs, counts and durations only
+ *  and is meant to accumulate until the baseline is real. It answers whether a
+ *  code mode is worth building, so it lives in userData rather than a
+ *  world-readable /tmp, and it never records a word from the user's screen. */
+let metrics = new MetricsLog(null);
+
+function startMetrics(): void {
+  if (!metricsEnabled(process.env)) return;
+  const file = join(app.getPath("userData"), "run-metrics.ndjson");
+  metrics = new MetricsLog((line) => appendFileSync(file, line + "\n"));
+  axLog(`metrics: recording to ${file}`);
+}
+
+/** Which tool call a bridge call happened inside. AsyncLocalStorage rather
+ *  than a module variable because two threads can have turns in flight at
+ *  once, and a counter would file one thread's driver calls under the other's
+ *  tool call — which is exactly the kind of quietly wrong number this whole
+ *  exercise exists to avoid producing. */
+const inToolCall = new AsyncLocalStorage<{ seq: number; thread: string | null; quiet: { id: number | null; role: string | null }[] }>();
+let toolSeq = 0;
+
+function metricNow(thread: string | null): { v: number; at: string; thread: string | null } {
+  return { v: METRICS_VERSION, at: new Date().toISOString(), thread };
+}
+
 /** The icon for a step, if we have already fetched it. Synchronous on purpose:
  *  a transcript row must not wait on IPC, and the icon arrives on the next
  *  read of the same app. */
@@ -2387,7 +2496,35 @@ async function startAxBridge(): Promise<void> {
     return;
   }
   const client = new AxClient(manifest);
-  client.onCall = (c) => axLog(describeAxCall(c));
+  client.onCall = (c) => {
+    axLog(describeAxCall(c));
+    const here = inToolCall.getStore();
+    const rec: DriverRecord & { of: number | null } = {
+      ...metricNow(here?.thread ?? null),
+      kind: "driver",
+      method: c.method,
+      app: c.app,
+      ms: c.ms,
+      waitedMs: c.waitedMs,
+      bytes: c.bytes,
+      lines: c.lines,
+      // Which pointer route carried it, when the bridge said. Phase 1 adds the
+      // snapshot generation beside this; it does not exist yet, so the field
+      // is absent rather than invented.
+      targetId: c.targetId,
+      // The role comes from the app's own index of element lines: the bridge
+      // reply does not carry it, and the line the model was shown does.
+      targetRole: c.app && c.targetId !== null ? roleOfLine(axLines.get(c.app)?.get(c.targetId)) : null,
+      route: pointerRoute(c.method, c.marks),
+      // wroteNothing only. valueUnchanged is the half-signal a batch step can
+      // report; its verdict is reached in the batch handler, once the closing
+      // diff is in, and recorded on the tool call there.
+      ...(c.marks.includes("wroteNothing") ? { silent: true } : {}),
+      failure: c.error ? classifyFailure(c.code ?? null, c.error) : null,
+      of: here?.seq ?? null,
+    };
+    metrics.record(rec);
+  };
   try {
     const hello = await client.start();
     ax = client;
@@ -2422,6 +2559,10 @@ async function runBatchStep(appName: string, st: BatchStep, settle = true): Prom
       return await ax!.request("act", { app: appName, id: st.id, action: st.action, ...opts });
     case "set_value":
       return await ax!.request("setValue", { app: appName, id: st.id, value: st.text, ...opts });
+    case "select_text":
+      // No settle: selecting changes nothing an app reports, so a diff for it
+      // would always be "(no changes)" and cost the deadline to say so.
+      return await ax!.request("selectText", { app: appName, id: st.id, ...(st.text !== undefined ? { text: st.text } : {}), ...axActionOpts(appName) });
     case "type":
       return await ax!.request("type", { app: appName, text: st.text, ...(st.id !== undefined ? { id: st.id } : {}), ...opts });
     case "pointer":
@@ -2686,6 +2827,10 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         // One bridge call per step. That is the cheap round trip — 3-70ms over
         // a local pipe — and collapsing them into ONE model round trip is the
         // entire point of this tool.
+        const quietSteps: string[] = [];
+        /** The ids behind those steps, so the verdict below can say what the
+         *  writes were aimed at rather than only how many there were. */
+        const quietCandidates: (number | null)[] = [];
         for (const [i, st] of steps.entries()) {
           const label = `step ${i + 1} (${traceStep(st)})`;
           try {
@@ -2695,6 +2840,14 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
             // and hands back that step's own diff: show it, or a frame removed
             // at step 4 is one id range in the closing diff.
             if (typeof stepResult.watched === "string" && typeof stepResult.diff === "string") watched.push({ step: label, diff: stepResult.diff });
+            // A write whose target held the same value afterwards. On its own
+            // that is not a verdict — some controls take a write and report
+            // the old value — so it is collected here and judged against the
+            // batch's closing diff, which is the second signal.
+            if (stepResult.valueUnchanged === true) {
+              quietSteps.push(label);
+              quietCandidates.push("id" in st && typeof st.id === "number" ? st.id : null);
+            }
             ran.push(label);
             if (st.waitMs > 0) await new Promise((r) => setTimeout(r, st.waitMs));
           } catch (err) {
@@ -2730,6 +2883,17 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
             // the diff still stands
           }
         }
+        // The verdict, reached here because here is where both signals are: the
+        // steps that reported their value unmoved, and the closing diff that
+        // says whether anything in the tree moved. Either alone is not it —
+        // counting the step's half-signal on its own read ten landed writes as
+        // ten failures on a run that succeeded.
+        if (diff.trim() === "(no changes)" && quietCandidates.length) {
+          const store = inToolCall.getStore();
+          for (const qid of quietCandidates) {
+            store?.quiet.push({ id: qid, role: qid !== null ? roleOfLine(axLines.get(appName)?.get(qid)) : null });
+          }
+        }
         const inspector = await inspectorBlock(appName);
         const captions = pictures.map((r, i) => {
           const where = r.onSpace === false ? ", on another Space" : "";
@@ -2739,12 +2903,13 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         const text = [
           summarizeBatch({
             ran, failed, remaining: steps.length - ran.length - (failed ? 1 : 0), diff,
-            unwatched: steps.length > 1, fields, watched,
+            unwatched: steps.length > 1, fields, watched, quiet: quietSteps,
           }),
           inspector,
           ...captions,
           batchNudgeText,
           remeasureNote(root),
+          outlineNote(root),
         ].filter(Boolean).join("\n");
         return {
           contentItems: [
@@ -2805,6 +2970,7 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
           axLog(`draw gate: held the first ${path?.length ?? 0}-point path in ${appName} until the surface is cleared${commands.length ? `, naming ${commands.length} command(s)` : ""}`);
           return axText(gate ?? "", false);
         }
+        if ((path?.length ?? 0) >= DRAW_GATE_POINTS) agePendingOutline(root, true);
         axLog(`pointer ${appName} #${String(a.id)} ${path ? `${path.length} point(s)` : "centre"}${clicks > 1 ? ` x${clicks}` : ""}${hold ? " held" : ""}${mods.length ? ` +${mods.join("+")}` : ""}`);
         const r = await ax.request("pointer", {
           app: appName,
@@ -2832,7 +2998,7 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
           app: appName, hold, asked: path ? path.length : null, landed: at.length || 1,
           note: typeof r.note === "string" ? r.note : null,
         });
-        return axText([`${headline}${where}\n${diff || "(nothing in the tree changed — a canvas often shows its result only as a new object, so read the app)"}`, inspector, pointerNudge, remeasureNote(root)].filter(Boolean).join("\n"), true);
+        return axText([`${headline}${where}\n${diff || "(nothing in the tree changed — a canvas often shows its result only as a new object, so read the app)"}`, inspector, pointerNudge, remeasureNote(root), outlineNote(root)].filter(Boolean).join("\n"), true);
       }
       case "computer_app_screenshot": {
         const r = await ax.request("screenshot", { app: appName, ...(typeof a.window === "number" ? { window: a.window } : {}) }, 15_000);
@@ -2848,6 +3014,54 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
           ],
           success: true,
         };
+      }
+      case "computer_find": {
+        const sel: Record<string, unknown> = { app: appName, ...axActionOpts(appName) };
+        for (const k of ["role", "label", "value", "action"]) if (typeof a[k] === "string") sel[k] = a[k];
+        for (const k of ["enabled", "selected", "contains", "caseInsensitive"]) if (typeof a[k] === "boolean") sel[k] = a[k];
+        if (typeof a.within === "number") sel.within = a.within;
+        axLog(`find ${appName} ${JSON.stringify(Object.fromEntries(Object.entries(sel).filter(([k]) => k !== "app")))}`);
+        const r = await ax.request("findUnique", sel);
+        if (r.ok === true) {
+          const frame = r.frame as { x: number; y: number; w: number; h: number } | undefined;
+          return axText(
+            `#${String(r.id)} ${String(r.role)}${r.label ? ` ${JSON.stringify(r.label)}` : ""}` +
+              `${r.value ? ` = ${String(r.value)}` : ""}` +
+              `${Array.isArray(r.actions) && r.actions.length ? ` {${(r.actions as string[]).join(",")}}` : ""}` +
+              `${frame ? ` @${frame.x},${frame.y} ${frame.w}x${frame.h}` : ""}`,
+            true,
+          );
+        }
+        // Fails closed, and hands back what it saw so the next call is aimed
+        // rather than guessed. Reading again does not repair an ambiguity.
+        const rows = (r.matches ?? r.near ?? []) as Record<string, unknown>[];
+        const listed = rows
+          .map((m) => {
+            const f = m.frame as { x: number; y: number } | undefined;
+            return `  #${String(m.id)} ${String(m.role)}${m.label ? ` ${JSON.stringify(m.label)}` : ""}${f ? ` @${f.x},${f.y}` : ""}`;
+          })
+          .join("\n");
+        return axText([String(r.note ?? r.error ?? "no match"), listed].filter(Boolean).join("\n"), false);
+      }
+      case "computer_verify": {
+        const sel: Record<string, unknown> = { app: appName, ...axActionOpts(appName) };
+        for (const k of ["role", "label", "value", "action"]) if (typeof a[k] === "string") sel[k] = a[k];
+        for (const k of ["contains", "caseInsensitive"]) if (typeof a[k] === "boolean") sel[k] = a[k];
+        if (typeof a.within === "number") sel.within = a.within;
+        if (a.expect && typeof a.expect === "object") sel.expect = a.expect;
+        if (typeof a.timeoutMs === "number") sel.timeoutMs = a.timeoutMs;
+        axLog(`verify ${appName} ${JSON.stringify(a.expect ?? {})}`);
+        // The bridge polls until its own deadline, so give the request room.
+        const r = await ax.request("verify", sel, 20_000);
+        const verdict = String(r.verdict ?? "unknown");
+        // ok is about whether the CHECK RAN, never about which way it came out.
+        // "unsatisfied" is a successful answer; reporting it as a failed call
+        // is how a caller learns to retry the thing it just proved did not
+        // happen — which on a toggle undoes the press that did.
+        return axText(
+          `${verdict.toUpperCase()}${r.id !== undefined ? ` — element #${String(r.id)}` : ""}\n${String(r.note ?? "")}`,
+          true,
+        );
       }
       case "computer_press":
       case "computer_set_value":
@@ -2902,7 +3116,7 @@ async function handleAxCall(tool: string, rawArgs: unknown, threadId: string | n
         // inspector's ids change; a key or a value write does not.
         const inspector = tool === "computer_press" || tool === "computer_act" ? await inspectorBlock(appName) : null;
         return axText(
-          [renderActionResult(diff, hint, hint && clicked ? parkedNextCall(appName) : null), inspector, nudge, remeasureNote(root)].filter(Boolean).join("\n"),
+          [renderActionResult(diff, hint, hint && clicked ? parkedNextCall(appName) : null), inspector, nudge, remeasureNote(root), outlineNote(root)].filter(Boolean).join("\n"),
           true,
         );
       }
@@ -3317,6 +3531,9 @@ function paneForThread(threadId: unknown): PaneId | null {
 // backgrounded conversation be reopened mid-turn with its busy state, the
 // partial assistant text, and any approval request the agent is blocked on.
 const runningTurns = new Map<string, string>(); // threadId → turnId
+/** threadId → the last token-usage numbers seen, so a retry that re-emits them
+ *  unchanged can be told from a new request. */
+const lastUsageSig = new Map<string, string>();
 // The in-flight assistant message per thread. Deltas reach the renderer only
 // while a pane owns the thread, so this is the sole record of text streamed
 // while a conversation was backgrounded. Cleared when the message completes.
@@ -4563,6 +4780,22 @@ let axRecentEdits: RecentEdit[] = [];
 const axBatchNudged = new Set<string>();
 /** Conversations whose first long click path has been held once — see drawGate. */
 const drawGateUsed = new Set<string>();
+
+/** The outline a conversation measured and has not drawn yet, and how many
+ *  desktop calls ago. See outlineReminder for the run this is for. */
+const pendingOutline = new Map<string, PendingOutline>();
+
+/** Every desktop call ages it; a long path spends it. */
+function agePendingOutline(root: string, drewAPath: boolean): void {
+  const p = pendingOutline.get(root);
+  if (!p) return;
+  if (drewAPath) { pendingOutline.delete(root); return; }
+  p.callsSince += 1;
+}
+
+function outlineNote(root: string): string | null {
+  return outlineReminder(pendingOutline.get(root) ?? null);
+}
 /** Record one logical edit and, once per compaction cycle, hand back the batch
  *  call that would have carried the recent run of them. */
 function recordEditAndNudge(root: string, appName: string, edit: RecentEdit): string | null {
@@ -5741,6 +5974,7 @@ function wireNotifications(): void {
           // gateway's per-org concurrency.
           learning?.setIdle(false);
           runningTurns.set(threadId, turn.id);
+          metrics.record({ ...metricNow(threadId), kind: "run", turn: turn.id, phase: "started", status: null } satisfies RunRecord);
           bgStream.delete(threadId);
           send("chat:thread-activity", { threadId, running: true });
           const sub = subAgents.get(threadId);
@@ -6008,6 +6242,26 @@ function wireNotifications(): void {
           // at 154% while every request was already failing.
           percent: window ? Math.round((used / window) * 100) : null,
         };
+        // A retry that never completes leaves tokenUsage.last exactly where it
+        // was, so the same numbers arrive again. Marked, not dropped: the
+        // repeats are the only evidence here that something retried at all.
+        const usageKey = String(params.threadId);
+        const usageSig = `${last?.inputTokens ?? 0}/${last?.outputTokens ?? 0}/${used}`;
+        const repeated = lastUsageSig.get(usageKey) === usageSig;
+        lastUsageSig.set(usageKey, usageSig);
+        metrics.record({
+          ...metricNow(params.threadId ? String(params.threadId) : null),
+          kind: "turn",
+          ...(repeated ? { repeat: true as const } : {}),
+          turn: runningTurns.get(String(params.threadId)) ?? null,
+          // `last` is the latest REQUEST's prompt and completion, so input is
+          // the whole context re-sent on that turn. Summed over a run that is
+          // the real bill; it is not the conversation's size.
+          input: last?.inputTokens ?? 0,
+          cached: (last as { cachedInputTokens?: number } | undefined)?.cachedInputTokens ?? 0,
+          output: last?.outputTokens ?? 0,
+          total: used,
+        } satisfies TurnRecord);
         // Persist per thread so the gauge survives restarts and resumes.
         try {
           const map = loadCtxUsage();
@@ -6049,6 +6303,16 @@ function wireNotifications(): void {
           observeLearning("turn_completed", threadId, `turn ${turn?.status ?? "completed"}`, {
             status: turn?.status ?? "completed",
           });
+          // Before runningTurns is cleared below: the id is what pairs this
+          // with its start record, and after the delete there is nothing to
+          // pair with.
+          metrics.record({
+            ...metricNow(threadId),
+            kind: "run",
+            turn: runningTurns.get(threadId) ?? null,
+            phase: "completed",
+            status: turn?.status ?? "completed",
+          } satisfies RunRecord);
           learning?.flush();
           // Idle again: nothing of the user's is competing for the gateway.
           if (runningTurns.size <= 1) learning?.setIdle(true);
@@ -6302,22 +6566,34 @@ function wireNotifications(): void {
         const args = (params as { arguments?: unknown }).arguments;
         // Three families now, dispatched by prefix rather than by assuming
         // the browser owns every dynamic tool.
-        const call = tool.startsWith("schedule_")
+        const seq = ++toolSeq;
+        const startedAt = Date.now();
+        const shape = payloadOf(tool, args);
+        // The whole dispatch runs inside the scope, so every bridge call it
+        // makes — one for a press, a dozen for a batch — files itself under
+        // this tool call rather than under whichever thread happened to be
+        // running at the same moment.
+        const quietWrites: { id: number | null; role: string | null }[] = [];
+        const call = inToolCall.run({ seq, thread: approvalThread, quiet: quietWrites }, () =>
+          tool.startsWith("schedule_")
           ? handleScheduleToolCall(tool, args, approvalThread)
           : tool.startsWith("checkpoint_")
             ? handleCheckpointToolCall(tool, args, approvalThread)
           : tool.startsWith("image_")
-            ? handleImageToolCall(tool, args)
+            ? handleImageToolCall(tool, args, approvalThread)
           : tool.startsWith("memory_")
             ? handleMemoryToolCall(tool, args, approvalThread)
             : routesToAx(tool)
               ? handleAxCall(tool, args, approvalThread)
             : tool.startsWith("computer_")
               ? handleComputerUseCall(tool, args, approvalThread)
-              : handleAgentBrowserCall(tool, args, approvalThread);
+              : handleAgentBrowserCall(tool, args, approvalThread),
+        );
         // The first desktop call of a conversation carries the computer-use
         // skill. See skillPreamble: the model does open it on its own, but
         // reactively, mid-task, after it has already stalled.
+        // A desktop call the outline was not used in is a call it drifts by.
+        if (routesToAx(tool)) agePendingOutline(rootThreadOf(approvalThread), false);
         const skillRoot = rootThreadOf(approvalThread);
         const sendSkill = shouldSendSkill(tool, axSkillSent.has(skillRoot));
         void call
@@ -6344,11 +6620,43 @@ function wireNotifications(): void {
           .then((response) => {
             if (!sendSkill) return response;
             const text = computerUseSkillText();
-            const preamble = text ? skillPreamble(text) : null;
+            const preamble = text ? skillPreamble(text, join(bundledSkillsDir(), "computer-use")) : null;
             if (!preamble) return response;
             axSkillSent.add(skillRoot);
             axLog(`sent the computer-use skill with the first desktop call (${tool})`);
             return appendSkill(response, preamble);
+          })
+          .then((response) => {
+            // Recorded after the skill and checkpoint passes so ms is the
+            // whole cost of answering the call, which is what a per-binding
+            // budget would have to clear.
+            const text = response.contentItems
+              .map((c) => (typeof (c as { text?: unknown }).text === "string" ? (c as { text: string }).text : ""))
+              .join("\n");
+            const ok = response.success !== false;
+            const rec: ToolRecord & { seq: number } = {
+              ...metricNow(approvalThread),
+              kind: "tool",
+              turn: approvalThread ? (runningTurns.get(approvalThread) ?? null) : null,
+              tool,
+              app: appOfStep(tool, (args && typeof args === "object" ? args : {}) as Record<string, unknown>),
+              verb: shape.verb,
+              size: shape.size,
+              unit: shape.unit,
+              parts: shape.parts,
+              ms: Date.now() - startedAt,
+              ok,
+              // What ambiguity looks like before anything resolves an element
+              // by label: the app took the action and the tree did not move.
+              noChange: ok && text.includes(ACTION_NO_CHANGE_SENTENCE),
+              ...(quietWrites.length ? { quietWrites } : {}),
+              // The tool layer has prose, not a code — the classified reason
+              // lives on the driver record underneath it, which has both.
+              failure: ok ? null : classifyFailure(null, text),
+              seq,
+            };
+            metrics.record(rec);
+            return response;
           })
           .then((response) => engine.respond(msg.id, response));
         return;
@@ -6625,7 +6933,7 @@ async function handleScheduleToolCall(
 /** image_outline: the main shape in a picture as a click path. Read-only, so
  *  no approval; pure geometry over the decoded bitmap, see image-outline.ts.
  *  Files the decoder cannot read are converted the way attachments are. */
-async function handleImageToolCall(tool: string, rawArgs: unknown): Promise<DynamicToolResponse> {
+async function handleImageToolCall(tool: string, rawArgs: unknown, threadId: string | null): Promise<DynamicToolResponse> {
   const text = (t: string, ok: boolean): DynamicToolResponse => ({ contentItems: [{ type: "inputText", text: t }], success: ok });
   if (tool !== "image_outline") return text(`Unknown tool ${tool}`, false);
   const a = (rawArgs ?? {}) as { path?: unknown; max_points?: unknown; fit?: unknown };
@@ -6656,8 +6964,12 @@ async function handleImageToolCall(tool: string, rawArgs: unknown): Promise<Dyna
   const maxPoints = typeof a.max_points === "number" && Number.isFinite(a.max_points) ? Math.round(a.max_points) : undefined;
   const result = outlineOf({ width, height, data: img.toBitmap() }, { maxPoints, fit });
   if ("error" in result) return text(`Nothing to trace in ${path}: ${result.error}.`, false);
-  axLog(`image_outline ${path.split("/").pop()}: ${result.points.length} points, ${result.color}, fit ${fit}`);
-  return text(renderOutline(path.split("/").pop() ?? path, result), true);
+  const name = path.split("/").pop() ?? path;
+  axLog(`image_outline ${name}: ${result.points.length} points, ${result.color}, fit ${fit}`);
+  // Held until it is drawn, so it can be brought back if the run wanders. See
+  // outlineReminder for the run that measured one and never used it.
+  pendingOutline.set(rootThreadOf(threadId), { name, path, points: result.points.length, color: result.color, callsSince: 0 });
+  return text(renderOutline(name, result), true);
 }
 
 /** checkpoint_save: the model's half of the working memory. Validated (no
@@ -7196,6 +7508,8 @@ async function startEngine(): Promise<void> {
   // After the engine, and never blocking it: an absent or broken sidecar
   // leaves the app exactly as it was.
   void startLearning();
+  // Before the bridge, so the bridge's own hello is the first thing recorded.
+  startMetrics();
   // Same footing as the sidecar: absent or broken, the app is exactly as it was.
   void startAxBridge();
 }

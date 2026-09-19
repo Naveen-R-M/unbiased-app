@@ -261,3 +261,29 @@ export function renderOutline(name: string, o: Outline): string {
     : "The points are FRACTIONS of the shape's own bounding box, so the shape fills the element you aim at edge to edge. Pass them unchanged as the path of computer_pointer.";
   return `${head}\n${how}\npath: ${JSON.stringify(o.points)}`;
 }
+
+/** An outline this conversation measured and has not drawn yet.
+ *
+ *  Measured 2026-09-11: a run traced a 59-point outline, then spent ten turns
+ *  and three full-window screenshots hunting for the right frame, pressed the
+ *  pen key, and gave up without ever sending the path. By then the points were
+ *  ten turns back behind the screenshots. This keeps them in view, cheaply: a
+ *  single line, and the reminder that re-reading them is free rather than
+ *  something to re-derive by eye.
+ */
+export type PendingOutline = { name: string; path: string; points: number; color: string; callsSince: number };
+
+/** Say it once the outline has started to drift out of reach, and keep saying
+ *  it while it is unused — a drawing that never happens is the failure this is
+ *  for. Silent until then, so a task that draws straight away never sees it. */
+export const OUTLINE_REMINDER_AFTER = 4;
+
+export function outlineReminder(pending: PendingOutline | null): string | null {
+  if (!pending || pending.callsSince < OUTLINE_REMINDER_AFTER) return null;
+  return (
+    `You measured the outline of ${pending.name} ${pending.callsSince} calls ago and have not drawn it: ` +
+    `${pending.points} points, fill ${pending.color}. Pass those points to computer_pointer as the path — ` +
+    `if they have scrolled out of view, call image_outline again for ${pending.path} (it costs nothing) ` +
+    "rather than writing points by eye."
+  );
+}

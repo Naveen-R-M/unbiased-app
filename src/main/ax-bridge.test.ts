@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-import { AX_TOOL_NAMES, SCREENSHOT_TOOL_NAMES, routesToAx, parseBatchSteps, describeBatch, summarizeBatch, MAX_BATCH_STEPS, AxClient, AxError, appOfStep, axConsent, axNeedsFocus, screenshotToolsOffered, coordinateToolAllowed, withScreenshotGuidance, SCREENSHOT_FRAME_SENTENCE, axReadOptsFrom, AX_DEFAULT_READ_OPTS, shouldRecoverRaise, describeAxAction, indexElementLines, readAxManifest, resolveAxDir, shouldOpenAccessibilitySettings, axNotTrustedText, RAISE_DESCRIPTION, APP_STATE_SPACE_SENTENCE, LAUNCH_FRONT_SENTENCE, withSpaceGuidance, otherSpaceNote, launchOutcome, renderActionResult, ACTION_NO_CHANGE_SENTENCE, TASK_DISCIPLINE_SENTENCE, SCREENSHOT_SPACE_SENTENCE, parseCandidates, describeCandidates, parkedNextCall, parkedReadNote, batchNudge, isSingleEdit, stepsForNudge, traceStep, MAX_TYPE_LENGTH, type BatchStep, BATCH_NUDGE_AFTER, type RecentEdit, pointerHeadline, drawGate, DRAW_GATE_POINTS, surfaceCommands, skillBody, skillPreamble, shouldSendSkill, prependSkill, appendSkill, MAX_SKILL_PREAMBLE, candidateWorked, summarizeCandidates, MAX_CANDIDATES, MAX_CANDIDATE_STEPS, type AxCallInfo, touchedFieldIds, renderFieldValues, MAX_FIELDS_READ_BACK, type FieldValue, renderInspector, MAX_INSPECTOR_FIELDS, BATCH_VERBS, type InspectorField } from "./ax-bridge";
+import { roleOfLine, pointerRoute, AX_TOOL_NAMES, SCREENSHOT_TOOL_NAMES, routesToAx, parseBatchSteps, describeBatch, summarizeBatch, MAX_BATCH_STEPS, AxClient, AxError, appOfStep, axConsent, axNeedsFocus, screenshotToolsOffered, coordinateToolAllowed, withScreenshotGuidance, SCREENSHOT_FRAME_SENTENCE, axReadOptsFrom, AX_DEFAULT_READ_OPTS, shouldRecoverRaise, describeAxAction, indexElementLines, readAxManifest, resolveAxDir, shouldOpenAccessibilitySettings, axNotTrustedText, RAISE_DESCRIPTION, APP_STATE_SPACE_SENTENCE, LAUNCH_FRONT_SENTENCE, withSpaceGuidance, otherSpaceNote, launchOutcome, renderActionResult, ACTION_NO_CHANGE_SENTENCE, TASK_DISCIPLINE_SENTENCE, SCREENSHOT_SPACE_SENTENCE, parseCandidates, describeCandidates, parkedNextCall, parkedReadNote, batchNudge, isSingleEdit, stepsForNudge, traceStep, MAX_TYPE_LENGTH, type BatchStep, BATCH_NUDGE_AFTER, type RecentEdit, pointerHeadline, drawGate, DRAW_GATE_POINTS, surfaceCommands, skillBody, skillPreamble, shouldSendSkill, prependSkill, appendSkill, MAX_SKILL_PREAMBLE, candidateWorked, summarizeCandidates, MAX_CANDIDATES, MAX_CANDIDATE_STEPS, type AxCallInfo, touchedFieldIds, renderFieldValues, MAX_FIELDS_READ_BACK, type FieldValue, renderInspector, MAX_INSPECTOR_FIELDS, BATCH_VERBS, type InspectorField } from "./ax-bridge";
 
 const scratch = () => mkdtempSync(join(tmpdir(), "ax-"));
 
@@ -895,6 +895,34 @@ test("every finished request reports its timing and size, errors included", asyn
   assert.ok(echo.ms >= 0 && echo.bytes > 0 && echo.error === null);
   const boom = calls.find((x) => x.method === "boom");
   assert.ok(boom && boom.error && boom.error.includes("No running app"), JSON.stringify(boom));
+  // The code travels beside the prose. Anything sorting failures into kinds —
+  // stale element ids apart from timeouts apart from a dead bridge — keys off
+  // this, because the messages are written to be read and get rewritten.
+  assert.equal(boom.code, "no_such_app");
+  assert.equal(echo.code, null, "a call that worked carries no code");
+});
+
+test("a call reports inside the async context of whoever asked for it", async () => {
+  const { AsyncLocalStorage } = await import("node:async_hooks");
+  const m = fakeBridge();
+  assert.ok(m && !("error" in m));
+  const c = new AxClient(m);
+  const seen: (string | undefined)[] = [];
+  const store = new AsyncLocalStorage<string>();
+  c.onCall = () => seen.push(store.getStore());
+  await c.start();
+  // A reply arrives on the bridge's stdout 'line' event, and that listener is
+  // registered once in start(). Without binding, report() runs in startup's
+  // context and every caller's async-local state is invisible — measured on a
+  // real run as 222 driver records with a null thread while the tool records
+  // wrapping them were all correct.
+  await store.run("the caller", () => c.request("echo", { app: "Maps" }));
+  c.stop();
+  assert.deepEqual(
+    seen.filter((x) => x !== undefined),
+    ["the caller"],
+    `the echo reported outside its caller's context: ${JSON.stringify(seen)}`,
+  );
 });
 
 // Run 3 of the Maps task: the model wanted to look, screenshotted a Space Maps
@@ -926,13 +954,130 @@ test("while Spaces are crossed, raise says looking is not a reason either", () =
   assert.ok(crossed.includes("computer_app_screenshot") && crossed.includes("Not to look"), crossed);
 });
 
+test("select_text parses, traces, and defaults to the whole value", () => {
+  const all = parseBatchSteps([{ do: "select_text", id: 7 }]);
+  assert.ok("steps" in all, JSON.stringify(all));
+  assert.deepEqual(all.steps[0], { do: "select_text", id: 7, waitMs: 0 });
+  assert.equal(traceStep(all.steps[0]), "select_text #7 (all)");
+
+  const some = parseBatchSteps([{ do: "select_text", id: 7, text: "121212" }]);
+  assert.ok("steps" in some);
+  assert.equal(traceStep(some.steps[0]), 'select_text #7 "121212"');
+
+  // id is what scopes it to a field rather than to the document; without one
+  // this would be command+a by another name.
+  assert.ok("error" in parseBatchSteps([{ do: "select_text" }]));
+  assert.ok("error" in parseBatchSteps([{ do: "select_text", id: 7, text: 12 }]));
+});
+
+test("a role is read off an element line by where it stops", () => {
+  assert.equal(roleOfLine('text field "Last name" = Kumar {press,show menu}'), "text field");
+  assert.equal(roleOfLine('pop up button "Country" = India {press}'), "pop up button");
+  assert.equal(roleOfLine('incrementor "Seats"'), "incrementor");
+  assert.equal(roleOfLine("button [disabled] {press}"), "button");
+  assert.equal(roleOfLine('text area = a long note'), "text area");
+  assert.equal(roleOfLine(undefined), null);
+  assert.equal(roleOfLine(""), null);
+});
+
+test("the preamble says where the reference files are, when it knows", () => {
+  const md = "---\nname: x\n---\n# Body\ntext";
+  const withDir = skillPreamble(md, "/Apps/Unbiased.app/Contents/Resources/skills/computer-use");
+  assert.ok(withDir!.includes("/references/"), withDir!);
+  assert.ok(withDir!.includes("shell command"), "it must say how to open one: " + withDir);
+  // A file the reader cannot locate reads as detail withheld, so without a
+  // directory the pointer is simply absent rather than dangling.
+  assert.ok(!skillPreamble(md)!.includes("/references/"));
+  assert.ok(skillPreamble(md)!.includes("# Body"));
+});
+
+test("computer_find is routed, and its description sells the refusal", () => {
+  assert.ok(AX_TOOL_NAMES.includes("computer_find"), "declared but not routed sends it to the screenshot handler");
+  assert.ok(routesToAx("computer_find"));
+  const src = readFileSync(join(__dirname, "index.ts"), "utf8");
+  const at = src.indexOf('name: "computer_find"');
+  assert.ok(at > 0, "computer_find must be declared to the model");
+  const decl = src.slice(at, src.indexOf("inputSchema", at));
+  // The value is that it refuses. A description that only promises to find
+  // something invites the model to treat a list of two as an answer.
+  assert.ok(/never picks for you/i.test(decl), "the description must say it does not choose");
+  assert.ok(/exact/i.test(decl), "and that matching is exact by default");
+});
+
+test("the pointer route is recorded, and the two that used to look alike no longer do", () => {
+  // The bug: "quiet" and "took the user's cursor and raised the app" both
+  // recorded as null, so the metrics could not answer which had happened. On a
+  // drawing run all thirteen pointer calls read null while the user watched
+  // their own cursor turn into a pen.
+  assert.equal(pointerRoute("pointer", "backgrounded,pointerUntouched"), "window");
+  assert.equal(pointerRoute("pointer", "pointerUntouched"), "quiet");
+  assert.equal(pointerRoute("pointer", "raised"), "cursor+raised");
+  assert.equal(pointerRoute("pointer", "pointerReturned"), "cursor");
+  assert.equal(pointerRoute("pointer", ""), "cursor-left");
+  assert.notEqual(pointerRoute("pointer", "pointerUntouched"), pointerRoute("pointer", "raised"));
+  // Only pointer calls have a route; everything else would be inventing one.
+  assert.equal(pointerRoute("act", "backgrounded"), null);
+  assert.equal(pointerRoute("tree", ""), null);
+});
+
+test("computer_verify is routed, and its description refuses to let unknown pass as yes", () => {
+  assert.ok(AX_TOOL_NAMES.includes("computer_verify"), "declared but not routed sends it to the screenshot handler");
+  assert.ok(routesToAx("computer_verify"));
+  const src = readFileSync(join(__dirname, "index.ts"), "utf8");
+  const at = src.indexOf('name: "computer_verify"');
+  assert.ok(at > 0, "computer_verify must be declared to the model");
+  const decl = src.slice(at, src.indexOf("inputSchema", at));
+  // The whole point is the third answer. A description that offers only yes
+  // and no teaches the model that anything else is a yes.
+  assert.ok(/unknown is NOT success/i.test(decl), "the description must say unknown is not success");
+  // And the reason it exists at all: the retry that undoes the thing.
+  assert.ok(/UNDO/i.test(decl), "it must warn that pressing a toggle again may undo the first press");
+  assert.ok(/looking again|read.*again/i.test(decl), "and that a stale tree is answered by reading, not by acting again");
+});
+
+test("a verify verdict is reported as an answer, never as a failed call", () => {
+  // "unsatisfied" means the check ran and said no. Marking that as a failed
+  // tool call is how a caller learns to retry what it just proved did not
+  // happen — which on a toggle undoes the press that did.
+  const src = readFileSync(join(__dirname, "index.ts"), "utf8");
+  const at = src.indexOf('case "computer_verify"');
+  assert.ok(at > 0, "computer_verify must be handled");
+  const body = src.slice(at, at + 1600);
+  assert.ok(/ok is about whether the CHECK RAN/i.test(body), "the reasoning must be stated where someone would change it");
+  assert.ok(/return axText\([\s\S]*?,\s*true,?\s*\);/.test(body), "the verdict is data; the call itself succeeded");
+});
+
+test("a batch says when its writes moved nothing, but only when the tree agrees", () => {
+  const ran = ["step 1 (press #4)", "step 2 (type \"abc\")"];
+  const quiet = ["step 2 (type \"abc\")"];
+  // Both signals: the values did not move AND nothing in the tree moved.
+  const both = summarizeBatch({ ran, failed: null, remaining: 0, diff: "(no changes)", quiet });
+  assert.ok(both.includes("wrote nothing that can be observed"), both);
+  assert.ok(both.includes("step 2"), "it names which step: " + both);
+  // One signal only: the tree moved, so the write did something even though
+  // the value reads the same — the case that made refusing this wrong.
+  const moved = summarizeBatch({ ran, failed: null, remaining: 0, diff: "~4 button \"OK\"", quiet });
+  assert.ok(!moved.includes("wrote nothing"), "a tree that changed acquits the write: " + moved);
+  // No quiet steps: unchanged from before.
+  const clean = summarizeBatch({ ran, failed: null, remaining: 0, diff: "(no changes)" });
+  assert.ok(!clean.includes("wrote nothing"), clean);
+  assert.ok(clean.includes(ACTION_NO_CHANGE_SENTENCE), clean);
+});
+
 test("a launch that showed the app and a blank picture are marked in the call line", async () => {
   const { describeAxCall } = await import("./ax-bridge");
-  const base = { method: "launch", app: "Maps", ms: 3000, waitedMs: null, bytes: 900, lines: 20, flags: "", marks: "shown", error: null };
+  const base = { method: "launch", app: "Maps", ms: 3000, waitedMs: null, bytes: 900, lines: 20, flags: "", marks: "shown", error: null, code: null, targetId: null };
   assert.ok(describeAxCall(base).includes("[shown]"));
   assert.ok(describeAxCall({ ...base, method: "screenshot", marks: "blank" }).includes("[blank]"));
+  assert.ok(describeAxCall({ ...base, method: "pointer", marks: "backgrounded" }).includes("[backgrounded]"));
+  // Both spellings of "this write did nothing". A settling call reports the
+  // verdict; a batch step reports the one signal it has. Watching for only the
+  // first counted zero across two runs in which every write was batched.
+  assert.ok(describeAxCall({ ...base, method: "setValue", marks: "wroteNothing" }).includes("[wroteNothing]"));
+  assert.ok(describeAxCall({ ...base, method: "setValue", marks: "valueUnchanged" }).includes("[valueUnchanged]"));
   assert.ok(!describeAxCall({ ...base, marks: "" }).includes("["));
 });
+
 
 // Candidates: several plausible routes to one state, tried locally, so a wrong
 // guess costs a bridge call instead of a model turn.
