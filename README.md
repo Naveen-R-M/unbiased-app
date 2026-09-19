@@ -1,4 +1,4 @@
-# Unbiased
+# Unbiased App
 
 Unbiased desktop — a Pareto-powered coding agent in an Electron shell. The
 app is a pure client: all agent intelligence lives in a separate
