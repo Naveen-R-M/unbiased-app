@@ -23,6 +23,18 @@
     ],
     "extraResources": [
       {
+        "from": "LICENSE",
+        "to": "licenses/unbiased/LICENSE"
+      },
+      {
+        "from": "NOTICE",
+        "to": "licenses/unbiased/NOTICE"
+      },
+      {
+        "from": "THIRD_PARTY_NOTICES.md",
+        "to": "licenses/unbiased/THIRD_PARTY_NOTICES.md"
+      },
+      {
         "from": "../unbiased-app-engine/dist/bundle",
         "to": "engine",
         "filter": [
@@ -74,7 +86,7 @@
     }
   },
   "keywords": [],
-  "license": "UNLICENSED",
+  "license": "Apache-2.0",
   "type": "commonjs",
   "dependencies": {
     "@lydell/node-pty": "^1.2.0-beta.15",
@@ -90,7 +102,7 @@
     "remark-gfm": "^4.0.1"
   },
   "devDependencies": {
-    "@types/node": "^26.2.0",
+    "@types/node": "^26.6.1",
     "@types/prismjs": "^1.26.6",
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.4",
@@ -98,7 +110,7 @@
     "electron": "^43.4.0",
     "electron-builder": "^26.15.3",
     "electron-vite": "^5.0.0",
-    "tsx": "^4.23.12",
+    "tsx": "^4.23.13",
     "typescript": "^7.0.2",
     "vite": "^7.3.6"
   },

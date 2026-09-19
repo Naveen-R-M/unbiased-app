@@ -1,8 +1,7 @@
 name: Release
 
 # Tag-driven releases, published CROSS-REPO to the public releases repo
-# (circuitandchisel/unbiased-app-releases) — this source repo stays private,
-# the same shape as unbiased-cli. Push a v* tag here and this builds the DMG,
+# (circuitandchisel/unbiased-app-releases). Push a v* tag here to build the DMG,
 # checksums it, publishes the release over there, and syncs install.sh so the
 # public copy never drifts from the source of truth in scripts/.
 #
@@ -18,7 +17,7 @@ name: Release
 # which belong to a PERSON: invisible from the org side, unrevokable by
 # offboarding, and expiring on their own 90-day clock. The App is owned by the
 # org, and what actually flows through CI is an installation token that lasts
-# about an hour (planning#262).
+# about an hour.
 #
 # Runs on macOS because a .dmg can only be built (and codesigned) on macOS.
 # macos-15 is an Apple Silicon runner, which matches our arm64-only target —
@@ -39,7 +38,7 @@ jobs:
     runs-on: macos-15
     steps:
       - name: checkout app
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: unbiased-app
 
@@ -49,7 +48,7 @@ jobs:
       # unbiased-app-releases. The App must be installed on all three.
       - name: mint a release token
         id: app-token
-        uses: actions/create-github-app-token@v2
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
         with:
           app-id: ${{ secrets.RELEASE_APP_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
@@ -62,7 +61,7 @@ jobs:
       # The engine must sit BESIDE the app: package.json's extraResources
       # copies from ../unbiased-app-engine/dist/bundle.
       - name: checkout engine
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: circuitandchisel/unbiased-app-engine
           token: ${{ steps.app-token.outputs.token }}
@@ -71,22 +70,19 @@ jobs:
       # The accessibility bridge must sit BESIDE the app too: extraResources
       # copies from ../unbiased-ax/dist. Without it `npm run dist` fails at
       # the copy, which would only show up on a tag push.
-      # No token: unbiased-ax is public, so this needs no App installation and
-      # cannot fail on a permissions change elsewhere. If it is ever made
-      # private, add `token: ${{ steps.app-token.outputs.token }}` here and
-      # `unbiased-ax` to the token's repositories list above.
+      # No token: this checkout uses only public repository data.
       - name: checkout accessibility bridge
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: circuitandchisel/unbiased-ax
           path: unbiased-ax
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: unbiased-app-engine/go.mod
           cache: true
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "22"
 
@@ -214,7 +210,7 @@ jobs:
             release/*.dmg \
             release/SHA256SUMS
 
-      # scripts/install.sh (here, private) is the source of truth and already
+      # scripts/install.sh is the source of truth and already
       # points its REPO at the public releases repo. Push a verbatim copy
       # every release so the public copy can never drift.
       - name: sync install.sh to the public repo

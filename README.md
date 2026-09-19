@@ -14,6 +14,21 @@ from keystroke to file on disk.
   <img src="resources/icon.png" alt="Unbiased icon" width="128" />
 </p>
 
+## Install
+
+Unbiased requires an Apple Silicon Mac running macOS 12 or newer. Download
+the latest build from
+[unbiased-app-releases](https://github.com/circuitandchisel/unbiased-app-releases/releases/latest),
+or use the verified installer:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/circuitandchisel/unbiased-app-releases/main/install.sh | bash
+```
+
+On first launch, choose **Sign in with browser** to select an Unbiased
+workload, or paste an existing Unbiased API key. Desktop-control features ask
+for macOS Accessibility or Screen Recording access only when they need it.
+
 ## Features
 
 - **Streaming chat** with markdown rendering, Prism-highlighted code
@@ -73,20 +88,24 @@ live on disk — see [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md).
 
 ## Development
 
-Requires Node.js and a sibling checkout of the engine:
+Requires Node.js 22 and sibling checkouts of the engine and accessibility
+bridge:
 
 ```
 Work/
 ├── unbiased-app/          # this repo
-└── unbiased-app-engine/   # run `make bundle` there first
+├── unbiased-app-engine/   # run `make bundle` there first
+└── unbiased-ax/           # run `make bundle` there first
 ```
 
 ```bash
-# 1. Build the engine bundle (once, and after engine changes)
+# 1. Build the native bundles (once, and after native changes)
 cd ../unbiased-app-engine && make bundle
+cd ../unbiased-ax && make bundle
 
 # 2. Install and run
-npm install
+cd ../unbiased-app
+npm ci
 npm run dev
 ```
 
@@ -103,4 +122,6 @@ npx electron .     # run the built app
 
 ## License
 
-UNLICENSED — private.
+Licensed under Apache-2.0. See [LICENSE](LICENSE), [NOTICE](NOTICE), and
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). The Unbiased name and logo
+are covered separately by [TRADEMARKS.md](TRADEMARKS.md).

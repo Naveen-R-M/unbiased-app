@@ -6896,7 +6896,7 @@ async function handleScheduleToolCall(
     schedule: checked.schedule,
     enabled: true,
     // The scratch directory is not a project. Recording it as one is what
-    // made the form announce "Runs in /Users/naveen/Unbiased" for a task that
+    // made the form announce a plausible local project path for a task that
     // never touches the filesystem — a real-looking path for a detail that
     // does not apply.
     projectPath: asked || (mainCwd && mainCwd !== defaultChatDir() ? mainCwd : null),
